@@ -486,6 +486,24 @@ impl<const R: usize, const C: usize, B: Kernels> DualMatrix<R, C, B> {
 
 // ---- Jacobians and gradients ------------------------------------------------
 
+/// The outer product of the gradient operator with the matrix.
+///
+/// Columns [j..j+N] are the derivatives w.r.t. xj.
+pub fn matrix_graient<const IN: usize, const OUT1: usize, const OUT2: usize, B: Kernels>(
+    at: &Vector<f32, IN, B>,
+    f: impl Fn(&DualVector<IN, B>) -> DualMatrix<OUT1, OUT2, B>,
+) -> Matrix<f32, OUT1, { IN * OUT2 }, B> {
+    let tangents = std::array::from_fn(|input| {
+        f(&DualVector::seed(duplicate_vector(at), input))
+            .tangent
+            .data
+    });
+
+    Matrix {
+        data: B::hmerge(tangents),
+    }
+}
+
 /// The Jacobian of `f` at `at`, by one forward pass per input element.
 ///
 /// Column `j` is the tangent of `f` seeded along input `j`, so this costs `IN`
@@ -496,15 +514,14 @@ pub fn jacobian<const IN: usize, const OUT: usize, B: Kernels>(
     at: &Vector<f32, IN, B>,
     f: impl Fn(&DualVector<IN, B>) -> DualVector<OUT, B>,
 ) -> Matrix<f32, OUT, IN, B> {
-    let mut entries = vec![0.0f32; OUT * IN];
-    for input in 0..IN {
-        let tangent = f(&DualVector::seed(duplicate_vector(at), input)).tangent;
-        for (output, derivative) in tangent.as_slice().iter().enumerate() {
-            entries[output * IN + input] = *derivative;
-        }
-    }
+    let tangents = std::array::from_fn(|input| {
+        f(&DualVector::seed(duplicate_vector(at), input))
+            .tangent
+            .data
+    });
+
     Matrix {
-        data: B::store_matrix::<OUT, IN>(&entries),
+        data: B::hstack::<OUT, IN>(tangents),
     }
 }
 

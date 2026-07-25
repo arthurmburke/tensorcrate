@@ -25,16 +25,16 @@
 //! statically-shaped tensor types do not fit.
 
 use std::cell::{OnceCell, RefCell};
-use std::mem::ManuallyDrop;
+use std::mem::{ManuallyDrop, size_of};
 use std::ptr::NonNull;
 
 use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
-    MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
-    MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
+    MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePipelineState,
+    MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
 };
 
 /// Threadgroup tile edge; must match `TILE` in the shader. 16×16 = 256 threads.
@@ -128,6 +128,88 @@ kernel void broadcast(
         case 1: C[i] = a - b; break;
         case 2: C[i] = a * b; break;
         default: C[i] = a / b; break;
+    }
+}
+
+// Copy one input vector into a row or column of a row-major output matrix.
+// `output_stride == 1` writes a contiguous row; otherwise it scatters a column.
+kernel void stack_vector(
+    device const float* input [[buffer(0)]],
+    device float* output      [[buffer(1)]],
+    constant uint& count      [[buffer(2)]],
+    constant uint& offset     [[buffer(3)]],
+    constant uint& output_stride [[buffer(4)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i < count) {
+        output[offset + i * output_stride] = input[i];
+    }
+}
+
+// Concatenate two row-major matrices with the same row count. Each thread
+// writes one output element; both input reads and output writes are coalesced.
+kernel void concat_horizontal(
+    device const float* left  [[buffer(0)]],
+    device const float* right [[buffer(1)]],
+    device float* output      [[buffer(2)]],
+    constant uint& rows       [[buffer(3)]],
+    constant uint& left_cols  [[buffer(4)]],
+    constant uint& right_cols [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint output_cols = left_cols + right_cols;
+    uint row = gid.y;
+    uint col = gid.x;
+    if (row >= rows || col >= output_cols) return;
+
+    output[row * output_cols + col] = col < left_cols
+        ? left[row * left_cols + col]
+        : right[row * right_cols + col - left_cols];
+}
+
+// Place one matrix into a horizontal block of a wider row-major matrix. The
+// encoder dispatches this once per input matrix in the same command buffer.
+kernel void merge_horizontal(
+    device const float* input [[buffer(0)]],
+    device float* output      [[buffer(1)]],
+    constant uint& rows       [[buffer(2)]],
+    constant uint& input_cols [[buffer(3)]],
+    constant uint& output_cols [[buffer(4)]],
+    constant uint& col_offset [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint row = gid.y;
+    uint col = gid.x;
+    if (row < rows && col < input_cols) {
+        output[row * output_cols + col_offset + col] =
+            input[row * input_cols + col];
+    }
+}
+
+// Transpose through a padded threadgroup tile. Adjacent threads read adjacent
+// input values and write adjacent output values; the extra column avoids bank
+// conflicts when the tile is read in the opposite direction.
+kernel void transpose_tiled(
+    device const float* input [[buffer(0)]],
+    device float* output      [[buffer(1)]],
+    constant uint& rows       [[buffer(2)]],
+    constant uint& cols       [[buffer(3)]],
+    uint2 tid [[thread_position_in_threadgroup]],
+    uint2 group [[threadgroup_position_in_grid]])
+{
+    threadgroup float tile[TILE][TILE + 1];
+
+    uint input_col = group.x * TILE + tid.x;
+    uint input_row = group.y * TILE + tid.y;
+    if (input_row < rows && input_col < cols) {
+        tile[tid.y][tid.x] = input[input_row * cols + input_col];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint output_col = group.y * TILE + tid.x;
+    uint output_row = group.x * TILE + tid.y;
+    if (output_row < cols && output_col < rows) {
+        output[output_row * rows + output_col] = tile[tid.x][tid.y];
     }
 }
 
@@ -283,6 +365,10 @@ struct Gpu {
     matmul: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     elementwise: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     broadcast: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    stack_vector: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    concat_horizontal: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    merge_horizontal: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    transpose: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     unary: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     unary_dual: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     fft_bit_reverse: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -327,6 +413,10 @@ fn build_gpu() -> Option<Gpu> {
         matmul: pipeline("matmul_tiled")?,
         elementwise: pipeline("elementwise")?,
         broadcast: pipeline("broadcast")?,
+        stack_vector: pipeline("stack_vector")?,
+        concat_horizontal: pipeline("concat_horizontal")?,
+        merge_horizontal: pipeline("merge_horizontal")?,
+        transpose: pipeline("transpose_tiled")?,
         unary: pipeline("unary")?,
         unary_dual: pipeline("unary_dual")?,
         fft_bit_reverse: pipeline("fft_bit_reverse")?,
@@ -448,6 +538,18 @@ impl MetalBuffer {
         Some(output)
     }
 
+    /// Transpose a row-major `rows × cols` matrix into a new shared buffer.
+    pub(crate) fn transpose(&self, rows: usize, cols: usize) -> Option<Self> {
+        if self.len != rows.checked_mul(cols)? {
+            return None;
+        }
+        let output = Self::allocate(self.len)?;
+        if self.len != 0 {
+            with_gpu(|gpu| encode_transpose(gpu, &self.raw, &output.raw, rows, cols))?;
+        }
+        Some(output)
+    }
+
     /// `target += A·B`, accumulated by the matmul kernel itself rather than by a
     /// second elementwise pass.
     ///
@@ -553,6 +655,110 @@ impl MetalBuffer {
         Some(output)
     }
 
+    /// Stack equal-length buffers as rows of one row-major matrix.
+    pub(crate) fn vstack(inputs: &[&Self], vector_len: usize) -> Option<Self> {
+        Self::stack(inputs, vector_len, 1, |index| index * vector_len)
+    }
+
+    /// Stack equal-length buffers as columns of one row-major matrix.
+    pub(crate) fn hstack(inputs: &[&Self], vector_len: usize) -> Option<Self> {
+        let columns = inputs.len();
+        Self::stack(inputs, vector_len, columns, |index| index)
+    }
+
+    fn stack(
+        inputs: &[&Self],
+        vector_len: usize,
+        output_stride: usize,
+        offset: impl Fn(usize) -> usize,
+    ) -> Option<Self> {
+        if inputs.iter().any(|input| input.len != vector_len) {
+            return None;
+        }
+        let output = Self::allocate(inputs.len().checked_mul(vector_len)?)?;
+        if output.len != 0 {
+            with_gpu(|gpu| {
+                encode_stack(gpu, inputs, &output.raw, vector_len, output_stride, offset)
+            })?;
+        }
+        Some(output)
+    }
+
+    /// Concatenate two row-major matrices horizontally.
+    pub(crate) fn concat_matrix(
+        &self,
+        rhs: &Self,
+        rows: usize,
+        left_cols: usize,
+        right_cols: usize,
+    ) -> Option<Self> {
+        if self.len != rows.checked_mul(left_cols)? || rhs.len != rows.checked_mul(right_cols)? {
+            return None;
+        }
+        let output_cols = left_cols.checked_add(right_cols)?;
+        let output = Self::allocate(rows.checked_mul(output_cols)?)?;
+        if output.len != 0 {
+            with_gpu(|gpu| {
+                encode_concat(
+                    gpu,
+                    &self.raw,
+                    &rhs.raw,
+                    &output.raw,
+                    rows,
+                    left_cols,
+                    right_cols,
+                )
+            })?;
+        }
+        Some(output)
+    }
+
+    /// Concatenate two row-major matrices vertically using contiguous blits.
+    pub(crate) fn stack_matrix(
+        &self,
+        rhs: &Self,
+        top_rows: usize,
+        bottom_rows: usize,
+        cols: usize,
+    ) -> Option<Self> {
+        if self.len != top_rows.checked_mul(cols)? || rhs.len != bottom_rows.checked_mul(cols)? {
+            return None;
+        }
+        let output = Self::allocate(self.len.checked_add(rhs.len)?)?;
+        if output.len != 0 {
+            with_gpu(|gpu| {
+                encode_matrix_stack(gpu, &self.raw, &rhs.raw, &output.raw, self.len, rhs.len)
+            })?;
+        }
+        Some(output)
+    }
+
+    /// Merge equally shaped row-major matrices horizontally.
+    pub(crate) fn hmerge(inputs: &[&Self], rows: usize, cols: usize) -> Option<Self> {
+        let matrix_len = rows.checked_mul(cols)?;
+        if inputs.iter().any(|input| input.len != matrix_len) {
+            return None;
+        }
+        let output = Self::allocate(matrix_len.checked_mul(inputs.len())?)?;
+        if output.len != 0 {
+            with_gpu(|gpu| encode_hmerge(gpu, inputs, &output.raw, rows, cols))?;
+        }
+        Some(output)
+    }
+
+    /// Merge equally shaped row-major matrices vertically with contiguous blits.
+    pub(crate) fn vmerge(inputs: &[&Self], rows: usize, cols: usize) -> Option<Self> {
+        let matrix_len = rows.checked_mul(cols)?;
+        if inputs.iter().any(|input| input.len != matrix_len) {
+            return None;
+        }
+        let output = Self::allocate(matrix_len.checked_mul(inputs.len())?)?;
+        if output.len != 0 {
+            with_gpu(|gpu| encode_vmerge(gpu, inputs, &output.raw, matrix_len))?;
+        }
+        Some(output)
+    }
+
     /// Radix-2 FFT over interleaved complex values. The layout is
     /// `[real0, imag0, real1, imag1, ...]`.
     pub fn fft(&self) -> Option<Self> {
@@ -647,6 +853,39 @@ fn encode_matmul(
     commit(gpu, command)
 }
 
+fn encode_transpose(
+    gpu: &Gpu,
+    input: &ProtocolObject<dyn MTLBuffer>,
+    output: &ProtocolObject<dyn MTLBuffer>,
+    rows: usize,
+    cols: usize,
+) -> Option<()> {
+    let rows_u32 = u32::try_from(rows).ok()?;
+    let cols_u32 = u32::try_from(cols).ok()?;
+    let command = gpu.queue.commandBuffer()?;
+    let encoder = command.computeCommandEncoder()?;
+    encoder.setComputePipelineState(&gpu.transpose);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
+        encoder.setBytes_length_atIndex(NonNull::from(&rows_u32).cast(), 4, 2);
+        encoder.setBytes_length_atIndex(NonNull::from(&cols_u32).cast(), 4, 3);
+    }
+    let groups = MTLSize {
+        width: cols.div_ceil(TILE),
+        height: rows.div_ceil(TILE),
+        depth: 1,
+    };
+    let per_group = MTLSize {
+        width: TILE,
+        height: TILE,
+        depth: 1,
+    };
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, per_group);
+    encoder.endEncoding();
+    commit(gpu, command)
+}
+
 fn encode_elementwise(
     gpu: &Gpu,
     a: &ProtocolObject<dyn MTLBuffer>,
@@ -690,6 +929,181 @@ fn encode_broadcast(
         encoder.setBytes_length_atIndex(NonNull::from(&scalar_left).cast(), 4, 4);
     }
     dispatch_1d(&encoder, len);
+    encoder.endEncoding();
+    commit(gpu, command)
+}
+
+fn encode_stack(
+    gpu: &Gpu,
+    inputs: &[&MetalBuffer],
+    output: &ProtocolObject<dyn MTLBuffer>,
+    vector_len: usize,
+    output_stride: usize,
+    offset: impl Fn(usize) -> usize,
+) -> Option<()> {
+    let count = u32::try_from(vector_len).ok()?;
+    let output_stride = u32::try_from(output_stride).ok()?;
+    let offsets = (0..inputs.len())
+        .map(|index| u32::try_from(offset(index)).ok())
+        .collect::<Option<Vec<_>>>()?;
+
+    let command = gpu.queue.commandBuffer()?;
+    let encoder = command.computeCommandEncoder()?;
+    encoder.setComputePipelineState(&gpu.stack_vector);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
+        encoder.setBytes_length_atIndex(NonNull::from(&count).cast(), 4, 2);
+        encoder.setBytes_length_atIndex(NonNull::from(&output_stride).cast(), 4, 4);
+    }
+    for (input, offset) in inputs.iter().zip(&offsets) {
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(&input.raw), 0, 0);
+            encoder.setBytes_length_atIndex(NonNull::from(offset).cast(), 4, 3);
+        }
+        dispatch_1d(&encoder, vector_len);
+    }
+    encoder.endEncoding();
+    commit(gpu, command)
+}
+
+fn encode_concat(
+    gpu: &Gpu,
+    left: &ProtocolObject<dyn MTLBuffer>,
+    right: &ProtocolObject<dyn MTLBuffer>,
+    output: &ProtocolObject<dyn MTLBuffer>,
+    rows: usize,
+    left_cols: usize,
+    right_cols: usize,
+) -> Option<()> {
+    let rows_u32 = u32::try_from(rows).ok()?;
+    let left_cols_u32 = u32::try_from(left_cols).ok()?;
+    let right_cols_u32 = u32::try_from(right_cols).ok()?;
+    let output_cols = left_cols.checked_add(right_cols)?;
+
+    let command = gpu.queue.commandBuffer()?;
+    let encoder = command.computeCommandEncoder()?;
+    encoder.setComputePipelineState(&gpu.concat_horizontal);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(left), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(right), 0, 1);
+        encoder.setBuffer_offset_atIndex(Some(output), 0, 2);
+        encoder.setBytes_length_atIndex(NonNull::from(&rows_u32).cast(), 4, 3);
+        encoder.setBytes_length_atIndex(NonNull::from(&left_cols_u32).cast(), 4, 4);
+        encoder.setBytes_length_atIndex(NonNull::from(&right_cols_u32).cast(), 4, 5);
+    }
+    let groups = MTLSize {
+        width: output_cols.div_ceil(TILE),
+        height: rows.div_ceil(TILE),
+        depth: 1,
+    };
+    let per_group = MTLSize {
+        width: TILE,
+        height: TILE,
+        depth: 1,
+    };
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, per_group);
+    encoder.endEncoding();
+    commit(gpu, command)
+}
+
+fn encode_matrix_stack(
+    gpu: &Gpu,
+    top: &ProtocolObject<dyn MTLBuffer>,
+    bottom: &ProtocolObject<dyn MTLBuffer>,
+    output: &ProtocolObject<dyn MTLBuffer>,
+    top_len: usize,
+    bottom_len: usize,
+) -> Option<()> {
+    let top_bytes = top_len.checked_mul(size_of::<f32>())?;
+    let bottom_bytes = bottom_len.checked_mul(size_of::<f32>())?;
+    let command = gpu.queue.commandBuffer()?;
+    let encoder = command.blitCommandEncoder()?;
+    unsafe {
+        if top_bytes != 0 {
+            encoder.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                top, 0, output, 0, top_bytes,
+            );
+        }
+        if bottom_bytes != 0 {
+            encoder.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                bottom,
+                0,
+                output,
+                top_bytes,
+                bottom_bytes,
+            );
+        }
+    }
+    encoder.endEncoding();
+    commit(gpu, command)
+}
+
+fn encode_hmerge(
+    gpu: &Gpu,
+    inputs: &[&MetalBuffer],
+    output: &ProtocolObject<dyn MTLBuffer>,
+    rows: usize,
+    cols: usize,
+) -> Option<()> {
+    let rows_u32 = u32::try_from(rows).ok()?;
+    let cols_u32 = u32::try_from(cols).ok()?;
+    let output_cols = cols.checked_mul(inputs.len())?;
+    let output_cols_u32 = u32::try_from(output_cols).ok()?;
+    let offsets = (0..inputs.len())
+        .map(|index| u32::try_from(index.checked_mul(cols)?).ok())
+        .collect::<Option<Vec<_>>>()?;
+
+    let command = gpu.queue.commandBuffer()?;
+    let encoder = command.computeCommandEncoder()?;
+    encoder.setComputePipelineState(&gpu.merge_horizontal);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
+        encoder.setBytes_length_atIndex(NonNull::from(&rows_u32).cast(), 4, 2);
+        encoder.setBytes_length_atIndex(NonNull::from(&cols_u32).cast(), 4, 3);
+        encoder.setBytes_length_atIndex(NonNull::from(&output_cols_u32).cast(), 4, 4);
+    }
+    let groups = MTLSize {
+        width: cols.div_ceil(TILE),
+        height: rows.div_ceil(TILE),
+        depth: 1,
+    };
+    let per_group = MTLSize {
+        width: TILE,
+        height: TILE,
+        depth: 1,
+    };
+    for (input, offset) in inputs.iter().zip(&offsets) {
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(&input.raw), 0, 0);
+            encoder.setBytes_length_atIndex(NonNull::from(offset).cast(), 4, 5);
+        }
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, per_group);
+    }
+    encoder.endEncoding();
+    commit(gpu, command)
+}
+
+fn encode_vmerge(
+    gpu: &Gpu,
+    inputs: &[&MetalBuffer],
+    output: &ProtocolObject<dyn MTLBuffer>,
+    matrix_len: usize,
+) -> Option<()> {
+    let matrix_bytes = matrix_len.checked_mul(size_of::<f32>())?;
+    let command = gpu.queue.commandBuffer()?;
+    let encoder = command.blitCommandEncoder()?;
+    for (index, input) in inputs.iter().enumerate() {
+        let destination_offset = index.checked_mul(matrix_bytes)?;
+        unsafe {
+            encoder.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                &input.raw,
+                0,
+                output,
+                destination_offset,
+                matrix_bytes,
+            );
+        }
+    }
     encoder.endEncoding();
     commit(gpu, command)
 }
@@ -1106,6 +1520,203 @@ mod tests {
         for (actual, expected) in reconstructed.iter().zip(complex.to_vec()) {
             assert!((actual - expected).abs() < 1e-5);
         }
+    }
+
+    #[test]
+    fn stacking_reads_queued_device_results_without_host_staging() {
+        let Some(first) = MetalBuffer::from_slice(&[1.0, 2.0, 3.0]) else {
+            eprintln!("no Metal device; skipping device stacking comparison");
+            return;
+        };
+        let second = MetalBuffer::from_slice(&[4.0, 5.0, 6.0]).unwrap();
+
+        // Leave both inputs as pending GPU results. The stack dispatch must
+        // consume those buffers directly, in command-queue order.
+        let first = first.broadcast(10.0, 0, false).unwrap();
+        let second = second.broadcast(20.0, 0, false).unwrap();
+
+        let vertical = MetalBuffer::vstack(&[&first, &second], 3).unwrap();
+        assert_eq!(vertical.to_vec(), vec![11.0, 12.0, 13.0, 24.0, 25.0, 26.0]);
+
+        let horizontal = MetalBuffer::hstack(&[&first, &second], 3).unwrap();
+        assert_eq!(
+            horizontal.to_vec(),
+            vec![11.0, 24.0, 12.0, 25.0, 13.0, 26.0]
+        );
+    }
+
+    #[test]
+    fn tiled_transpose_stays_queued_and_handles_partial_tiles() {
+        const ROWS: usize = 19;
+        const COLS: usize = 23;
+        synchronize();
+
+        let values = (0..ROWS * COLS)
+            .map(|index| index as f32)
+            .collect::<Vec<_>>();
+        let Some(input) = MetalBuffer::from_slice(&values) else {
+            eprintln!("no Metal device; skipping device transpose comparison");
+            return;
+        };
+        let queued = input.broadcast(1.0, 0, false).unwrap();
+        let transposed = queued.transpose(ROWS, COLS).unwrap();
+
+        let pending = GPU.with(|cell| {
+            cell.get()
+                .and_then(Option::as_ref)
+                .map_or(0, |gpu| gpu.pending.borrow().len())
+        });
+        assert_eq!(pending, 2, "transpose unexpectedly synchronized GPU work");
+
+        let expected = (0..COLS)
+            .flat_map(|col| (0..ROWS).map(move |row| (row * COLS + col) as f32 + 1.0))
+            .collect::<Vec<_>>();
+        assert_eq!(transposed.to_vec(), expected);
+
+        let empty = MetalBuffer::from_slice(&[]).unwrap();
+        assert!(empty.transpose(0, COLS).unwrap().is_empty());
+    }
+
+    #[test]
+    fn matrix_concat_and_stack_stay_on_the_device() {
+        const ROWS: usize = 19;
+        const LEFT_COLS: usize = 13;
+        const RIGHT_COLS: usize = 7;
+        synchronize();
+
+        let left_values = (0..ROWS * LEFT_COLS)
+            .map(|index| index as f32)
+            .collect::<Vec<_>>();
+        let right_values = (0..ROWS * RIGHT_COLS)
+            .map(|index| 1_000.0 + index as f32)
+            .collect::<Vec<_>>();
+        let Some(left) = MetalBuffer::from_slice(&left_values) else {
+            eprintln!("no Metal device; skipping matrix assembly comparison");
+            return;
+        };
+        let right = MetalBuffer::from_slice(&right_values).unwrap();
+        let left = left.broadcast(1.0, 0, false).unwrap();
+        let right = right.broadcast(2.0, 0, false).unwrap();
+        let concat = left
+            .concat_matrix(&right, ROWS, LEFT_COLS, RIGHT_COLS)
+            .unwrap();
+
+        const TOP_ROWS: usize = 5;
+        const BOTTOM_ROWS: usize = 7;
+        const COLS: usize = 11;
+        let top_values = (0..TOP_ROWS * COLS)
+            .map(|index| index as f32)
+            .collect::<Vec<_>>();
+        let bottom_values = (0..BOTTOM_ROWS * COLS)
+            .map(|index| 500.0 + index as f32)
+            .collect::<Vec<_>>();
+        let top = MetalBuffer::from_slice(&top_values)
+            .unwrap()
+            .broadcast(3.0, 0, false)
+            .unwrap();
+        let bottom = MetalBuffer::from_slice(&bottom_values)
+            .unwrap()
+            .broadcast(4.0, 0, false)
+            .unwrap();
+        let stack = top
+            .stack_matrix(&bottom, TOP_ROWS, BOTTOM_ROWS, COLS)
+            .unwrap();
+
+        let pending = GPU.with(|cell| {
+            cell.get()
+                .and_then(Option::as_ref)
+                .map_or(0, |gpu| gpu.pending.borrow().len())
+        });
+        assert_eq!(
+            pending, 6,
+            "matrix assembly unexpectedly synchronized GPU work"
+        );
+
+        let mut expected_concat = Vec::with_capacity(ROWS * (LEFT_COLS + RIGHT_COLS));
+        for row in 0..ROWS {
+            expected_concat.extend(
+                left_values[row * LEFT_COLS..(row + 1) * LEFT_COLS]
+                    .iter()
+                    .map(|value| value + 1.0),
+            );
+            expected_concat.extend(
+                right_values[row * RIGHT_COLS..(row + 1) * RIGHT_COLS]
+                    .iter()
+                    .map(|value| value + 2.0),
+            );
+        }
+        assert_eq!(concat.to_vec(), expected_concat);
+
+        let expected_stack = top_values
+            .iter()
+            .map(|value| value + 3.0)
+            .chain(bottom_values.iter().map(|value| value + 4.0))
+            .collect::<Vec<_>>();
+        assert_eq!(stack.to_vec(), expected_stack);
+    }
+
+    #[test]
+    fn matrix_merges_consume_queued_device_buffers() {
+        const MATRICES: usize = 3;
+        const ROWS: usize = 19;
+        const COLS: usize = 7;
+        synchronize();
+
+        let host = (0..MATRICES)
+            .map(|matrix| {
+                (0..ROWS * COLS)
+                    .map(|index| matrix as f32 * 1_000.0 + index as f32)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let Some(inputs) = host
+            .iter()
+            .map(|values| MetalBuffer::from_slice(values))
+            .collect::<Option<Vec<_>>>()
+        else {
+            eprintln!("no Metal device; skipping matrix merge comparison");
+            return;
+        };
+        let queued = inputs
+            .iter()
+            .enumerate()
+            .map(|(index, input)| input.broadcast(index as f32 + 1.0, 0, false).unwrap())
+            .collect::<Vec<_>>();
+        let buffers = queued.iter().collect::<Vec<_>>();
+
+        let horizontal = MetalBuffer::hmerge(&buffers, ROWS, COLS).unwrap();
+        let vertical = MetalBuffer::vmerge(&buffers, ROWS, COLS).unwrap();
+
+        let pending = GPU.with(|cell| {
+            cell.get()
+                .and_then(Option::as_ref)
+                .map_or(0, |gpu| gpu.pending.borrow().len())
+        });
+        assert_eq!(
+            pending, 5,
+            "matrix merge unexpectedly synchronized GPU work"
+        );
+
+        let mut expected_horizontal = Vec::with_capacity(MATRICES * ROWS * COLS);
+        for row in 0..ROWS {
+            for (matrix, values) in host.iter().enumerate() {
+                expected_horizontal.extend(
+                    values[row * COLS..(row + 1) * COLS]
+                        .iter()
+                        .map(|value| value + matrix as f32 + 1.0),
+                );
+            }
+        }
+        assert_eq!(horizontal.to_vec(), expected_horizontal);
+
+        let expected_vertical = host
+            .iter()
+            .enumerate()
+            .flat_map(|(matrix, values)| {
+                values.iter().map(move |value| value + matrix as f32 + 1.0)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(vertical.to_vec(), expected_vertical);
     }
 
     /// Operations are committed without waiting, so a long dependent chain is

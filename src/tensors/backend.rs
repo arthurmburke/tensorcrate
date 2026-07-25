@@ -48,13 +48,47 @@ pub trait Backend: sealed::Sealed + Sized + 'static {
     /// Build vector storage from `N` `f32` values.
     fn store_vector<const N: usize>(values: &[f32]) -> Self::Vector<f32, N>;
 
+    /// Reinterpret a vector as a `1 × N` row matrix.
+    fn vector_into_row<const N: usize>(vector: Self::Vector<f32, N>) -> Self::Matrix<f32, 1, N>;
+
+    /// Reinterpret a vector as an `N × 1` column matrix.
+    fn vector_into_column<const N: usize>(vector: Self::Vector<f32, N>) -> Self::Matrix<f32, N, 1>;
+
     /// Build a matrix from a collection of vectors stacked along the
     /// vertical axis (vectors are row vectors).
-    fn vstack<const M: usize, const N: usize>(vectors: [Self::Vector<f32, N>; M]) -> Self::Matrix<f32, M, N>;
+    fn vstack<const M: usize, const N: usize>(
+        vectors: [Self::Vector<f32, N>; M],
+    ) -> Self::Matrix<f32, M, N>;
 
     /// Build a matrix from a collection of vectors stacked along the
     /// horizontal axis (vectors are column vectors).
-    fn hstack<const M: usize, const N: usize>(vectors: [Self::Vector<f32, M>; N]) -> Self::Matrix<f32, M, N>;
+    fn hstack<const M: usize, const N: usize>(
+        vectors: [Self::Vector<f32, M>; N],
+    ) -> Self::Matrix<f32, M, N>;
+
+    /// Builds a matrix by stacking two matrices horizontally.
+    fn concat<const M: usize, const N1: usize, const N2: usize>(
+        a: Self::Matrix<f32, M, N1>,
+        b: Self::Matrix<f32, M, N2>,
+    ) -> Self::Matrix<f32, M, { N1 + N2 }>;
+
+    /// Builds a matrix by stacking two matrices vertically.
+    fn stack<const M1: usize, const M2: usize, const N: usize>(
+        a: Self::Matrix<f32, M1, N>,
+        b: Self::Matrix<f32, M2, N>,
+    ) -> Self::Matrix<f32, { M1 + M2 }, N>;
+
+    /// Builds a matrix by concating a collection of matrices with
+    /// the same number of columns along the horizontal axis.
+    fn hmerge<const M: usize, const N: usize, const K: usize>(
+        matrices: [Self::Matrix<f32, M, N>; K],
+    ) -> Self::Matrix<f32, M, { K * N }>;
+
+    /// Builds a matrix by concating a collection of matrices with
+    /// the same number of columns along the vertical axis.
+    fn vmerge<const M: usize, const N: usize, const K: usize>(
+        matrices: [Self::Matrix<f32, M, N>; K],
+    ) -> Self::Matrix<f32, { K * M }, N>;
 
     /// Borrow this vector storage as a flat `f32` slice of length `N`.
     ///
@@ -92,6 +126,14 @@ impl Backend for Host {
         std::array::from_fn(|index| values[index])
     }
 
+    fn vector_into_row<const N: usize>(vector: [f32; N]) -> [[f32; N]; 1] {
+        [vector]
+    }
+
+    fn vector_into_column<const N: usize>(vector: [f32; N]) -> [[f32; 1]; N] {
+        vector.map(|value| [value])
+    }
+
     fn vector_slice<const N: usize>(storage: &[f32; N]) -> &[f32] {
         storage
     }
@@ -106,13 +148,51 @@ impl Backend for Host {
         // adjacent `f32` with no padding.
         unsafe { std::slice::from_raw_parts(storage.as_ptr().cast::<f32>(), R * C) }
     }
-    
-    fn vstack<const M: usize, const N: usize>(vectors: [Self::Vector<f32, N>; M]) -> Self::Matrix<f32, M, N> {
+
+    fn vstack<const M: usize, const N: usize>(
+        vectors: [Self::Vector<f32, N>; M],
+    ) -> Self::Matrix<f32, M, N> {
         std::array::from_fn(|row| vectors[row])
     }
-    
-    fn hstack<const M: usize, const N: usize>(vectors: [Self::Vector<f32, M>; N]) -> Self::Matrix<f32, M, N> {
+
+    fn hstack<const M: usize, const N: usize>(
+        vectors: [Self::Vector<f32, M>; N],
+    ) -> Self::Matrix<f32, M, N> {
         std::array::from_fn(|row| std::array::from_fn(|col| vectors[col][row]))
+    }
+
+    fn concat<const M: usize, const N1: usize, const N2: usize>(
+        a: Self::Matrix<f32, M, N1>,
+        b: Self::Matrix<f32, M, N2>,
+    ) -> Self::Matrix<f32, M, { N1 + N2 }> {
+        std::array::from_fn(|row| {
+            std::array::from_fn(|col| {
+                if col < N1 {
+                    a[row][col]
+                } else {
+                    b[row][col - N1]
+                }
+            })
+        })
+    }
+
+    fn stack<const M1: usize, const M2: usize, const N: usize>(
+        a: Self::Matrix<f32, M1, N>,
+        b: Self::Matrix<f32, M2, N>,
+    ) -> Self::Matrix<f32, { M1 + M2 }, N> {
+        std::array::from_fn(|row| if row < M1 { a[row] } else { b[row - M1] })
+    }
+
+    fn hmerge<const M: usize, const N: usize, const K: usize>(
+        matrices: [Self::Matrix<f32, M, N>; K],
+    ) -> Self::Matrix<f32, M, { K * N }> {
+        std::array::from_fn(|row| std::array::from_fn(|col| matrices[col / N][row][col % N]))
+    }
+
+    fn vmerge<const M: usize, const N: usize, const K: usize>(
+        matrices: [Self::Matrix<f32, M, N>; K],
+    ) -> Self::Matrix<f32, { K * M }, N> {
+        std::array::from_fn(|row| matrices[row / M][row % M])
     }
 }
 
@@ -151,6 +231,14 @@ mod gpu {
             MetalStorage::from_slice(values)
         }
 
+        fn vector_into_row<const N: usize>(vector: MetalStorage) -> MetalStorage {
+            vector
+        }
+
+        fn vector_into_column<const N: usize>(vector: MetalStorage) -> MetalStorage {
+            vector
+        }
+
         fn vector_slice<const N: usize>(storage: &MetalStorage) -> &[f32] {
             storage.as_slice()
         }
@@ -163,13 +251,94 @@ mod gpu {
         fn matrix_slice<const R: usize, const C: usize>(storage: &MetalStorage) -> &[f32] {
             storage.as_slice()
         }
-        
-        fn vstack<const M: usize, const N: usize>(vectors: [Self::Vector<f32, N>; M]) -> Self::Matrix<f32, M, N> {
-            todo!()
+
+        fn vstack<const M: usize, const N: usize>(
+            vectors: [Self::Vector<f32, N>; M],
+        ) -> Self::Matrix<f32, M, N> {
+            if let Some(storage) = MetalStorage::vstack(&vectors, N) {
+                return storage;
+            }
+            let mut values = Vec::with_capacity(M * N);
+            for vector in &vectors {
+                values.extend_from_slice(vector.as_slice());
+            }
+            MetalStorage::from_slice(&values)
         }
-        
-        fn hstack<const M: usize, const N: usize>(vectors: [Self::Vector<f32, M>; N]) -> Self::Matrix<f32, M, N> {
-            todo!()
+
+        fn hstack<const M: usize, const N: usize>(
+            vectors: [Self::Vector<f32, M>; N],
+        ) -> Self::Matrix<f32, M, N> {
+            if let Some(storage) = MetalStorage::hstack(&vectors, M) {
+                return storage;
+            }
+            let mut values = vec![0.0; M * N];
+            for (col, vector) in vectors.iter().enumerate() {
+                for (row, value) in vector.as_slice().iter().enumerate() {
+                    values[row * N + col] = *value;
+                }
+            }
+            MetalStorage::from_slice(&values)
+        }
+
+        fn concat<const M: usize, const N1: usize, const N2: usize>(
+            a: Self::Matrix<f32, M, N1>,
+            b: Self::Matrix<f32, M, N2>,
+        ) -> Self::Matrix<f32, M, { N1 + N2 }> {
+            if let Some(storage) = a.concat(&b, M, N1, N2) {
+                return storage;
+            }
+            let (left, right) = (a.as_slice(), b.as_slice());
+            let mut values = Vec::with_capacity(M * (N1 + N2));
+            for row in 0..M {
+                values.extend_from_slice(&left[row * N1..(row + 1) * N1]);
+                values.extend_from_slice(&right[row * N2..(row + 1) * N2]);
+            }
+            MetalStorage::from_slice(&values)
+        }
+
+        fn stack<const M1: usize, const M2: usize, const N: usize>(
+            a: Self::Matrix<f32, M1, N>,
+            b: Self::Matrix<f32, M2, N>,
+        ) -> Self::Matrix<f32, { M1 + M2 }, N> {
+            if let Some(storage) = a.stack(&b, M1, M2, N) {
+                return storage;
+            }
+            let mut values = Vec::with_capacity((M1 + M2) * N);
+            values.extend_from_slice(a.as_slice());
+            values.extend_from_slice(b.as_slice());
+            MetalStorage::from_slice(&values)
+        }
+
+        fn hmerge<const M: usize, const N: usize, const K: usize>(
+            matrices: [Self::Matrix<f32, M, N>; K],
+        ) -> Self::Matrix<f32, M, { K * N }> {
+            if let Some(storage) = MetalStorage::hmerge(&matrices, M, N) {
+                return storage;
+            }
+            let slices = matrices
+                .iter()
+                .map(Self::matrix_slice::<M, N>)
+                .collect::<Vec<_>>();
+            let mut values = Vec::with_capacity(M * K * N);
+            for row in 0..M {
+                for matrix in &slices {
+                    values.extend_from_slice(&matrix[row * N..(row + 1) * N]);
+                }
+            }
+            MetalStorage::from_slice(&values)
+        }
+
+        fn vmerge<const M: usize, const N: usize, const K: usize>(
+            matrices: [Self::Matrix<f32, M, N>; K],
+        ) -> Self::Matrix<f32, { K * M }, N> {
+            if let Some(storage) = MetalStorage::vmerge(&matrices, M, N) {
+                return storage;
+            }
+            let mut values = Vec::with_capacity(K * M * N);
+            for matrix in &matrices {
+                values.extend_from_slice(matrix.as_slice());
+            }
+            MetalStorage::from_slice(&values)
         }
     }
 
@@ -235,6 +404,82 @@ mod gpu {
                 Residency::Device(buffer) => Some(buffer),
                 Residency::Host(_) => None,
             }
+        }
+
+        fn vstack(inputs: &[Self], vector_len: usize) -> Option<Self> {
+            let buffers = inputs
+                .iter()
+                .map(Self::device)
+                .collect::<Option<Vec<_>>>()?;
+            Some(Self(Residency::Device(MetalBuffer::vstack(
+                &buffers, vector_len,
+            )?)))
+        }
+
+        fn hstack(inputs: &[Self], vector_len: usize) -> Option<Self> {
+            let buffers = inputs
+                .iter()
+                .map(Self::device)
+                .collect::<Option<Vec<_>>>()?;
+            Some(Self(Residency::Device(MetalBuffer::hstack(
+                &buffers, vector_len,
+            )?)))
+        }
+
+        fn concat(
+            &self,
+            rhs: &Self,
+            rows: usize,
+            left_cols: usize,
+            right_cols: usize,
+        ) -> Option<Self> {
+            Some(Self(Residency::Device(self.device()?.concat_matrix(
+                rhs.device()?,
+                rows,
+                left_cols,
+                right_cols,
+            )?)))
+        }
+
+        fn stack(
+            &self,
+            rhs: &Self,
+            top_rows: usize,
+            bottom_rows: usize,
+            cols: usize,
+        ) -> Option<Self> {
+            Some(Self(Residency::Device(self.device()?.stack_matrix(
+                rhs.device()?,
+                top_rows,
+                bottom_rows,
+                cols,
+            )?)))
+        }
+
+        fn hmerge(inputs: &[Self], rows: usize, cols: usize) -> Option<Self> {
+            let buffers = inputs
+                .iter()
+                .map(Self::device)
+                .collect::<Option<Vec<_>>>()?;
+            Some(Self(Residency::Device(MetalBuffer::hmerge(
+                &buffers, rows, cols,
+            )?)))
+        }
+
+        fn vmerge(inputs: &[Self], rows: usize, cols: usize) -> Option<Self> {
+            let buffers = inputs
+                .iter()
+                .map(Self::device)
+                .collect::<Option<Vec<_>>>()?;
+            Some(Self(Residency::Device(MetalBuffer::vmerge(
+                &buffers, rows, cols,
+            )?)))
+        }
+
+        pub(crate) fn transpose(&self, rows: usize, cols: usize) -> Option<Self> {
+            Some(Self(Residency::Device(
+                self.device()?.transpose(rows, cols)?,
+            )))
         }
 
         /// `C[m×n] = A[m×k] · B[k×n]`, entirely on the GPU. `None` when either

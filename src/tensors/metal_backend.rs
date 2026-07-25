@@ -7,10 +7,9 @@
 //! operations costs one upload at the start and one download at the end rather
 //! than a pair per call.
 //!
-//! Two things are deliberately not GPU dispatches. [`Vector::dot`] reduces on
-//! the CPU over the shared allocations — still copy-free — because a `1×N·N×1`
-//! matmul would put the entire reduction on one GPU thread. And
-//! [`Matrix::transpose`] has no kernel, so it round-trips through the host.
+//! [`Vector::dot`] deliberately is not a GPU dispatch. It reduces on the CPU
+//! over the shared allocations — still copy-free — because a `1×N·N×1` matmul
+//! would put the entire reduction on one GPU thread.
 //!
 //! When a dispatch cannot run at all — no Metal device, or an operation the
 //! shaders do not implement, like `%` — the operands move to the [`Host`]
@@ -150,12 +149,11 @@ impl<const R: usize, const C: usize> Matrix<f32, R, C, Metal> {
     }
 
     /// Transpose: an `R×C` matrix becomes `C×R`.
-    ///
-    /// There is no transpose kernel, so this one goes out to the host and back —
-    /// two copies. Where it matters, arrange the products to avoid it, or
-    /// transpose once on the [`Host`] backend before uploading.
     pub fn transpose(&self) -> Matrix<f32, C, R, Metal> {
-        self.to_backend::<Host>().transpose().to_backend()
+        match self.data.transpose(R, C) {
+            Some(data) => Matrix { data },
+            None => self.to_backend::<Host>().transpose().to_backend(),
+        }
     }
 
     /// Apply an analytic function elementwise, on the GPU; see

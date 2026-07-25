@@ -333,6 +333,26 @@ impl<const N: usize, B: Backend> Vector<f32, N, B> {
         let values = self.as_slice();
         std::array::from_fn(|index| values[index])
     }
+
+    /// Consume this vector and view its elements as a `1 × N` row matrix.
+    ///
+    /// On the Metal backend this only changes the static shape; the existing
+    /// allocation is reused without a copy or kernel dispatch.
+    pub fn into_row_matrix(self) -> Matrix<f32, 1, N, B> {
+        Matrix {
+            data: B::vector_into_row(self.data),
+        }
+    }
+
+    /// Consume this vector and view its elements as an `N × 1` column matrix.
+    ///
+    /// As with [`into_row_matrix`](Self::into_row_matrix), Metal reuses the
+    /// existing allocation.
+    pub fn into_column_matrix(self) -> Matrix<f32, N, 1, B> {
+        Matrix {
+            data: B::vector_into_column(self.data),
+        }
+    }
 }
 
 impl<T, const N: usize> Vector<T, N> {

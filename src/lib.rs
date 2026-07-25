@@ -16,6 +16,9 @@
 //! assert_eq!(z.to_string(), "5+0i");
 //! ```
 
+#![feature(generic_const_exprs)]
+#![allow(incomplete_features)] 
+
 /// The `math!` macro: a small mathematical language that expands to
 /// statically-typed Rust using [`numbers`] and [`tensors`]. Matrix and
 /// matrix/vector products use `@`, vector `*` vector is a dot product, and

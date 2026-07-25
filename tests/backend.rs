@@ -8,7 +8,7 @@
 
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
-use rinterp::tensors::{Host, Matrix, Metal, Vector};
+use rinterp::tensors::{Backend, Host, Matrix, Metal, Vector};
 
 /// Deterministic filler with a mix of signs and magnitudes, all integral so
 /// GPU and CPU accumulation orders agree exactly.
@@ -60,6 +60,147 @@ fn filled_allocates_directly_on_the_backend() {
 
     let sevens = Matrix::<f32, 4, 6, Metal>::filled(7.0);
     assert_eq!(sevens.to_rows(), [[7.0f32; 6]; 4]);
+}
+
+#[test]
+fn stacking_vectors_uses_row_major_matrix_layout() {
+    let rows = [
+        Metal::store_vector::<3>(&[-3.0, -2.0, -1.0]),
+        Metal::store_vector::<3>(&[4.0, 5.0, 6.0]),
+    ];
+    let vertical = Metal::vstack::<2, 3>(rows);
+    assert_eq!(
+        Metal::matrix_slice::<2, 3>(&vertical),
+        &[-3.0, -2.0, -1.0, 4.0, 5.0, 6.0]
+    );
+
+    let columns = [
+        Metal::store_vector::<2>(&[1.0, 2.0]),
+        Metal::store_vector::<2>(&[3.0, 4.0]),
+        Metal::store_vector::<2>(&[5.0, 6.0]),
+    ];
+    let horizontal = Metal::hstack::<2, 3>(columns);
+    assert_eq!(
+        Metal::matrix_slice::<2, 3>(&horizontal),
+        &[1.0, 3.0, 5.0, 2.0, 4.0, 6.0]
+    );
+
+    let empty = Metal::vstack::<0, 3>([]);
+    assert!(Metal::matrix_slice::<0, 3>(&empty).is_empty());
+    let empty = Metal::hstack::<2, 0>([]);
+    assert!(Metal::matrix_slice::<2, 0>(&empty).is_empty());
+}
+
+#[test]
+fn concatenating_and_stacking_matrices_preserves_row_major_layout() {
+    let host_concat = Host::concat::<2, 2, 1>([[1.0, 2.0], [3.0, 4.0]], [[5.0], [6.0]]);
+    assert_eq!(host_concat, [[1.0, 2.0, 5.0], [3.0, 4.0, 6.0]]);
+
+    let host_stack = Host::stack::<1, 2, 2>([[1.0, 2.0]], [[3.0, 4.0], [5.0, 6.0]]);
+    assert_eq!(host_stack, [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]);
+
+    let left = Metal::store_matrix::<2, 2>(&[1.0, 2.0, 3.0, 4.0]);
+    let right = Metal::store_matrix::<2, 1>(&[5.0, 6.0]);
+    let concat = Metal::concat::<2, 2, 1>(left, right);
+    assert_eq!(
+        Metal::matrix_slice::<2, 3>(&concat),
+        &[1.0, 2.0, 5.0, 3.0, 4.0, 6.0]
+    );
+
+    let top = Metal::store_matrix::<1, 2>(&[1.0, 2.0]);
+    let bottom = Metal::store_matrix::<2, 2>(&[3.0, 4.0, 5.0, 6.0]);
+    let stack = Metal::stack::<1, 2, 2>(top, bottom);
+    assert_eq!(
+        Metal::matrix_slice::<3, 2>(&stack),
+        &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    );
+
+    let empty_left = Metal::store_matrix::<2, 0>(&[]);
+    let right = Metal::store_matrix::<2, 1>(&[7.0, 8.0]);
+    let concat = Metal::concat::<2, 0, 1>(empty_left, right);
+    assert_eq!(Metal::matrix_slice::<2, 1>(&concat), &[7.0, 8.0]);
+
+    let empty_top = Metal::store_matrix::<0, 2>(&[]);
+    let bottom = Metal::store_matrix::<1, 2>(&[9.0, 10.0]);
+    let stack = Metal::stack::<0, 1, 2>(empty_top, bottom);
+    assert_eq!(Metal::matrix_slice::<1, 2>(&stack), &[9.0, 10.0]);
+}
+
+#[test]
+fn merging_matrix_collections_preserves_input_order() {
+    let matrices = [
+        [[1.0, 2.0], [3.0, 4.0]],
+        [[5.0, 6.0], [7.0, 8.0]],
+        [[9.0, 10.0], [11.0, 12.0]],
+    ];
+    assert_eq!(
+        Host::hmerge::<2, 2, 3>(matrices),
+        [
+            [1.0, 2.0, 5.0, 6.0, 9.0, 10.0],
+            [3.0, 4.0, 7.0, 8.0, 11.0, 12.0],
+        ]
+    );
+    assert_eq!(
+        Host::vmerge::<2, 2, 3>(matrices),
+        [
+            [1.0, 2.0],
+            [3.0, 4.0],
+            [5.0, 6.0],
+            [7.0, 8.0],
+            [9.0, 10.0],
+            [11.0, 12.0],
+        ]
+    );
+
+    let matrices = [
+        Metal::store_matrix::<2, 2>(&[1.0, 2.0, 3.0, 4.0]),
+        Metal::store_matrix::<2, 2>(&[5.0, 6.0, 7.0, 8.0]),
+        Metal::store_matrix::<2, 2>(&[9.0, 10.0, 11.0, 12.0]),
+    ];
+    let horizontal = Metal::hmerge::<2, 2, 3>(matrices);
+    assert_eq!(
+        Metal::matrix_slice::<2, 6>(&horizontal),
+        &[
+            1.0, 2.0, 5.0, 6.0, 9.0, 10.0, 3.0, 4.0, 7.0, 8.0, 11.0, 12.0
+        ]
+    );
+
+    let matrices = [
+        Metal::store_matrix::<2, 2>(&[1.0, 2.0, 3.0, 4.0]),
+        Metal::store_matrix::<2, 2>(&[5.0, 6.0, 7.0, 8.0]),
+        Metal::store_matrix::<2, 2>(&[9.0, 10.0, 11.0, 12.0]),
+    ];
+    let vertical = Metal::vmerge::<2, 2, 3>(matrices);
+    assert_eq!(
+        Metal::matrix_slice::<6, 2>(&vertical),
+        &[
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0
+        ]
+    );
+
+    assert!(Metal::matrix_slice::<2, 0>(&Metal::hmerge::<2, 3, 0>([])).is_empty());
+    assert!(Metal::matrix_slice::<0, 3>(&Metal::vmerge::<2, 3, 0>([])).is_empty());
+}
+
+#[test]
+fn vectors_convert_to_row_and_column_matrices() {
+    let row = Vector::new([1.0f32, 2.0, 3.0]).into_row_matrix();
+    assert_eq!(row.to_rows(), [[1.0, 2.0, 3.0]]);
+
+    let column = Vector::new([1.0f32, 2.0, 3.0]).into_column_matrix();
+    assert_eq!(column.to_rows(), [[1.0], [2.0], [3.0]]);
+
+    let resident = Vector::new([4.0f32, 5.0, 6.0]).to_backend::<Metal>();
+    let was_resident = resident.is_device_resident();
+    let row = resident.into_row_matrix();
+    assert_eq!(row.is_device_resident(), was_resident);
+    assert_eq!(row.to_rows(), [[4.0, 5.0, 6.0]]);
+
+    let resident = Vector::new([7.0f32, 8.0, 9.0]).to_backend::<Metal>();
+    let was_resident = resident.is_device_resident();
+    let column = resident.into_column_matrix();
+    assert_eq!(column.is_device_resident(), was_resident);
+    assert_eq!(column.to_rows(), [[7.0], [8.0], [9.0]]);
 }
 
 #[test]
