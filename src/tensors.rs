@@ -11,6 +11,14 @@
 //! Storage is a fixed-size array (`[T; N]` / `[[T; C]; R]`), so these live on the
 //! stack and are `Copy` when `T` is. `+ - * /` are elementwise; the
 //! linear-algebra products are the named methods.
+//!
+//! Both types take a third parameter, the storage [`Backend`], which defaults to
+//! [`Host`] — the fixed-size array just described. On macOS with the `metal`
+//! feature, `f32` tensors can instead be placed on the [`Metal`] backend, whose
+//! elements live in GPU-shared memory so a chain of operations runs without
+//! copying between CPU and GPU pools. [`Vector::to_backend`] and
+//! [`Matrix::to_backend`] move between the two; see the [`backend`] module for
+//! the details.
 
 use std::cmp::Ordering;
 use std::fmt::{self, Display};
@@ -21,139 +29,21 @@ use num_traits::{Float, NumCast};
 use crate::errors::Error;
 use crate::numbers::{Coefficient, Complex};
 
+pub mod backend;
+pub mod dual;
+pub mod kernels;
+
+/// The `Metal`-backed inherent operations. It declares no new types, so there is
+/// nothing to re-export — naming the module is what puts the methods on the
+/// tensors.
 #[cfg(all(feature = "metal", target_os = "macos"))]
-mod metal_dispatch {
-    use std::any::TypeId;
+mod metal_backend;
 
-    use super::{Complex, Matrix, Vector};
-    use crate::numbers::Coefficient;
-
-    pub const MIN_ELEMENT_COUNT: usize = 4_096;
-    pub const MIN_FFT_LENGTH: usize = 1_024;
-    pub const MIN_MATMUL_OPERATIONS: usize = 32_768;
-
-    fn is_f32<T: 'static>() -> bool {
-        TypeId::of::<T>() == TypeId::of::<f32>()
-    }
-
-    fn as_f32_slice<T: 'static>(values: &[T]) -> Option<&[f32]> {
-        if !is_f32::<T>() {
-            return None;
-        }
-        // SAFETY: the TypeId check proves T is f32, so the element layout and
-        // lifetime are identical.
-        Some(unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), values.len()) })
-    }
-
-    fn from_f32<T: Copy + 'static>(value: f32) -> T {
-        debug_assert!(is_f32::<T>());
-        // SAFETY: every caller first checks that T is exactly f32.
-        unsafe { std::ptr::read((&value as *const f32).cast::<T>()) }
-    }
-
-    pub fn elementwise<T: Coefficient>(a: &[T], b: &[T], op: u32) -> Option<Vec<T>> {
-        if a.len() < MIN_ELEMENT_COUNT {
-            return None;
-        }
-        let output = crate::metal::elementwise_f32(as_f32_slice(a)?, as_f32_slice(b)?, op)?;
-        Some(output.into_iter().map(from_f32).collect())
-    }
-
-    pub fn broadcast<T: Coefficient>(
-        values: &[T],
-        scalar: T,
-        op: u32,
-        scalar_left: bool,
-    ) -> Option<Vec<T>> {
-        if values.len() < MIN_ELEMENT_COUNT || !is_f32::<T>() {
-            return None;
-        }
-        let scalar = as_f32_slice(std::slice::from_ref(&scalar))?[0];
-        let output = crate::metal::broadcast_f32(as_f32_slice(values)?, scalar, op, scalar_left)?;
-        Some(output.into_iter().map(from_f32).collect())
-    }
-
-    pub fn matmul<T: Coefficient, const R: usize, const K: usize, const C: usize>(
-        a: &[[T; K]; R],
-        b: &[[T; C]; K],
-    ) -> Option<Matrix<T, R, C>> {
-        if R.saturating_mul(K).saturating_mul(C) < MIN_MATMUL_OPERATIONS {
-            return None;
-        }
-        let a = as_f32_slice(unsafe {
-            std::slice::from_raw_parts(a.as_ptr().cast::<T>(), R.saturating_mul(K))
-        })?;
-        let b = as_f32_slice(unsafe {
-            std::slice::from_raw_parts(b.as_ptr().cast::<T>(), K.saturating_mul(C))
-        })?;
-        let output = crate::metal::matmul_f32(a, b, R, K, C)?;
-        Some(Matrix::from_rows(std::array::from_fn(|row| {
-            std::array::from_fn(|col| from_f32(output[row * C + col]))
-        })))
-    }
-
-    pub fn matvec<T: Coefficient, const R: usize, const C: usize>(
-        matrix: &[[T; C]; R],
-        vector: &[T; C],
-    ) -> Option<Vector<T, R>> {
-        if R.saturating_mul(C) < MIN_MATMUL_OPERATIONS {
-            return None;
-        }
-        let matrix = as_f32_slice(unsafe {
-            std::slice::from_raw_parts(matrix.as_ptr().cast::<T>(), R.saturating_mul(C))
-        })?;
-        let output = crate::metal::matmul_f32(matrix, as_f32_slice(vector)?, R, C, 1)?;
-        Some(Vector::new(std::array::from_fn(|row| {
-            from_f32(output[row])
-        })))
-    }
-
-    pub fn vecmat<T: Coefficient, const R: usize, const C: usize>(
-        vector: &[T; R],
-        matrix: &[[T; C]; R],
-    ) -> Option<Vector<T, C>> {
-        if R.saturating_mul(C) < MIN_MATMUL_OPERATIONS {
-            return None;
-        }
-        let matrix = as_f32_slice(unsafe {
-            std::slice::from_raw_parts(matrix.as_ptr().cast::<T>(), R.saturating_mul(C))
-        })?;
-        let output = crate::metal::matmul_f32(as_f32_slice(vector)?, matrix, 1, R, C)?;
-        Some(Vector::new(std::array::from_fn(|col| {
-            from_f32(output[col])
-        })))
-    }
-
-    pub fn dot<T: Coefficient, const N: usize>(a: &[T; N], b: &[T; N]) -> Option<T> {
-        if N < MIN_MATMUL_OPERATIONS {
-            return None;
-        }
-        let output = crate::metal::matmul_f32(as_f32_slice(a)?, as_f32_slice(b)?, 1, N, 1)?;
-        Some(from_f32(output[0]))
-    }
-
-    pub fn fft<T: Coefficient, const N: usize>(
-        input: &[Complex<T>; N],
-        inverse: bool,
-    ) -> Option<[Complex<T>; N]> {
-        if N < MIN_FFT_LENGTH || !N.is_power_of_two() || !is_f32::<T>() {
-            return None;
-        }
-        let mut interleaved = Vec::with_capacity(N * 2);
-        for value in input {
-            interleaved.push(as_f32_slice(std::slice::from_ref(&value.real))?[0]);
-            interleaved.push(as_f32_slice(std::slice::from_ref(&value.im))?[0]);
-        }
-        let output = if inverse {
-            crate::metal::ifft_f32_interleaved(&interleaved)?
-        } else {
-            crate::metal::fft_f32_interleaved(&interleaved)?
-        };
-        Some(std::array::from_fn(|index| {
-            Complex::new(from_f32(output[index * 2]), from_f32(output[index * 2 + 1]))
-        }))
-    }
-}
+pub use backend::{Backend, Host};
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub use backend::{Metal, MetalStorage};
+pub use dual::{DualMatrix, DualVector, gradient, jacobian};
+pub use kernels::{Analytic, Kernels};
 
 #[cfg(all(feature = "simd", target_arch = "aarch64"))]
 mod simd_dispatch {
@@ -239,16 +129,18 @@ mod simd_dispatch {
             return None;
         }
         unsafe {
-            if let (Some(v), Some(s)) =
-                (as_slice::<T, f32>(values), as_slice::<T, f32>(std::slice::from_ref(&scalar)))
-            {
+            if let (Some(v), Some(s)) = (
+                as_slice::<T, f32>(values),
+                as_slice::<T, f32>(std::slice::from_ref(&scalar)),
+            ) {
                 let mut out = vec![0.0f32; v.len()];
                 crate::simd::f32k::broadcast(v, s[0], op, scalar_left, &mut out);
                 return Some(out.into_iter().map(from_f32).collect());
             }
-            if let (Some(v), Some(s)) =
-                (as_slice::<T, f64>(values), as_slice::<T, f64>(std::slice::from_ref(&scalar)))
-            {
+            if let (Some(v), Some(s)) = (
+                as_slice::<T, f64>(values),
+                as_slice::<T, f64>(std::slice::from_ref(&scalar)),
+            ) {
                 let mut out = vec![0.0f64; v.len()];
                 crate::simd::f64k::broadcast(v, s[0], op, scalar_left, &mut out);
                 return Some(out.into_iter().map(from_f64).collect());
@@ -347,9 +239,8 @@ mod simd_dispatch {
         }
         // SAFETY: T is f32 and `Complex` is `#[repr(C)]`, so the buffer is
         // exactly `[re, im, …]` — `2*N` contiguous f32.
-        let buf = unsafe {
-            std::slice::from_raw_parts_mut(output.as_mut_ptr().cast::<f32>(), 2 * N)
-        };
+        let buf =
+            unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr().cast::<f32>(), 2 * N) };
         crate::simd::fft_f32::radix2(buf, N, direction as f32);
         true
     }
@@ -357,10 +248,91 @@ mod simd_dispatch {
 
 // ---- vectors ----------------------------------------------------------------
 
-/// A length-`N` vector, backed by `[T; N]`.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Vector<T, const N: usize> {
-    data: [T; N],
+/// A length-`N` vector, backed by `[T; N]` on the default [`Host`] backend.
+pub struct Vector<T, const N: usize, B: Backend = Host> {
+    data: B::Vector<T, N>,
+}
+
+// The storage type varies with the backend, so these are the derives written by
+// hand: a `Host` tensor is `Copy` because an array of `Copy` elements is, and a
+// `Metal` tensor is not because a shared allocation is not.
+impl<T, const N: usize, B: Backend> Copy for Vector<T, N, B> where B::Vector<T, N>: Copy {}
+
+impl<T, const N: usize, B: Backend> Clone for Vector<T, N, B>
+where
+    B::Vector<T, N>: Clone,
+{
+    fn clone(&self) -> Self {
+        Vector {
+            data: self.data.clone(),
+        }
+    }
+}
+
+impl<T, const N: usize, B: Backend> PartialEq for Vector<T, N, B>
+where
+    B::Vector<T, N>: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.data == other.data
+    }
+}
+
+impl<T, const N: usize, B: Backend> Eq for Vector<T, N, B> where B::Vector<T, N>: Eq {}
+
+impl<T, const N: usize, B: Backend> fmt::Debug for Vector<T, N, B>
+where
+    B::Vector<T, N>: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Vector").field("data", &self.data).finish()
+    }
+}
+
+/// `f32` vectors on any backend. These are the operations that do not depend on
+/// where the elements live — everything else is implemented per backend.
+impl<const N: usize, B: Backend> Vector<f32, N, B> {
+    /// Move this vector's elements onto backend `B2`.
+    ///
+    /// This is the operation that copies: onto [`Metal`] it is an upload into
+    /// shared memory, off it a download. Everything in between stays put.
+    ///
+    /// ```
+    /// # #[cfg(all(feature = "metal", target_os = "macos"))] {
+    /// use rinterp::tensors::{Host, Metal, Vector};
+    ///
+    /// let v = Vector::new([1.0f32, 2.0, 3.0]);
+    /// let resident = v.to_backend::<Metal>();
+    /// assert_eq!(resident.to_backend::<Host>(), v);
+    /// # }
+    /// ```
+    pub fn to_backend<B2: Backend>(&self) -> Vector<f32, N, B2> {
+        Vector {
+            data: B2::store_vector::<N>(B::vector_slice::<N>(&self.data)),
+        }
+    }
+
+    /// Every element set to `value`, allocated directly on backend `B`.
+    ///
+    /// The values are staged on the heap rather than written as an `[f32; N]`
+    /// literal, so on a GPU backend this is how to build a tensor too large to
+    /// sit on the stack: `Vector::<f32, 1_000_000, Metal>::filled(0.0)`.
+    pub fn filled(value: f32) -> Self {
+        Vector {
+            data: B::store_vector::<N>(&vec![value; N]),
+        }
+    }
+
+    /// Borrow the elements as a slice, without copying.
+    pub fn as_slice(&self) -> &[f32] {
+        B::vector_slice::<N>(&self.data)
+    }
+
+    /// Copy the elements into an array.
+    pub fn to_array(&self) -> [f32; N] {
+        let values = self.as_slice();
+        std::array::from_fn(|index| values[index])
+    }
 }
 
 impl<T, const N: usize> Vector<T, N> {
@@ -409,10 +381,6 @@ impl<T: Coefficient, const N: usize> Vector<T, N> {
     /// Implementation hook used by `math!` for tensor/scalar broadcasting.
     #[doc(hidden)]
     pub fn broadcast_right(&self, scalar: T, op: u32) -> Self {
-        #[cfg(all(feature = "metal", target_os = "macos"))]
-        if let Some(output) = metal_dispatch::broadcast(&self.data, scalar, op, false) {
-            return Vector::new(std::array::from_fn(|index| output[index]));
-        }
         #[cfg(all(feature = "simd", target_arch = "aarch64"))]
         if let Some(output) = simd_dispatch::broadcast(&self.data, scalar, op, false) {
             return Vector::new(std::array::from_fn(|index| output[index]));
@@ -430,10 +398,6 @@ impl<T: Coefficient, const N: usize> Vector<T, N> {
     /// Implementation hook used by `math!` for scalar/tensor broadcasting.
     #[doc(hidden)]
     pub fn broadcast_left(&self, scalar: T, op: u32) -> Self {
-        #[cfg(all(feature = "metal", target_os = "macos"))]
-        if let Some(output) = metal_dispatch::broadcast(&self.data, scalar, op, true) {
-            return Vector::new(std::array::from_fn(|index| output[index]));
-        }
         #[cfg(all(feature = "simd", target_arch = "aarch64"))]
         if let Some(output) = simd_dispatch::broadcast(&self.data, scalar, op, true) {
             return Vector::new(std::array::from_fn(|index| output[index]));
@@ -451,10 +415,6 @@ impl<T: Coefficient, const N: usize> Vector<T, N> {
     /// Dot product with a vector of the same length — the length match is
     /// enforced by the type.
     pub fn dot(&self, other: &Vector<T, N>) -> T {
-        #[cfg(all(feature = "metal", target_os = "macos"))]
-        if let Some(output) = metal_dispatch::dot(&self.data, &other.data) {
-            return output;
-        }
         #[cfg(all(feature = "simd", target_arch = "aarch64"))]
         if let Some(output) = simd_dispatch::dot(&self.data, &other.data) {
             return output;
@@ -468,10 +428,6 @@ impl<T: Coefficient, const N: usize> Vector<T, N> {
 
     /// Row vector times matrix: `(1×N)·(N×C) = (1×C)`.
     pub fn vecmat<const C: usize>(&self, m: &Matrix<T, N, C>) -> Vector<T, C> {
-        #[cfg(all(feature = "metal", target_os = "macos"))]
-        if let Some(output) = metal_dispatch::vecmat(&self.data, &m.data) {
-            return output;
-        }
         #[cfg(all(feature = "simd", target_arch = "aarch64"))]
         if let Some(output) = simd_dispatch::vecmat(&self.data, &m.data) {
             return output;
@@ -508,11 +464,6 @@ impl<T: Coefficient, const N: usize> Vector<T, N> {
             return Vector::new(output);
         }
 
-        #[cfg(all(feature = "metal", target_os = "macos"))]
-        if let Some(output) = metal_dispatch::fft(&output, false) {
-            return Vector::new(output);
-        }
-
         if !N.is_power_of_two() {
             let transformed = mixed_radix_fft(&output, false);
             output.copy_from_slice(&transformed);
@@ -539,11 +490,6 @@ impl<T: Float + Coefficient, const N: usize> Vector<Complex<T>, N> {
     pub fn ifft(&self) -> Vector<Complex<T>, N> {
         if N <= 1 {
             return *self;
-        }
-
-        #[cfg(all(feature = "metal", target_os = "macos"))]
-        if let Some(output) = metal_dispatch::fft(&self.data, true) {
-            return Vector::new(output);
         }
 
         let mut output = self.data;
@@ -719,10 +665,84 @@ mod fft_tests {
 
 // ---- matrices ---------------------------------------------------------------
 
-/// An `R × C` matrix, backed by `[[T; C]; R]` in row-major order.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Matrix<T, const R: usize, const C: usize> {
-    data: [[T; C]; R],
+/// An `R × C` matrix, backed by `[[T; C]; R]` in row-major order on the default
+/// [`Host`] backend.
+pub struct Matrix<T, const R: usize, const C: usize, B: Backend = Host> {
+    data: B::Matrix<T, R, C>,
+}
+
+// As for `Vector`: hand-written derives, because the storage type — and so which
+// of these a tensor gets — depends on the backend.
+impl<T, const R: usize, const C: usize, B: Backend> Copy for Matrix<T, R, C, B> where
+    B::Matrix<T, R, C>: Copy
+{
+}
+
+impl<T, const R: usize, const C: usize, B: Backend> Clone for Matrix<T, R, C, B>
+where
+    B::Matrix<T, R, C>: Clone,
+{
+    fn clone(&self) -> Self {
+        Matrix {
+            data: self.data.clone(),
+        }
+    }
+}
+
+impl<T, const R: usize, const C: usize, B: Backend> PartialEq for Matrix<T, R, C, B>
+where
+    B::Matrix<T, R, C>: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.data == other.data
+    }
+}
+
+impl<T, const R: usize, const C: usize, B: Backend> Eq for Matrix<T, R, C, B> where
+    B::Matrix<T, R, C>: Eq
+{
+}
+
+impl<T, const R: usize, const C: usize, B: Backend> fmt::Debug for Matrix<T, R, C, B>
+where
+    B::Matrix<T, R, C>: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Matrix").field("data", &self.data).finish()
+    }
+}
+
+/// `f32` matrices on any backend, as for [`Vector`] above.
+impl<const R: usize, const C: usize, B: Backend> Matrix<f32, R, C, B> {
+    /// Move this matrix's elements onto backend `B2`.
+    ///
+    /// The counterpart to [`Vector::to_backend`], and the only place a
+    /// `Metal`-backed chain copies between CPU and GPU memory.
+    pub fn to_backend<B2: Backend>(&self) -> Matrix<f32, R, C, B2> {
+        Matrix {
+            data: B2::store_matrix::<R, C>(B::matrix_slice::<R, C>(&self.data)),
+        }
+    }
+
+    /// Every element set to `value`, allocated directly on backend `B`, staged on
+    /// the heap rather than as a `[[f32; C]; R]` literal — see
+    /// [`Vector::filled`].
+    pub fn filled(value: f32) -> Self {
+        Matrix {
+            data: B::store_matrix::<R, C>(&vec![value; R * C]),
+        }
+    }
+
+    /// Borrow the elements as one flat row-major slice, without copying.
+    pub fn as_slice(&self) -> &[f32] {
+        B::matrix_slice::<R, C>(&self.data)
+    }
+
+    /// Copy the elements into an array of rows.
+    pub fn to_rows(&self) -> [[f32; C]; R] {
+        let values = self.as_slice();
+        std::array::from_fn(|row| std::array::from_fn(|col| values[row * C + col]))
+    }
 }
 
 /// A type-erased matrix used to assemble a heterogeneous const-generic matrix
@@ -1258,19 +1278,6 @@ impl<T: Coefficient, const R: usize, const C: usize> Matrix<T, R, C> {
     /// Implementation hook used by `math!` for tensor/scalar broadcasting.
     #[doc(hidden)]
     pub fn broadcast_right(&self, scalar: T, op: u32) -> Self {
-        #[cfg(all(feature = "metal", target_os = "macos"))]
-        {
-            // SAFETY: nested arrays are contiguous and contain exactly R*C
-            // elements of T.
-            let input = unsafe {
-                std::slice::from_raw_parts(self.data.as_ptr().cast::<T>(), R.saturating_mul(C))
-            };
-            if let Some(output) = metal_dispatch::broadcast(input, scalar, op, false) {
-                return Matrix::from_rows(std::array::from_fn(|row| {
-                    std::array::from_fn(|col| output[row * C + col])
-                }));
-            }
-        }
         #[cfg(all(feature = "simd", target_arch = "aarch64"))]
         {
             // SAFETY: nested arrays are contiguous and hold exactly R*C `T`.
@@ -1296,19 +1303,6 @@ impl<T: Coefficient, const R: usize, const C: usize> Matrix<T, R, C> {
     /// Implementation hook used by `math!` for scalar/tensor broadcasting.
     #[doc(hidden)]
     pub fn broadcast_left(&self, scalar: T, op: u32) -> Self {
-        #[cfg(all(feature = "metal", target_os = "macos"))]
-        {
-            // SAFETY: nested arrays are contiguous and contain exactly R*C
-            // elements of T.
-            let input = unsafe {
-                std::slice::from_raw_parts(self.data.as_ptr().cast::<T>(), R.saturating_mul(C))
-            };
-            if let Some(output) = metal_dispatch::broadcast(input, scalar, op, true) {
-                return Matrix::from_rows(std::array::from_fn(|row| {
-                    std::array::from_fn(|col| output[row * C + col])
-                }));
-            }
-        }
         #[cfg(all(feature = "simd", target_arch = "aarch64"))]
         {
             // SAFETY: nested arrays are contiguous and hold exactly R*C `T`.
@@ -1334,10 +1328,6 @@ impl<T: Coefficient, const R: usize, const C: usize> Matrix<T, R, C> {
     /// Matrix product `(R×C)·(C×C2) = (R×C2)`. The shared inner dimension `C` is
     /// enforced by the type: a mismatch does not compile.
     pub fn matmul<const C2: usize>(&self, other: &Matrix<T, C, C2>) -> Matrix<T, R, C2> {
-        #[cfg(all(feature = "metal", target_os = "macos"))]
-        if let Some(output) = metal_dispatch::matmul(&self.data, &other.data) {
-            return output;
-        }
         #[cfg(all(feature = "simd", target_arch = "aarch64"))]
         if let Some(output) = simd_dispatch::matmul(&self.data, &other.data) {
             return output;
@@ -1357,10 +1347,6 @@ impl<T: Coefficient, const R: usize, const C: usize> Matrix<T, R, C> {
 
     /// Matrix times column vector: `(R×C)·(C×1) = (R×1)`.
     pub fn matvec(&self, v: &Vector<T, C>) -> Vector<T, R> {
-        #[cfg(all(feature = "metal", target_os = "macos"))]
-        if let Some(output) = metal_dispatch::matvec(&self.data, &v.data) {
-            return output;
-        }
         #[cfg(all(feature = "simd", target_arch = "aarch64"))]
         if let Some(output) = simd_dispatch::matvec(&self.data, &v.data) {
             return output;
@@ -1517,10 +1503,6 @@ impl<T: Coefficient, const N: usize> Mul for Vector<T, N> {
     type Output = Vector<T, N>;
 
     fn mul(self, rhs: Self) -> Self::Output {
-        #[cfg(all(feature = "metal", target_os = "macos"))]
-        if let Some(output) = metal_dispatch::elementwise(&self.data, &rhs.data, 2) {
-            return Vector::new(std::array::from_fn(|index| output[index]));
-        }
         #[cfg(all(feature = "simd", target_arch = "aarch64"))]
         if let Some(output) = simd_dispatch::elementwise(&self.data, &rhs.data, 2) {
             return Vector::new(std::array::from_fn(|index| output[index]));
@@ -1533,23 +1515,6 @@ impl<T: Coefficient, const R: usize, const C: usize> Mul for Matrix<T, R, C> {
     type Output = Matrix<T, R, C>;
 
     fn mul(self, rhs: Self) -> Self::Output {
-        #[cfg(all(feature = "metal", target_os = "macos"))]
-        {
-            // SAFETY: nested arrays are contiguous and contain exactly R*C
-            // elements of T.
-            let left = unsafe {
-                std::slice::from_raw_parts(self.data.as_ptr().cast::<T>(), R.saturating_mul(C))
-            };
-            // SAFETY: same representation argument as `left`.
-            let right = unsafe {
-                std::slice::from_raw_parts(rhs.data.as_ptr().cast::<T>(), R.saturating_mul(C))
-            };
-            if let Some(output) = metal_dispatch::elementwise(left, right, 2) {
-                return Matrix::from_rows(std::array::from_fn(|row| {
-                    std::array::from_fn(|col| output[row * C + col])
-                }));
-            }
-        }
         #[cfg(all(feature = "simd", target_arch = "aarch64"))]
         {
             // SAFETY: nested arrays are contiguous and hold exactly R*C `T`.

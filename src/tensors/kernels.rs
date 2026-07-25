@@ -1,0 +1,511 @@
+//! The `f32` tensor algebra, named per backend.
+//!
+//! [`Vector`] and [`Matrix`] implement their products and elementwise
+//! operations as inherent methods, once for each backend, and nothing ties those
+//! two sets together — `Matrix<f32, R, C, Host>::matmul` and
+//! `Matrix<f32, R, C, Metal>::matmul` are unrelated functions that happen to
+//! share a name. [`Kernels`] is that missing link: one trait naming every
+//! operation both backends provide, so code written against it compiles for
+//! either.
+//!
+//! Automatic differentiation is the reason it exists. The forward-mode layer in
+//! [`dual`](super::dual) is written once against `Kernels` and instantiates on
+//! both backends, which also means the `Host` instantiation is an exact
+//! correctness oracle for the `Metal` one — same code, different memory.
+//!
+//! The trait is sealed, since [`Backend`] is.
+
+use super::{Backend, Host, Matrix, Vector};
+
+/// The analytic functions, paired with their derivatives.
+///
+/// This is the op-code enum for the GPU `unary`/`unary_dual` kernels and the
+/// dispatch table for the CPU path, so both sides stay in step. The variants
+/// mirror the functions `math!` accepts, and each derivative is written the same
+/// way as the matching [`Dual`](crate::numbers::Dual) implementation.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Analytic {
+    Sin,
+    Cos,
+    Tan,
+    Sec,
+    Csc,
+    Arcsin,
+    Arccos,
+    Arctan,
+    Exp,
+    Ln,
+    Sinh,
+    Cosh,
+    Tanh,
+}
+
+impl Analytic {
+    /// Every function, in op-code order.
+    pub const ALL: [Analytic; 13] = [
+        Analytic::Sin,
+        Analytic::Cos,
+        Analytic::Tan,
+        Analytic::Sec,
+        Analytic::Csc,
+        Analytic::Arcsin,
+        Analytic::Arccos,
+        Analytic::Arctan,
+        Analytic::Exp,
+        Analytic::Ln,
+        Analytic::Sinh,
+        Analytic::Cosh,
+        Analytic::Tanh,
+    ];
+
+    /// The shader op code. These numbers are a wire format shared with the
+    /// `analytic_value`/`analytic_derivative` switches in [`crate::metal`], so
+    /// only ever append to them.
+    pub const fn code(self) -> u32 {
+        match self {
+            Analytic::Sin => 0,
+            Analytic::Cos => 1,
+            Analytic::Tan => 2,
+            Analytic::Sec => 3,
+            Analytic::Csc => 4,
+            Analytic::Arcsin => 5,
+            Analytic::Arccos => 6,
+            Analytic::Arctan => 7,
+            Analytic::Exp => 8,
+            Analytic::Ln => 9,
+            Analytic::Sinh => 10,
+            Analytic::Cosh => 11,
+            Analytic::Tanh => 12,
+        }
+    }
+
+    /// `f(x)`.
+    pub fn value(self, x: f32) -> f32 {
+        match self {
+            Analytic::Sin => x.sin(),
+            Analytic::Cos => x.cos(),
+            Analytic::Tan => x.tan(),
+            Analytic::Sec => x.cos().recip(),
+            Analytic::Csc => x.sin().recip(),
+            Analytic::Arcsin => x.asin(),
+            Analytic::Arccos => x.acos(),
+            Analytic::Arctan => x.atan(),
+            Analytic::Exp => x.exp(),
+            Analytic::Ln => x.ln(),
+            Analytic::Sinh => x.sinh(),
+            Analytic::Cosh => x.cosh(),
+            Analytic::Tanh => x.tanh(),
+        }
+    }
+
+    /// `f'(x)`.
+    pub fn derivative(self, x: f32) -> f32 {
+        match self {
+            Analytic::Sin => x.cos(),
+            Analytic::Cos => -x.sin(),
+            Analytic::Tan => {
+                let cos = x.cos();
+                (cos * cos).recip()
+            }
+            Analytic::Sec => {
+                let cos = x.cos();
+                x.sin() / (cos * cos)
+            }
+            Analytic::Csc => {
+                let sin = x.sin();
+                -x.cos() / (sin * sin)
+            }
+            Analytic::Arcsin => (1.0 - x * x).sqrt().recip(),
+            Analytic::Arccos => -(1.0 - x * x).sqrt().recip(),
+            Analytic::Arctan => (1.0 + x * x).recip(),
+            Analytic::Exp => x.exp(),
+            Analytic::Ln => x.recip(),
+            Analytic::Sinh => x.cosh(),
+            Analytic::Cosh => x.sinh(),
+            Analytic::Tanh => {
+                let tanh = x.tanh();
+                1.0 - tanh * tanh
+            }
+        }
+    }
+}
+
+/// The `f32` tensor operations a [`Backend`] provides.
+///
+/// Op codes for the elementwise and broadcast entry points match the rest of the
+/// crate: 0 add, 1 subtract, 2 multiply, 3 divide, 4 remainder.
+pub trait Kernels: Backend {
+    // ---- vectors ----
+
+    fn vector_elementwise<const N: usize>(
+        a: &Vector<f32, N, Self>,
+        b: &Vector<f32, N, Self>,
+        op: u32,
+    ) -> Vector<f32, N, Self>;
+
+    fn vector_broadcast<const N: usize>(
+        a: &Vector<f32, N, Self>,
+        scalar: f32,
+        op: u32,
+        scalar_left: bool,
+    ) -> Vector<f32, N, Self>;
+
+    /// `f(a)`, elementwise.
+    fn vector_unary<const N: usize>(a: &Vector<f32, N, Self>, f: Analytic) -> Vector<f32, N, Self>;
+
+    /// `(f(value), f'(value) ⊙ tangent)` — one forward-mode step.
+    fn vector_unary_dual<const N: usize>(
+        value: &Vector<f32, N, Self>,
+        tangent: &Vector<f32, N, Self>,
+        f: Analytic,
+    ) -> (Vector<f32, N, Self>, Vector<f32, N, Self>);
+
+    fn dot<const N: usize>(a: &Vector<f32, N, Self>, b: &Vector<f32, N, Self>) -> f32;
+
+    fn vecmat<const N: usize, const C: usize>(
+        v: &Vector<f32, N, Self>,
+        m: &Matrix<f32, N, C, Self>,
+    ) -> Vector<f32, C, Self>;
+
+    fn matvec<const R: usize, const C: usize>(
+        m: &Matrix<f32, R, C, Self>,
+        v: &Vector<f32, C, Self>,
+    ) -> Vector<f32, R, Self>;
+
+    // ---- matrices ----
+
+    fn matrix_elementwise<const R: usize, const C: usize>(
+        a: &Matrix<f32, R, C, Self>,
+        b: &Matrix<f32, R, C, Self>,
+        op: u32,
+    ) -> Matrix<f32, R, C, Self>;
+
+    fn matrix_broadcast<const R: usize, const C: usize>(
+        a: &Matrix<f32, R, C, Self>,
+        scalar: f32,
+        op: u32,
+        scalar_left: bool,
+    ) -> Matrix<f32, R, C, Self>;
+
+    /// `f(a)`, elementwise.
+    fn matrix_unary<const R: usize, const C: usize>(
+        a: &Matrix<f32, R, C, Self>,
+        f: Analytic,
+    ) -> Matrix<f32, R, C, Self>;
+
+    /// `(f(value), f'(value) ⊙ tangent)` — one forward-mode step.
+    fn matrix_unary_dual<const R: usize, const C: usize>(
+        value: &Matrix<f32, R, C, Self>,
+        tangent: &Matrix<f32, R, C, Self>,
+        f: Analytic,
+    ) -> (Matrix<f32, R, C, Self>, Matrix<f32, R, C, Self>);
+
+    fn matmul<const R: usize, const K: usize, const C: usize>(
+        a: &Matrix<f32, R, K, Self>,
+        b: &Matrix<f32, K, C, Self>,
+    ) -> Matrix<f32, R, C, Self>;
+
+    /// `addend + a·b`.
+    ///
+    /// Backends that can accumulate inside the product kernel do so, which is
+    /// what makes a dual matmul two dispatches instead of three. `addend` is
+    /// consumed because it may become the accumulator.
+    fn matmul_add<const R: usize, const K: usize, const C: usize>(
+        a: &Matrix<f32, R, K, Self>,
+        b: &Matrix<f32, K, C, Self>,
+        addend: Matrix<f32, R, C, Self>,
+    ) -> Matrix<f32, R, C, Self>;
+
+    fn transpose<const R: usize, const C: usize>(
+        m: &Matrix<f32, R, C, Self>,
+    ) -> Matrix<f32, C, R, Self>;
+}
+
+/// Every operation here already exists as an inherent method or an operator on
+/// the host-backed tensors; this is pure forwarding.
+impl Kernels for Host {
+    fn vector_elementwise<const N: usize>(
+        a: &Vector<f32, N, Self>,
+        b: &Vector<f32, N, Self>,
+        op: u32,
+    ) -> Vector<f32, N, Self> {
+        match op {
+            0 => *a + *b,
+            1 => *a - *b,
+            2 => *a * *b,
+            3 => *a / *b,
+            4 => *a % *b,
+            _ => unreachable!("unknown elementwise operation"),
+        }
+    }
+
+    fn vector_broadcast<const N: usize>(
+        a: &Vector<f32, N, Self>,
+        scalar: f32,
+        op: u32,
+        scalar_left: bool,
+    ) -> Vector<f32, N, Self> {
+        if scalar_left {
+            a.broadcast_left(scalar, op)
+        } else {
+            a.broadcast_right(scalar, op)
+        }
+    }
+
+    fn vector_unary<const N: usize>(a: &Vector<f32, N, Self>, f: Analytic) -> Vector<f32, N, Self> {
+        a.map(|&x| f.value(x))
+    }
+
+    fn vector_unary_dual<const N: usize>(
+        value: &Vector<f32, N, Self>,
+        tangent: &Vector<f32, N, Self>,
+        f: Analytic,
+    ) -> (Vector<f32, N, Self>, Vector<f32, N, Self>) {
+        let values = value.data();
+        (
+            value.map(|&x| f.value(x)),
+            Vector::new(std::array::from_fn(|i| {
+                f.derivative(values[i]) * tangent.data()[i]
+            })),
+        )
+    }
+
+    fn dot<const N: usize>(a: &Vector<f32, N, Self>, b: &Vector<f32, N, Self>) -> f32 {
+        a.dot(b)
+    }
+
+    fn vecmat<const N: usize, const C: usize>(
+        v: &Vector<f32, N, Self>,
+        m: &Matrix<f32, N, C, Self>,
+    ) -> Vector<f32, C, Self> {
+        v.vecmat(m)
+    }
+
+    fn matvec<const R: usize, const C: usize>(
+        m: &Matrix<f32, R, C, Self>,
+        v: &Vector<f32, C, Self>,
+    ) -> Vector<f32, R, Self> {
+        m.matvec(v)
+    }
+
+    fn matrix_elementwise<const R: usize, const C: usize>(
+        a: &Matrix<f32, R, C, Self>,
+        b: &Matrix<f32, R, C, Self>,
+        op: u32,
+    ) -> Matrix<f32, R, C, Self> {
+        match op {
+            0 => *a + *b,
+            1 => *a - *b,
+            2 => *a * *b,
+            3 => *a / *b,
+            4 => *a % *b,
+            _ => unreachable!("unknown elementwise operation"),
+        }
+    }
+
+    fn matrix_broadcast<const R: usize, const C: usize>(
+        a: &Matrix<f32, R, C, Self>,
+        scalar: f32,
+        op: u32,
+        scalar_left: bool,
+    ) -> Matrix<f32, R, C, Self> {
+        if scalar_left {
+            a.broadcast_left(scalar, op)
+        } else {
+            a.broadcast_right(scalar, op)
+        }
+    }
+
+    fn matrix_unary<const R: usize, const C: usize>(
+        a: &Matrix<f32, R, C, Self>,
+        f: Analytic,
+    ) -> Matrix<f32, R, C, Self> {
+        a.map(|&x| f.value(x))
+    }
+
+    fn matrix_unary_dual<const R: usize, const C: usize>(
+        value: &Matrix<f32, R, C, Self>,
+        tangent: &Matrix<f32, R, C, Self>,
+        f: Analytic,
+    ) -> (Matrix<f32, R, C, Self>, Matrix<f32, R, C, Self>) {
+        let (values, tangents) = (value.data(), tangent.data());
+        (
+            value.map(|&x| f.value(x)),
+            Matrix::from_rows(std::array::from_fn(|row| {
+                std::array::from_fn(|col| f.derivative(values[row][col]) * tangents[row][col])
+            })),
+        )
+    }
+
+    fn matmul<const R: usize, const K: usize, const C: usize>(
+        a: &Matrix<f32, R, K, Self>,
+        b: &Matrix<f32, K, C, Self>,
+    ) -> Matrix<f32, R, C, Self> {
+        a.matmul(b)
+    }
+
+    fn matmul_add<const R: usize, const K: usize, const C: usize>(
+        a: &Matrix<f32, R, K, Self>,
+        b: &Matrix<f32, K, C, Self>,
+        addend: Matrix<f32, R, C, Self>,
+    ) -> Matrix<f32, R, C, Self> {
+        // No accumulating kernel on the CPU path: the product and the sum are
+        // two passes either way.
+        a.matmul(b) + addend
+    }
+
+    fn transpose<const R: usize, const C: usize>(
+        m: &Matrix<f32, R, C, Self>,
+    ) -> Matrix<f32, C, R, Self> {
+        m.transpose()
+    }
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+mod gpu {
+    use super::{Analytic, Kernels, Matrix, Vector};
+    use crate::tensors::metal_backend::{matrix_elementwise, vector_elementwise};
+    use crate::tensors::{Host, Metal};
+
+    /// Forwarding again, but to the resident operations: every one of these
+    /// leaves its result in GPU-shared memory.
+    impl Kernels for Metal {
+        fn vector_elementwise<const N: usize>(
+            a: &Vector<f32, N, Self>,
+            b: &Vector<f32, N, Self>,
+            op: u32,
+        ) -> Vector<f32, N, Self> {
+            vector_elementwise(a, b, op)
+        }
+
+        fn vector_broadcast<const N: usize>(
+            a: &Vector<f32, N, Self>,
+            scalar: f32,
+            op: u32,
+            scalar_left: bool,
+        ) -> Vector<f32, N, Self> {
+            if scalar_left {
+                a.broadcast_left(scalar, op)
+            } else {
+                a.broadcast_right(scalar, op)
+            }
+        }
+
+        fn vector_unary<const N: usize>(
+            a: &Vector<f32, N, Self>,
+            f: Analytic,
+        ) -> Vector<f32, N, Self> {
+            a.analytic(f)
+        }
+
+        fn vector_unary_dual<const N: usize>(
+            value: &Vector<f32, N, Self>,
+            tangent: &Vector<f32, N, Self>,
+            f: Analytic,
+        ) -> (Vector<f32, N, Self>, Vector<f32, N, Self>) {
+            match value.data.unary_dual(&tangent.data, f.code()) {
+                Some((value, tangent)) => (Vector { data: value }, Vector { data: tangent }),
+                None => {
+                    let (value, tangent) = Host::vector_unary_dual(
+                        &value.to_backend::<Host>(),
+                        &tangent.to_backend::<Host>(),
+                        f,
+                    );
+                    (value.to_backend(), tangent.to_backend())
+                }
+            }
+        }
+
+        fn dot<const N: usize>(a: &Vector<f32, N, Self>, b: &Vector<f32, N, Self>) -> f32 {
+            a.dot(b)
+        }
+
+        fn vecmat<const N: usize, const C: usize>(
+            v: &Vector<f32, N, Self>,
+            m: &Matrix<f32, N, C, Self>,
+        ) -> Vector<f32, C, Self> {
+            v.vecmat(m)
+        }
+
+        fn matvec<const R: usize, const C: usize>(
+            m: &Matrix<f32, R, C, Self>,
+            v: &Vector<f32, C, Self>,
+        ) -> Vector<f32, R, Self> {
+            m.matvec(v)
+        }
+
+        fn matrix_elementwise<const R: usize, const C: usize>(
+            a: &Matrix<f32, R, C, Self>,
+            b: &Matrix<f32, R, C, Self>,
+            op: u32,
+        ) -> Matrix<f32, R, C, Self> {
+            matrix_elementwise(a, b, op)
+        }
+
+        fn matrix_broadcast<const R: usize, const C: usize>(
+            a: &Matrix<f32, R, C, Self>,
+            scalar: f32,
+            op: u32,
+            scalar_left: bool,
+        ) -> Matrix<f32, R, C, Self> {
+            if scalar_left {
+                a.broadcast_left(scalar, op)
+            } else {
+                a.broadcast_right(scalar, op)
+            }
+        }
+
+        fn matrix_unary<const R: usize, const C: usize>(
+            a: &Matrix<f32, R, C, Self>,
+            f: Analytic,
+        ) -> Matrix<f32, R, C, Self> {
+            a.analytic(f)
+        }
+
+        fn matrix_unary_dual<const R: usize, const C: usize>(
+            value: &Matrix<f32, R, C, Self>,
+            tangent: &Matrix<f32, R, C, Self>,
+            f: Analytic,
+        ) -> (Matrix<f32, R, C, Self>, Matrix<f32, R, C, Self>) {
+            match value.data.unary_dual(&tangent.data, f.code()) {
+                Some((value, tangent)) => (Matrix { data: value }, Matrix { data: tangent }),
+                None => {
+                    let (value, tangent) = Host::matrix_unary_dual(
+                        &value.to_backend::<Host>(),
+                        &tangent.to_backend::<Host>(),
+                        f,
+                    );
+                    (value.to_backend(), tangent.to_backend())
+                }
+            }
+        }
+
+        fn matmul<const R: usize, const K: usize, const C: usize>(
+            a: &Matrix<f32, R, K, Self>,
+            b: &Matrix<f32, K, C, Self>,
+        ) -> Matrix<f32, R, C, Self> {
+            a.matmul(b)
+        }
+
+        fn matmul_add<const R: usize, const K: usize, const C: usize>(
+            a: &Matrix<f32, R, K, Self>,
+            b: &Matrix<f32, K, C, Self>,
+            mut addend: Matrix<f32, R, C, Self>,
+        ) -> Matrix<f32, R, C, Self> {
+            // The fused form writes the product straight into `addend`.
+            if a.data
+                .matmul_accumulate(&b.data, &mut addend.data, R, K, C)
+                .is_some()
+            {
+                return addend;
+            }
+            matrix_elementwise(&a.matmul(b), &addend, 0)
+        }
+
+        fn transpose<const R: usize, const C: usize>(
+            m: &Matrix<f32, R, C, Self>,
+        ) -> Matrix<f32, C, R, Self> {
+            m.transpose()
+        }
+    }
+}

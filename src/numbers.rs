@@ -174,6 +174,7 @@ pub trait Recip {
 ///
 /// The coefficients may be any [`Coefficient`] — including [`Complex`], giving a
 /// dual number with complex parts.
+#[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Dual<T> {
     /// The real part, `a`.
