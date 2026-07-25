@@ -2,7 +2,7 @@
 
 use rinterp::errors::Error;
 use rinterp::numbers::{Complex, Dual};
-use rinterp::tensors::{Matrix, Vector};
+use rinterp::tensors::{Matrix, MatrixOperand, Vector};
 
 fn close(a: f64, b: f64) -> bool {
     (a - b).abs() < 1e-9
@@ -18,6 +18,199 @@ fn vectors_are_statically_sized() {
 }
 
 #[test]
+fn fft_handles_power_of_two_and_general_lengths() {
+    let impulse = Vector::new([1.0_f64, 0.0, 0.0, 0.0]).fft();
+    for value in impulse.data() {
+        assert!(close(value.real, 1.0));
+        assert!(close(value.im, 0.0));
+    }
+
+    let shifted = Vector::new([0.0_f64, 1.0, 0.0, 0.0]).fft();
+    let expected = [
+        Complex::new(1.0, 0.0),
+        Complex::new(0.0, -1.0),
+        Complex::new(-1.0, 0.0),
+        Complex::new(0.0, 1.0),
+    ];
+    for (actual, expected) in shifted.data().iter().zip(expected) {
+        assert!(close(actual.real, expected.real));
+        assert!(close(actual.im, expected.im));
+    }
+
+    // Three is a prime length; the direct leaf must use the same convention and
+    // output ordering as the fast paths.
+    let general = Vector::new([1.0_f64, 2.0, 3.0]).fft();
+    let root = 3.0_f64.sqrt() / 2.0;
+    let expected = [
+        Complex::new(6.0, 0.0),
+        Complex::new(-1.5, root),
+        Complex::new(-1.5, -root),
+    ];
+    for (actual, expected) in general.data().iter().zip(expected) {
+        assert!(close(actual.real, expected.real));
+        assert!(close(actual.im, expected.im));
+    }
+}
+
+#[test]
+fn fft_supports_edge_lengths_and_f32() {
+    let empty = Vector::<f64, 0>::new([]).fft();
+    assert!(empty.is_empty());
+
+    let singleton = Vector::new([7.0_f64]).fft();
+    assert_eq!(singleton, Vector::new([Complex::new(7.0, 0.0)]));
+
+    let values: Vector<Complex<f32>, 2> = Vector::new([1.0_f32, -1.0]).fft();
+    assert!((values.get(0).unwrap().real - 0.0).abs() < 1e-6);
+    assert!((values.get(1).unwrap().real - 2.0).abs() < 1e-6);
+}
+
+fn assert_fft_matches_dft<const N: usize>(input: [f64; N]) {
+    let actual = Vector::new(input).fft();
+    let tau = std::f64::consts::TAU;
+    for frequency in 0..N {
+        let mut expected = Complex::new(0.0, 0.0);
+        for (index, value) in input.iter().enumerate() {
+            let angle = -tau * frequency as f64 * index as f64 / N as f64;
+            expected = expected + Complex::new(value * angle.cos(), value * angle.sin());
+        }
+        assert!(
+            close(actual.data()[frequency].real, expected.real)
+                && close(actual.data()[frequency].im, expected.im),
+            "N={N}, bin={frequency}: actual={:?}, expected={expected:?}",
+            actual.data()[frequency]
+        );
+    }
+}
+
+#[test]
+fn fft_uses_mixed_radices_for_composite_lengths() {
+    // Exercise repeated and mixed factors: 3², 2×3, 2×5, 2²×3, and 3×5.
+    assert_fft_matches_dft([1.0, -2.0, 3.5, 4.0, -1.0, 0.5]);
+    assert_fft_matches_dft([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+    assert_fft_matches_dft([1.0, 0.0, -1.0, 2.0, -2.0, 3.0, -3.0, 4.0, -4.0, 5.0]);
+    assert_fft_matches_dft([
+        0.25, 1.0, -1.5, 2.0, 3.25, -0.5, 4.0, -2.0, 1.25, 0.0, 2.5, -3.0,
+    ]);
+    assert_fft_matches_dft([
+        1.0, 1.5, -2.0, 0.0, 3.0, -1.0, 2.25, 4.0, -3.5, 0.5, 1.25, -0.75, 2.0, -1.5, 3.25,
+    ]);
+}
+
+fn assert_fft_ifft_round_trip<const N: usize>(input: [f64; N]) {
+    let reconstructed = Vector::new(input).fft().ifft();
+    for (actual, expected) in reconstructed.data().iter().zip(input) {
+        assert!(
+            close(actual.real, expected) && close(actual.im, 0.0),
+            "N={N}: actual={actual:?}, expected={expected}"
+        );
+    }
+}
+
+fn assert_ifft_matches_idft<const N: usize>(input: [Complex<f64>; N]) {
+    let actual = Vector::new(input).ifft();
+    let tau = std::f64::consts::TAU;
+    for index in 0..N {
+        let mut expected = Complex::new(0.0, 0.0);
+        for (frequency, value) in input.iter().enumerate() {
+            let angle = tau * frequency as f64 * index as f64 / N as f64;
+            expected = expected + *value * Complex::new(angle.cos(), angle.sin());
+        }
+        expected = expected / N as f64;
+        assert!(
+            close(actual.data()[index].real, expected.real)
+                && close(actual.data()[index].im, expected.im),
+            "N={N}, sample={index}: actual={:?}, expected={expected:?}",
+            actual.data()[index]
+        );
+    }
+}
+
+#[test]
+fn ifft_inverts_power_of_two_mixed_radix_and_prime_transforms() {
+    assert_fft_ifft_round_trip([1.0, -2.0, 3.5, 4.0]);
+    assert_fft_ifft_round_trip([1.0, -2.0, 3.5, 4.0, -1.0, 0.5]);
+    assert_fft_ifft_round_trip([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+    assert_fft_ifft_round_trip([1.0, 0.0, -1.0, 2.0, -2.0, 3.0, -3.0, 4.0, -4.0, 5.0]);
+    assert_fft_ifft_round_trip([
+        0.25, 1.0, -1.5, 2.0, 3.25, -0.5, 4.0, -2.0, 1.25, 0.0, 2.5, -3.0,
+    ]);
+    assert_fft_ifft_round_trip([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+
+    assert_ifft_matches_idft([
+        Complex::new(1.0, -0.5),
+        Complex::new(-2.0, 1.0),
+        Complex::new(3.5, 2.0),
+        Complex::new(0.0, -1.5),
+        Complex::new(2.25, 0.75),
+        Complex::new(-3.0, 4.0),
+    ]);
+}
+
+#[test]
+fn ifft_supports_edge_lengths_and_f32() {
+    let empty = Vector::<Complex<f64>, 0>::new([]).ifft();
+    assert!(empty.is_empty());
+
+    let singleton = Vector::new([Complex::new(7.0_f64, -2.0)]).ifft();
+    assert_eq!(singleton, Vector::new([Complex::new(7.0, -2.0)]));
+
+    let values = Vector::new([Complex::new(0.0_f32, 0.0), Complex::new(2.0, 0.0)]).ifft();
+    assert!((values.data()[0].real - 1.0).abs() < 1e-6);
+    assert!((values.data()[1].real + 1.0).abs() < 1e-6);
+    assert!(values.data().iter().all(|value| value.im.abs() < 1e-6));
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+fn tensor_operations_use_metal_or_transparently_fall_back() {
+    let a = Matrix::<f32, 32, 32>::from_rows(std::array::from_fn(|row| {
+        std::array::from_fn(|col| (row + col) as f32 * 0.125)
+    }));
+    let identity = Matrix::<f32, 32, 32>::identity();
+    assert_eq!(a.matmul(&identity), a);
+
+    let wide = Matrix::<f32, 128, 256>::from_rows([[1.0; 256]; 128]);
+    let row = Vector::<f32, 128>::new([1.0; 128]);
+    assert!(row.vecmat(&wide).data().iter().all(|&value| value == 128.0));
+    let tall = wide.transpose();
+    let column = Vector::<f32, 128>::new([1.0; 128]);
+    assert!(
+        tall.matvec(&column)
+            .data()
+            .iter()
+            .all(|&value| value == 128.0)
+    );
+
+    let dot_left = Vector::<f32, 32768>::new([1.0; 32768]);
+    let dot_right = Vector::<f32, 32768>::new([2.0; 32768]);
+    assert_eq!(dot_left.dot(&dot_right), 65536.0);
+
+    let values = Vector::<f32, 4096>::new(std::array::from_fn(|index| index as f32 * 0.25));
+    let factors = Vector::<f32, 4096>::new(std::array::from_fn(|index| (index % 7) as f32 + 1.0));
+    let multiplied = values * factors;
+    let scaled = values.scale(2.0);
+    let shifted = values.broadcast_right(3.0, 0);
+    let reversed = values.broadcast_left(10.0, 1);
+    for index in 0..4096 {
+        assert_eq!(
+            multiplied.data()[index],
+            values.data()[index] * factors.data()[index]
+        );
+        assert_eq!(scaled.data()[index], values.data()[index] * 2.0);
+        assert_eq!(shifted.data()[index], values.data()[index] + 3.0);
+        assert_eq!(reversed.data()[index], 10.0 - values.data()[index]);
+    }
+
+    let signal = Vector::<f32, 1024>::new(std::array::from_fn(|index| (index % 19) as f32 - 4.0));
+    let reconstructed = signal.fft().ifft();
+    for (actual, expected) in reconstructed.data().iter().zip(signal.data()) {
+        assert!((actual.real - expected).abs() < 2e-3);
+        assert!(actual.im.abs() < 2e-3);
+    }
+}
+
+#[test]
 fn matrices_are_statically_shaped() {
     let a: Matrix<i32, 2, 3> = Matrix::from_rows([[1, 2, 3], [4, 5, 6]]);
     let b: Matrix<i32, 3, 2> = Matrix::from_rows([[7, 8], [9, 10], [11, 12]]);
@@ -29,6 +222,35 @@ fn matrices_are_statically_shaped() {
     assert_eq!(a.matvec(&column), Vector::new([14, 32]));
     let row: Vector<i32, 2> = Vector::new([1, 2]);
     assert_eq!(row.vecmat(&a), Vector::new([9, 12, 15]));
+}
+
+#[test]
+fn chained_matmul_restores_optimal_order_and_const_result_shape() {
+    let a: Matrix<i64, 2, 3> = Matrix::from_rows([[1, 2, 3], [4, 5, 6]]);
+    let b: Matrix<i64, 3, 2> = Matrix::from_rows([[1, 0], [0, 1], [1, 1]]);
+    let c: Matrix<i64, 2, 4> = Matrix::from_rows([[1, 2, 3, 4], [5, 6, 7, 8]]);
+    let chain = [
+        MatrixOperand::from(&a),
+        MatrixOperand::from(&b),
+        MatrixOperand::from(&c),
+    ];
+
+    let product: Matrix<i64, 2, 4> = Matrix::chained_matmul(&chain).unwrap();
+    assert_eq!(product, a.matmul(&b).matmul(&c));
+    assert_eq!(Matrix::<i64, 2, 4>::chained_matmul_cost(&chain), Ok(28));
+}
+
+#[test]
+fn hu_shing_cost_finds_the_classic_optimum() {
+    let a = Matrix::<i64, 10, 20>::zeros();
+    let b = Matrix::<i64, 20, 5>::zeros();
+    let c = Matrix::<i64, 5, 30>::zeros();
+    let chain = [
+        MatrixOperand::from(&a),
+        MatrixOperand::from(&b),
+        MatrixOperand::from(&c),
+    ];
+    assert_eq!(Matrix::<i64, 10, 30>::chained_matmul_cost(&chain), Ok(2500));
 }
 
 #[test]
@@ -63,6 +285,62 @@ fn complex_and_dual_elements_work() {
         ),
         (4.0, 4.0)
     );
+}
+
+#[test]
+fn all_vector_and_matrix_products_support_complex_coefficients() {
+    let gaussian: Vector<Complex<i32>, 1> = Vector::new([Complex::new(1, 2)]);
+    assert_eq!(gaussian.dot(&gaussian), Complex::new(-3, 4));
+
+    let u = Vector::new([Complex::new(1.0, 1.0), Complex::new(3.0, 0.0)]);
+    let v = Vector::new([Complex::new(2.0, -1.0), Complex::new(0.0, 1.0)]);
+    assert_eq!(u.dot(&v), Complex::new(3.0, 4.0));
+
+    let matrix = Matrix::from_rows([
+        [Complex::new(1.0, 0.0), Complex::new(0.0, 1.0)],
+        [Complex::new(2.0, 0.0), Complex::new(1.0, 0.0)],
+    ]);
+    assert_eq!(
+        matrix.matvec(&v),
+        Vector::new([Complex::new(1.0, -1.0), Complex::new(4.0, -1.0)])
+    );
+    assert_eq!(
+        u.vecmat(&matrix),
+        Vector::new([Complex::new(7.0, 1.0), Complex::new(2.0, 1.0)])
+    );
+
+    let identity = Matrix::<Complex<f64>, 2, 2>::identity();
+    assert_eq!(matrix.matmul(&identity), matrix);
+}
+
+#[test]
+fn all_vector_and_matrix_products_support_dual_coefficients() {
+    let integral: Vector<Dual<i64>, 1> = Vector::new([Dual::new(2, 1)]);
+    assert_eq!(integral.dot(&integral), Dual::new(4, 4));
+
+    let x = Dual::variable(2.0_f64);
+    let one = Dual::constant(1.0);
+    let two = Dual::constant(2.0);
+    let three = Dual::constant(3.0);
+    let zero = Dual::constant(0.0);
+
+    let u = Vector::new([x, one]);
+    let v = Vector::new([two, three]);
+    assert_eq!(u.dot(&v), Dual::new(7.0, 2.0));
+
+    let matrix = Matrix::from_rows([[x, one], [zero, one]]);
+    assert_eq!(
+        matrix.matvec(&v),
+        Vector::new([Dual::new(7.0, 2.0), Dual::constant(3.0)])
+    );
+    assert_eq!(
+        u.vecmat(&matrix),
+        Vector::new([Dual::new(4.0, 4.0), Dual::new(3.0, 1.0)])
+    );
+
+    let squared = matrix.matmul(&matrix);
+    assert_eq!(squared.get(0, 0), Some(&Dual::new(4.0, 4.0)));
+    assert_eq!(squared.get(0, 1), Some(&Dual::new(3.0, 1.0)));
 }
 
 #[test]

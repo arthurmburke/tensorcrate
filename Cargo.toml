@@ -11,8 +11,11 @@ rinterp-macros = { path = "macros" }
 num-traits = "0.2"
 
 [features]
+default = ["metal", "simd"]
 # GPU-accelerated tensor ops via Apple Metal (macOS only).
 metal = ["dep:objc2", "dep:objc2-metal", "dep:objc2-foundation"]
+# NEON-vectorized CPU math kernels (aarch64 only; a no-op on other targets).
+simd = []
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6", optional = true }

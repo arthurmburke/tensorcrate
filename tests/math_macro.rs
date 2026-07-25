@@ -165,6 +165,55 @@ fn a_real_dual_binding_widens_into_a_complex_one() {
     assert_eq!(z.dual, Complex::new(1.0, 0.0));
 }
 
+#[test]
+fn complex_and_dual_unification_is_operand_order_independent() {
+    let left: Dual<Complex<f64>> = math! {
+        let z = 2 + 3i;
+        let d = 5 + 7d;
+        z + d
+    };
+    let right: Dual<Complex<f64>> = math! {
+        let z = 2 + 3i;
+        let d = 5 + 7d;
+        d + z
+    };
+
+    let expected = Dual::new(Complex::new(7.0, 3.0), Complex::new(7.0, 0.0));
+    assert_eq!(left, expected);
+    assert_eq!(right, expected);
+
+    // This also exercises widening through nested expressions rather than only
+    // through a literal or a single binding.
+    let product: Dual<Complex<f64>> = math! {
+        let z = 1 + 2i;
+        let d = 3 + 4d;
+        (z + 2) * (d - 1)
+    };
+    assert_eq!(product.real, Complex::new(6.0, 4.0));
+    assert_eq!(product.dual, Complex::new(12.0, 8.0));
+}
+
+#[test]
+fn analytic_functions_and_power_preserve_complex_duals() {
+    // exp(i + ε) = exp(i) + exp(i)ε.
+    let exponential: Dual<Complex<f64>> = math! { exp(1i + 1d) };
+    let exp_i = Complex::new(1.0_f64.cos(), 1.0_f64.sin());
+    assert!(close(exponential.real.real, exp_i.real));
+    assert!(close(exponential.real.im, exp_i.im));
+    assert!(close(exponential.dual.real, exp_i.real));
+    assert!(close(exponential.dual.im, exp_i.im));
+
+    let squared: Dual<Complex<f64>> = math! { pow(1 + 1i + 1d, 2) };
+    assert!(close(squared.real.real, 0.0));
+    assert!(close(squared.real.im, 2.0));
+    assert!(close(squared.dual.real, 2.0));
+    assert!(close(squared.dual.im, 2.0));
+
+    let conjugated: Dual<Complex<f64>> = math! { conj(1 + 2i + 3d * (1 + 1i)) };
+    assert_eq!(conjugated.real, Complex::new(1.0, -2.0));
+    assert_eq!(conjugated.dual, Complex::new(3.0, -3.0));
+}
+
 // ---- tensors ----------------------------------------------------------------
 
 use rinterp::tensors::{Matrix, Vector};
@@ -202,6 +251,42 @@ fn matmul_dot_and_det() {
 
     let det: f64 = math! { det([[1, 2], [3, 4]]) };
     assert_eq!(det, -2.0);
+}
+
+#[test]
+fn symbolic_products_are_deduced_from_operand_shapes() {
+    let matrix_product: Matrix<f64, 2, 2> = math! {
+        let a = [[1, 2, 3], [4, 5, 6]];
+        let b = [[7, 8], [9, 10], [11, 12]];
+        a @ b
+    };
+    assert_eq!(matrix_product.data(), &[[58.0, 64.0], [139.0, 154.0]]);
+
+    let matrix_vector: Vector<f64, 2> = math! {
+        let a = [[1, 2, 3], [4, 5, 6]];
+        let v = [1, 2, 3];
+        a @ v
+    };
+    assert_eq!(matrix_vector.data(), &[14.0, 32.0]);
+
+    let row_matrix: Vector<f64, 3> = math! {
+        let v = [1, 2];
+        let b = [[1, 2, 3], [4, 5, 6]];
+        v @ b
+    };
+    assert_eq!(row_matrix.data(), &[9.0, 12.0, 15.0]);
+
+    let dot: f64 = math! { [1, 2, 3] * [4, 5, 6] };
+    assert_eq!(dot, 32.0);
+
+    // `@` has multiplicative precedence and chains left-to-right.
+    let chained: Matrix<f64, 2, 2> = math! {
+        let a = [[1, 2], [3, 4]];
+        let b = [[2, 0], [0, 2]];
+        let c = [[1, 1], [0, 1]];
+        a @ b @ c + [[1, 0], [0, 1]]
+    };
+    assert_eq!(chained.data(), &[[3.0, 6.0], [6.0, 15.0]]);
 }
 
 #[test]
@@ -261,7 +346,71 @@ fn tensors_differentiate_through_matmul() {
 }
 
 #[test]
+fn tensors_unify_real_complex_and_dual_elements() {
+    let literal: Vector<Dual<Complex<f64>>, 3> = math! { [1, 2 + 3i, 4 + 5d] };
+    assert_eq!(
+        literal.get(0),
+        Some(&Dual::constant(Complex::new(1.0, 0.0)))
+    );
+    assert_eq!(
+        literal.get(1),
+        Some(&Dual::constant(Complex::new(2.0, 3.0)))
+    );
+    assert_eq!(
+        literal.get(2),
+        Some(&Dual::new(Complex::new(4.0, 0.0), Complex::new(5.0, 0.0)))
+    );
+
+    // Tensor/tensor and scalar/tensor widening both lift every coefficient.
+    let sum: Vector<Dual<Complex<f64>>, 2> = math! { [1 + 1i, 2] + [3 + 4d, 5 + 6d] };
+    assert_eq!(
+        sum.get(0),
+        Some(&Dual::new(Complex::new(4.0, 1.0), Complex::new(4.0, 0.0)))
+    );
+
+    let broadcast: Vector<Dual<Complex<f64>>, 2> = math! { (1 + 2i) * [3 + 1d, 4 + 2d] };
+    assert_eq!(
+        broadcast.get(0),
+        Some(&Dual::new(Complex::new(3.0, 6.0), Complex::new(1.0, 2.0)))
+    );
+
+    let conjugated: Vector<Dual<Complex<f64>>, 1> = math! { conj([1 + 2i + 3d * (1 + 1i)]) };
+    assert_eq!(
+        conjugated.get(0),
+        Some(&Dual::new(Complex::new(1.0, -2.0), Complex::new(3.0, -3.0)))
+    );
+}
+
+#[test]
+fn linear_algebra_infers_complex_dual_results() {
+    let dot_product: Dual<Complex<f64>> = math! { dot([1 + 1i, 2], [3 + 1d, 4 + 2d]) };
+    assert_eq!(dot_product.real, Complex::new(11.0, 3.0));
+    assert_eq!(dot_product.dual, Complex::new(5.0, 1.0));
+
+    let product: Matrix<Dual<Complex<f64>>, 2, 2> = math! {
+        matmul(
+            [[1 + 1i, 0], [0, 1]],
+            [[2 + 1d, 0], [0, 3 + 2d]]
+        )
+    };
+    assert_eq!(
+        product.get(0, 0),
+        Some(&Dual::new(Complex::new(2.0, 2.0), Complex::new(1.0, 1.0)))
+    );
+    assert_eq!(
+        product.get(1, 1),
+        Some(&Dual::new(Complex::new(3.0, 0.0), Complex::new(2.0, 0.0)))
+    );
+}
+
+#[test]
 fn elementwise_functions_map_over_tensors() {
     let v: Vector<f64, 3> = math! { exp([0, 0, 0]) };
     assert_eq!(v.data(), &[1.0, 1.0, 1.0]);
+
+    let sine: Matrix<f64, 2, 2> = math! { sin([[0, 0], [0, 0]]) };
+    assert_eq!(sine.data(), &[[0.0, 0.0], [0.0, 0.0]]);
+
+    let cosine: Vector<f64, 3> = math! { cos([0, 0, 0]) };
+    assert_eq!(cosine.data(), &[1.0, 1.0, 1.0]);
 }

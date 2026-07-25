@@ -16,8 +16,344 @@ use std::cmp::Ordering;
 use std::fmt::{self, Display};
 use std::ops::{Add, Div, Mul, Neg, Rem, Sub};
 
+use num_traits::{Float, NumCast};
+
 use crate::errors::Error;
-use crate::numbers::Coefficient;
+use crate::numbers::{Coefficient, Complex};
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+mod metal_dispatch {
+    use std::any::TypeId;
+
+    use super::{Complex, Matrix, Vector};
+    use crate::numbers::Coefficient;
+
+    pub const MIN_ELEMENT_COUNT: usize = 4_096;
+    pub const MIN_FFT_LENGTH: usize = 1_024;
+    pub const MIN_MATMUL_OPERATIONS: usize = 32_768;
+
+    fn is_f32<T: 'static>() -> bool {
+        TypeId::of::<T>() == TypeId::of::<f32>()
+    }
+
+    fn as_f32_slice<T: 'static>(values: &[T]) -> Option<&[f32]> {
+        if !is_f32::<T>() {
+            return None;
+        }
+        // SAFETY: the TypeId check proves T is f32, so the element layout and
+        // lifetime are identical.
+        Some(unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), values.len()) })
+    }
+
+    fn from_f32<T: Copy + 'static>(value: f32) -> T {
+        debug_assert!(is_f32::<T>());
+        // SAFETY: every caller first checks that T is exactly f32.
+        unsafe { std::ptr::read((&value as *const f32).cast::<T>()) }
+    }
+
+    pub fn elementwise<T: Coefficient>(a: &[T], b: &[T], op: u32) -> Option<Vec<T>> {
+        if a.len() < MIN_ELEMENT_COUNT {
+            return None;
+        }
+        let output = crate::metal::elementwise_f32(as_f32_slice(a)?, as_f32_slice(b)?, op)?;
+        Some(output.into_iter().map(from_f32).collect())
+    }
+
+    pub fn broadcast<T: Coefficient>(
+        values: &[T],
+        scalar: T,
+        op: u32,
+        scalar_left: bool,
+    ) -> Option<Vec<T>> {
+        if values.len() < MIN_ELEMENT_COUNT || !is_f32::<T>() {
+            return None;
+        }
+        let scalar = as_f32_slice(std::slice::from_ref(&scalar))?[0];
+        let output = crate::metal::broadcast_f32(as_f32_slice(values)?, scalar, op, scalar_left)?;
+        Some(output.into_iter().map(from_f32).collect())
+    }
+
+    pub fn matmul<T: Coefficient, const R: usize, const K: usize, const C: usize>(
+        a: &[[T; K]; R],
+        b: &[[T; C]; K],
+    ) -> Option<Matrix<T, R, C>> {
+        if R.saturating_mul(K).saturating_mul(C) < MIN_MATMUL_OPERATIONS {
+            return None;
+        }
+        let a = as_f32_slice(unsafe {
+            std::slice::from_raw_parts(a.as_ptr().cast::<T>(), R.saturating_mul(K))
+        })?;
+        let b = as_f32_slice(unsafe {
+            std::slice::from_raw_parts(b.as_ptr().cast::<T>(), K.saturating_mul(C))
+        })?;
+        let output = crate::metal::matmul_f32(a, b, R, K, C)?;
+        Some(Matrix::from_rows(std::array::from_fn(|row| {
+            std::array::from_fn(|col| from_f32(output[row * C + col]))
+        })))
+    }
+
+    pub fn matvec<T: Coefficient, const R: usize, const C: usize>(
+        matrix: &[[T; C]; R],
+        vector: &[T; C],
+    ) -> Option<Vector<T, R>> {
+        if R.saturating_mul(C) < MIN_MATMUL_OPERATIONS {
+            return None;
+        }
+        let matrix = as_f32_slice(unsafe {
+            std::slice::from_raw_parts(matrix.as_ptr().cast::<T>(), R.saturating_mul(C))
+        })?;
+        let output = crate::metal::matmul_f32(matrix, as_f32_slice(vector)?, R, C, 1)?;
+        Some(Vector::new(std::array::from_fn(|row| {
+            from_f32(output[row])
+        })))
+    }
+
+    pub fn vecmat<T: Coefficient, const R: usize, const C: usize>(
+        vector: &[T; R],
+        matrix: &[[T; C]; R],
+    ) -> Option<Vector<T, C>> {
+        if R.saturating_mul(C) < MIN_MATMUL_OPERATIONS {
+            return None;
+        }
+        let matrix = as_f32_slice(unsafe {
+            std::slice::from_raw_parts(matrix.as_ptr().cast::<T>(), R.saturating_mul(C))
+        })?;
+        let output = crate::metal::matmul_f32(as_f32_slice(vector)?, matrix, 1, R, C)?;
+        Some(Vector::new(std::array::from_fn(|col| {
+            from_f32(output[col])
+        })))
+    }
+
+    pub fn dot<T: Coefficient, const N: usize>(a: &[T; N], b: &[T; N]) -> Option<T> {
+        if N < MIN_MATMUL_OPERATIONS {
+            return None;
+        }
+        let output = crate::metal::matmul_f32(as_f32_slice(a)?, as_f32_slice(b)?, 1, N, 1)?;
+        Some(from_f32(output[0]))
+    }
+
+    pub fn fft<T: Coefficient, const N: usize>(
+        input: &[Complex<T>; N],
+        inverse: bool,
+    ) -> Option<[Complex<T>; N]> {
+        if N < MIN_FFT_LENGTH || !N.is_power_of_two() || !is_f32::<T>() {
+            return None;
+        }
+        let mut interleaved = Vec::with_capacity(N * 2);
+        for value in input {
+            interleaved.push(as_f32_slice(std::slice::from_ref(&value.real))?[0]);
+            interleaved.push(as_f32_slice(std::slice::from_ref(&value.im))?[0]);
+        }
+        let output = if inverse {
+            crate::metal::ifft_f32_interleaved(&interleaved)?
+        } else {
+            crate::metal::fft_f32_interleaved(&interleaved)?
+        };
+        Some(std::array::from_fn(|index| {
+            Complex::new(from_f32(output[index * 2]), from_f32(output[index * 2 + 1]))
+        }))
+    }
+}
+
+#[cfg(all(feature = "simd", target_arch = "aarch64"))]
+mod simd_dispatch {
+    //! CPU SIMD tier: sits between `metal_dispatch` and the generic scalar
+    //! loops. Each entry point downcasts the generic element type to a concrete
+    //! float via `TypeId` (returning `None` — i.e. defer to scalar — for every
+    //! other type), then calls the NEON kernels in [`crate::simd`]. The size
+    //! gates are deliberately small: NEON has almost no fixed cost, so it wins
+    //! far below the Metal thresholds.
+
+    use std::any::TypeId;
+
+    use super::{Complex, Matrix, Vector};
+    use crate::numbers::Coefficient;
+
+    // Below these lengths the generic scalar loop is already fine (and the
+    // reinterpret/dispatch bookkeeping is not worth it).
+    const MIN_ELEMENTS: usize = 16;
+    const MIN_MATMUL_OPS: usize = 512;
+    const MIN_FFT_LENGTH: usize = 8;
+
+    fn is<T: 'static, U: 'static>() -> bool {
+        TypeId::of::<T>() == TypeId::of::<U>()
+    }
+
+    /// Reinterpret `&[T]` as `&[U]` when `T` is exactly `U`. SAFETY rests on the
+    /// `TypeId` equality: identical type ⇒ identical layout and lifetime.
+    unsafe fn as_slice<T: 'static, U: 'static>(values: &[T]) -> Option<&[U]> {
+        if !is::<T, U>() {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<U>(), values.len()) })
+    }
+
+    fn from_f32<T: Copy + 'static>(v: f32) -> T {
+        unsafe { std::ptr::read((&v as *const f32).cast::<T>()) }
+    }
+    fn from_f64<T: Copy + 'static>(v: f64) -> T {
+        unsafe { std::ptr::read((&v as *const f64).cast::<T>()) }
+    }
+
+    pub fn dot<T: Coefficient, const N: usize>(a: &[T; N], b: &[T; N]) -> Option<T> {
+        if N < MIN_ELEMENTS {
+            return None;
+        }
+        unsafe {
+            if let (Some(a), Some(b)) = (as_slice::<T, f32>(a), as_slice::<T, f32>(b)) {
+                return Some(from_f32(crate::simd::f32k::dot(a, b)));
+            }
+            if let (Some(a), Some(b)) = (as_slice::<T, f64>(a), as_slice::<T, f64>(b)) {
+                return Some(from_f64(crate::simd::f64k::dot(a, b)));
+            }
+        }
+        None
+    }
+
+    pub fn elementwise<T: Coefficient>(a: &[T], b: &[T], op: u32) -> Option<Vec<T>> {
+        if a.len() < MIN_ELEMENTS || op == 4 {
+            return None;
+        }
+        unsafe {
+            if let (Some(a), Some(b)) = (as_slice::<T, f32>(a), as_slice::<T, f32>(b)) {
+                let mut out = vec![0.0f32; a.len()];
+                crate::simd::f32k::elementwise(a, b, op, &mut out);
+                return Some(out.into_iter().map(from_f32).collect());
+            }
+            if let (Some(a), Some(b)) = (as_slice::<T, f64>(a), as_slice::<T, f64>(b)) {
+                let mut out = vec![0.0f64; a.len()];
+                crate::simd::f64k::elementwise(a, b, op, &mut out);
+                return Some(out.into_iter().map(from_f64).collect());
+            }
+        }
+        None
+    }
+
+    pub fn broadcast<T: Coefficient>(
+        values: &[T],
+        scalar: T,
+        op: u32,
+        scalar_left: bool,
+    ) -> Option<Vec<T>> {
+        if values.len() < MIN_ELEMENTS || op == 4 {
+            return None;
+        }
+        unsafe {
+            if let (Some(v), Some(s)) =
+                (as_slice::<T, f32>(values), as_slice::<T, f32>(std::slice::from_ref(&scalar)))
+            {
+                let mut out = vec![0.0f32; v.len()];
+                crate::simd::f32k::broadcast(v, s[0], op, scalar_left, &mut out);
+                return Some(out.into_iter().map(from_f32).collect());
+            }
+            if let (Some(v), Some(s)) =
+                (as_slice::<T, f64>(values), as_slice::<T, f64>(std::slice::from_ref(&scalar)))
+            {
+                let mut out = vec![0.0f64; v.len()];
+                crate::simd::f64k::broadcast(v, s[0], op, scalar_left, &mut out);
+                return Some(out.into_iter().map(from_f64).collect());
+            }
+        }
+        None
+    }
+
+    pub fn matmul<T: Coefficient, const R: usize, const K: usize, const C: usize>(
+        a: &[[T; K]; R],
+        b: &[[T; C]; K],
+    ) -> Option<Matrix<T, R, C>> {
+        if R.saturating_mul(K).saturating_mul(C) < MIN_MATMUL_OPS {
+            return None;
+        }
+        unsafe {
+            let a_flat = std::slice::from_raw_parts(a.as_ptr().cast::<T>(), R * K);
+            let b_flat = std::slice::from_raw_parts(b.as_ptr().cast::<T>(), K * C);
+            if let (Some(a), Some(b)) = (as_slice::<T, f32>(a_flat), as_slice::<T, f32>(b_flat)) {
+                let mut out = vec![0.0f32; R * C];
+                crate::simd::f32k::matmul(a, b, R, K, C, &mut out);
+                return Some(Matrix::from_rows(std::array::from_fn(|i| {
+                    std::array::from_fn(|j| from_f32(out[i * C + j]))
+                })));
+            }
+            if let (Some(a), Some(b)) = (as_slice::<T, f64>(a_flat), as_slice::<T, f64>(b_flat)) {
+                let mut out = vec![0.0f64; R * C];
+                crate::simd::f64k::matmul(a, b, R, K, C, &mut out);
+                return Some(Matrix::from_rows(std::array::from_fn(|i| {
+                    std::array::from_fn(|j| from_f64(out[i * C + j]))
+                })));
+            }
+        }
+        None
+    }
+
+    pub fn matvec<T: Coefficient, const R: usize, const C: usize>(
+        matrix: &[[T; C]; R],
+        vector: &[T; C],
+    ) -> Option<Vector<T, R>> {
+        if R.saturating_mul(C) < MIN_MATMUL_OPS {
+            return None;
+        }
+        // Row-times-vector: each output is a dot product of a matrix row with
+        // the vector, so the per-row reduction kernel is the right shape here.
+        unsafe {
+            let m = std::slice::from_raw_parts(matrix.as_ptr().cast::<T>(), R * C);
+            if let (Some(m), Some(v)) = (as_slice::<T, f32>(m), as_slice::<T, f32>(vector)) {
+                return Some(Vector::new(std::array::from_fn(|i| {
+                    from_f32(crate::simd::f32k::dot(&m[i * C..i * C + C], v))
+                })));
+            }
+            if let (Some(m), Some(v)) = (as_slice::<T, f64>(m), as_slice::<T, f64>(vector)) {
+                return Some(Vector::new(std::array::from_fn(|i| {
+                    from_f64(crate::simd::f64k::dot(&m[i * C..i * C + C], v))
+                })));
+            }
+        }
+        None
+    }
+
+    pub fn vecmat<T: Coefficient, const R: usize, const C: usize>(
+        vector: &[T; R],
+        matrix: &[[T; C]; R],
+    ) -> Option<Vector<T, C>> {
+        if R.saturating_mul(C) < MIN_MATMUL_OPS {
+            return None;
+        }
+        // (1×R)·(R×C): the broadcast-A matmul vectorizes across the C columns.
+        unsafe {
+            let m = std::slice::from_raw_parts(matrix.as_ptr().cast::<T>(), R * C);
+            if let (Some(v), Some(m)) = (as_slice::<T, f32>(vector), as_slice::<T, f32>(m)) {
+                let mut out = vec![0.0f32; C];
+                crate::simd::f32k::matmul(v, m, 1, R, C, &mut out);
+                return Some(Vector::new(std::array::from_fn(|j| from_f32(out[j]))));
+            }
+            if let (Some(v), Some(m)) = (as_slice::<T, f64>(vector), as_slice::<T, f64>(m)) {
+                let mut out = vec![0.0f64; C];
+                crate::simd::f64k::matmul(v, m, 1, R, C, &mut out);
+                return Some(Vector::new(std::array::from_fn(|j| from_f64(out[j]))));
+            }
+        }
+        None
+    }
+
+    /// In-place radix-2 FFT for power-of-two `f32` lengths. Returns `false` (so
+    /// the caller keeps the generic path) for every other element type or shape.
+    /// `direction` is `-1.0` forward, `+1.0` inverse; normalization stays with
+    /// the caller.
+    pub fn radix2_fft<T: Coefficient, const N: usize>(
+        output: &mut [Complex<T>; N],
+        direction: f64,
+    ) -> bool {
+        if N < MIN_FFT_LENGTH || !N.is_power_of_two() || !is::<T, f32>() {
+            return false;
+        }
+        // SAFETY: T is f32 and `Complex` is `#[repr(C)]`, so the buffer is
+        // exactly `[re, im, …]` — `2*N` contiguous f32.
+        let buf = unsafe {
+            std::slice::from_raw_parts_mut(output.as_mut_ptr().cast::<f32>(), 2 * N)
+        };
+        crate::simd::fft_f32::radix2(buf, N, direction as f32);
+        true
+    }
+}
 
 // ---- vectors ----------------------------------------------------------------
 
@@ -67,12 +403,62 @@ impl<T: Coefficient, const N: usize> Vector<T, N> {
 
     /// Multiply every element by `scalar`.
     pub fn scale(&self, scalar: T) -> Self {
-        self.map(|&x| x * scalar)
+        self.broadcast_right(scalar, 2)
+    }
+
+    /// Implementation hook used by `math!` for tensor/scalar broadcasting.
+    #[doc(hidden)]
+    pub fn broadcast_right(&self, scalar: T, op: u32) -> Self {
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        if let Some(output) = metal_dispatch::broadcast(&self.data, scalar, op, false) {
+            return Vector::new(std::array::from_fn(|index| output[index]));
+        }
+        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        if let Some(output) = simd_dispatch::broadcast(&self.data, scalar, op, false) {
+            return Vector::new(std::array::from_fn(|index| output[index]));
+        }
+        self.map(|&value| match op {
+            0 => value + scalar,
+            1 => value - scalar,
+            2 => value * scalar,
+            3 => value / scalar,
+            4 => value % scalar,
+            _ => unreachable!("unknown broadcast operation"),
+        })
+    }
+
+    /// Implementation hook used by `math!` for scalar/tensor broadcasting.
+    #[doc(hidden)]
+    pub fn broadcast_left(&self, scalar: T, op: u32) -> Self {
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        if let Some(output) = metal_dispatch::broadcast(&self.data, scalar, op, true) {
+            return Vector::new(std::array::from_fn(|index| output[index]));
+        }
+        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        if let Some(output) = simd_dispatch::broadcast(&self.data, scalar, op, true) {
+            return Vector::new(std::array::from_fn(|index| output[index]));
+        }
+        self.map(|&value| match op {
+            0 => scalar + value,
+            1 => scalar - value,
+            2 => scalar * value,
+            3 => scalar / value,
+            4 => scalar % value,
+            _ => unreachable!("unknown broadcast operation"),
+        })
     }
 
     /// Dot product with a vector of the same length — the length match is
     /// enforced by the type.
     pub fn dot(&self, other: &Vector<T, N>) -> T {
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        if let Some(output) = metal_dispatch::dot(&self.data, &other.data) {
+            return output;
+        }
+        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        if let Some(output) = simd_dispatch::dot(&self.data, &other.data) {
+            return output;
+        }
         let mut sum = T::zero();
         for i in 0..N {
             sum = sum + self.data[i] * other.data[i];
@@ -82,6 +468,14 @@ impl<T: Coefficient, const N: usize> Vector<T, N> {
 
     /// Row vector times matrix: `(1×N)·(N×C) = (1×C)`.
     pub fn vecmat<const C: usize>(&self, m: &Matrix<T, N, C>) -> Vector<T, C> {
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        if let Some(output) = metal_dispatch::vecmat(&self.data, &m.data) {
+            return output;
+        }
+        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        if let Some(output) = simd_dispatch::vecmat(&self.data, &m.data) {
+            return output;
+        }
         Vector {
             data: std::array::from_fn(|j| {
                 let mut sum = T::zero();
@@ -92,6 +486,235 @@ impl<T: Coefficient, const N: usize> Vector<T, N> {
             }),
         }
     }
+
+    /// Discrete Fourier transform.
+    ///
+    /// Power-of-two lengths use iterative radix-2 Cooley–Tukey (`O(N log N)`).
+    /// Other composite lengths use a recursive mixed-radix Cooley–Tukey
+    /// decomposition for radices up to 15. Sub-transforms without a factor in
+    /// that range use the definition directly, so every const length—including
+    /// zero and one—is supported.
+    ///
+    /// This is the conventional unnormalized forward transform:
+    /// `X[k] = Σ x[n] exp(-2πikn/N)`.
+    pub fn fft(&self) -> Vector<Complex<T>, N>
+    where
+        T: Float,
+    {
+        let mut output =
+            std::array::from_fn(|i| Complex::new(self.data[i], <T as num_traits::Zero>::zero()));
+
+        if N <= 1 {
+            return Vector::new(output);
+        }
+
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        if let Some(output) = metal_dispatch::fft(&output, false) {
+            return Vector::new(output);
+        }
+
+        if !N.is_power_of_two() {
+            let transformed = mixed_radix_fft(&output, false);
+            output.copy_from_slice(&transformed);
+            return Vector::new(output);
+        }
+
+        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        if simd_dispatch::radix2_fft(&mut output, -1.0) {
+            return Vector::new(output);
+        }
+
+        radix2_fft(&mut output, false);
+        Vector::new(output)
+    }
+}
+
+impl<T: Float + Coefficient, const N: usize> Vector<Complex<T>, N> {
+    /// Inverse discrete Fourier transform.
+    ///
+    /// This uses the same radix-2 and mixed-radix Cooley–Tukey paths as
+    /// [`Vector::fft`], with a direct DFT for leaves whose smallest factor
+    /// exceeds 15. It is the conventional normalized inverse transform:
+    /// `x[n] = (1/N) Σ X[k] exp(2πikn/N)`.
+    pub fn ifft(&self) -> Vector<Complex<T>, N> {
+        if N <= 1 {
+            return *self;
+        }
+
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        if let Some(output) = metal_dispatch::fft(&self.data, true) {
+            return Vector::new(output);
+        }
+
+        let mut output = self.data;
+        if N.is_power_of_two() {
+            #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+            let vectorized = simd_dispatch::radix2_fft(&mut output, 1.0);
+            #[cfg(not(all(feature = "simd", target_arch = "aarch64")))]
+            let vectorized = false;
+            if !vectorized {
+                radix2_fft(&mut output, true);
+            }
+        } else {
+            let transformed = mixed_radix_fft(&output, true);
+            output.copy_from_slice(&transformed);
+        }
+
+        let normalization = cast::<T>(N);
+        for value in &mut output {
+            value.real = value.real / normalization;
+            value.im = value.im / normalization;
+        }
+        Vector::new(output)
+    }
+}
+
+fn cast<T: NumCast>(value: impl NumCast) -> T {
+    NumCast::from(value).expect("usize and f64 Fourier constants fit supported float types")
+}
+
+fn radix2_fft<T: Float + Coefficient>(output: &mut [Complex<T>], inverse: bool) {
+    let n = output.len();
+
+    // Bit-reversal permutation puts inputs in the order consumed by the
+    // iterative butterfly stages.
+    let mut j = 0;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j ^= bit;
+        if i < j {
+            output.swap(i, j);
+        }
+    }
+
+    let direction = if inverse {
+        <T as num_traits::One>::one()
+    } else {
+        -<T as num_traits::One>::one()
+    };
+    let tau = cast::<T>(std::f64::consts::TAU);
+    let mut len = 2;
+    while len <= n {
+        let angle = direction * tau / cast::<T>(len);
+        let step = Complex::new(angle.cos(), angle.sin());
+        for start in (0..n).step_by(len) {
+            let mut twiddle = Complex::new(
+                <T as num_traits::One>::one(),
+                <T as num_traits::Zero>::zero(),
+            );
+            for offset in 0..len / 2 {
+                let even = output[start + offset];
+                let odd = output[start + offset + len / 2] * twiddle;
+                output[start + offset] = even + odd;
+                output[start + offset + len / 2] = even - odd;
+                twiddle = twiddle * step;
+            }
+        }
+        len *= 2;
+    }
+}
+
+/// Cooley–Tukey decomposition for arbitrary composite lengths. Splitting by
+/// the smallest supported factor uses radices up to 15. If no supported factor
+/// divides the length, the transform uses the quadratic DFT rather than a
+/// high-radix stage.
+fn mixed_radix_fft<T: Float + Coefficient>(input: &[Complex<T>], inverse: bool) -> Vec<Complex<T>> {
+    let n = input.len();
+    if n <= 1 {
+        return input.to_vec();
+    }
+
+    let Some(radix) = smallest_mixed_radix(n) else {
+        return direct_dft(input, inverse);
+    };
+
+    let quotient = n / radix;
+    let mut sub_transforms = Vec::with_capacity(radix);
+    for residue in 0..radix {
+        let subsequence = (0..quotient)
+            .map(|index| input[residue + radix * index])
+            .collect::<Vec<_>>();
+        sub_transforms.push(mixed_radix_fft(&subsequence, inverse));
+    }
+
+    let zero = Complex::new(
+        <T as num_traits::Zero>::zero(),
+        <T as num_traits::Zero>::zero(),
+    );
+    let tau = cast::<T>(std::f64::consts::TAU);
+    let direction = if inverse {
+        <T as num_traits::One>::one()
+    } else {
+        -<T as num_traits::One>::one()
+    };
+    let mut output = vec![zero; n];
+    for (high_frequency, frequency_band) in output.chunks_exact_mut(quotient).enumerate() {
+        for (low_frequency, target) in frequency_band.iter_mut().enumerate() {
+            let frequency = low_frequency + quotient * high_frequency;
+            let mut sum = zero;
+            for (residue, sub_transform) in sub_transforms.iter().enumerate() {
+                let angle =
+                    direction * tau * cast::<T>(residue) * cast::<T>(frequency) / cast::<T>(n);
+                let twiddle = Complex::new(angle.cos(), angle.sin());
+                sum = sum + sub_transform[low_frequency] * twiddle;
+            }
+            *target = sum;
+        }
+    }
+    output
+}
+
+fn direct_dft<T: Float + Coefficient>(input: &[Complex<T>], inverse: bool) -> Vec<Complex<T>> {
+    let n = input.len();
+    let tau = cast::<T>(std::f64::consts::TAU);
+    let direction = if inverse {
+        <T as num_traits::One>::one()
+    } else {
+        -<T as num_traits::One>::one()
+    };
+    (0..n)
+        .map(|frequency| {
+            let mut sum = Complex::new(
+                <T as num_traits::Zero>::zero(),
+                <T as num_traits::Zero>::zero(),
+            );
+            for (index, &value) in input.iter().enumerate() {
+                let angle =
+                    direction * tau * cast::<T>(frequency) * cast::<T>(index) / cast::<T>(n);
+                let twiddle = Complex::new(angle.cos(), angle.sin());
+                sum = sum + value * twiddle;
+            }
+            sum
+        })
+        .collect()
+}
+
+const MAX_MIXED_RADIX: usize = 15;
+
+fn smallest_mixed_radix(n: usize) -> Option<usize> {
+    // These are all primes up to MAX_MIXED_RADIX. If none divides n, its
+    // smallest prime factor necessarily exceeds the mixed-radix cutoff.
+    [2, 3, 5, 7, 11, 13]
+        .into_iter()
+        .take_while(|&factor| factor <= MAX_MIXED_RADIX)
+        .find(|&factor| n.is_multiple_of(factor))
+}
+
+#[cfg(test)]
+mod fft_tests {
+    use super::smallest_mixed_radix;
+
+    #[test]
+    fn mixed_radix_selection_stops_above_fifteen() {
+        assert_eq!(smallest_mixed_radix(2 * 17), Some(2));
+        assert_eq!(smallest_mixed_radix(13 * 17), Some(13));
+        assert_eq!(smallest_mixed_radix(17 * 19), None);
+        assert_eq!(smallest_mixed_radix(17), None);
+    }
 }
 
 // ---- matrices ---------------------------------------------------------------
@@ -100,6 +723,486 @@ impl<T: Coefficient, const N: usize> Vector<T, N> {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Matrix<T, const R: usize, const C: usize> {
     data: [[T; C]; R],
+}
+
+/// A type-erased matrix used to assemble a heterogeneous const-generic matrix
+/// chain. Construct one with `MatrixOperand::from(&matrix)`.
+///
+/// Rust slices cannot directly contain `Matrix<T, R, C>` values with differing
+/// `R` and `C` parameters. This small owned adapter erases those intermediate
+/// dimensions while [`chained_matmul`] restores the final dimensions in its
+/// return type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MatrixOperand<T> {
+    rows: usize,
+    cols: usize,
+    data: Vec<T>,
+}
+
+impl<T: Copy, const R: usize, const C: usize> From<&Matrix<T, R, C>> for MatrixOperand<T> {
+    fn from(matrix: &Matrix<T, R, C>) -> Self {
+        Self {
+            rows: R,
+            cols: C,
+            data: matrix.data.iter().flatten().copied().collect(),
+        }
+    }
+}
+
+/// Multiply a heterogeneous chain in the optimal parenthesization.
+///
+/// The returned `R × C` shape is const-generic and is checked against the
+/// chain's endpoints. The optimal order is found with the classic matrix-chain
+/// dynamic program; use [`chained_matmul_cost`] when only the optimal cost is
+/// needed, since that function uses the `O(n log n)` Hu–Shing solver.
+pub fn chained_matmul<T: Coefficient, const R: usize, const C: usize>(
+    matrices: &[MatrixOperand<T>],
+) -> Result<Matrix<T, R, C>, Error> {
+    let dims = validate_chain(matrices)?;
+    if R != dims[0] || C != dims[dims.len() - 1] {
+        return Err(Error::shape(format!(
+            "chain result is {}×{}, but the requested Matrix type is {R}×{C}",
+            dims[0],
+            dims[dims.len() - 1]
+        )));
+    }
+
+    let n = matrices.len();
+    let mut costs = vec![vec![0u128; n]; n];
+    let mut splits = vec![vec![0usize; n]; n];
+    for span in 2..=n {
+        for i in 0..=n - span {
+            let j = i + span - 1;
+            costs[i][j] = u128::MAX;
+            for k in i..j {
+                let multiplication = (dims[i] as u128)
+                    .saturating_mul(dims[k + 1] as u128)
+                    .saturating_mul(dims[j + 1] as u128);
+                let candidate = costs[i][k]
+                    .saturating_add(costs[k + 1][j])
+                    .saturating_add(multiplication);
+                if candidate < costs[i][j] {
+                    costs[i][j] = candidate;
+                    splits[i][j] = k;
+                }
+            }
+        }
+    }
+
+    fn evaluate<T: Coefficient>(
+        matrices: &[MatrixOperand<T>],
+        splits: &[Vec<usize>],
+        i: usize,
+        j: usize,
+    ) -> MatrixOperand<T> {
+        if i == j {
+            return matrices[i].clone();
+        }
+        let k = splits[i][j];
+        let left = evaluate(matrices, splits, i, k);
+        let right = evaluate(matrices, splits, k + 1, j);
+        multiply_operands(&left, &right)
+    }
+
+    let result = evaluate(matrices, &splits, 0, n - 1);
+    Ok(Matrix::from_rows(std::array::from_fn(|i| {
+        std::array::from_fn(|j| result.data[i * C + j])
+    })))
+}
+
+/// Minimum scalar-multiplication cost for a matrix chain, computed by the
+/// Hu–Shing `O(n log n)` optimal polygon-triangulation algorithm.
+pub fn chained_matmul_cost<T>(matrices: &[MatrixOperand<T>]) -> Result<u128, Error> {
+    let dims = validate_chain(matrices)?;
+    Ok(hu_shing::optimal_cost(&dims.iter().map(|&d| d as i128).collect::<Vec<_>>()) as u128)
+}
+
+fn validate_chain<T>(matrices: &[MatrixOperand<T>]) -> Result<Vec<usize>, Error> {
+    if matrices.len() < 2 {
+        return Err(Error::InvalidArgument(
+            "expected at least 2 matrices to multiply".to_string(),
+        ));
+    }
+    let mut dims = Vec::with_capacity(matrices.len() + 1);
+    dims.push(matrices[0].rows);
+    for (i, matrix) in matrices.iter().enumerate() {
+        if i > 0 && matrix.rows != dims[i] {
+            return Err(Error::shape(format!(
+                "chained_matmul dimension mismatch: matrix {} has {} columns but matrix {i} has {} rows",
+                i - 1,
+                dims[i],
+                matrix.rows
+            )));
+        }
+        dims.push(matrix.cols);
+    }
+    if dims.contains(&0) {
+        return Err(Error::InvalidArgument(
+            "matrix-chain dimensions must be positive".to_string(),
+        ));
+    }
+    Ok(dims)
+}
+
+fn multiply_operands<T: Coefficient>(
+    left: &MatrixOperand<T>,
+    right: &MatrixOperand<T>,
+) -> MatrixOperand<T> {
+    debug_assert_eq!(left.cols, right.rows);
+    let mut data = vec![T::zero(); left.rows * right.cols];
+    for i in 0..left.rows {
+        for j in 0..right.cols {
+            let mut sum = T::zero();
+            for k in 0..left.cols {
+                sum = sum + left.data[i * left.cols + k] * right.data[k * right.cols + j];
+            }
+            data[i * right.cols + j] = sum;
+        }
+    }
+    MatrixOperand {
+        rows: left.rows,
+        cols: right.cols,
+        data,
+    }
+}
+
+/// Hu–Shing's optimal weighted-polygon triangulation algorithm, restored from
+/// the original tensor implementation. A matrix chain's boundary dimensions
+/// are the polygon weights.
+mod hu_shing {
+    use std::cmp::Ordering;
+    use std::collections::BinaryHeap;
+
+    #[derive(Clone, Copy)]
+    struct HArc {
+        u: usize,
+        v: usize,
+        low: usize,
+        base: i128,
+        mul: i128,
+        num: i128,
+        den: i128,
+    }
+
+    impl HArc {
+        fn contains(&self, other: &HArc) -> bool {
+            self.u <= other.u && other.v <= self.v
+        }
+
+        fn support(&self) -> i128 {
+            self.num / self.den
+        }
+    }
+
+    impl PartialEq for HArc {
+        fn eq(&self, other: &Self) -> bool {
+            self.support() == other.support()
+        }
+    }
+
+    impl Eq for HArc {}
+
+    impl PartialOrd for HArc {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    impl Ord for HArc {
+        fn cmp(&self, other: &Self) -> Ordering {
+            self.support().cmp(&other.support())
+        }
+    }
+
+    struct Solver {
+        n: usize,
+        w: Vec<i128>,
+        cp: Vec<i128>,
+        h: Vec<HArc>,
+        n_arcs: usize,
+        sub: Vec<usize>,
+        child: Vec<Vec<usize>>,
+        n_pqs: usize,
+        qid: Vec<usize>,
+        pq: Vec<BinaryHeap<HArc>>,
+        con: Vec<Vec<HArc>>,
+    }
+
+    impl Solver {
+        fn new_arc(&mut self, u: usize, v: usize) {
+            debug_assert!(u <= v);
+            self.n_arcs += 1;
+            let low = if self.w[u] < self.w[v] { u } else { v };
+            let mul = self.w[u] * self.w[v];
+            let base = self.cp[v] - self.cp[u] - mul;
+            self.h[self.n_arcs] = HArc {
+                u,
+                v,
+                low,
+                base,
+                mul,
+                num: 0,
+                den: 1,
+            };
+        }
+
+        fn build_tree(&mut self, arcs: &[(usize, usize)]) {
+            let mut stack = Vec::new();
+            self.new_arc(1, self.n + 1);
+            for &(a, b) in arcs {
+                self.new_arc(a, b);
+                let current = self.n_arcs;
+                while let Some(&top) = stack.last() {
+                    if self.h[current].contains(&self.h[top]) {
+                        self.child[current].push(top);
+                        stack.pop();
+                    } else {
+                        break;
+                    }
+                }
+                stack.push(current);
+            }
+            while let Some(top) = stack.pop() {
+                self.child[1].push(top);
+            }
+        }
+
+        fn one_sweep(&mut self) {
+            let mut stack = Vec::new();
+            let mut arcs = Vec::new();
+            for i in 1..=self.n {
+                while stack.len() >= 2 && self.w[*stack.last().unwrap()] > self.w[i] {
+                    arcs.push((stack[stack.len() - 2], i));
+                    stack.pop();
+                }
+                stack.push(i);
+            }
+            while stack.len() >= 4 {
+                arcs.push((1, stack[stack.len() - 2]));
+                stack.pop();
+            }
+            let arcs = arcs
+                .into_iter()
+                .filter(|&(a, b)| a != 1 && b != 1)
+                .collect::<Vec<_>>();
+            self.build_tree(&arcs);
+        }
+
+        fn prepare(&mut self) {
+            let mut first = 1;
+            for i in 2..=self.n {
+                if self.w[i] < self.w[first] {
+                    first = i;
+                }
+            }
+            self.w[1..=self.n].rotate_left(first - 1);
+            self.w[self.n + 1] = self.w[1];
+            for i in 1..=self.n + 1 {
+                self.cp[i] = self.w[i] * self.w[i - 1] + self.cp[i - 1];
+            }
+        }
+
+        fn minimum_neighbor_product(&self, node: usize) -> i128 {
+            if node == 1 {
+                return self.w[1] * self.w[2] + self.w[1] * self.w[self.n];
+            }
+            let current = self.h[node];
+            if current.u == current.low {
+                match self.con[current.u].last() {
+                    Some(back) if current.contains(back) => back.mul,
+                    _ => self.w[current.u] * self.w[current.u + 1],
+                }
+            } else {
+                match self.con[current.v].last() {
+                    Some(back) if current.contains(back) => back.mul,
+                    _ => self.w[current.v] * self.w[current.v - 1],
+                }
+            }
+        }
+
+        fn add_arc(&mut self, node: usize, arc: HArc) {
+            let queue = self.qid[node];
+            self.pq[queue].push(arc);
+            self.con[arc.u].push(arc);
+            self.con[arc.v].push(arc);
+        }
+
+        fn remove_arc(&mut self, node: usize) {
+            let queue = self.qid[node];
+            let arc = *self.pq[queue].peek().expect("remove_arc on empty queue");
+            self.con[arc.u].pop();
+            self.con[arc.v].pop();
+            self.pq[queue].pop();
+        }
+
+        fn merge_queues(&mut self, node: usize) {
+            let mut largest = usize::MAX;
+            for &child in &self.child[node] {
+                if largest == usize::MAX || self.sub[largest] < self.sub[child] {
+                    largest = child;
+                }
+            }
+            self.qid[node] = self.qid[largest];
+            let target = self.qid[node];
+            for child in self.child[node].clone() {
+                if child != largest {
+                    let source = std::mem::take(&mut self.pq[self.qid[child]]);
+                    self.pq[target].extend(source);
+                }
+            }
+        }
+
+        fn solve_subtree(&mut self, node: usize) {
+            self.sub[node] = 1;
+            let mul = self.h[node].mul;
+            let low = self.h[node].low;
+
+            if self.child[node].is_empty() {
+                self.n_pqs += 1;
+                self.qid[node] = self.n_pqs;
+                let den = self.h[node].base;
+                let num = self.w[low] * (den + mul - self.minimum_neighbor_product(node));
+                self.h[node].num = num;
+                self.h[node].den = den;
+                self.add_arc(node, self.h[node]);
+                return;
+            }
+
+            let mut den = self.h[node].base;
+            for child in self.child[node].clone() {
+                self.solve_subtree(child);
+                self.sub[node] += self.sub[child];
+                den -= self.h[child].base;
+            }
+            let mut num = self.w[low] * (den + mul - self.minimum_neighbor_product(node));
+            self.merge_queues(node);
+            let queue = self.qid[node];
+
+            while matches!(self.pq[queue].peek(), Some(top) if top.support() >= self.w[low]) {
+                den += self.pq[queue].peek().unwrap().den;
+                self.remove_arc(node);
+                num = self.w[low] * (den + mul - self.minimum_neighbor_product(node));
+            }
+            while matches!(self.pq[queue].peek(), Some(top) if num / den <= top.support()) {
+                let top = *self.pq[queue].peek().unwrap();
+                den += top.den;
+                self.remove_arc(node);
+                num += top.num;
+            }
+
+            self.h[node].num = num;
+            self.h[node].den = den;
+            self.add_arc(node, self.h[node]);
+        }
+
+        fn answer(&mut self) -> i128 {
+            self.solve_subtree(1);
+            let queue = std::mem::take(&mut self.pq[self.qid[1]]);
+            queue.into_iter().map(|arc| arc.num).sum()
+        }
+    }
+
+    pub fn optimal_cost(dims: &[i128]) -> i128 {
+        match dims.len() {
+            0 | 1 => return 0,
+            2 => return dims[0] * dims[1],
+            _ => {}
+        }
+        let n = dims.len();
+        let len = n + 3;
+        let empty_arc = HArc {
+            u: 0,
+            v: 0,
+            low: 0,
+            base: 0,
+            mul: 0,
+            num: 0,
+            den: 1,
+        };
+        let mut solver = Solver {
+            n,
+            w: vec![0; len],
+            cp: vec![0; len],
+            h: vec![empty_arc; len],
+            n_arcs: 0,
+            sub: vec![0; len],
+            child: vec![Vec::new(); len],
+            n_pqs: 0,
+            qid: vec![0; len],
+            pq: (0..len).map(|_| BinaryHeap::new()).collect(),
+            con: vec![Vec::new(); len],
+        };
+        solver.w[1..=n].copy_from_slice(dims);
+        solver.prepare();
+        solver.one_sweep();
+        solver.answer()
+    }
+}
+
+#[cfg(test)]
+mod hu_shing_tests {
+    use super::hu_shing;
+
+    fn dynamic_programming_cost(dims: &[i128]) -> i128 {
+        let n = dims.len() - 1;
+        let mut costs = vec![vec![0i128; n]; n];
+        for span in 2..=n {
+            for i in 0..=n - span {
+                let j = i + span - 1;
+                costs[i][j] = i128::MAX;
+                for k in i..j {
+                    costs[i][j] = costs[i][j]
+                        .min(costs[i][k] + costs[k + 1][j] + dims[i] * dims[k + 1] * dims[j + 1]);
+                }
+            }
+        }
+        costs[0][n - 1]
+    }
+
+    #[test]
+    fn hu_shing_matches_the_cubic_oracle_exhaustively() {
+        let choices = [1i128, 2, 3, 4];
+        for matrices in 2..=6usize {
+            let dimension_count = matrices + 1;
+            let cases = choices.len().pow(dimension_count as u32);
+            for mut code in 0..cases {
+                let dims = (0..dimension_count)
+                    .map(|_| {
+                        let dimension = choices[code % choices.len()];
+                        code /= choices.len();
+                        dimension
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    hu_shing::optimal_cost(&dims),
+                    dynamic_programming_cost(&dims),
+                    "dims={dims:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hu_shing_matches_the_cubic_oracle_for_random_long_chains() {
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut random = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        for _ in 0..1_000 {
+            let matrices = 2 + (random() % 30) as usize;
+            let dims = (0..=matrices)
+                .map(|_| 1 + (random() % 50) as i128)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                hu_shing::optimal_cost(&dims),
+                dynamic_programming_cost(&dims),
+                "dims={dims:?}"
+            );
+        }
+    }
 }
 
 impl<T, const R: usize, const C: usize> Matrix<T, R, C> {
@@ -129,6 +1232,18 @@ impl<T, const R: usize, const C: usize> Matrix<T, R, C> {
 }
 
 impl<T: Coefficient, const R: usize, const C: usize> Matrix<T, R, C> {
+    /// Multiply a heterogeneous matrix chain in its optimal order.
+    ///
+    /// Convert each differently-shaped matrix with [`MatrixOperand::from`].
+    pub fn chained_matmul(matrices: &[MatrixOperand<T>]) -> Result<Self, Error> {
+        crate::tensors::chained_matmul(matrices)
+    }
+
+    /// Return the optimal multiplication cost using the Hu–Shing algorithm.
+    pub fn chained_matmul_cost(matrices: &[MatrixOperand<T>]) -> Result<u128, Error> {
+        crate::tensors::chained_matmul_cost(matrices)
+    }
+
     pub fn zeros() -> Self {
         Matrix {
             data: std::array::from_fn(|_| std::array::from_fn(|_| T::zero())),
@@ -137,12 +1252,96 @@ impl<T: Coefficient, const R: usize, const C: usize> Matrix<T, R, C> {
 
     /// Multiply every element by `scalar`.
     pub fn scale(&self, scalar: T) -> Self {
-        self.map(|&x| x * scalar)
+        self.broadcast_right(scalar, 2)
+    }
+
+    /// Implementation hook used by `math!` for tensor/scalar broadcasting.
+    #[doc(hidden)]
+    pub fn broadcast_right(&self, scalar: T, op: u32) -> Self {
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            // SAFETY: nested arrays are contiguous and contain exactly R*C
+            // elements of T.
+            let input = unsafe {
+                std::slice::from_raw_parts(self.data.as_ptr().cast::<T>(), R.saturating_mul(C))
+            };
+            if let Some(output) = metal_dispatch::broadcast(input, scalar, op, false) {
+                return Matrix::from_rows(std::array::from_fn(|row| {
+                    std::array::from_fn(|col| output[row * C + col])
+                }));
+            }
+        }
+        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        {
+            // SAFETY: nested arrays are contiguous and hold exactly R*C `T`.
+            let input = unsafe {
+                std::slice::from_raw_parts(self.data.as_ptr().cast::<T>(), R.saturating_mul(C))
+            };
+            if let Some(output) = simd_dispatch::broadcast(input, scalar, op, false) {
+                return Matrix::from_rows(std::array::from_fn(|row| {
+                    std::array::from_fn(|col| output[row * C + col])
+                }));
+            }
+        }
+        self.map(|&value| match op {
+            0 => value + scalar,
+            1 => value - scalar,
+            2 => value * scalar,
+            3 => value / scalar,
+            4 => value % scalar,
+            _ => unreachable!("unknown broadcast operation"),
+        })
+    }
+
+    /// Implementation hook used by `math!` for scalar/tensor broadcasting.
+    #[doc(hidden)]
+    pub fn broadcast_left(&self, scalar: T, op: u32) -> Self {
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            // SAFETY: nested arrays are contiguous and contain exactly R*C
+            // elements of T.
+            let input = unsafe {
+                std::slice::from_raw_parts(self.data.as_ptr().cast::<T>(), R.saturating_mul(C))
+            };
+            if let Some(output) = metal_dispatch::broadcast(input, scalar, op, true) {
+                return Matrix::from_rows(std::array::from_fn(|row| {
+                    std::array::from_fn(|col| output[row * C + col])
+                }));
+            }
+        }
+        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        {
+            // SAFETY: nested arrays are contiguous and hold exactly R*C `T`.
+            let input = unsafe {
+                std::slice::from_raw_parts(self.data.as_ptr().cast::<T>(), R.saturating_mul(C))
+            };
+            if let Some(output) = simd_dispatch::broadcast(input, scalar, op, true) {
+                return Matrix::from_rows(std::array::from_fn(|row| {
+                    std::array::from_fn(|col| output[row * C + col])
+                }));
+            }
+        }
+        self.map(|&value| match op {
+            0 => scalar + value,
+            1 => scalar - value,
+            2 => scalar * value,
+            3 => scalar / value,
+            4 => scalar % value,
+            _ => unreachable!("unknown broadcast operation"),
+        })
     }
 
     /// Matrix product `(R×C)·(C×C2) = (R×C2)`. The shared inner dimension `C` is
     /// enforced by the type: a mismatch does not compile.
     pub fn matmul<const C2: usize>(&self, other: &Matrix<T, C, C2>) -> Matrix<T, R, C2> {
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        if let Some(output) = metal_dispatch::matmul(&self.data, &other.data) {
+            return output;
+        }
+        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        if let Some(output) = simd_dispatch::matmul(&self.data, &other.data) {
+            return output;
+        }
         Matrix {
             data: std::array::from_fn(|i| {
                 std::array::from_fn(|j| {
@@ -158,6 +1357,14 @@ impl<T: Coefficient, const R: usize, const C: usize> Matrix<T, R, C> {
 
     /// Matrix times column vector: `(R×C)·(C×1) = (R×1)`.
     pub fn matvec(&self, v: &Vector<T, C>) -> Vector<T, R> {
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        if let Some(output) = metal_dispatch::matvec(&self.data, &v.data) {
+            return output;
+        }
+        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        if let Some(output) = simd_dispatch::matvec(&self.data, &v.data) {
+            return output;
+        }
         Vector {
             data: std::array::from_fn(|i| {
                 let mut sum = T::zero();
@@ -268,8 +1475,6 @@ impl<T: Coefficient, const N: usize> Matrix<T, N, N> {
     }
 }
 
-// ---- elementwise operators --------------------------------------------------
-
 macro_rules! elementwise {
     ($Type:ident < $($dim:ident),+ >, $Trait:ident, $method:ident, $op:tt) => {
         impl<T: Coefficient, $(const $dim: usize),+> $Trait for $Type<T, $($dim),+> {
@@ -301,14 +1506,68 @@ impl<T: Coefficient, const R: usize, const C: usize> Matrix<T, R, C> {
 
 elementwise!(Vector<N>, Add, add, +);
 elementwise!(Vector<N>, Sub, sub, -);
-elementwise!(Vector<N>, Mul, mul, *);
 elementwise!(Vector<N>, Div, div, /);
 elementwise!(Vector<N>, Rem, rem, %);
 elementwise!(Matrix<R, C>, Add, add, +);
 elementwise!(Matrix<R, C>, Sub, sub, -);
-elementwise!(Matrix<R, C>, Mul, mul, *);
 elementwise!(Matrix<R, C>, Div, div, /);
 elementwise!(Matrix<R, C>, Rem, rem, %);
+
+impl<T: Coefficient, const N: usize> Mul for Vector<T, N> {
+    type Output = Vector<T, N>;
+
+    fn mul(self, rhs: Self) -> Self::Output {
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        if let Some(output) = metal_dispatch::elementwise(&self.data, &rhs.data, 2) {
+            return Vector::new(std::array::from_fn(|index| output[index]));
+        }
+        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        if let Some(output) = simd_dispatch::elementwise(&self.data, &rhs.data, 2) {
+            return Vector::new(std::array::from_fn(|index| output[index]));
+        }
+        self.zip_with(&rhs, |a, b| a * b)
+    }
+}
+
+impl<T: Coefficient, const R: usize, const C: usize> Mul for Matrix<T, R, C> {
+    type Output = Matrix<T, R, C>;
+
+    fn mul(self, rhs: Self) -> Self::Output {
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            // SAFETY: nested arrays are contiguous and contain exactly R*C
+            // elements of T.
+            let left = unsafe {
+                std::slice::from_raw_parts(self.data.as_ptr().cast::<T>(), R.saturating_mul(C))
+            };
+            // SAFETY: same representation argument as `left`.
+            let right = unsafe {
+                std::slice::from_raw_parts(rhs.data.as_ptr().cast::<T>(), R.saturating_mul(C))
+            };
+            if let Some(output) = metal_dispatch::elementwise(left, right, 2) {
+                return Matrix::from_rows(std::array::from_fn(|row| {
+                    std::array::from_fn(|col| output[row * C + col])
+                }));
+            }
+        }
+        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        {
+            // SAFETY: nested arrays are contiguous and hold exactly R*C `T`.
+            let left = unsafe {
+                std::slice::from_raw_parts(self.data.as_ptr().cast::<T>(), R.saturating_mul(C))
+            };
+            let right = unsafe {
+                std::slice::from_raw_parts(rhs.data.as_ptr().cast::<T>(), R.saturating_mul(C))
+            };
+            if let Some(output) = simd_dispatch::elementwise(left, right, 2) {
+                return Matrix::from_rows(std::array::from_fn(|row| {
+                    std::array::from_fn(|col| output[row * C + col])
+                }));
+            }
+        }
+        self.zip_with(&rhs, |a, b| a * b)
+    }
+}
 
 impl<T: Coefficient + Neg<Output = T>, const N: usize> Neg for Vector<T, N> {
     type Output = Vector<T, N>;

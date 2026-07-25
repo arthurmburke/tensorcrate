@@ -15,6 +15,11 @@
 //! compiler type-checks the result and the optimizer sees straight-line
 //! arithmetic.
 //!
+//! Tensor products are selected symbolically from their inferred shapes:
+//! `A @ B` is matrix multiplication (including matrix/vector and vector/matrix
+//! products), while `v * u` is a vector dot product. Analytic functions such as
+//! `sin(A)` and `cos(v)` map elementwise over matrices and vectors.
+//!
 //! The input is parsed with `syn` as Rust syntax, which gives operator
 //! precedence, parentheses, grouping and array literals for free. The only
 //! extensions are literal suffixes: `2i` is imaginary and `2d` is the dual
@@ -25,7 +30,7 @@
 
 use std::collections::HashMap;
 
-use proc_macro2::{Literal, Span, TokenStream};
+use proc_macro2::{Group, Ident, Literal, Punct, Spacing, Span, TokenStream, TokenTree};
 use quote::quote;
 use syn::parse::Parser;
 use syn::spanned::Spanned;
@@ -132,9 +137,67 @@ type Env = HashMap<String, Ty>;
 
 #[proc_macro]
 pub fn math(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
-    match expand(input.into()) {
+    match expand(rewrite_matmul_operator(input.into())) {
         Ok(ts) => ts.into(),
         Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// `@` is not part of Rust's expression grammar. Rewrite it to a reserved
+/// `lhs / marker / rhs` form before `syn` parses the block. Division has the
+/// same precedence and associativity that matrix multiplication should have,
+/// and [`matmul_operands`] recognizes the resulting AST without confusing an
+/// ordinary `/`.
+fn rewrite_matmul_operator(input: TokenStream) -> TokenStream {
+    let mut output = TokenStream::new();
+    for token in input {
+        match token {
+            TokenTree::Punct(at) if at.as_char() == '@' => {
+                let span = at.span();
+                let mut slash = Punct::new('/', Spacing::Alone);
+                slash.set_span(span);
+                output.extend([TokenTree::Punct(slash.clone())]);
+                output.extend([TokenTree::Ident(Ident::new(
+                    "__rinterp_matmul_operator__",
+                    span,
+                ))]);
+                output.extend([TokenTree::Punct(slash)]);
+            }
+            TokenTree::Group(group) => {
+                let mut rewritten =
+                    Group::new(group.delimiter(), rewrite_matmul_operator(group.stream()));
+                rewritten.set_span(group.span());
+                output.extend([TokenTree::Group(rewritten)]);
+            }
+            token => output.extend([token]),
+        }
+    }
+    output
+}
+
+fn is_matmul_marker(expr: &Expr) -> bool {
+    matches!(expr, Expr::Path(path) if path.path.is_ident("__rinterp_matmul_operator__"))
+}
+
+/// Recover the operands from the reserved `(lhs / marker) / rhs` AST shape.
+fn matmul_operands(expr: &Expr) -> Option<(&Expr, &Expr)> {
+    let Expr::Binary(outer) = expr else {
+        return None;
+    };
+    matmul_binary_operands(outer)
+}
+
+fn matmul_binary_operands(outer: &syn::ExprBinary) -> Option<(&Expr, &Expr)> {
+    if !matches!(outer.op, BinOp::Div(_)) {
+        return None;
+    }
+    let Expr::Binary(partial) = &*outer.left else {
+        return None;
+    };
+    if matches!(partial.op, BinOp::Div(_)) && is_matmul_marker(&partial.right) {
+        Some((&partial.left, &outer.right))
+    } else {
+        None
     }
 }
 
@@ -311,6 +374,23 @@ fn tensor_literal(arr: &syn::ExprArray) -> syn::Result<TensorLit<'_>> {
 
 // ---- type inference ---------------------------------------------------------
 
+fn infer_matmul(left: Ty, right: Ty, span: Span) -> syn::Result<Ty> {
+    let shape = match (left.shape, right.shape) {
+        (Shape::Matrix(rows, inner), Shape::Matrix(inner2, columns)) if inner == inner2 => {
+            Shape::Matrix(rows, columns)
+        }
+        (Shape::Matrix(rows, inner), Shape::Vector(len)) if inner == len => Shape::Vector(rows),
+        (Shape::Vector(len), Shape::Matrix(rows, columns)) if len == rows => Shape::Vector(columns),
+        _ => {
+            return Err(syn::Error::new(
+                span,
+                "`@` operands have incompatible matrix/vector shapes",
+            ));
+        }
+    };
+    Ok(left.unify(right).with_shape(shape))
+}
+
 /// Work out an expression's type without generating code.
 fn infer(expr: &Expr, env: &Env) -> syn::Result<Ty> {
     match expr {
@@ -346,8 +426,23 @@ fn infer(expr: &Expr, env: &Env) -> syn::Result<Ty> {
             _ => Err(syn::Error::new(expr.span(), "unsupported unary operator")),
         },
         Expr::Binary(b) => {
+            if let Some((lhs, rhs)) = matmul_operands(expr) {
+                return infer_matmul(infer(lhs, env)?, infer(rhs, env)?, b.span());
+            }
             let left = infer(&b.left, env)?;
             let right = infer(&b.right, env)?;
+            if matches!(b.op, BinOp::Mul(_))
+                && let (Shape::Vector(left_len), Shape::Vector(right_len)) =
+                    (left.shape, right.shape)
+            {
+                if left_len != right_len {
+                    return Err(syn::Error::new(
+                        b.span(),
+                        "vector dot-product operands must have the same length",
+                    ));
+                }
+                return Ok(left.unify(right).element());
+            }
             if left.is_tensor() && right.is_tensor() && left.shape != right.shape {
                 return Err(syn::Error::new(
                     b.span(),
@@ -384,20 +479,12 @@ fn infer(expr: &Expr, env: &Env) -> syn::Result<Ty> {
                 }
                 ("matmul", 2) => {
                     let (a, b) = (arg_ty(0)?, arg_ty(1)?);
-                    let shape = match (a.shape, b.shape) {
-                        (Shape::Matrix(r, k), Shape::Matrix(k2, c)) if k == k2 => {
-                            Shape::Matrix(r, c)
-                        }
-                        (Shape::Matrix(r, k), Shape::Vector(n)) if k == n => Shape::Vector(r),
-                        (Shape::Vector(n), Shape::Matrix(r, c)) if n == r => Shape::Vector(c),
-                        _ => {
-                            return Err(syn::Error::new(
-                                call.span(),
-                                "`matmul` operands have incompatible matrix/vector shapes",
-                            ));
-                        }
-                    };
-                    Ok(a.unify(b).with_shape(shape))
+                    infer_matmul(a, b, call.span()).map_err(|_| {
+                        syn::Error::new(
+                            call.span(),
+                            "`matmul` operands have incompatible matrix/vector shapes",
+                        )
+                    })
                 }
                 ("det" | "inv", 1) => {
                     let a = arg_ty(0)?;
@@ -577,7 +664,36 @@ fn lower_literal(lit: &syn::ExprLit, target: Ty) -> syn::Result<TokenStream> {
     })
 }
 
+fn lower_matmul(left: &Expr, right: &Expr, target: Ty, env: &Env) -> syn::Result<TokenStream> {
+    let (left_ty, right_ty) = (infer(left, env)?, infer(right, env)?);
+    let left = lower(left, target.element().with_shape(left_ty.shape), env)?;
+    let right = lower(right, target.element().with_shape(right_ty.shape), env)?;
+    Ok(match (left_ty.shape, right_ty.shape) {
+        (Shape::Matrix(_, _), Shape::Matrix(_, _)) => quote!((#left).matmul(&(#right))),
+        (Shape::Matrix(_, _), Shape::Vector(_)) => quote!((#left).matvec(&(#right))),
+        (Shape::Vector(_), Shape::Matrix(_, _)) => quote!((#left).vecmat(&(#right))),
+        _ => unreachable!("infer_matmul validated the operand shapes"),
+    })
+}
+
 fn lower_binary(b: &syn::ExprBinary, target: Ty, env: &Env) -> syn::Result<TokenStream> {
+    if let Some((left, right)) = matmul_binary_operands(b) {
+        return lower_matmul(left, right, target, env);
+    }
+
+    let (left_ty, right_ty) = (infer(&b.left, env)?, infer(&b.right, env)?);
+    if matches!(b.op, BinOp::Mul(_))
+        && matches!(
+            (left_ty.shape, right_ty.shape),
+            (Shape::Vector(_), Shape::Vector(_))
+        )
+    {
+        let vector_target = target.with_shape(left_ty.shape);
+        let left = lower(&b.left, vector_target, env)?;
+        let right = lower(&b.right, vector_target, env)?;
+        return Ok(quote!((#left).dot(&(#right))));
+    }
+
     let op = match b.op {
         BinOp::Add(_) => quote!(+),
         BinOp::Sub(_) => quote!(-),
@@ -598,6 +714,14 @@ fn lower_binary(b: &syn::ExprBinary, target: Ty, env: &Env) -> syn::Result<Token
             ));
         }
     };
+    let broadcast_op = match b.op {
+        BinOp::Add(_) => 0u32,
+        BinOp::Sub(_) => 1,
+        BinOp::Mul(_) => 2,
+        BinOp::Div(_) => 3,
+        BinOp::Rem(_) => 4,
+        _ => unreachable!("unsupported operators returned above"),
+    };
 
     if !target.is_tensor() {
         let left = lower(&b.left, target, env)?;
@@ -608,8 +732,7 @@ fn lower_binary(b: &syn::ExprBinary, target: Ty, env: &Env) -> syn::Result<Token
     // At least one side is a tensor. Two tensors combine elementwise (which can
     // fail on a shape mismatch); a tensor and a scalar broadcast the scalar.
     let element = target.element();
-    let (lt, rt) = (infer(&b.left, env)?, infer(&b.right, env)?);
-    Ok(match (lt.is_tensor(), rt.is_tensor()) {
+    Ok(match (left_ty.is_tensor(), right_ty.is_tensor()) {
         (true, true) => {
             let left = lower(&b.left, target, env)?;
             let right = lower(&b.right, target, env)?;
@@ -618,12 +741,12 @@ fn lower_binary(b: &syn::ExprBinary, target: Ty, env: &Env) -> syn::Result<Token
         (true, false) => {
             let left = lower(&b.left, target, env)?;
             let right = lower(&b.right, element, env)?;
-            quote!({ let __scalar = #right; (#left).map(|&__x| __x #op __scalar) })
+            quote!((#left).broadcast_right(#right, #broadcast_op))
         }
         (false, true) => {
             let left = lower(&b.left, element, env)?;
             let right = lower(&b.right, target, env)?;
-            quote!({ let __scalar = #left; (#right).map(|&__x| __scalar #op __x) })
+            quote!((#right).broadcast_left(#left, #broadcast_op))
         }
         (false, false) => unreachable!("target is a tensor only if an operand is"),
     })
@@ -698,19 +821,30 @@ fn lower_call(call: &syn::ExprCall, target: Ty, env: &Env) -> syn::Result<TokenS
             Ok(quote!((#a).determinant()))
         }
         ("conj", 1) => {
-            if target.dual {
-                return Err(syn::Error::new(
-                    call.span(),
-                    "conj of a dual number is not supported yet; \
-                     conjugate the coefficients before making it dual",
-                ));
-            }
             let inner = lower(args[0], target, env)?;
-            Ok(elementwise(
-                quote!(::rinterp::numbers::Complex::conj),
-                inner,
-                target,
-            ))
+            if target.dual {
+                let conjugate_dual = |value: TokenStream| {
+                    quote!({
+                        let __dual = #value;
+                        ::rinterp::numbers::Dual::new(
+                            ::rinterp::numbers::Complex::conj(__dual.real),
+                            ::rinterp::numbers::Complex::conj(__dual.dual),
+                        )
+                    })
+                };
+                Ok(if target.is_tensor() {
+                    let conjugated = conjugate_dual(quote!(__x));
+                    quote!((#inner).map(|&__x| #conjugated))
+                } else {
+                    conjugate_dual(inner)
+                })
+            } else {
+                Ok(elementwise(
+                    quote!(::rinterp::numbers::Complex::conj),
+                    inner,
+                    target,
+                ))
+            }
         }
         (_, 1) if ANALYTIC.iter().any(|(n, _)| *n == name) => {
             let (_, trait_name) = ANALYTIC.iter().find(|(n, _)| *n == name).unwrap();

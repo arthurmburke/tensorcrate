@@ -17,7 +17,7 @@ use num_traits::{Float, Num, One, Zero};
 ///
 /// Because `Complex` and `Dual` are themselves coefficients, the extensions
 /// nest — `Dual<Complex<f64>>` and `Vector<Dual<f64>, N>` are ordinary types.
-pub trait Coefficient: Num + Copy {
+pub trait Coefficient: Num + Copy + 'static {
     /// The quotient truncated toward zero, `trunc(self / rhs)`. This is the
     /// (locally constant) integer quotient underlying `%`.
     fn trunc_div(self, rhs: Self) -> Self;
@@ -599,6 +599,9 @@ impl<T: Display> Display for Dual<T> {
 /// coefficients the arithmetic gives Gaussian integers (with Rust's standard
 /// integer division/overflow behaviour). The analytic operations additionally
 /// need floating-point coefficients.
+// `repr(C)` fixes the field order to `real` then `im`, so `[Complex<f32>]` has
+// the interleaved `[re, im, re, im, …]` layout the NEON FFT kernel reads.
+#[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Complex<T> {
     /// The real part, `a`.

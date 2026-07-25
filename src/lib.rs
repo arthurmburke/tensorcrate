@@ -17,11 +17,15 @@
 //! ```
 
 /// The `math!` macro: a small mathematical language that expands to
-/// statically-typed Rust using [`numbers`] and [`tensors`].
+/// statically-typed Rust using [`numbers`] and [`tensors`]. Matrix and
+/// matrix/vector products use `@`, vector `*` vector is a dot product, and
+/// analytic functions map elementwise over tensors.
 pub use rinterp_macros::math;
 
 pub mod errors;
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal;
 pub mod numbers;
+#[cfg(all(feature = "simd", target_arch = "aarch64"))]
+pub mod simd;
 pub mod tensors;
