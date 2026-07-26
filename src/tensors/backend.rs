@@ -54,6 +54,21 @@ pub trait Backend: sealed::Sealed + Sized + 'static {
     /// Reinterpret a vector as an `N × 1` column matrix.
     fn vector_into_column<const N: usize>(vector: Self::Vector<f32, N>) -> Self::Matrix<f32, N, 1>;
 
+    /// Reinterpret a matrix as its row-major flattening.
+    ///
+    /// This and [`vector_into_matrix`](Self::vector_into_matrix) are what let a
+    /// matrix input be differentiated by the vector machinery. Both are free on
+    /// the [`Metal`] backend, where a vector and a matrix are the same
+    /// allocation — which is why they take ownership rather than borrowing.
+    fn matrix_into_flattened<const R: usize, const C: usize>(
+        matrix: Self::Matrix<f32, R, C>,
+    ) -> Self::Vector<f32, { R * C }>;
+
+    /// Reinterpret a vector as an `R × C` matrix, filling rows in order.
+    fn vector_into_matrix<const R: usize, const C: usize>(
+        vector: Self::Vector<f32, { R * C }>,
+    ) -> Self::Matrix<f32, R, C>;
+
     /// Build a matrix from a collection of vectors stacked along the
     /// vertical axis (vectors are row vectors).
     fn vstack<const M: usize, const N: usize>(
@@ -134,6 +149,17 @@ impl Backend for Host {
         vector.map(|value| [value])
     }
 
+    fn matrix_into_flattened<const R: usize, const C: usize>(
+        matrix: [[f32; C]; R],
+    ) -> [f32; R * C] {
+        let flat = matrix.as_flattened();
+        std::array::from_fn(|index| flat[index])
+    }
+
+    fn vector_into_matrix<const R: usize, const C: usize>(vector: [f32; R * C]) -> [[f32; C]; R] {
+        std::array::from_fn(|row| std::array::from_fn(|col| vector[row * C + col]))
+    }
+
     fn vector_slice<const N: usize>(storage: &[f32; N]) -> &[f32] {
         storage
     }
@@ -205,6 +231,7 @@ mod gpu {
 
     use super::{Backend, sealed};
     use crate::metal::MetalBuffer;
+    use crate::tensors::{Analytic, BinaryOp};
 
     /// A backend that keeps `f32` elements in GPU-shared memory, so the Metal
     /// kernels read and write them in place.
@@ -236,6 +263,20 @@ mod gpu {
         }
 
         fn vector_into_column<const N: usize>(vector: MetalStorage) -> MetalStorage {
+            vector
+        }
+
+        // A vector and a matrix are the same shared allocation, and row-major
+        // flattening is the identity on it: these move, they do not copy.
+        fn matrix_into_flattened<const R: usize, const C: usize>(
+            matrix: MetalStorage,
+        ) -> MetalStorage {
+            matrix
+        }
+
+        fn vector_into_matrix<const R: usize, const C: usize>(
+            vector: MetalStorage,
+        ) -> MetalStorage {
             vector
         }
 
@@ -490,16 +531,21 @@ mod gpu {
             Some(Self(Residency::Device(product)))
         }
 
-        /// Elementwise operation on the GPU; `op` is 0=add, 1=sub, 2=mul, 3=div.
-        /// The shaders have no remainder kernel, so `op == 4` returns `None`.
-        pub(crate) fn elementwise(&self, rhs: &Self, op: u32) -> Option<Self> {
+        /// Elementwise operation on the GPU. The shaders have no remainder
+        /// kernel, so [`BinaryOp::Rem`] returns `None`.
+        pub(crate) fn elementwise(&self, rhs: &Self, op: BinaryOp) -> Option<Self> {
             let output = self.device()?.elementwise(rhs.device()?, op)?;
             Some(Self(Residency::Device(output)))
         }
 
         /// Scalar broadcast on the GPU, with `op` encoded as in
         /// [`elementwise`](Self::elementwise).
-        pub(crate) fn broadcast(&self, scalar: f32, op: u32, scalar_left: bool) -> Option<Self> {
+        pub(crate) fn broadcast(
+            &self,
+            scalar: f32,
+            op: BinaryOp,
+            scalar_left: bool,
+        ) -> Option<Self> {
             let output = self.device()?.broadcast(scalar, op, scalar_left)?;
             Some(Self(Residency::Device(output)))
         }
@@ -524,8 +570,7 @@ mod gpu {
         }
 
         /// Analytic function applied to a value/tangent pair, in one dispatch;
-        /// `op` is an [`Analytic::code`](crate::tensors::Analytic::code).
-        pub(crate) fn unary_dual(&self, tangent: &Self, op: u32) -> Option<(Self, Self)> {
+        pub(crate) fn unary_dual(&self, tangent: &Self, op: Analytic) -> Option<(Self, Self)> {
             let (value, tangent) = self.device()?.unary_dual(tangent.device()?, op)?;
             Some((
                 Self(Residency::Device(value)),
@@ -534,8 +579,7 @@ mod gpu {
         }
 
         /// Analytic function applied elementwise; `op` is an
-        /// [`Analytic::code`](crate::tensors::Analytic::code).
-        pub(crate) fn unary(&self, op: u32) -> Option<Self> {
+        pub(crate) fn unary(&self, op: Analytic) -> Option<Self> {
             Some(Self(Residency::Device(self.device()?.unary(op)?)))
         }
     }

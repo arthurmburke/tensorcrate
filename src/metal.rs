@@ -37,13 +37,10 @@ use objc2_metal::{
     MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
 };
 
+use crate::tensors::{Analytic, BinaryOp};
+
 /// Threadgroup tile edge; must match `TILE` in the shader. 16×16 = 256 threads.
 const TILE: usize = 16;
-
-/// Number of analytic function op codes the shader understands, taken from the
-/// enum that defines them so the two cannot drift apart. The codes themselves are
-/// [`Analytic::code`](crate::tensors::Analytic::code).
-const ANALYTIC_OPS: u32 = crate::tensors::Analytic::ALL.len() as u32;
 
 /// The compute kernels.
 ///
@@ -55,6 +52,30 @@ const KERNELS: &str = r#"
 using namespace metal;
 
 #define TILE 16
+
+enum class BinaryOp : ushort {
+    Add = 0,
+    Sub = 1,
+    Mul = 2,
+    Div = 3,
+    Rem = 4
+};
+
+enum class AnalyticOp : ushort {
+    Sin = 0,
+    Cos = 1,
+    Tan = 2,
+    Sec = 3,
+    Csc = 4,
+    Arcsin = 5,
+    Arccos = 6,
+    Arctan = 7,
+    Exp = 8,
+    Ln = 9,
+    Sinh = 10,
+    Cosh = 11,
+    Tanh = 12
+};
 
 kernel void matmul_tiled(
     device const float* A [[buffer(0)]],
@@ -100,15 +121,15 @@ kernel void elementwise(
     device const float* A [[buffer(0)]],
     device const float* B [[buffer(1)]],
     device float* C       [[buffer(2)]],
-    constant uint& op     [[buffer(3)]],
+    constant BinaryOp& op [[buffer(3)]],
     uint i [[thread_position_in_grid]])
 {
     float a = A[i];
     float b = B[i];
     switch (op) {
-        case 0: C[i] = a + b; break;
-        case 1: C[i] = a - b; break;
-        case 2: C[i] = a * b; break;
+        case BinaryOp::Add: C[i] = a + b; break;
+        case BinaryOp::Sub: C[i] = a - b; break;
+        case BinaryOp::Mul: C[i] = a * b; break;
         default: C[i] = a / b; break;
     }
 }
@@ -117,16 +138,16 @@ kernel void broadcast(
     device const float* A [[buffer(0)]],
     device float* C       [[buffer(1)]],
     constant float& scalar [[buffer(2)]],
-    constant uint& op      [[buffer(3)]],
+    constant BinaryOp& op  [[buffer(3)]],
     constant uint& scalar_left [[buffer(4)]],
     uint i [[thread_position_in_grid]])
 {
     float a = scalar_left ? scalar : A[i];
     float b = scalar_left ? A[i] : scalar;
     switch (op) {
-        case 0: C[i] = a + b; break;
-        case 1: C[i] = a - b; break;
-        case 2: C[i] = a * b; break;
+        case BinaryOp::Add: C[i] = a + b; break;
+        case BinaryOp::Sub: C[i] = a - b; break;
+        case BinaryOp::Mul: C[i] = a * b; break;
         default: C[i] = a / b; break;
     }
 }
@@ -213,45 +234,42 @@ kernel void transpose_tiled(
     }
 }
 
-// The analytic functions, by op code. These must agree with
-// `tensors::kernels::Analytic::code`, and each derivative must be written the
-// same way as the matching `Dual` impl in `numbers.rs` so the GPU and CPU paths
-// differ only by float precision. An unknown code yields NaN, which shows up as
-// a loud test failure rather than a silently wrong number.
-inline float analytic_value(uint op, float x) {
+// These variants must agree with `tensors::kernels::Analytic`, and each
+// derivative must match the corresponding `Dual` implementation.
+inline float analytic_value(AnalyticOp op, float x) {
     switch (op) {
-        case 0:  return sin(x);
-        case 1:  return cos(x);
-        case 2:  return tan(x);
-        case 3:  return 1.0f / cos(x);   // sec
-        case 4:  return 1.0f / sin(x);   // csc
-        case 5:  return asin(x);
-        case 6:  return acos(x);
-        case 7:  return atan(x);
-        case 8:  return exp(x);
-        case 9:  return log(x);          // natural log
-        case 10: return sinh(x);
-        case 11: return cosh(x);
-        case 12: return tanh(x);
+        case AnalyticOp::Sin:    return sin(x);
+        case AnalyticOp::Cos:    return cos(x);
+        case AnalyticOp::Tan:    return tan(x);
+        case AnalyticOp::Sec:    return 1.0f / cos(x);
+        case AnalyticOp::Csc:    return 1.0f / sin(x);
+        case AnalyticOp::Arcsin: return asin(x);
+        case AnalyticOp::Arccos: return acos(x);
+        case AnalyticOp::Arctan: return atan(x);
+        case AnalyticOp::Exp:    return exp(x);
+        case AnalyticOp::Ln:     return log(x);
+        case AnalyticOp::Sinh:   return sinh(x);
+        case AnalyticOp::Cosh:   return cosh(x);
+        case AnalyticOp::Tanh:   return tanh(x);
         default: return NAN;
     }
 }
 
-inline float analytic_derivative(uint op, float x) {
+inline float analytic_derivative(AnalyticOp op, float x) {
     switch (op) {
-        case 0:  return cos(x);
-        case 1:  return -sin(x);
-        case 2:  { float c = cos(x); return 1.0f / (c * c); }
-        case 3:  { float c = cos(x); return sin(x) / (c * c); }
-        case 4:  { float s = sin(x); return -cos(x) / (s * s); }
-        case 5:  return 1.0f / sqrt(1.0f - x * x);
-        case 6:  return -1.0f / sqrt(1.0f - x * x);
-        case 7:  return 1.0f / (1.0f + x * x);
-        case 8:  return exp(x);
-        case 9:  return 1.0f / x;
-        case 10: return cosh(x);
-        case 11: return sinh(x);
-        case 12: { float t = tanh(x); return 1.0f - t * t; }
+        case AnalyticOp::Sin:    return cos(x);
+        case AnalyticOp::Cos:    return -sin(x);
+        case AnalyticOp::Tan:    { float c = cos(x); return 1.0f / (c * c); }
+        case AnalyticOp::Sec:    { float c = cos(x); return sin(x) / (c * c); }
+        case AnalyticOp::Csc:    { float s = sin(x); return -cos(x) / (s * s); }
+        case AnalyticOp::Arcsin: return 1.0f / sqrt(1.0f - x * x);
+        case AnalyticOp::Arccos: return -1.0f / sqrt(1.0f - x * x);
+        case AnalyticOp::Arctan: return 1.0f / (1.0f + x * x);
+        case AnalyticOp::Exp:    return exp(x);
+        case AnalyticOp::Ln:     return 1.0f / x;
+        case AnalyticOp::Sinh:   return cosh(x);
+        case AnalyticOp::Cosh:   return sinh(x);
+        case AnalyticOp::Tanh:   { float t = tanh(x); return 1.0f - t * t; }
         default: return NAN;
     }
 }
@@ -259,7 +277,7 @@ inline float analytic_derivative(uint op, float x) {
 kernel void unary(
     device const float* A [[buffer(0)]],
     device float* C       [[buffer(1)]],
-    constant uint& op     [[buffer(2)]],
+    constant AnalyticOp& op [[buffer(2)]],
     uint i [[thread_position_in_grid]])
 {
     C[i] = analytic_value(op, A[i]);
@@ -272,7 +290,7 @@ kernel void unary_dual(
     device const float* tangent  [[buffer(1)]],
     device float* out_value      [[buffer(2)]],
     device float* out_tangent    [[buffer(3)]],
-    constant uint& op            [[buffer(4)]],
+    constant AnalyticOp& op      [[buffer(4)]],
     uint i [[thread_position_in_grid]])
 {
     float v = value[i];
@@ -333,7 +351,16 @@ kernel void fft_stage(
 /// allocation). A buffer is reused when it is at least as large as requested.
 #[derive(Default)]
 struct Pool {
+    /// Safe to hand out: every command buffer that could have touched these has
+    /// completed.
     free: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    /// Released while GPU work was still queued, so a pending kernel may yet
+    /// read or write them. [`sync`] promotes these into `free`.
+    ///
+    /// Recycling one of these early is not a use-after-free — a command buffer
+    /// retains the resources it references — but it would let an upload, or the
+    /// next kernel, race the writes still owed to the previous owner.
+    retiring: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
 }
 
 impl Pool {
@@ -348,11 +375,25 @@ impl Pool {
         device.newBufferWithLength_options(len.max(1), MTLResourceOptions::StorageModeShared)
     }
 
-    fn release(&mut self, buffer: Retained<ProtocolObject<dyn MTLBuffer>>) {
+    /// Take an allocation back. `work_in_flight` says whether any command buffer
+    /// has been committed but not yet waited on; if so the allocation waits for
+    /// the next [`sync`] before it can be handed out again.
+    fn release(&mut self, buffer: Retained<ProtocolObject<dyn MTLBuffer>>, work_in_flight: bool) {
         const CAP: usize = 12;
-        if self.free.len() < CAP {
-            self.free.push(buffer);
+        let bucket = if work_in_flight {
+            &mut self.retiring
+        } else {
+            &mut self.free
+        };
+        if bucket.len() < CAP {
+            bucket.push(buffer);
         }
+    }
+
+    /// Every queued command buffer has completed, so anything held back is now
+    /// safe to reuse.
+    fn retire(&mut self) {
+        self.free.append(&mut self.retiring);
     }
 }
 
@@ -577,12 +618,8 @@ impl MetalBuffer {
         with_gpu(|gpu| encode_matmul(gpu, &self.raw, &rhs.raw, &target.raw, m, k, n, true))
     }
 
-    /// Apply an analytic function elementwise. `op` is an
-    /// [`Analytic::code`](crate::tensors::Analytic::code).
-    pub fn unary(&self, op: u32) -> Option<Self> {
-        if op >= ANALYTIC_OPS {
-            return None;
-        }
+    /// Apply an analytic function elementwise.
+    pub fn unary(&self, op: Analytic) -> Option<Self> {
         let output = Self::allocate(self.len)?;
         if self.len != 0 {
             with_gpu(|gpu| encode_unary(gpu, &self.raw, &output.raw, self.len, op))?;
@@ -593,10 +630,9 @@ impl MetalBuffer {
     /// Apply an analytic function to a value/tangent pair — forward-mode
     /// differentiation, `f(v) + f'(v)·d·ε` — returning `(value, tangent)`.
     ///
-    /// One dispatch produces both parts. `op` is an
-    /// [`Analytic::code`](crate::tensors::Analytic::code).
-    pub fn unary_dual(&self, tangent: &Self, op: u32) -> Option<(Self, Self)> {
-        if self.len != tangent.len || op >= ANALYTIC_OPS {
+    /// One dispatch produces both parts.
+    pub fn unary_dual(&self, tangent: &Self, op: Analytic) -> Option<(Self, Self)> {
+        if self.len != tangent.len {
             return None;
         }
         let out_value = Self::allocate(self.len)?;
@@ -617,10 +653,9 @@ impl MetalBuffer {
         Some((out_value, out_tangent))
     }
 
-    /// Elementwise operation with another shared buffer. `op` is 0=add,
-    /// 1=subtract, 2=multiply, and 3=divide.
-    pub fn elementwise(&self, rhs: &Self, op: u32) -> Option<Self> {
-        if self.len != rhs.len || op > 3 {
+    /// Elementwise operation with another shared buffer.
+    pub fn elementwise(&self, rhs: &Self, op: BinaryOp) -> Option<Self> {
+        if self.len != rhs.len || op == BinaryOp::Rem {
             return None;
         }
         let output = Self::allocate(self.len)?;
@@ -634,8 +669,8 @@ impl MetalBuffer {
 
     /// Broadcast operation with a scalar. `op` has the same encoding as
     /// [`elementwise`](Self::elementwise).
-    pub fn broadcast(&self, scalar: f32, op: u32, scalar_left: bool) -> Option<Self> {
-        if op > 3 {
+    pub fn broadcast(&self, scalar: f32, op: BinaryOp, scalar_left: bool) -> Option<Self> {
+        if op == BinaryOp::Rem {
             return None;
         }
         let output = Self::allocate(self.len)?;
@@ -801,7 +836,13 @@ impl Drop for MetalBuffer {
             if let Some(Some(gpu)) = cell.get()
                 && let Ok(mut pool) = gpu.pool.try_borrow_mut()
             {
-                pool.release(raw);
+                // Anything committed but not yet waited on may still reference
+                // this allocation, so it cannot go straight back into service.
+                let work_in_flight = gpu
+                    .pending
+                    .try_borrow()
+                    .is_ok_and(|queue| !queue.is_empty());
+                pool.release(raw, work_in_flight);
             }
         });
     }
@@ -892,7 +933,7 @@ fn encode_elementwise(
     b: &ProtocolObject<dyn MTLBuffer>,
     output: &ProtocolObject<dyn MTLBuffer>,
     len: usize,
-    op: u32,
+    op: BinaryOp,
 ) -> Option<()> {
     let command = gpu.queue.commandBuffer()?;
     let encoder = command.computeCommandEncoder()?;
@@ -901,7 +942,7 @@ fn encode_elementwise(
         encoder.setBuffer_offset_atIndex(Some(a), 0, 0);
         encoder.setBuffer_offset_atIndex(Some(b), 0, 1);
         encoder.setBuffer_offset_atIndex(Some(output), 0, 2);
-        encoder.setBytes_length_atIndex(NonNull::from(&op).cast(), 4, 3);
+        encoder.setBytes_length_atIndex(NonNull::from(&op).cast(), size_of::<BinaryOp>(), 3);
     }
     dispatch_1d(&encoder, len);
     encoder.endEncoding();
@@ -914,7 +955,7 @@ fn encode_broadcast(
     output: &ProtocolObject<dyn MTLBuffer>,
     len: usize,
     scalar: f32,
-    op: u32,
+    op: BinaryOp,
     scalar_left: bool,
 ) -> Option<()> {
     let command = gpu.queue.commandBuffer()?;
@@ -925,7 +966,7 @@ fn encode_broadcast(
         encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
         encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
         encoder.setBytes_length_atIndex(NonNull::from(&scalar).cast(), 4, 2);
-        encoder.setBytes_length_atIndex(NonNull::from(&op).cast(), 4, 3);
+        encoder.setBytes_length_atIndex(NonNull::from(&op).cast(), size_of::<BinaryOp>(), 3);
         encoder.setBytes_length_atIndex(NonNull::from(&scalar_left).cast(), 4, 4);
     }
     dispatch_1d(&encoder, len);
@@ -1113,7 +1154,7 @@ fn encode_unary(
     input: &ProtocolObject<dyn MTLBuffer>,
     output: &ProtocolObject<dyn MTLBuffer>,
     len: usize,
-    op: u32,
+    op: Analytic,
 ) -> Option<()> {
     let command = gpu.queue.commandBuffer()?;
     let encoder = command.computeCommandEncoder()?;
@@ -1121,7 +1162,7 @@ fn encode_unary(
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
         encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
-        encoder.setBytes_length_atIndex(NonNull::from(&op).cast(), 4, 2);
+        encoder.setBytes_length_atIndex(NonNull::from(&op).cast(), size_of::<Analytic>(), 2);
     }
     dispatch_1d(&encoder, len);
     encoder.endEncoding();
@@ -1135,7 +1176,7 @@ fn encode_unary_dual(
     out_value: &ProtocolObject<dyn MTLBuffer>,
     out_tangent: &ProtocolObject<dyn MTLBuffer>,
     len: usize,
-    op: u32,
+    op: Analytic,
 ) -> Option<()> {
     let command = gpu.queue.commandBuffer()?;
     let encoder = command.computeCommandEncoder()?;
@@ -1145,7 +1186,7 @@ fn encode_unary_dual(
         encoder.setBuffer_offset_atIndex(Some(tangent), 0, 1);
         encoder.setBuffer_offset_atIndex(Some(out_value), 0, 2);
         encoder.setBuffer_offset_atIndex(Some(out_tangent), 0, 3);
-        encoder.setBytes_length_atIndex(NonNull::from(&op).cast(), 4, 4);
+        encoder.setBytes_length_atIndex(NonNull::from(&op).cast(), size_of::<Analytic>(), 4);
     }
     dispatch_1d(&encoder, len);
     encoder.endEncoding();
@@ -1228,7 +1269,8 @@ fn commit(gpu: &Gpu, command: Retained<ProtocolObject<dyn MTLCommandBuffer>>) ->
     Some(())
 }
 
-/// Block until every command buffer committed so far has finished.
+/// Block until every command buffer committed so far has finished, and release
+/// the allocations that were waiting on them.
 ///
 /// Call this before the CPU reads any shared allocation the GPU may still be
 /// writing. Returns `None` if any of them failed.
@@ -1245,6 +1287,12 @@ fn sync(gpu: &Gpu) -> Option<()> {
             ok = false;
         }
     }
+    // Nothing is in flight any more, so allocations released while it was can go
+    // back into service. A busy borrow means an allocation is being handed out
+    // right now; the next sync will promote them instead.
+    if let Ok(mut pool) = gpu.pool.try_borrow_mut() {
+        pool.retire();
+    }
     ok.then_some(())
 }
 
@@ -1260,8 +1308,8 @@ pub fn synchronize() {
 
 /// GPU elementwise `f32` op over two equal-length buffers. `op` is 0=add,
 /// 1=sub, 2=mul, 3=div. Returns `None` if no device is available.
-pub fn elementwise_f32(a: &[f32], b: &[f32], op: u32) -> Option<Vec<f32>> {
-    if a.len() != b.len() || op > 3 {
+pub fn elementwise_f32(a: &[f32], b: &[f32], op: BinaryOp) -> Option<Vec<f32>> {
+    if a.len() != b.len() || op == BinaryOp::Rem {
         return None;
     }
     let len = a.len();
@@ -1285,9 +1333,9 @@ pub fn elementwise_f32(a: &[f32], b: &[f32], op: u32) -> Option<Vec<f32>> {
         sync(gpu)?;
         let out = download(&buf_c, len);
         let mut pool = gpu.pool.borrow_mut();
-        pool.release(buf_a);
-        pool.release(buf_b);
-        pool.release(buf_c);
+        pool.release(buf_a, false);
+        pool.release(buf_b, false);
+        pool.release(buf_c, false);
         Some(out)
     })
 }
@@ -1295,8 +1343,13 @@ pub fn elementwise_f32(a: &[f32], b: &[f32], op: u32) -> Option<Vec<f32>> {
 /// GPU `f32` broadcast operation between a buffer and a scalar. `op` uses the
 /// same encoding as [`elementwise_f32`]; `scalar_left` controls operand order
 /// for subtraction and division.
-pub fn broadcast_f32(values: &[f32], scalar: f32, op: u32, scalar_left: bool) -> Option<Vec<f32>> {
-    if op > 3 {
+pub fn broadcast_f32(
+    values: &[f32],
+    scalar: f32,
+    op: BinaryOp,
+    scalar_left: bool,
+) -> Option<Vec<f32>> {
+    if op == BinaryOp::Rem {
         return None;
     }
     let len = values.len();
@@ -1318,8 +1371,8 @@ pub fn broadcast_f32(values: &[f32], scalar: f32, op: u32, scalar_left: bool) ->
         sync(gpu)?;
         let out = download(&output, len);
         let mut pool = gpu.pool.borrow_mut();
-        pool.release(input);
-        pool.release(output);
+        pool.release(input, false);
+        pool.release(output, false);
         Some(out)
     })
 }
@@ -1361,8 +1414,8 @@ fn fourier_transform_f32_interleaved(input: &[f32], inverse: bool) -> Option<Vec
         sync(gpu)?;
         let out = download(&values, input.len());
         let mut pool = gpu.pool.borrow_mut();
-        pool.release(source);
-        pool.release(values);
+        pool.release(source, false);
+        pool.release(values, false);
         Some(out)
     })
 }
@@ -1404,15 +1457,15 @@ mod tests {
         let a: Vec<f32> = (0..1000).map(|i| i as f32 * 0.1).collect();
         let b: Vec<f32> = (0..1000).map(|i| (i % 9) as f32 + 1.0).collect();
         for (op, f) in [
-            (0u32, (|x: f32, y| x + y) as fn(f32, f32) -> f32),
-            (1, |x, y| x - y),
-            (2, |x, y| x * y),
-            (3, |x, y| x / y),
+            (BinaryOp::Add, (|x: f32, y| x + y) as fn(f32, f32) -> f32),
+            (BinaryOp::Sub, |x, y| x - y),
+            (BinaryOp::Mul, |x, y| x * y),
+            (BinaryOp::Div, |x, y| x / y),
         ] {
             if let Some(gpu) = elementwise_f32(&a, &b, op) {
                 for (i, g) in gpu.iter().enumerate() {
                     let want = f(a[i], b[i]);
-                    assert!((g - want).abs() < 1e-3, "op {op} at {i}: {g} vs {want}");
+                    assert!((g - want).abs() < 1e-3, "op {op:?} at {i}: {g} vs {want}");
                 }
             }
         }
@@ -1421,7 +1474,7 @@ mod tests {
     #[test]
     fn gpu_broadcast_matches_cpu() {
         let values: Vec<f32> = (0..1000).map(|i| i as f32 * 0.125 - 3.0).collect();
-        if let Some(gpu) = broadcast_f32(&values, 2.5, 2, false) {
+        if let Some(gpu) = broadcast_f32(&values, 2.5, BinaryOp::Mul, false) {
             for (actual, value) in gpu.iter().zip(values) {
                 assert!((actual - value * 2.5).abs() < 1e-5);
             }
@@ -1485,7 +1538,7 @@ mod tests {
         let buf_tangent = MetalBuffer::from_slice(&tangent).unwrap();
 
         // Op 12 is tanh: f' = 1 − tanh².
-        let (values, tangents) = buf_value.unary_dual(&buf_tangent, 12).unwrap();
+        let (values, tangents) = buf_value.unary_dual(&buf_tangent, Analytic::Tanh).unwrap();
         for (index, (&actual, &expected)) in values.as_slice().iter().zip(&value).enumerate() {
             let want = expected.tanh();
             assert!((actual - want).abs() < 1e-4, "value at {index}");
@@ -1497,8 +1550,31 @@ mod tests {
             );
         }
 
-        // An op code the shader does not know is rejected before dispatch.
-        assert!(buf_value.unary(ANALYTIC_OPS).is_none());
+        assert_eq!(size_of::<BinaryOp>(), 2);
+        assert_eq!(size_of::<Analytic>(), 2);
+    }
+
+    #[test]
+    fn a_recycled_allocation_is_never_clobbered_by_queued_work() {
+        // Work is committed without waiting, so an allocation dropped while its
+        // dispatch is still queued must not be handed straight back out: the
+        // kernel would land on top of whatever the next owner put there. Ten
+        // rounds, because the failure is a race the GPU can win by luck.
+        let input: Vec<f32> = (0..256).map(|i| (i % 13) as f32 * 0.1).collect();
+        let Some(source) = MetalBuffer::from_slice(&input) else {
+            eprintln!("no Metal device; skipping the recycling check");
+            return;
+        };
+
+        let known: Vec<f32> = (0..256).map(|i| i as f32).collect();
+        for round in 0..10 {
+            // Queue a dispatch and drop its output immediately.
+            drop(source.unary(Analytic::Tanh).expect("unary dispatch"));
+            // This may reuse that allocation; its contents must be what was
+            // uploaded, not what the queued kernel owed its previous owner.
+            let fresh = MetalBuffer::from_slice(&known).expect("upload");
+            assert_eq!(fresh.to_vec(), known, "round {round}");
+        }
     }
 
     #[test]
@@ -1511,7 +1587,7 @@ mod tests {
         };
         let b = MetalBuffer::from_slice(&b).unwrap();
         let product = a.matmul(&b, 2, 2, 2).unwrap();
-        let scaled = product.broadcast(0.5, 2, false).unwrap();
+        let scaled = product.broadcast(0.5, BinaryOp::Mul, false).unwrap();
         assert_eq!(scaled.to_vec(), vec![9.5, 11.0, 21.5, 25.0]);
 
         let complex =
@@ -1532,8 +1608,8 @@ mod tests {
 
         // Leave both inputs as pending GPU results. The stack dispatch must
         // consume those buffers directly, in command-queue order.
-        let first = first.broadcast(10.0, 0, false).unwrap();
-        let second = second.broadcast(20.0, 0, false).unwrap();
+        let first = first.broadcast(10.0, BinaryOp::Add, false).unwrap();
+        let second = second.broadcast(20.0, BinaryOp::Add, false).unwrap();
 
         let vertical = MetalBuffer::vstack(&[&first, &second], 3).unwrap();
         assert_eq!(vertical.to_vec(), vec![11.0, 12.0, 13.0, 24.0, 25.0, 26.0]);
@@ -1558,7 +1634,7 @@ mod tests {
             eprintln!("no Metal device; skipping device transpose comparison");
             return;
         };
-        let queued = input.broadcast(1.0, 0, false).unwrap();
+        let queued = input.broadcast(1.0, BinaryOp::Add, false).unwrap();
         let transposed = queued.transpose(ROWS, COLS).unwrap();
 
         let pending = GPU.with(|cell| {
@@ -1595,8 +1671,8 @@ mod tests {
             return;
         };
         let right = MetalBuffer::from_slice(&right_values).unwrap();
-        let left = left.broadcast(1.0, 0, false).unwrap();
-        let right = right.broadcast(2.0, 0, false).unwrap();
+        let left = left.broadcast(1.0, BinaryOp::Add, false).unwrap();
+        let right = right.broadcast(2.0, BinaryOp::Add, false).unwrap();
         let concat = left
             .concat_matrix(&right, ROWS, LEFT_COLS, RIGHT_COLS)
             .unwrap();
@@ -1612,11 +1688,11 @@ mod tests {
             .collect::<Vec<_>>();
         let top = MetalBuffer::from_slice(&top_values)
             .unwrap()
-            .broadcast(3.0, 0, false)
+            .broadcast(3.0, BinaryOp::Add, false)
             .unwrap();
         let bottom = MetalBuffer::from_slice(&bottom_values)
             .unwrap()
-            .broadcast(4.0, 0, false)
+            .broadcast(4.0, BinaryOp::Add, false)
             .unwrap();
         let stack = top
             .stack_matrix(&bottom, TOP_ROWS, BOTTOM_ROWS, COLS)
@@ -1680,7 +1756,11 @@ mod tests {
         let queued = inputs
             .iter()
             .enumerate()
-            .map(|(index, input)| input.broadcast(index as f32 + 1.0, 0, false).unwrap())
+            .map(|(index, input)| {
+                input
+                    .broadcast(index as f32 + 1.0, BinaryOp::Add, false)
+                    .unwrap()
+            })
             .collect::<Vec<_>>();
         let buffers = queued.iter().collect::<Vec<_>>();
 
@@ -1738,8 +1818,8 @@ mod tests {
         for _ in 0..LINKS {
             // +1 via broadcast, then +1 via elementwise: two kernels per link,
             // each reading what the one before it just wrote.
-            buffer = buffer.broadcast(1.0, 0, false).unwrap();
-            buffer = buffer.elementwise(&ones, 0).unwrap();
+            buffer = buffer.broadcast(1.0, BinaryOp::Add, false).unwrap();
+            buffer = buffer.elementwise(&ones, BinaryOp::Add).unwrap();
         }
 
         let expected: Vec<f32> = (0..64).map(|i| (i + 2 * LINKS) as f32).collect();
@@ -1754,7 +1834,7 @@ mod tests {
             eprintln!("no Metal device; skipping synchronize check");
             return;
         };
-        let doubled = buffer.broadcast(2.0, 2, false).unwrap();
+        let doubled = buffer.broadcast(2.0, BinaryOp::Mul, false).unwrap();
         synchronize();
         assert_eq!(doubled.to_vec(), vec![6.0f32; 32]);
     }

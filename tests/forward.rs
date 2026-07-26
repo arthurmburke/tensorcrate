@@ -10,8 +10,10 @@
 //!    they run the same code over different memory.
 
 use rinterp::numbers::Dual;
-use rinterp::tensors::dual::{DualMatrix, DualVector, gradient, jacobian};
-use rinterp::tensors::{Analytic, Host, Kernels, Matrix, Vector};
+use rinterp::tensors::dual::{
+    DualMatrix, DualVector, gradient, gradient_wrt_matrix, jacobian, jacobian_wrt_matrix,
+};
+use rinterp::tensors::{Analytic, BinaryOp, Host, Kernels, Matrix, Vector};
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use rinterp::tensors::Metal;
@@ -76,18 +78,25 @@ fn elementwise_rules_match_the_scalar_dual_path() {
     let oracle_a = dual_a.to_dual_vector();
     let oracle_b = dual_b.to_dual_vector();
 
-    for (op, label) in [(0u32, "add"), (1, "sub"), (2, "mul"), (3, "div")] {
+    for (op, label) in [
+        (BinaryOp::Add, "add"),
+        (BinaryOp::Sub, "sub"),
+        (BinaryOp::Mul, "mul"),
+        (BinaryOp::Div, "div"),
+    ] {
         let actual = match op {
-            0 => &dual_a + &dual_b,
-            1 => &dual_a - &dual_b,
-            2 => &dual_a * &dual_b,
-            _ => &dual_a / &dual_b,
+            BinaryOp::Add => &dual_a + &dual_b,
+            BinaryOp::Sub => &dual_a - &dual_b,
+            BinaryOp::Mul => &dual_a * &dual_b,
+            BinaryOp::Div => &dual_a / &dual_b,
+            BinaryOp::Rem => unreachable!(),
         };
         let expected = match op {
-            0 => oracle_a + oracle_b,
-            1 => oracle_a - oracle_b,
-            2 => oracle_a * oracle_b,
-            _ => oracle_a / oracle_b,
+            BinaryOp::Add => oracle_a + oracle_b,
+            BinaryOp::Sub => oracle_a - oracle_b,
+            BinaryOp::Mul => oracle_a * oracle_b,
+            BinaryOp::Div => oracle_a / oracle_b,
+            BinaryOp::Rem => unreachable!(),
         };
         for (index, dual) in expected.data().iter().enumerate() {
             assert!(
@@ -297,14 +306,14 @@ fn scalar_helpers_follow_the_product_and_quotient_rules() {
 
     // A *dual* scalar brings its own tangent: d(a·s) = ȧs + aṡ.
     let s = Dual::new(2.0f32, 5.0);
-    let scaled = x.broadcast(s, 2, false);
+    let scaled = x.broadcast(s, BinaryOp::Mul, false);
     for i in 0..4 {
         let expected = x.tangent().as_slice()[i] * s.real + x.value().as_slice()[i] * s.dual;
         assert!(close(scaled.tangent().as_slice()[i], expected));
     }
 
     // d(s/a) = ṡ/a − sȧ/a², checked against the scalar path.
-    let divided = x.broadcast(s, 3, true);
+    let divided = x.broadcast(s, BinaryOp::Div, true);
     let oracle = x
         .to_dual_vector()
         .map(|&element| Dual::new(s.real, s.dual) / element);
@@ -396,11 +405,11 @@ fn the_metal_backend_agrees_with_the_host_backend() {
 }
 
 /// Every arm of the shader's `analytic_value`/`analytic_derivative` switch against
-/// the CPU table — a mistyped op code or formula in one of the thirteen would
+/// the CPU table — a mismatched discriminant or formula in one of the thirteen would
 /// otherwise only show up for whichever function the other tests happen to use.
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
-fn every_analytic_op_code_agrees_between_the_shader_and_the_cpu_table() {
+fn every_analytic_variant_agrees_between_the_shader_and_the_cpu_table() {
     let (v, dv) = (vector::<16>(), direction::<16>());
     let host = DualVector::<16, Host>::new(v, dv);
     let gpu = DualVector::<16, Metal>::new(v.to_backend(), dv.to_backend());
@@ -450,6 +459,167 @@ trait ShiftUp {
 
 impl<const N: usize> ShiftUp for Vector<f32, N> {
     fn shift_up(self) -> Self {
-        self.broadcast_right(2.0, 0)
+        self.broadcast_right(2.0, BinaryOp::Add)
     }
+}
+
+// ---- differentiating with respect to a matrix --------------------------------
+
+#[test]
+fn flattening_round_trips_and_reshapes_preserve_row_major_order() {
+    let (m, dm) = (matrix::<2, 3>(), matrix_direction::<2, 3>());
+    let dual = DualMatrix::<2, 3>::new(m, dm);
+
+    let flat = dual.flattened();
+    assert_eq!(flat.value().as_slice(), m.as_slice());
+    assert_eq!(flat.tangent().as_slice(), dm.as_slice());
+
+    let restored = DualMatrix::<2, 3>::from_flattened(flat);
+    assert_eq!(restored.value().to_rows(), m.to_rows());
+    assert_eq!(restored.tangent().to_rows(), dm.to_rows());
+
+    // A vector viewed as a one-row or one-column matrix keeps its elements.
+    let v = DualVector::<4>::new(vector::<4>(), direction::<4>());
+    let row = v.into_row();
+    assert_eq!(row.value().to_rows()[0], vector::<4>().to_array());
+    let column = v.into_column();
+    assert_eq!(column.value().to_rows()[2][0], vector::<4>().to_array()[2]);
+    assert_eq!(column.value().shape(), (4, 1));
+}
+
+/// `f(A) = ‖A·x‖²`, whose gradient with respect to `A` is `2(Ax)xᵀ`.
+fn projection_energy<const R: usize, const C: usize, B: Kernels>(
+    x: &Vector<f32, C, B>,
+    a: &DualMatrix<R, C, B>,
+) -> Dual<f32> {
+    let mapped = a.matvec(&DualVector::constant(duplicate(x)));
+    mapped.dot(&mapped)
+}
+
+fn duplicate<const N: usize, B: Kernels>(v: &Vector<f32, N, B>) -> Vector<f32, N, B> {
+    v.to_backend::<B>()
+}
+
+#[test]
+fn gradient_wrt_matrix_matches_the_closed_form_and_finite_differences() {
+    let a = matrix::<3, 4>();
+    let x = vector::<4>();
+
+    let computed = gradient_wrt_matrix(&a, |m| projection_energy(&x, m));
+
+    // Closed form: 2(Ax)xᵀ.
+    let projected = a.matvec(&x);
+    for row in 0..3 {
+        for col in 0..4 {
+            let expected = 2.0 * projected.data()[row] * x.data()[col];
+            assert!(
+                close(computed.data()[row][col], expected),
+                "∂f/∂A[{row},{col}]: {} vs {expected}",
+                computed.data()[row][col]
+            );
+        }
+    }
+
+    // And central differences on every entry, which needs no closed form.
+    let step = 1e-3f32;
+    for row in 0..3 {
+        for col in 0..4 {
+            let mut forward = *a.data();
+            let mut backward = *a.data();
+            forward[row][col] += step;
+            backward[row][col] -= step;
+            let numeric =
+                (projection_energy(&x, &DualMatrix::constant(Matrix::from_rows(forward))).real
+                    - projection_energy(&x, &DualMatrix::constant(Matrix::from_rows(backward)))
+                        .real)
+                    / (2.0 * step);
+            assert!(
+                (computed.data()[row][col] - numeric).abs() < 5e-3,
+                "∂f/∂A[{row},{col}]: forward mode {} vs finite difference {numeric}",
+                computed.data()[row][col]
+            );
+        }
+    }
+}
+
+#[test]
+fn jacobian_wrt_matrix_has_one_column_per_input_element() {
+    // f(A) = A·x, so ∂(Ax)ᵢ/∂Aⱼₖ = δᵢⱼ·xₖ.
+    let a = matrix::<3, 4>();
+    let x = vector::<4>();
+    let computed = jacobian_wrt_matrix(&a, |m| m.matvec(&DualVector::constant(x)));
+
+    for output in 0..3 {
+        for row in 0..3 {
+            for col in 0..4 {
+                let expected = if output == row { x.data()[col] } else { 0.0 };
+                assert!(
+                    close(computed.data()[output][row * 4 + col], expected),
+                    "J[{output}, ({row},{col})]: {} vs {expected}",
+                    computed.data()[output][row * 4 + col]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_matrix_valued_function_flattens_into_a_square_jacobian() {
+    // f(A) = A·B, so ∂(AB)ᵢⱼ/∂Aₖₗ = δᵢₖ·Bₗⱼ.
+    let a = matrix::<2, 2>();
+    let b = matrix_direction::<2, 2>();
+    let computed = jacobian_wrt_matrix(&a, |m| m.matmul(&DualMatrix::constant(b)).into_flattened());
+
+    for i in 0..2 {
+        for j in 0..2 {
+            for k in 0..2 {
+                for l in 0..2 {
+                    let expected = if i == k { b.data()[l][j] } else { 0.0 };
+                    let actual = computed.data()[i * 2 + j][k * 2 + l];
+                    assert!(
+                        close(actual, expected),
+                        "J[({i},{j}),({k},{l})]: {actual} vs {expected}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+fn matrix_derivatives_agree_between_the_backends() {
+    let a = matrix::<4, 5>();
+    let x = vector::<5>();
+
+    let host = gradient_wrt_matrix(&a, |m| projection_energy(&x, m));
+    let resident = gradient_wrt_matrix(&a.to_backend::<Metal>(), |m| {
+        projection_energy(&x.to_backend::<Metal>(), m)
+    });
+    assert_slice_close(
+        resident.as_slice(),
+        host.as_slice(),
+        "gradient with respect to a matrix",
+    );
+    if a.to_backend::<Metal>().is_device_resident() {
+        assert!(resident.is_device_resident(), "the gradient stays resident");
+    }
+
+    let host = jacobian_wrt_matrix(&a, |m| m.matvec(&DualVector::constant(x)));
+    let resident = jacobian_wrt_matrix(&a.to_backend::<Metal>(), |m| {
+        m.matvec(&DualVector::constant(x.to_backend::<Metal>()))
+    });
+    assert_slice_close(
+        resident.as_slice(),
+        host.as_slice(),
+        "Jacobian with respect to a matrix",
+    );
+
+    // Flattening is a move on this backend, so it must not disturb the values.
+    let dual = DualMatrix::<4, 5, Metal>::new(a.to_backend(), a.to_backend());
+    assert_slice_close(
+        dual.flattened().value().as_slice(),
+        a.as_slice(),
+        "resident flattening",
+    );
 }

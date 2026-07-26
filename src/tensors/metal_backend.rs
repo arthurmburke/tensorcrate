@@ -28,7 +28,7 @@
 use std::fmt::{self, Display};
 use std::ops::{Add, Div, Mul, Neg, Rem, Sub};
 
-use super::{Analytic, Host, Kernels, Matrix, Metal, Vector};
+use super::{Analytic, BinaryOp, Host, Kernels, Matrix, Metal, Vector};
 
 impl<const N: usize> Vector<f32, N, Metal> {
     /// Whether the elements really are in GPU-shared memory.
@@ -75,7 +75,7 @@ impl<const N: usize> Vector<f32, N, Metal> {
     /// through `Float`, which the 32-bit shaders cannot, so resident tensors get
     /// this instead.
     pub fn analytic(&self, f: Analytic) -> Self {
-        match self.data.unary(f.code()) {
+        match self.data.unary(f) {
             Some(data) => Vector { data },
             None => Host::vector_unary(&self.to_backend::<Host>(), f).to_backend(),
         }
@@ -83,12 +83,12 @@ impl<const N: usize> Vector<f32, N, Metal> {
 
     /// Multiply every element by `scalar`, on the GPU.
     pub fn scale(&self, scalar: f32) -> Self {
-        self.broadcast_right(scalar, 2)
+        self.broadcast_right(scalar, BinaryOp::Mul)
     }
 
     /// Implementation hook used by `math!` for tensor/scalar broadcasting.
     #[doc(hidden)]
-    pub fn broadcast_right(&self, scalar: f32, op: u32) -> Self {
+    pub fn broadcast_right(&self, scalar: f32, op: BinaryOp) -> Self {
         match self.data.broadcast(scalar, op, false) {
             Some(data) => Vector { data },
             None => self
@@ -100,7 +100,7 @@ impl<const N: usize> Vector<f32, N, Metal> {
 
     /// Implementation hook used by `math!` for scalar/tensor broadcasting.
     #[doc(hidden)]
-    pub fn broadcast_left(&self, scalar: f32, op: u32) -> Self {
+    pub fn broadcast_left(&self, scalar: f32, op: BinaryOp) -> Self {
         match self.data.broadcast(scalar, op, true) {
             Some(data) => Vector { data },
             None => self
@@ -159,7 +159,7 @@ impl<const R: usize, const C: usize> Matrix<f32, R, C, Metal> {
     /// Apply an analytic function elementwise, on the GPU; see
     /// [`Vector::analytic`].
     pub fn analytic(&self, f: Analytic) -> Self {
-        match self.data.unary(f.code()) {
+        match self.data.unary(f) {
             Some(data) => Matrix { data },
             None => Host::matrix_unary(&self.to_backend::<Host>(), f).to_backend(),
         }
@@ -167,12 +167,12 @@ impl<const R: usize, const C: usize> Matrix<f32, R, C, Metal> {
 
     /// Multiply every element by `scalar`, on the GPU.
     pub fn scale(&self, scalar: f32) -> Self {
-        self.broadcast_right(scalar, 2)
+        self.broadcast_right(scalar, BinaryOp::Mul)
     }
 
     /// Implementation hook used by `math!` for tensor/scalar broadcasting.
     #[doc(hidden)]
-    pub fn broadcast_right(&self, scalar: f32, op: u32) -> Self {
+    pub fn broadcast_right(&self, scalar: f32, op: BinaryOp) -> Self {
         match self.data.broadcast(scalar, op, false) {
             Some(data) => Matrix { data },
             None => self
@@ -184,7 +184,7 @@ impl<const R: usize, const C: usize> Matrix<f32, R, C, Metal> {
 
     /// Implementation hook used by `math!` for scalar/tensor broadcasting.
     #[doc(hidden)]
-    pub fn broadcast_left(&self, scalar: f32, op: u32) -> Self {
+    pub fn broadcast_left(&self, scalar: f32, op: BinaryOp) -> Self {
         match self.data.broadcast(scalar, op, true) {
             Some(data) => Matrix { data },
             None => self
@@ -211,7 +211,7 @@ fn reduce_dot(a: &[f32], b: &[f32]) -> f32 {
 pub(super) fn vector_elementwise<const N: usize>(
     a: &Vector<f32, N, Metal>,
     b: &Vector<f32, N, Metal>,
-    op: u32,
+    op: BinaryOp,
 ) -> Vector<f32, N, Metal> {
     match a.data.elementwise(&b.data, op) {
         Some(data) => Vector { data },
@@ -224,7 +224,7 @@ pub(super) fn vector_elementwise<const N: usize>(
 pub(super) fn matrix_elementwise<const R: usize, const C: usize>(
     a: &Matrix<f32, R, C, Metal>,
     b: &Matrix<f32, R, C, Metal>,
-    op: u32,
+    op: BinaryOp,
 ) -> Matrix<f32, R, C, Metal> {
     match a.data.elementwise(&b.data, op) {
         Some(data) => Matrix { data },
@@ -258,42 +258,42 @@ macro_rules! resident_operator {
     };
 }
 
-resident_operator!(Vector<N>, Add, add, 0, vector_elementwise);
-resident_operator!(Vector<N>, Sub, sub, 1, vector_elementwise);
-resident_operator!(Vector<N>, Mul, mul, 2, vector_elementwise);
-resident_operator!(Vector<N>, Div, div, 3, vector_elementwise);
-resident_operator!(Vector<N>, Rem, rem, 4, vector_elementwise);
-resident_operator!(Matrix<R, C>, Add, add, 0, matrix_elementwise);
-resident_operator!(Matrix<R, C>, Sub, sub, 1, matrix_elementwise);
-resident_operator!(Matrix<R, C>, Mul, mul, 2, matrix_elementwise);
-resident_operator!(Matrix<R, C>, Div, div, 3, matrix_elementwise);
-resident_operator!(Matrix<R, C>, Rem, rem, 4, matrix_elementwise);
+resident_operator!(Vector<N>, Add, add, BinaryOp::Add, vector_elementwise);
+resident_operator!(Vector<N>, Sub, sub, BinaryOp::Sub, vector_elementwise);
+resident_operator!(Vector<N>, Mul, mul, BinaryOp::Mul, vector_elementwise);
+resident_operator!(Vector<N>, Div, div, BinaryOp::Div, vector_elementwise);
+resident_operator!(Vector<N>, Rem, rem, BinaryOp::Rem, vector_elementwise);
+resident_operator!(Matrix<R, C>, Add, add, BinaryOp::Add, matrix_elementwise);
+resident_operator!(Matrix<R, C>, Sub, sub, BinaryOp::Sub, matrix_elementwise);
+resident_operator!(Matrix<R, C>, Mul, mul, BinaryOp::Mul, matrix_elementwise);
+resident_operator!(Matrix<R, C>, Div, div, BinaryOp::Div, matrix_elementwise);
+resident_operator!(Matrix<R, C>, Rem, rem, BinaryOp::Rem, matrix_elementwise);
 
 impl<const N: usize> Neg for Vector<f32, N, Metal> {
     type Output = Self;
     fn neg(self) -> Self {
-        self.broadcast_right(-1.0, 2)
+        self.broadcast_right(-1.0, BinaryOp::Mul)
     }
 }
 
 impl<const N: usize> Neg for &Vector<f32, N, Metal> {
     type Output = Vector<f32, N, Metal>;
     fn neg(self) -> Self::Output {
-        self.broadcast_right(-1.0, 2)
+        self.broadcast_right(-1.0, BinaryOp::Mul)
     }
 }
 
 impl<const R: usize, const C: usize> Neg for Matrix<f32, R, C, Metal> {
     type Output = Self;
     fn neg(self) -> Self {
-        self.broadcast_right(-1.0, 2)
+        self.broadcast_right(-1.0, BinaryOp::Mul)
     }
 }
 
 impl<const R: usize, const C: usize> Neg for &Matrix<f32, R, C, Metal> {
     type Output = Matrix<f32, R, C, Metal>;
     fn neg(self) -> Self::Output {
-        self.broadcast_right(-1.0, 2)
+        self.broadcast_right(-1.0, BinaryOp::Mul)
     }
 }
 

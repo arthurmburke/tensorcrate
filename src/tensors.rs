@@ -32,6 +32,7 @@ use crate::numbers::{Coefficient, Complex};
 pub mod backend;
 pub mod dual;
 pub mod kernels;
+pub mod tape;
 
 /// The `Metal`-backed inherent operations. It declares no new types, so there is
 /// nothing to re-export — naming the module is what puts the methods on the
@@ -42,8 +43,12 @@ mod metal_backend;
 pub use backend::{Backend, Host};
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub use backend::{Metal, MetalStorage};
-pub use dual::{DualMatrix, DualVector, gradient, jacobian};
-pub use kernels::{Analytic, Kernels};
+pub use dual::{
+    DualMatrix, DualVector, gradient, gradient_wrt_matrix, jacobian, jacobian_wrt_matrix,
+    matrix_gradient,
+};
+pub use kernels::{Analytic, BinaryOp, Kernels};
+pub use tape::{MatrixVar, ScalarVar, Tape, Var, VectorVar};
 
 #[cfg(all(feature = "simd", target_arch = "aarch64"))]
 mod simd_dispatch {
@@ -56,7 +61,7 @@ mod simd_dispatch {
 
     use std::any::TypeId;
 
-    use super::{Complex, Matrix, Vector};
+    use super::{BinaryOp, Complex, Matrix, Vector};
     use crate::numbers::Coefficient;
 
     // Below these lengths the generic scalar loop is already fine (and the
@@ -100,8 +105,8 @@ mod simd_dispatch {
         None
     }
 
-    pub fn elementwise<T: Coefficient>(a: &[T], b: &[T], op: u32) -> Option<Vec<T>> {
-        if a.len() < MIN_ELEMENTS || op == 4 {
+    pub fn elementwise<T: Coefficient>(a: &[T], b: &[T], op: BinaryOp) -> Option<Vec<T>> {
+        if a.len() < MIN_ELEMENTS || op == BinaryOp::Rem {
             return None;
         }
         unsafe {
@@ -122,10 +127,10 @@ mod simd_dispatch {
     pub fn broadcast<T: Coefficient>(
         values: &[T],
         scalar: T,
-        op: u32,
+        op: BinaryOp,
         scalar_left: bool,
     ) -> Option<Vec<T>> {
-        if values.len() < MIN_ELEMENTS || op == 4 {
+        if values.len() < MIN_ELEMENTS || op == BinaryOp::Rem {
             return None;
         }
         unsafe {
@@ -395,40 +400,38 @@ impl<T: Coefficient, const N: usize> Vector<T, N> {
 
     /// Multiply every element by `scalar`.
     pub fn scale(&self, scalar: T) -> Self {
-        self.broadcast_right(scalar, 2)
+        self.broadcast_right(scalar, BinaryOp::Mul)
     }
 
     /// Implementation hook used by `math!` for tensor/scalar broadcasting.
     #[doc(hidden)]
-    pub fn broadcast_right(&self, scalar: T, op: u32) -> Self {
+    pub fn broadcast_right(&self, scalar: T, op: BinaryOp) -> Self {
         #[cfg(all(feature = "simd", target_arch = "aarch64"))]
         if let Some(output) = simd_dispatch::broadcast(&self.data, scalar, op, false) {
             return Vector::new(std::array::from_fn(|index| output[index]));
         }
         self.map(|&value| match op {
-            0 => value + scalar,
-            1 => value - scalar,
-            2 => value * scalar,
-            3 => value / scalar,
-            4 => value % scalar,
-            _ => unreachable!("unknown broadcast operation"),
+            BinaryOp::Add => value + scalar,
+            BinaryOp::Sub => value - scalar,
+            BinaryOp::Mul => value * scalar,
+            BinaryOp::Div => value / scalar,
+            BinaryOp::Rem => value % scalar,
         })
     }
 
     /// Implementation hook used by `math!` for scalar/tensor broadcasting.
     #[doc(hidden)]
-    pub fn broadcast_left(&self, scalar: T, op: u32) -> Self {
+    pub fn broadcast_left(&self, scalar: T, op: BinaryOp) -> Self {
         #[cfg(all(feature = "simd", target_arch = "aarch64"))]
         if let Some(output) = simd_dispatch::broadcast(&self.data, scalar, op, true) {
             return Vector::new(std::array::from_fn(|index| output[index]));
         }
         self.map(|&value| match op {
-            0 => scalar + value,
-            1 => scalar - value,
-            2 => scalar * value,
-            3 => scalar / value,
-            4 => scalar % value,
-            _ => unreachable!("unknown broadcast operation"),
+            BinaryOp::Add => scalar + value,
+            BinaryOp::Sub => scalar - value,
+            BinaryOp::Mul => scalar * value,
+            BinaryOp::Div => scalar / value,
+            BinaryOp::Rem => scalar % value,
         })
     }
 
@@ -1292,12 +1295,12 @@ impl<T: Coefficient, const R: usize, const C: usize> Matrix<T, R, C> {
 
     /// Multiply every element by `scalar`.
     pub fn scale(&self, scalar: T) -> Self {
-        self.broadcast_right(scalar, 2)
+        self.broadcast_right(scalar, BinaryOp::Mul)
     }
 
     /// Implementation hook used by `math!` for tensor/scalar broadcasting.
     #[doc(hidden)]
-    pub fn broadcast_right(&self, scalar: T, op: u32) -> Self {
+    pub fn broadcast_right(&self, scalar: T, op: BinaryOp) -> Self {
         #[cfg(all(feature = "simd", target_arch = "aarch64"))]
         {
             // SAFETY: nested arrays are contiguous and hold exactly R*C `T`.
@@ -1311,18 +1314,17 @@ impl<T: Coefficient, const R: usize, const C: usize> Matrix<T, R, C> {
             }
         }
         self.map(|&value| match op {
-            0 => value + scalar,
-            1 => value - scalar,
-            2 => value * scalar,
-            3 => value / scalar,
-            4 => value % scalar,
-            _ => unreachable!("unknown broadcast operation"),
+            BinaryOp::Add => value + scalar,
+            BinaryOp::Sub => value - scalar,
+            BinaryOp::Mul => value * scalar,
+            BinaryOp::Div => value / scalar,
+            BinaryOp::Rem => value % scalar,
         })
     }
 
     /// Implementation hook used by `math!` for scalar/tensor broadcasting.
     #[doc(hidden)]
-    pub fn broadcast_left(&self, scalar: T, op: u32) -> Self {
+    pub fn broadcast_left(&self, scalar: T, op: BinaryOp) -> Self {
         #[cfg(all(feature = "simd", target_arch = "aarch64"))]
         {
             // SAFETY: nested arrays are contiguous and hold exactly R*C `T`.
@@ -1336,12 +1338,11 @@ impl<T: Coefficient, const R: usize, const C: usize> Matrix<T, R, C> {
             }
         }
         self.map(|&value| match op {
-            0 => scalar + value,
-            1 => scalar - value,
-            2 => scalar * value,
-            3 => scalar / value,
-            4 => scalar % value,
-            _ => unreachable!("unknown broadcast operation"),
+            BinaryOp::Add => scalar + value,
+            BinaryOp::Sub => scalar - value,
+            BinaryOp::Mul => scalar * value,
+            BinaryOp::Div => scalar / value,
+            BinaryOp::Rem => scalar % value,
         })
     }
 
@@ -1524,7 +1525,7 @@ impl<T: Coefficient, const N: usize> Mul for Vector<T, N> {
 
     fn mul(self, rhs: Self) -> Self::Output {
         #[cfg(all(feature = "simd", target_arch = "aarch64"))]
-        if let Some(output) = simd_dispatch::elementwise(&self.data, &rhs.data, 2) {
+        if let Some(output) = simd_dispatch::elementwise(&self.data, &rhs.data, BinaryOp::Mul) {
             return Vector::new(std::array::from_fn(|index| output[index]));
         }
         self.zip_with(&rhs, |a, b| a * b)
@@ -1544,7 +1545,7 @@ impl<T: Coefficient, const R: usize, const C: usize> Mul for Matrix<T, R, C> {
             let right = unsafe {
                 std::slice::from_raw_parts(rhs.data.as_ptr().cast::<T>(), R.saturating_mul(C))
             };
-            if let Some(output) = simd_dispatch::elementwise(left, right, 2) {
+            if let Some(output) = simd_dispatch::elementwise(left, right, BinaryOp::Mul) {
                 return Matrix::from_rows(std::array::from_fn(|row| {
                     std::array::from_fn(|col| output[row * C + col])
                 }));

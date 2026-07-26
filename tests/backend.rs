@@ -8,7 +8,7 @@
 
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
-use rinterp::tensors::{Backend, Host, Matrix, Metal, Vector};
+use rinterp::tensors::{Backend, BinaryOp, Host, Matrix, Metal, Vector};
 
 /// Deterministic filler with a mix of signs and magnitudes, all integral so
 /// GPU and CPU accumulation orders agree exactly.
@@ -262,7 +262,7 @@ fn large_products_agree_with_the_host_within_float_tolerance() {
 #[test]
 fn elementwise_operators_and_broadcasts_match_the_host_backend() {
     let a = vector::<48>();
-    let b = vector::<48>().broadcast_right(9.0, 0); // no zeros, so `/` and `%` are safe
+    let b = vector::<48>().broadcast_right(9.0, BinaryOp::Add); // no zeros
     let (ga, gb) = (a.to_backend::<Metal>(), b.to_backend::<Metal>());
 
     assert_eq!((&ga + &gb).to_backend::<Host>(), a + b);
@@ -275,12 +275,12 @@ fn elementwise_operators_and_broadcasts_match_the_host_backend() {
     assert_eq!((-&ga).to_backend::<Host>(), -a);
     assert_eq!(ga.scale(2.5).to_backend::<Host>(), a.scale(2.5));
     assert_eq!(
-        ga.broadcast_left(1.0, 1).to_backend::<Host>(),
-        a.broadcast_left(1.0, 1)
+        ga.broadcast_left(1.0, BinaryOp::Sub).to_backend::<Host>(),
+        a.broadcast_left(1.0, BinaryOp::Sub)
     );
 
     let m = matrix::<8, 8>();
-    let n = matrix::<8, 8>().broadcast_right(9.0, 0);
+    let n = matrix::<8, 8>().broadcast_right(9.0, BinaryOp::Add);
     let (gm, gn) = (m.to_backend::<Metal>(), n.to_backend::<Metal>());
     assert_eq!((&gm + &gn).to_backend::<Host>(), m + n);
     assert_eq!((&gm * &gn).to_backend::<Host>(), m * n);
@@ -314,7 +314,7 @@ fn a_chain_of_operations_stays_in_shared_memory() {
     assert!((&v * &v).is_device_resident());
 
     // `%` has no kernel: it round-trips, and the result comes back resident.
-    assert!((&v % &v.broadcast_right(9.0, 0)).is_device_resident());
+    assert!((&v % &v.broadcast_right(9.0, BinaryOp::Add)).is_device_resident());
 }
 
 #[test]

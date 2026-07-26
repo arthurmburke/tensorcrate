@@ -2,7 +2,7 @@
 
 use rinterp::errors::Error;
 use rinterp::numbers::{Complex, Dual};
-use rinterp::tensors::{Matrix, MatrixOperand, Vector};
+use rinterp::tensors::{BinaryOp, Matrix, MatrixOperand, Vector};
 
 fn close(a: f64, b: f64) -> bool {
     (a - b).abs() < 1e-9
@@ -190,8 +190,8 @@ fn tensor_operations_use_metal_or_transparently_fall_back() {
     let factors = Vector::<f32, 4096>::new(std::array::from_fn(|index| (index % 7) as f32 + 1.0));
     let multiplied = values * factors;
     let scaled = values.scale(2.0);
-    let shifted = values.broadcast_right(3.0, 0);
-    let reversed = values.broadcast_left(10.0, 1);
+    let shifted = values.broadcast_right(3.0, BinaryOp::Add);
+    let reversed = values.broadcast_left(10.0, BinaryOp::Sub);
     for index in 0..4096 {
         assert_eq!(
             multiplied.data()[index],

@@ -30,6 +30,7 @@ macro_rules! neon_kernels {
         fma = $fma:ident, addv = $addv:ident
     ) => {
         pub mod $modname {
+            use crate::tensors::BinaryOp;
             use core::arch::aarch64::*;
 
             /// Lanes per NEON register for this element type.
@@ -76,17 +77,13 @@ macro_rules! neon_kernels {
                 total
             }
 
-            /// Elementwise binary op. `op` matches the encoding used by
-            /// `broadcast_right`/`elementwise` in `tensors`:
-            /// 0 = add, 1 = sub, 2 = mul, 3 = div, 4 = rem.
-            ///
-            /// Remainder has no NEON floating-point instruction, so op 4 runs the
-            /// scalar loop; the caller gates it out before reaching SIMD anyway.
+            /// Elementwise binary operation. Remainder has no NEON
+            /// floating-point instruction, so it uses the scalar loop.
             #[inline]
-            pub fn elementwise(a: &[$t], b: &[$t], op: u32, out: &mut [$t]) {
+            pub fn elementwise(a: &[$t], b: &[$t], op: BinaryOp, out: &mut [$t]) {
                 let n = a.len();
                 debug_assert!(b.len() == n && out.len() == n);
-                if op == 4 {
+                if op == BinaryOp::Rem {
                     for i in 0..n {
                         out[i] = a[i] % b[i];
                     }
@@ -98,10 +95,11 @@ macro_rules! neon_kernels {
                         let va = $load(a.as_ptr().add(i));
                         let vb = $load(b.as_ptr().add(i));
                         let vr = match op {
-                            0 => $add(va, vb),
-                            1 => $sub(va, vb),
-                            2 => $mul(va, vb),
-                            _ => $div(va, vb),
+                            BinaryOp::Add => $add(va, vb),
+                            BinaryOp::Sub => $sub(va, vb),
+                            BinaryOp::Mul => $mul(va, vb),
+                            BinaryOp::Div => $div(va, vb),
+                            BinaryOp::Rem => unreachable!(),
                         };
                         $store(out.as_mut_ptr().add(i), vr);
                         i += LANES;
@@ -109,10 +107,11 @@ macro_rules! neon_kernels {
                 }
                 while i < n {
                     out[i] = match op {
-                        0 => a[i] + b[i],
-                        1 => a[i] - b[i],
-                        2 => a[i] * b[i],
-                        _ => a[i] / b[i],
+                        BinaryOp::Add => a[i] + b[i],
+                        BinaryOp::Sub => a[i] - b[i],
+                        BinaryOp::Mul => a[i] * b[i],
+                        BinaryOp::Div => a[i] / b[i],
+                        BinaryOp::Rem => unreachable!(),
                     };
                     i += 1;
                 }
@@ -121,12 +120,22 @@ macro_rules! neon_kernels {
             /// Tensor/scalar broadcast. `scalar_left` selects operand order for
             /// the non-commutative ops (`scalar - x` vs `x - scalar`, etc.).
             #[inline]
-            pub fn broadcast(values: &[$t], scalar: $t, op: u32, scalar_left: bool, out: &mut [$t]) {
+            pub fn broadcast(
+                values: &[$t],
+                scalar: $t,
+                op: BinaryOp,
+                scalar_left: bool,
+                out: &mut [$t],
+            ) {
                 let n = values.len();
                 debug_assert_eq!(out.len(), n);
-                if op == 4 {
+                if op == BinaryOp::Rem {
                     for i in 0..n {
-                        out[i] = if scalar_left { scalar % values[i] } else { values[i] % scalar };
+                        out[i] = if scalar_left {
+                            scalar % values[i]
+                        } else {
+                            values[i] % scalar
+                        };
                     }
                     return;
                 }
@@ -137,10 +146,11 @@ macro_rules! neon_kernels {
                         let vx = $load(values.as_ptr().add(i));
                         let (lhs, rhs) = if scalar_left { (vs, vx) } else { (vx, vs) };
                         let vr = match op {
-                            0 => $add(lhs, rhs),
-                            1 => $sub(lhs, rhs),
-                            2 => $mul(lhs, rhs),
-                            _ => $div(lhs, rhs),
+                            BinaryOp::Add => $add(lhs, rhs),
+                            BinaryOp::Sub => $sub(lhs, rhs),
+                            BinaryOp::Mul => $mul(lhs, rhs),
+                            BinaryOp::Div => $div(lhs, rhs),
+                            BinaryOp::Rem => unreachable!(),
                         };
                         $store(out.as_mut_ptr().add(i), vr);
                         i += LANES;
@@ -148,12 +158,17 @@ macro_rules! neon_kernels {
                 }
                 while i < n {
                     let x = values[i];
-                    let (l, r) = if scalar_left { (scalar, x) } else { (x, scalar) };
+                    let (l, r) = if scalar_left {
+                        (scalar, x)
+                    } else {
+                        (x, scalar)
+                    };
                     out[i] = match op {
-                        0 => l + r,
-                        1 => l - r,
-                        2 => l * r,
-                        _ => l / r,
+                        BinaryOp::Add => l + r,
+                        BinaryOp::Sub => l - r,
+                        BinaryOp::Mul => l * r,
+                        BinaryOp::Div => l / r,
+                        BinaryOp::Rem => unreachable!(),
                     };
                     i += 1;
                 }
@@ -191,7 +206,8 @@ macro_rules! neon_kernels {
                                 j += LANES;
                             }
                             while j < n {
-                                *out.get_unchecked_mut(orow + j) += aip * *b.get_unchecked(brow + j);
+                                *out.get_unchecked_mut(orow + j) +=
+                                    aip * *b.get_unchecked(brow + j);
                                 j += 1;
                             }
                         }

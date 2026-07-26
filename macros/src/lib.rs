@@ -715,11 +715,11 @@ fn lower_binary(b: &syn::ExprBinary, target: Ty, env: &Env) -> syn::Result<Token
         }
     };
     let broadcast_op = match b.op {
-        BinOp::Add(_) => 0u32,
-        BinOp::Sub(_) => 1,
-        BinOp::Mul(_) => 2,
-        BinOp::Div(_) => 3,
-        BinOp::Rem(_) => 4,
+        BinOp::Add(_) => quote!(::rinterp::tensors::BinaryOp::Add),
+        BinOp::Sub(_) => quote!(::rinterp::tensors::BinaryOp::Sub),
+        BinOp::Mul(_) => quote!(::rinterp::tensors::BinaryOp::Mul),
+        BinOp::Div(_) => quote!(::rinterp::tensors::BinaryOp::Div),
+        BinOp::Rem(_) => quote!(::rinterp::tensors::BinaryOp::Rem),
         _ => unreachable!("unsupported operators returned above"),
     };
 

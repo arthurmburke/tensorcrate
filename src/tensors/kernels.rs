@@ -17,31 +17,67 @@
 
 use super::{Backend, Host, Matrix, Vector};
 
+/// An elementwise binary operation.
+///
+/// The representation is part of the Metal shader ABI. Keep existing
+/// discriminants stable and only append new operations.
+#[repr(u16)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum BinaryOp {
+    Add = 0,
+    Sub = 1,
+    Mul = 2,
+    Div = 3,
+    Rem = 4,
+}
+
+impl From<BinaryOp> for u16 {
+    fn from(op: BinaryOp) -> Self {
+        op as u16
+    }
+}
+
+impl TryFrom<u16> for BinaryOp {
+    type Error = u16;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Add),
+            1 => Ok(Self::Sub),
+            2 => Ok(Self::Mul),
+            3 => Ok(Self::Div),
+            4 => Ok(Self::Rem),
+            value => Err(value),
+        }
+    }
+}
+
 /// The analytic functions, paired with their derivatives.
 ///
-/// This is the op-code enum for the GPU `unary`/`unary_dual` kernels and the
+/// This is the operation enum for the GPU `unary`/`unary_dual` kernels and the
 /// dispatch table for the CPU path, so both sides stay in step. The variants
 /// mirror the functions `math!` accepts, and each derivative is written the same
 /// way as the matching [`Dual`](crate::numbers::Dual) implementation.
+#[repr(u16)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Analytic {
-    Sin,
-    Cos,
-    Tan,
-    Sec,
-    Csc,
-    Arcsin,
-    Arccos,
-    Arctan,
-    Exp,
-    Ln,
-    Sinh,
-    Cosh,
-    Tanh,
+    Sin = 0,
+    Cos = 1,
+    Tan = 2,
+    Sec = 3,
+    Csc = 4,
+    Arcsin = 5,
+    Arccos = 6,
+    Arctan = 7,
+    Exp = 8,
+    Ln = 9,
+    Sinh = 10,
+    Cosh = 11,
+    Tanh = 12,
 }
 
 impl Analytic {
-    /// Every function, in op-code order.
+    /// Every function, in discriminant order.
     pub const ALL: [Analytic; 13] = [
         Analytic::Sin,
         Analytic::Cos,
@@ -57,27 +93,6 @@ impl Analytic {
         Analytic::Cosh,
         Analytic::Tanh,
     ];
-
-    /// The shader op code. These numbers are a wire format shared with the
-    /// `analytic_value`/`analytic_derivative` switches in [`crate::metal`], so
-    /// only ever append to them.
-    pub const fn code(self) -> u32 {
-        match self {
-            Analytic::Sin => 0,
-            Analytic::Cos => 1,
-            Analytic::Tan => 2,
-            Analytic::Sec => 3,
-            Analytic::Csc => 4,
-            Analytic::Arcsin => 5,
-            Analytic::Arccos => 6,
-            Analytic::Arctan => 7,
-            Analytic::Exp => 8,
-            Analytic::Ln => 9,
-            Analytic::Sinh => 10,
-            Analytic::Cosh => 11,
-            Analytic::Tanh => 12,
-        }
-    }
 
     /// `f(x)`.
     pub fn value(self, x: f32) -> f32 {
@@ -130,23 +145,63 @@ impl Analytic {
     }
 }
 
+impl From<Analytic> for u16 {
+    fn from(op: Analytic) -> Self {
+        op as u16
+    }
+}
+
+impl TryFrom<u16> for Analytic {
+    type Error = u16;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        Self::ALL.get(value as usize).copied().ok_or(value)
+    }
+}
+
+#[cfg(test)]
+mod operation_tests {
+    use std::mem::size_of;
+
+    use super::{Analytic, BinaryOp};
+
+    #[test]
+    fn operation_enums_have_a_stable_u16_representation() {
+        assert_eq!(size_of::<BinaryOp>(), size_of::<u16>());
+        assert_eq!(size_of::<Analytic>(), size_of::<u16>());
+
+        for op in [
+            BinaryOp::Add,
+            BinaryOp::Sub,
+            BinaryOp::Mul,
+            BinaryOp::Div,
+            BinaryOp::Rem,
+        ] {
+            assert_eq!(BinaryOp::try_from(u16::from(op)), Ok(op));
+        }
+        for op in Analytic::ALL {
+            assert_eq!(Analytic::try_from(u16::from(op)), Ok(op));
+        }
+        assert_eq!(BinaryOp::try_from(u16::MAX), Err(u16::MAX));
+        assert_eq!(Analytic::try_from(u16::MAX), Err(u16::MAX));
+    }
+}
+
 /// The `f32` tensor operations a [`Backend`] provides.
 ///
-/// Op codes for the elementwise and broadcast entry points match the rest of the
-/// crate: 0 add, 1 subtract, 2 multiply, 3 divide, 4 remainder.
 pub trait Kernels: Backend {
     // ---- vectors ----
 
     fn vector_elementwise<const N: usize>(
         a: &Vector<f32, N, Self>,
         b: &Vector<f32, N, Self>,
-        op: u32,
+        op: BinaryOp,
     ) -> Vector<f32, N, Self>;
 
     fn vector_broadcast<const N: usize>(
         a: &Vector<f32, N, Self>,
         scalar: f32,
-        op: u32,
+        op: BinaryOp,
         scalar_left: bool,
     ) -> Vector<f32, N, Self>;
 
@@ -177,13 +232,13 @@ pub trait Kernels: Backend {
     fn matrix_elementwise<const R: usize, const C: usize>(
         a: &Matrix<f32, R, C, Self>,
         b: &Matrix<f32, R, C, Self>,
-        op: u32,
+        op: BinaryOp,
     ) -> Matrix<f32, R, C, Self>;
 
     fn matrix_broadcast<const R: usize, const C: usize>(
         a: &Matrix<f32, R, C, Self>,
         scalar: f32,
-        op: u32,
+        op: BinaryOp,
         scalar_left: bool,
     ) -> Matrix<f32, R, C, Self>;
 
@@ -227,22 +282,21 @@ impl Kernels for Host {
     fn vector_elementwise<const N: usize>(
         a: &Vector<f32, N, Self>,
         b: &Vector<f32, N, Self>,
-        op: u32,
+        op: BinaryOp,
     ) -> Vector<f32, N, Self> {
         match op {
-            0 => *a + *b,
-            1 => *a - *b,
-            2 => *a * *b,
-            3 => *a / *b,
-            4 => *a % *b,
-            _ => unreachable!("unknown elementwise operation"),
+            BinaryOp::Add => *a + *b,
+            BinaryOp::Sub => *a - *b,
+            BinaryOp::Mul => *a * *b,
+            BinaryOp::Div => *a / *b,
+            BinaryOp::Rem => *a % *b,
         }
     }
 
     fn vector_broadcast<const N: usize>(
         a: &Vector<f32, N, Self>,
         scalar: f32,
-        op: u32,
+        op: BinaryOp,
         scalar_left: bool,
     ) -> Vector<f32, N, Self> {
         if scalar_left {
@@ -291,22 +345,21 @@ impl Kernels for Host {
     fn matrix_elementwise<const R: usize, const C: usize>(
         a: &Matrix<f32, R, C, Self>,
         b: &Matrix<f32, R, C, Self>,
-        op: u32,
+        op: BinaryOp,
     ) -> Matrix<f32, R, C, Self> {
         match op {
-            0 => *a + *b,
-            1 => *a - *b,
-            2 => *a * *b,
-            3 => *a / *b,
-            4 => *a % *b,
-            _ => unreachable!("unknown elementwise operation"),
+            BinaryOp::Add => *a + *b,
+            BinaryOp::Sub => *a - *b,
+            BinaryOp::Mul => *a * *b,
+            BinaryOp::Div => *a / *b,
+            BinaryOp::Rem => *a % *b,
         }
     }
 
     fn matrix_broadcast<const R: usize, const C: usize>(
         a: &Matrix<f32, R, C, Self>,
         scalar: f32,
-        op: u32,
+        op: BinaryOp,
         scalar_left: bool,
     ) -> Matrix<f32, R, C, Self> {
         if scalar_left {
@@ -363,7 +416,7 @@ impl Kernels for Host {
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod gpu {
-    use super::{Analytic, Kernels, Matrix, Vector};
+    use super::{Analytic, BinaryOp, Kernels, Matrix, Vector};
     use crate::tensors::metal_backend::{matrix_elementwise, vector_elementwise};
     use crate::tensors::{Host, Metal};
 
@@ -373,7 +426,7 @@ mod gpu {
         fn vector_elementwise<const N: usize>(
             a: &Vector<f32, N, Self>,
             b: &Vector<f32, N, Self>,
-            op: u32,
+            op: BinaryOp,
         ) -> Vector<f32, N, Self> {
             vector_elementwise(a, b, op)
         }
@@ -381,7 +434,7 @@ mod gpu {
         fn vector_broadcast<const N: usize>(
             a: &Vector<f32, N, Self>,
             scalar: f32,
-            op: u32,
+            op: BinaryOp,
             scalar_left: bool,
         ) -> Vector<f32, N, Self> {
             if scalar_left {
@@ -403,7 +456,7 @@ mod gpu {
             tangent: &Vector<f32, N, Self>,
             f: Analytic,
         ) -> (Vector<f32, N, Self>, Vector<f32, N, Self>) {
-            match value.data.unary_dual(&tangent.data, f.code()) {
+            match value.data.unary_dual(&tangent.data, f) {
                 Some((value, tangent)) => (Vector { data: value }, Vector { data: tangent }),
                 None => {
                     let (value, tangent) = Host::vector_unary_dual(
@@ -437,7 +490,7 @@ mod gpu {
         fn matrix_elementwise<const R: usize, const C: usize>(
             a: &Matrix<f32, R, C, Self>,
             b: &Matrix<f32, R, C, Self>,
-            op: u32,
+            op: BinaryOp,
         ) -> Matrix<f32, R, C, Self> {
             matrix_elementwise(a, b, op)
         }
@@ -445,7 +498,7 @@ mod gpu {
         fn matrix_broadcast<const R: usize, const C: usize>(
             a: &Matrix<f32, R, C, Self>,
             scalar: f32,
-            op: u32,
+            op: BinaryOp,
             scalar_left: bool,
         ) -> Matrix<f32, R, C, Self> {
             if scalar_left {
@@ -467,7 +520,7 @@ mod gpu {
             tangent: &Matrix<f32, R, C, Self>,
             f: Analytic,
         ) -> (Matrix<f32, R, C, Self>, Matrix<f32, R, C, Self>) {
-            match value.data.unary_dual(&tangent.data, f.code()) {
+            match value.data.unary_dual(&tangent.data, f) {
                 Some((value, tangent)) => (Matrix { data: value }, Matrix { data: tangent }),
                 None => {
                     let (value, tangent) = Host::matrix_unary_dual(
@@ -499,7 +552,7 @@ mod gpu {
             {
                 return addend;
             }
-            matrix_elementwise(&a.matmul(b), &addend, 0)
+            matrix_elementwise(&a.matmul(b), &addend, BinaryOp::Add)
         }
 
         fn transpose<const R: usize, const C: usize>(
