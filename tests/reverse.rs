@@ -338,6 +338,39 @@ fn matmul_gradients_match_the_closed_form() {
 }
 
 #[test]
+fn fused_multiply_adds_differentiate_the_addend() {
+    let a = matrix::<3, 4>();
+    let x = vector::<4>();
+    let bias = vector::<3>();
+    let tape = Tape::new();
+    let matrix_var = tape.matrix(a);
+    let vector_var = tape.vector(x);
+    let bias_var = tape.vector(bias);
+    matrix_var
+        .matvec_add(&vector_var, &bias_var)
+        .sum()
+        .backward();
+
+    assert_eq!(bias_var.grad().to_array(), [1.0; 3]);
+    for row in 0..3 {
+        assert_eq!(matrix_var.grad().data()[row], *x.data());
+    }
+    for col in 0..4 {
+        let expected: f32 = (0..3).map(|row| a.data()[row][col]).sum();
+        assert!(close(vector_var.grad().data()[col], expected));
+    }
+
+    let b = matrix::<4, 2>();
+    let addend = matrix::<3, 2>();
+    let tape = Tape::new();
+    let left = tape.matrix(a);
+    let right = tape.matrix(b);
+    let addend_var = tape.matrix(addend);
+    left.matmul_add(&right, &addend_var).sum().backward();
+    assert_eq!(addend_var.grad().to_rows(), [[1.0; 2]; 3]);
+}
+
+#[test]
 fn vecmat_and_transpose_and_reshapes_round_trip_their_adjoints() {
     let a = matrix::<3, 4>();
     let x = vector::<3>();
@@ -460,6 +493,32 @@ fn each_backward_pass_is_independent_of_the_last() {
     let scaled = x.scale(3.0).sum();
     (&loss + &scaled).backward();
     assert_eq!(x.grad().to_array(), [4.0; 3]);
+}
+
+#[test]
+fn a_backward_pass_clears_gradients_on_later_nodes() {
+    let tape = Tape::<Host>::new();
+    let x = tape.scalar(2.0);
+    let earlier = x.scale(3.0);
+    let later = earlier.scale(4.0);
+
+    later.backward();
+    assert!(later.has_grad());
+
+    earlier.backward();
+    assert!(!later.has_grad());
+    assert_eq!(later.grad(), 0.0);
+    assert_eq!(x.grad(), 3.0);
+}
+
+#[test]
+#[should_panic(expected = "reverse-mode operands belong to different tapes")]
+fn operands_from_different_tapes_are_rejected() {
+    let left_tape = Tape::<Host>::new();
+    let right_tape = Tape::<Host>::new();
+    let left = left_tape.scalar(1.0);
+    let right = right_tape.scalar(2.0);
+    let _ = &left + &right;
 }
 
 #[test]
@@ -931,4 +990,40 @@ fn jacobians_and_outer_products_agree_between_the_backends() {
 
     assert_slice_close(gu.grad().as_slice(), hu.grad().as_slice(), "∂(u⊗v)/∂u");
     assert_slice_close(gv.grad().as_slice(), hv.grad().as_slice(), "∂(u⊗v)/∂v");
+}
+
+#[test]
+fn the_squared_error_reductions_are_all_the_same_scalar() {
+    // ‖R‖²_F is the sum of squares however it is spelled: as the Frobenius inner
+    // product with itself, as an elementwise square then a sum, or as the vector
+    // dot product of the flattening. Same value, and same gradient 2R.
+    let residual = matrix::<3, 4>();
+    let expected: f32 = residual.as_slice().iter().map(|value| value * value).sum();
+
+    let tape = Tape::new();
+    let r = tape.matrix(residual);
+    let frobenius = r.frobenius_dot(&r);
+    let squared_then_summed = (&r * &r).sum();
+    let flattened = r.flattened().dot(&r.flattened());
+
+    assert!(close(*frobenius.value(), expected), "frobenius_dot");
+    assert!(close(*squared_then_summed.value(), expected), "(R⊙R).sum()");
+    assert!(close(*flattened.value(), expected), "flattened dot");
+
+    // Each reduction differentiates to 2R — the factor of two comes from the two
+    // edges into `r`, not from a special rule for squaring.
+    for output in [&frobenius, &squared_then_summed, &flattened] {
+        output.backward();
+        assert_slice_close(
+            r.grad().as_slice(),
+            residual.scale(2.0).as_slice(),
+            "d‖R‖²/dR",
+        );
+    }
+
+    // A plain sum is *not* a loss: signed errors cancel, and its gradient is
+    // constant, so descent would push every residual toward −∞.
+    tape.zero_grad();
+    r.sum().backward();
+    assert_eq!(r.grad().to_rows(), [[1.0f32; 4]; 3]);
 }

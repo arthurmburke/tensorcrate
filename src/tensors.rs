@@ -83,6 +83,15 @@ mod simd_dispatch {
         Some(unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<U>(), values.len()) })
     }
 
+    unsafe fn as_slice_mut<T: 'static, U: 'static>(values: &mut [T]) -> Option<&mut [U]> {
+        if !is::<T, U>() {
+            return None;
+        }
+        Some(unsafe {
+            std::slice::from_raw_parts_mut(values.as_mut_ptr().cast::<U>(), values.len())
+        })
+    }
+
     fn from_f32<T: Copy + 'static>(v: f32) -> T {
         unsafe { std::ptr::read((&v as *const f32).cast::<T>()) }
     }
@@ -182,6 +191,41 @@ mod simd_dispatch {
         None
     }
 
+    pub fn matmul_add<T: Coefficient, const R: usize, const K: usize, const C: usize>(
+        a: &[[T; K]; R],
+        b: &[[T; C]; K],
+        addend: &mut [[T; C]; R],
+    ) -> bool {
+        if R.saturating_mul(K).saturating_mul(C) < MIN_MATMUL_OPS {
+            return false;
+        }
+        unsafe {
+            let a_flat = std::slice::from_raw_parts(a.as_ptr().cast::<T>(), R * K);
+            let b_flat = std::slice::from_raw_parts(b.as_ptr().cast::<T>(), K * C);
+            let addend_flat = std::slice::from_raw_parts_mut(
+                addend.as_mut_ptr().cast::<T>(),
+                R.saturating_mul(C),
+            );
+            if let (Some(a), Some(b), Some(addend)) = (
+                as_slice::<T, f32>(a_flat),
+                as_slice::<T, f32>(b_flat),
+                as_slice_mut::<T, f32>(addend_flat),
+            ) {
+                crate::simd::f32k::matmul_accumulate(a, b, R, K, C, addend);
+                return true;
+            }
+            if let (Some(a), Some(b), Some(addend)) = (
+                as_slice::<T, f64>(a_flat),
+                as_slice::<T, f64>(b_flat),
+                as_slice_mut::<T, f64>(addend_flat),
+            ) {
+                crate::simd::f64k::matmul_accumulate(a, b, R, K, C, addend);
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn matvec<T: Coefficient, const R: usize, const C: usize>(
         matrix: &[[T; C]; R],
         vector: &[T; C],
@@ -201,6 +245,38 @@ mod simd_dispatch {
             if let (Some(m), Some(v)) = (as_slice::<T, f64>(m), as_slice::<T, f64>(vector)) {
                 return Some(Vector::new(std::array::from_fn(|i| {
                     from_f64(crate::simd::f64k::dot(&m[i * C..i * C + C], v))
+                })));
+            }
+        }
+        None
+    }
+
+    pub fn matvec_add<T: Coefficient, const R: usize, const C: usize>(
+        matrix: &[[T; C]; R],
+        vector: &[T; C],
+        addend: &[T; R],
+    ) -> Option<Vector<T, R>> {
+        if R.saturating_mul(C) < MIN_MATMUL_OPS {
+            return None;
+        }
+        unsafe {
+            let m = std::slice::from_raw_parts(matrix.as_ptr().cast::<T>(), R * C);
+            if let (Some(m), Some(v), Some(addend)) = (
+                as_slice::<T, f32>(m),
+                as_slice::<T, f32>(vector),
+                as_slice::<T, f32>(addend),
+            ) {
+                return Some(Vector::new(std::array::from_fn(|i| {
+                    from_f32(crate::simd::f32k::dot(&m[i * C..i * C + C], v) + addend[i])
+                })));
+            }
+            if let (Some(m), Some(v), Some(addend)) = (
+                as_slice::<T, f64>(m),
+                as_slice::<T, f64>(vector),
+                as_slice::<T, f64>(addend),
+            ) {
+                return Some(Vector::new(std::array::from_fn(|i| {
+                    from_f64(crate::simd::f64k::dot(&m[i * C..i * C + C], v) + addend[i])
                 })));
             }
         }
@@ -1366,6 +1442,30 @@ impl<T: Coefficient, const R: usize, const C: usize> Matrix<T, R, C> {
         }
     }
 
+    /// Fused matrix multiply-add: `self·other + addend`.
+    ///
+    /// `addend` is consumed and used as the accumulator, avoiding a separate
+    /// product allocation and elementwise addition.
+    pub fn matmul_add<const C2: usize>(
+        &self,
+        other: &Matrix<T, C, C2>,
+        addend: Matrix<T, R, C2>,
+    ) -> Matrix<T, R, C2> {
+        let mut output = addend;
+        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        if simd_dispatch::matmul_add(&self.data, &other.data, &mut output.data) {
+            return output;
+        }
+        for i in 0..R {
+            for p in 0..C {
+                for j in 0..C2 {
+                    output.data[i][j] = output.data[i][j] + self.data[i][p] * other.data[p][j];
+                }
+            }
+        }
+        output
+    }
+
     /// Matrix times column vector: `(R×C)·(C×1) = (R×1)`.
     pub fn matvec(&self, v: &Vector<T, C>) -> Vector<T, R> {
         #[cfg(all(feature = "simd", target_arch = "aarch64"))]
@@ -1381,6 +1481,26 @@ impl<T: Coefficient, const R: usize, const C: usize> Matrix<T, R, C> {
                 sum
             }),
         }
+    }
+
+    /// Fused matrix-vector multiply-add: `self·v + addend`.
+    ///
+    /// Each row uses the SIMD dot-product kernel when available, and the owned
+    /// addend is updated in place.
+    pub fn matvec_add(&self, v: &Vector<T, C>, addend: Vector<T, R>) -> Vector<T, R> {
+        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        if let Some(output) = simd_dispatch::matvec_add(&self.data, &v.data, &addend.data) {
+            return output;
+        }
+        let mut output = addend;
+        for i in 0..R {
+            let mut sum = T::zero();
+            for p in 0..C {
+                sum = sum + self.data[i][p] * v.data[p];
+            }
+            output.data[i] = output.data[i] + sum;
+        }
+        output
     }
 
     /// Transpose: an `R×C` matrix becomes `C×R`.
@@ -1437,8 +1557,15 @@ impl<T: Coefficient, const N: usize> Matrix<T, N, N> {
     /// Inverse, by Gauss–Jordan elimination with partial pivoting on
     /// [`Coefficient::magnitude`] (so complex and dual elements, which have no
     /// ordering, still pivot sensibly). Returns [`Error::Singular`] when the
-    /// matrix has no inverse.
+    /// matrix has no inverse. Coefficient domains with truncating division, such
+    /// as primitive integers and integer-based complex or dual numbers, return
+    /// [`Error::InvalidArgument`] because Gauss–Jordan requires fractions.
     pub fn inverse(&self) -> Result<Self, Error> {
+        if !T::supports_fractional_division() {
+            return Err(Error::InvalidArgument(
+                "matrix inversion requires coefficients with fractional division".to_string(),
+            ));
+        }
         let mut a = self.data;
         let mut inv = Self::identity().data;
 

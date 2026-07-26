@@ -272,6 +272,46 @@ fn jacobian_columns_are_the_seeded_tangents() {
 }
 
 #[test]
+fn fused_multiply_adds_propagate_every_tangent() {
+    let a = matrix::<3, 4>();
+    let da = matrix_direction::<3, 4>();
+    let x = vector::<4>();
+    let dx = direction::<4>();
+    let bias = vector::<3>();
+    let dbias = direction::<3>();
+
+    let fused =
+        DualMatrix::new(a, da).matvec_add(&DualVector::new(x, dx), &DualVector::new(bias, dbias));
+    assert_slice_close(
+        fused.value().as_slice(),
+        a.matvec_add(&x, bias).as_slice(),
+        "fused matvec value",
+    );
+    assert_slice_close(
+        fused.tangent().as_slice(),
+        (da.matvec(&x) + a.matvec(&dx) + dbias).as_slice(),
+        "fused matvec tangent",
+    );
+
+    let b = matrix::<4, 2>();
+    let db = matrix_direction::<4, 2>();
+    let addend = matrix::<3, 2>();
+    let daddend = matrix_direction::<3, 2>();
+    let fused = DualMatrix::new(a, da)
+        .matmul_add(&DualMatrix::new(b, db), &DualMatrix::new(addend, daddend));
+    assert_slice_close(
+        fused.value().as_slice(),
+        a.matmul_add(&b, addend).as_slice(),
+        "fused matmul value",
+    );
+    assert_slice_close(
+        fused.tangent().as_slice(),
+        (da.matmul(&b) + a.matmul(&db) + daddend).as_slice(),
+        "fused matmul tangent",
+    );
+}
+
+#[test]
 fn constants_have_no_tangent_and_seeds_are_one_hot() {
     let constant = DualVector::<5>::constant(vector::<5>());
     assert_eq!(constant.tangent().to_array(), [0.0; 5]);

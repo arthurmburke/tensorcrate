@@ -264,6 +264,15 @@ fn determinant_and_inverse() {
 
     let singular = Matrix::from_rows([[1.0, 2.0], [2.0, 4.0]]);
     assert_eq!(singular.inverse(), Err(Error::Singular));
+
+    // Integer Gauss–Jordan division would truncate the first 1/2 to zero and
+    // silently return the wrong answer, even though this matrix is unimodular.
+    let integer = Matrix::<i32, 2, 2>::from_rows([[2, 1], [1, 1]]);
+    assert!(matches!(
+        integer.inverse(),
+        Err(Error::InvalidArgument(message))
+            if message.contains("fractional division")
+    ));
 }
 
 #[test]

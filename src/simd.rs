@@ -190,6 +190,42 @@ macro_rules! neon_kernels {
                 for v in out.iter_mut() {
                     *v = 0 as $t;
                 }
+                matmul_accumulate(a, b, m, k, n, out);
+            }
+
+            /// Row-major fused matrix multiply-add: `out = addend + a·b`.
+            ///
+            /// Initializing the accumulator from `addend` folds the addition
+            /// into the same NEON FMA loop as the product.
+            #[inline]
+            pub fn matmul_add(
+                a: &[$t],
+                b: &[$t],
+                addend: &[$t],
+                m: usize,
+                k: usize,
+                n: usize,
+                out: &mut [$t],
+            ) {
+                debug_assert!(
+                    a.len() == m * k
+                        && b.len() == k * n
+                        && addend.len() == m * n
+                        && out.len() == m * n
+                );
+                out.copy_from_slice(addend);
+                matmul_accumulate(a, b, m, k, n, out);
+            }
+
+            #[inline]
+            pub fn matmul_accumulate(
+                a: &[$t],
+                b: &[$t],
+                m: usize,
+                k: usize,
+                n: usize,
+                out: &mut [$t],
+            ) {
                 unsafe {
                     for i in 0..m {
                         let arow = i * k;

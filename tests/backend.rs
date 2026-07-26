@@ -208,6 +208,8 @@ fn products_match_the_host_backend() {
     let a = matrix::<12, 20>();
     let b = matrix::<20, 7>();
     let v = vector::<20>();
+    let vector_addend = vector::<12>();
+    let matrix_addend = matrix::<12, 7>();
     let row = vector::<12>();
 
     let (ga, gb) = (a.to_backend::<Metal>(), b.to_backend::<Metal>());
@@ -215,6 +217,16 @@ fn products_match_the_host_backend() {
     assert_eq!(
         ga.matvec(&v.to_backend()).to_backend::<Host>(),
         a.matvec(&v)
+    );
+    assert_eq!(
+        ga.matvec_add(&v.to_backend(), vector_addend.to_backend())
+            .to_backend::<Host>(),
+        a.matvec_add(&v, vector_addend)
+    );
+    assert_eq!(
+        ga.matmul_add(&gb, matrix_addend.to_backend())
+            .to_backend::<Host>(),
+        a.matmul_add(&b, matrix_addend)
     );
     assert_eq!(
         row.to_backend::<Metal>().vecmat(&ga).to_backend::<Host>(),
@@ -301,6 +313,8 @@ fn a_chain_of_operations_stays_in_shared_memory() {
 
     let b = matrix::<32, 32>().to_backend::<Metal>();
     let v = vector::<32>().to_backend::<Metal>();
+    let vector_addend = vector::<32>().to_backend::<Metal>();
+    let matrix_addend = matrix::<32, 32>().to_backend::<Metal>();
 
     // Nothing in here should touch the host: every intermediate is a shared
     // allocation produced by a kernel that read shared allocations.
@@ -311,6 +325,8 @@ fn a_chain_of_operations_stays_in_shared_memory() {
     let summed = &scaled + &product;
     assert!(summed.is_device_resident());
     assert!(summed.matvec(&v).is_device_resident());
+    assert!(a.matvec_add(&v, vector_addend).is_device_resident());
+    assert!(a.matmul_add(&b, matrix_addend).is_device_resident());
     assert!((&v * &v).is_device_resident());
 
     // `%` has no kernel: it round-trips, and the result comes back resident.

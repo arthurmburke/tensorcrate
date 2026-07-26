@@ -92,6 +92,7 @@ fn matmul_matches_triple_loop() {
     const N: usize = 7;
     let a: Vec<f32> = (0..M * K).map(|i| (i as f32) * 0.1).collect();
     let b: Vec<f32> = (0..K * N).map(|i| (i as f32) * 0.2 - 1.0).collect();
+    let addend: Vec<f32> = (0..M * N).map(|i| (i as f32) * -0.3 + 2.0).collect();
     let mut got = vec![0.0f32; M * N];
     f32k::matmul(&a, &b, M, K, N, &mut got);
     for i in 0..M {
@@ -101,6 +102,17 @@ fn matmul_matches_triple_loop() {
                 want += a[i * K + p] * b[p * N + j];
             }
             assert!(approx(got[i * N + j], want, 1e-4), "i={i} j={j}");
+        }
+    }
+
+    f32k::matmul_add(&a, &b, &addend, M, K, N, &mut got);
+    for i in 0..M {
+        for j in 0..N {
+            let mut want = addend[i * N + j];
+            for p in 0..K {
+                want += a[i * K + p] * b[p * N + j];
+            }
+            assert!(approx(got[i * N + j], want, 1e-4), "fused i={i} j={j}");
         }
     }
 }

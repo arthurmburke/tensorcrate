@@ -281,6 +281,27 @@ impl<const R: usize, const C: usize, B: Kernels> DualMatrix<R, C, B> {
         }
     }
 
+    /// Fused matrix multiply-add, differentiated:
+    /// `AB + D + (ȦB + AḂ + Ḋ)ε`.
+    pub fn matmul_add<const C2: usize>(
+        &self,
+        other: &DualMatrix<C, C2, B>,
+        addend: &DualMatrix<R, C2, B>,
+    ) -> DualMatrix<R, C2, B> {
+        DualMatrix {
+            value: B::matmul_add(&self.value, &other.value, duplicate_matrix(&addend.value)),
+            tangent: B::matmul_add(
+                &self.value,
+                &other.tangent,
+                B::matmul_add(
+                    &self.tangent,
+                    &other.value,
+                    duplicate_matrix(&addend.tangent),
+                ),
+            ),
+        }
+    }
+
     /// Matrix times column vector, differentiated: `Av + (Ȧv + Av̇)ε`.
     pub fn matvec(&self, v: &DualVector<C, B>) -> DualVector<R, B> {
         DualVector {
@@ -289,6 +310,19 @@ impl<const R: usize, const C: usize, B: Kernels> DualMatrix<R, C, B> {
                 &B::matvec(&self.tangent, &v.value),
                 &B::matvec(&self.value, &v.tangent),
                 BinaryOp::Add,
+            ),
+        }
+    }
+
+    /// Fused matrix-vector multiply-add, differentiated:
+    /// `Av + b + (Ȧv + Av̇ + ḃ)ε`.
+    pub fn matvec_add(&self, v: &DualVector<C, B>, addend: &DualVector<R, B>) -> DualVector<R, B> {
+        DualVector {
+            value: B::matvec_add(&self.value, &v.value, duplicate_vector(&addend.value)),
+            tangent: B::matvec_add(
+                &self.value,
+                &v.tangent,
+                B::matvec_add(&self.tangent, &v.value, duplicate_vector(&addend.tangent)),
             ),
         }
     }

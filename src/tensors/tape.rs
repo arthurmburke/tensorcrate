@@ -58,7 +58,8 @@
 //! - the binary operations `+ - * / %`, elementwise, and as operators on `&Var`;
 //! - negation, and scaling or shifting by a constant;
 //! - products: [`matmul`](MatrixVar::matmul), [`matvec`](MatrixVar::matvec),
-//!   [`vecmat`](VectorVar::vecmat), [`dot`](VectorVar::dot);
+//!   their fused multiply-add forms, [`vecmat`](VectorVar::vecmat), and
+//!   [`dot`](VectorVar::dot);
 //! - reductions to a scalar: [`sum`](VectorVar::sum), [`dot`](VectorVar::dot);
 //! - reshaping: [`transpose`](MatrixVar::transpose),
 //!   [`flattened`](MatrixVar::flattened), [`into_row`](VectorVar::into_row),
@@ -322,14 +323,25 @@ impl<'t, T: Adjoint<B>, B: Kernels> Var<'t, T, B> {
     /// one pass rather than two.
     pub fn backward_with(&self, seed: T) {
         let nodes = self.tape.nodes.borrow();
-        let reachable = &nodes[..=self.node.index];
-        for node in reachable {
+        // A fresh pass invalidates every gradient on the tape, including nodes
+        // recorded after this output. Those later nodes are not propagated, but
+        // retaining their previous adjoints would make `grad()` report stale
+        // results from an earlier pass.
+        for node in nodes.iter() {
             node.clear();
         }
+        let reachable = &nodes[..=self.node.index];
         self.node.accumulate(seed);
         for node in reachable.iter().rev() {
             node.propagate();
         }
+    }
+
+    fn assert_same_tape<U>(&self, other: &Var<'t, U, B>) {
+        assert!(
+            std::ptr::eq(self.tape, other.tape),
+            "reverse-mode operands belong to different tapes"
+        );
     }
 
     /// Record a node whose rule pushes into this graph.
@@ -388,6 +400,7 @@ fn truncated_quotient(a: &[f32], b: &[f32]) -> Vec<f32> {
 
 impl<'t, B: Kernels> ScalarVar<'t, B> {
     fn binary(&self, rhs: &Self, op: BinaryOp) -> Self {
+        self.assert_same_tape(rhs);
         let (x, y) = (self.node.value, rhs.node.value);
         let value = match op {
             BinaryOp::Add => x + y,
@@ -477,6 +490,7 @@ impl<'t, B: Kernels> ScalarVar<'t, B> {
 
 impl<'t, const N: usize, B: Kernels> VectorVar<'t, N, B> {
     fn binary(&self, rhs: &Self, op: BinaryOp) -> Self {
+        self.assert_same_tape(rhs);
         let value = vector_op(self.value(), rhs.value(), op);
         let (left, right) = (self.node.clone(), rhs.node.clone());
         self.record(value, move |adjoint| match op {
@@ -564,6 +578,7 @@ impl<'t, const N: usize, B: Kernels> VectorVar<'t, N, B> {
 
     /// Dot product: `ū += s̄·v` and `v̄ += s̄·u`.
     pub fn dot(&self, other: &Self) -> ScalarVar<'t, B> {
+        self.assert_same_tape(other);
         let value = B::dot(self.value(), other.value());
         let (left, right) = (self.node.clone(), other.node.clone());
         self.record(value, move |adjoint| {
@@ -585,6 +600,7 @@ impl<'t, const N: usize, B: Kernels> VectorVar<'t, N, B> {
 
     /// Row vector times matrix, `(1×N)·(N×C)`: `x̄ += A·ȳ` and `Ā += x ⊗ ȳ`.
     pub fn vecmat<const C: usize>(&self, m: &MatrixVar<'t, N, C, B>) -> VectorVar<'t, C, B> {
+        self.assert_same_tape(m);
         let value = B::vecmat(self.value(), m.value());
         let (vector, matrix) = (self.node.clone(), m.node.clone());
         self.record(value, move |adjoint| {
@@ -613,6 +629,7 @@ impl<'t, const N: usize, B: Kernels> VectorVar<'t, N, B> {
     /// weight update looks like. Its own rules are the two contractions of the
     /// adjoint: `ū = Ȳ·v` and `v̄ = uᵀ·Ȳ`.
     pub fn outer<const M: usize>(&self, other: &VectorVar<'t, M, B>) -> MatrixVar<'t, N, M, B> {
+        self.assert_same_tape(other);
         let value = outer(self.value(), other.value());
         let (left, right) = (self.node.clone(), other.node.clone());
         self.record(value, move |adjoint| {
@@ -654,6 +671,7 @@ fn outer<const R: usize, const C: usize, B: Kernels>(
 
 impl<'t, const R: usize, const C: usize, B: Kernels> MatrixVar<'t, R, C, B> {
     fn binary(&self, rhs: &Self, op: BinaryOp) -> Self {
+        self.assert_same_tape(rhs);
         let value = matrix_op(self.value(), rhs.value(), op);
         let (left, right) = (self.node.clone(), rhs.node.clone());
         self.record(value, move |adjoint| match op {
@@ -732,6 +750,7 @@ impl<'t, const R: usize, const C: usize, B: Kernels> MatrixVar<'t, R, C, B> {
         &self,
         other: &MatrixVar<'t, C, C2, B>,
     ) -> MatrixVar<'t, R, C2, B> {
+        self.assert_same_tape(other);
         let value = B::matmul(self.value(), other.value());
         let (left, right) = (self.node.clone(), other.node.clone());
         self.record(value, move |adjoint| {
@@ -751,13 +770,59 @@ impl<'t, const R: usize, const C: usize, B: Kernels> MatrixVar<'t, R, C, B> {
         })
     }
 
+    /// Fused matrix multiply-add: `self·other + addend`.
+    pub fn matmul_add<const C2: usize>(
+        &self,
+        other: &MatrixVar<'t, C, C2, B>,
+        addend: &MatrixVar<'t, R, C2, B>,
+    ) -> MatrixVar<'t, R, C2, B> {
+        self.assert_same_tape(other);
+        self.assert_same_tape(addend);
+        let value = B::matmul_add(self.value(), other.value(), addend.value().duplicate());
+        let (left, right, bias) = (self.node.clone(), other.node.clone(), addend.node.clone());
+        self.record(value, move |adjoint| {
+            let left_adjoint = B::matmul_add(
+                adjoint,
+                &B::transpose(&right.value),
+                current_or_zeros(&left.adjoint),
+            );
+            *left.adjoint.borrow_mut() = Some(left_adjoint);
+
+            let right_adjoint = B::matmul_add(
+                &B::transpose(&left.value),
+                adjoint,
+                current_or_zeros(&right.adjoint),
+            );
+            *right.adjoint.borrow_mut() = Some(right_adjoint);
+            bias.accumulate(adjoint.duplicate());
+        })
+    }
+
     /// Matrix times vector: `Ā += ȳ ⊗ x` and `x̄ += Aᵀ·ȳ`.
     pub fn matvec(&self, v: &VectorVar<'t, C, B>) -> VectorVar<'t, R, B> {
+        self.assert_same_tape(v);
         let value = B::matvec(self.value(), v.value());
         let (matrix, vector) = (self.node.clone(), v.node.clone());
         self.record(value, move |adjoint| {
             matrix.accumulate(outer(adjoint, &vector.value));
             vector.accumulate(B::vecmat(adjoint, &matrix.value));
+        })
+    }
+
+    /// Fused matrix-vector multiply-add: `self·v + addend`.
+    pub fn matvec_add(
+        &self,
+        v: &VectorVar<'t, C, B>,
+        addend: &VectorVar<'t, R, B>,
+    ) -> VectorVar<'t, R, B> {
+        self.assert_same_tape(v);
+        self.assert_same_tape(addend);
+        let value = B::matvec_add(self.value(), v.value(), addend.value().duplicate());
+        let (matrix, vector, bias) = (self.node.clone(), v.node.clone(), addend.node.clone());
+        self.record(value, move |adjoint| {
+            matrix.accumulate(outer(adjoint, &vector.value));
+            vector.accumulate(B::vecmat(adjoint, &matrix.value));
+            bias.accumulate(adjoint.duplicate());
         })
     }
 

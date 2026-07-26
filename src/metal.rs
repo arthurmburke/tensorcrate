@@ -5,9 +5,10 @@
 //! FFTs to the GPU. Metal compute shaders are 32-bit, so `f64`, matrix
 //! inversion, and non-radix-2 FFT leaves stay on the CPU path.
 //!
-//! Every entry point returns `Option`: if no Metal device is available, or any
-//! step fails, the caller falls back to the CPU kernel, so enabling the feature
-//! never changes results — only performance.
+//! Every entry point returns `Option`: if no Metal device is available or an
+//! operation cannot be encoded, the caller falls back to the CPU kernel. A
+//! failure reported asynchronously by Metal is surfaced as a panic at the next
+//! synchronization point rather than exposing an incomplete output buffer.
 //!
 //! Input/output buffers are recycled through a small per-thread pool so
 //! repeated calls avoid re-allocating GPU memory.
@@ -546,7 +547,11 @@ impl MetalBuffer {
     /// where queued GPU work has to have actually happened; it blocks until it
     /// has. Every CPU read of a `Metal`-backed tensor comes through here.
     pub fn as_slice(&self) -> &[f32] {
-        with_gpu(sync);
+        with_gpu(|gpu| {
+            sync_or_panic(gpu);
+            Some(())
+        })
+        .expect("a Metal buffer cannot outlive its thread-local device");
         // SAFETY: `MTLStorageModeShared` memory is CPU-readable at
         // `contents()`, and holds `len` initialized floats — a buffer is only
         // handed out after an upload or a kernel that writes every element. The
@@ -1296,6 +1301,14 @@ fn sync(gpu: &Gpu) -> Option<()> {
     ok.then_some(())
 }
 
+/// Synchronize queued work and stop before an incomplete allocation can be read.
+fn sync_or_panic(gpu: &Gpu) {
+    assert!(
+        sync(gpu).is_some(),
+        "Metal command buffer failed; its output is invalid"
+    );
+}
+
 /// Block until all GPU work submitted on this thread has completed.
 ///
 /// Operations on [`Metal`](crate::tensors::Metal)-backed tensors are queued and
@@ -1303,7 +1316,13 @@ fn sync(gpu: &Gpu) -> Option<()> {
 /// work observable — reading the values back already does it implicitly. It is
 /// also what a benchmark needs in order to time GPU work rather than submission.
 pub fn synchronize() {
-    with_gpu(sync);
+    autoreleasepool(|_| {
+        GPU.with(|cell| {
+            if let Some(gpu) = cell.get_or_init(build_gpu).as_ref() {
+                sync_or_panic(gpu);
+            }
+        });
+    });
 }
 
 /// GPU elementwise `f32` op over two equal-length buffers. `op` is 0=add,

@@ -18,6 +18,15 @@ use num_traits::{Float, Num, One, Zero};
 /// Because `Complex` and `Dual` are themselves coefficients, the extensions
 /// nest — `Dual<Complex<f64>>` and `Vector<Dual<f64>, N>` are ordinary types.
 pub trait Coefficient: Num + Copy + 'static {
+    /// Whether ordinary division belongs to a field-like coefficient domain.
+    ///
+    /// Matrix inversion needs fractional intermediate values. Primitive integer
+    /// division truncates them, so it cannot implement Gauss–Jordan elimination
+    /// correctly even when the final inverse happens to contain only integers.
+    fn supports_fractional_division() -> bool {
+        true
+    }
+
     /// The quotient truncated toward zero, `trunc(self / rhs)`. This is the
     /// (locally constant) integer quotient underlying `%`.
     fn trunc_div(self, rhs: Self) -> Self;
@@ -34,6 +43,8 @@ pub trait Coefficient: Num + Copy + 'static {
 macro_rules! int_coefficient {
     ($($t:ty),+ $(,)?) => {$(
         impl Coefficient for $t {
+            fn supports_fractional_division() -> bool { false }
+
             // Integer division already truncates toward zero.
             fn trunc_div(self, rhs: Self) -> Self { self / rhs }
 
@@ -312,6 +323,10 @@ impl<T: Coefficient> Num for Dual<T> {
 /// Dual numbers are themselves valid coefficients, so a tensor can hold them
 /// (and a dual can nest for higher-order work).
 impl<T: Coefficient> Coefficient for Dual<T> {
+    fn supports_fractional_division() -> bool {
+        T::supports_fractional_division()
+    }
+
     /// The quotient is locally constant, so it carries no `ε` part.
     fn trunc_div(self, rhs: Self) -> Self {
         Dual::constant(self.real.trunc_div(rhs.real))
@@ -818,6 +833,10 @@ impl<T: Coefficient> Num for Complex<T> {
 /// Complex numbers are themselves valid coefficients, which is what lets a dual
 /// number carry complex parts (`Dual<Complex<f64>>`).
 impl<T: Coefficient> Coefficient for Complex<T> {
+    fn supports_fractional_division() -> bool {
+        T::supports_fractional_division()
+    }
+
     /// The quotient rounded to the nearest Gaussian integer — the same
     /// locally-constant quotient [`Complex`]'s own `%` uses.
     fn trunc_div(self, rhs: Self) -> Self {

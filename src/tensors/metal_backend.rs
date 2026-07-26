@@ -137,6 +137,27 @@ impl<const R: usize, const C: usize> Matrix<f32, R, C, Metal> {
         }
     }
 
+    /// Fused matrix multiply-add: `self·other + addend`.
+    ///
+    /// The owned addend is the Metal kernel's accumulator, so the operation
+    /// needs neither an intermediate product buffer nor a second dispatch.
+    pub fn matmul_add<const C2: usize>(
+        &self,
+        other: &Matrix<f32, C, C2, Metal>,
+        mut addend: Matrix<f32, R, C2, Metal>,
+    ) -> Matrix<f32, R, C2, Metal> {
+        if self
+            .data
+            .matmul_accumulate(&other.data, &mut addend.data, R, C, C2)
+            .is_some()
+        {
+            return addend;
+        }
+        self.to_backend::<Host>()
+            .matmul_add(&other.to_backend::<Host>(), addend.to_backend::<Host>())
+            .to_backend()
+    }
+
     /// Matrix times column vector: `(R×C)·(C×1) = (R×1)`, on the GPU.
     pub fn matvec(&self, v: &Vector<f32, C, Metal>) -> Vector<f32, R, Metal> {
         match self.data.matmul(&v.data, R, C, 1) {
@@ -146,6 +167,26 @@ impl<const R: usize, const C: usize> Matrix<f32, R, C, Metal> {
                 .matvec(&v.to_backend::<Host>())
                 .to_backend(),
         }
+    }
+
+    /// Fused matrix-vector multiply-add: `self·v + addend`.
+    ///
+    /// This is the same accumulating Metal matmul with a single output column.
+    pub fn matvec_add(
+        &self,
+        v: &Vector<f32, C, Metal>,
+        mut addend: Vector<f32, R, Metal>,
+    ) -> Vector<f32, R, Metal> {
+        if self
+            .data
+            .matmul_accumulate(&v.data, &mut addend.data, R, C, 1)
+            .is_some()
+        {
+            return addend;
+        }
+        self.to_backend::<Host>()
+            .matvec_add(&v.to_backend::<Host>(), addend.to_backend::<Host>())
+            .to_backend()
     }
 
     /// Transpose: an `R×C` matrix becomes `C×R`.

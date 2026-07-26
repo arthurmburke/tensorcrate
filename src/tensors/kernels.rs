@@ -227,6 +227,13 @@ pub trait Kernels: Backend {
         v: &Vector<f32, C, Self>,
     ) -> Vector<f32, R, Self>;
 
+    /// `addend + m·v`, using `addend` as the accumulator when possible.
+    fn matvec_add<const R: usize, const C: usize>(
+        m: &Matrix<f32, R, C, Self>,
+        v: &Vector<f32, C, Self>,
+        addend: Vector<f32, R, Self>,
+    ) -> Vector<f32, R, Self>;
+
     // ---- matrices ----
 
     fn matrix_elementwise<const R: usize, const C: usize>(
@@ -342,6 +349,14 @@ impl Kernels for Host {
         m.matvec(v)
     }
 
+    fn matvec_add<const R: usize, const C: usize>(
+        m: &Matrix<f32, R, C, Self>,
+        v: &Vector<f32, C, Self>,
+        addend: Vector<f32, R, Self>,
+    ) -> Vector<f32, R, Self> {
+        m.matvec_add(v, addend)
+    }
+
     fn matrix_elementwise<const R: usize, const C: usize>(
         a: &Matrix<f32, R, C, Self>,
         b: &Matrix<f32, R, C, Self>,
@@ -402,9 +417,7 @@ impl Kernels for Host {
         b: &Matrix<f32, K, C, Self>,
         addend: Matrix<f32, R, C, Self>,
     ) -> Matrix<f32, R, C, Self> {
-        // No accumulating kernel on the CPU path: the product and the sum are
-        // two passes either way.
-        a.matmul(b) + addend
+        a.matmul_add(b, addend)
     }
 
     fn transpose<const R: usize, const C: usize>(
@@ -487,6 +500,14 @@ mod gpu {
             m.matvec(v)
         }
 
+        fn matvec_add<const R: usize, const C: usize>(
+            m: &Matrix<f32, R, C, Self>,
+            v: &Vector<f32, C, Self>,
+            addend: Vector<f32, R, Self>,
+        ) -> Vector<f32, R, Self> {
+            m.matvec_add(v, addend)
+        }
+
         fn matrix_elementwise<const R: usize, const C: usize>(
             a: &Matrix<f32, R, C, Self>,
             b: &Matrix<f32, R, C, Self>,
@@ -543,16 +564,9 @@ mod gpu {
         fn matmul_add<const R: usize, const K: usize, const C: usize>(
             a: &Matrix<f32, R, K, Self>,
             b: &Matrix<f32, K, C, Self>,
-            mut addend: Matrix<f32, R, C, Self>,
+            addend: Matrix<f32, R, C, Self>,
         ) -> Matrix<f32, R, C, Self> {
-            // The fused form writes the product straight into `addend`.
-            if a.data
-                .matmul_accumulate(&b.data, &mut addend.data, R, K, C)
-                .is_some()
-            {
-                return addend;
-            }
-            matrix_elementwise(&a.matmul(b), &addend, BinaryOp::Add)
+            a.matmul_add(b, addend)
         }
 
         fn transpose<const R: usize, const C: usize>(
