@@ -85,7 +85,8 @@ enum class AnalyticOp : ushort {
     Ln = 9,
     Sinh = 10,
     Cosh = 11,
-    Tanh = 12
+    Tanh = 12,
+    Sqrt = 13
 };
 
 kernel void matmul_tiled(
@@ -293,6 +294,7 @@ inline float analytic_value(AnalyticOp op, float x) {
         case AnalyticOp::Sinh:   return sinh(x);
         case AnalyticOp::Cosh:   return cosh(x);
         case AnalyticOp::Tanh:   return tanh(x);
+        case AnalyticOp::Sqrt:   return sqrt(x);
         default: return NAN;
     }
 }
@@ -312,6 +314,7 @@ inline float analytic_derivative(AnalyticOp op, float x) {
         case AnalyticOp::Sinh:   return cosh(x);
         case AnalyticOp::Cosh:   return sinh(x);
         case AnalyticOp::Tanh:   { float t = tanh(x); return 1.0f - t * t; }
+        case AnalyticOp::Sqrt:   return 0.5f * rsqrt(x);
         default: return NAN;
     }
 }

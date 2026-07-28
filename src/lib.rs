@@ -29,6 +29,7 @@ pub mod errors;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal;
 pub mod numbers;
+pub mod optim;
 #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub mod simd;
 pub mod tensors;

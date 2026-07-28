@@ -131,11 +131,12 @@ pub enum Analytic {
     Sinh = 10,
     Cosh = 11,
     Tanh = 12,
+    Sqrt = 13,
 }
 
 impl Analytic {
     /// Every function, in discriminant order.
-    pub const ALL: [Analytic; 13] = [
+    pub const ALL: [Analytic; 14] = [
         Analytic::Sin,
         Analytic::Cos,
         Analytic::Tan,
@@ -149,6 +150,7 @@ impl Analytic {
         Analytic::Sinh,
         Analytic::Cosh,
         Analytic::Tanh,
+        Analytic::Sqrt,
     ];
 
     /// `f(x)`.
@@ -167,6 +169,7 @@ impl Analytic {
             Analytic::Sinh => x.sinh(),
             Analytic::Cosh => x.cosh(),
             Analytic::Tanh => x.tanh(),
+            Analytic::Sqrt => x.sqrt(),
         }
     }
 
@@ -198,6 +201,7 @@ impl Analytic {
                 let tanh = x.tanh();
                 1.0 - tanh * tanh
             }
+            Analytic::Sqrt => (2.0 * x.sqrt()).recip(),
         }
     }
 }

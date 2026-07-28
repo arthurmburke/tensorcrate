@@ -1,0 +1,7 @@
+# `generic_const_exprs` is what lets a shape like `Matrix<f32, OUT, { R * C }>`
+# name the flattening of an `R × C` input, so the crate needs nightly. Pinning it
+# here means the toolchain travels with the repository instead of living in a
+# per-directory rustup override — which is what broke when the crate was renamed.
+[toolchain]
+channel = "nightly"
+components = ["clippy", "rustfmt"]
