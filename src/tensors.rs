@@ -61,7 +61,7 @@ mod simd_dispatch {
 
     use std::any::TypeId;
 
-    use super::{BinaryOp, Complex, Matrix, Vector};
+    use super::{BinaryOp, Complex, Vector};
     use crate::numbers::Coefficient;
 
     // Below these lengths the generic scalar loop is already fine (and the
@@ -114,81 +114,108 @@ mod simd_dispatch {
         None
     }
 
-    pub fn elementwise<T: Coefficient>(a: &[T], b: &[T], op: BinaryOp) -> Option<Vec<T>> {
+    /// Writes `a op b` into `out`, returning whether the SIMD path ran.
+    ///
+    /// `out` is the caller's own storage. The earlier shape returned a `Vec`,
+    /// which cost two allocations — one for the kernel's scratch buffer and a
+    /// second for the `collect` that converted it back to `T` — plus a copy at
+    /// the call site.
+    pub fn elementwise<T: Coefficient>(a: &[T], b: &[T], op: BinaryOp, out: &mut [T]) -> bool {
         if a.len() < MIN_ELEMENTS || op == BinaryOp::Rem {
-            return None;
+            return false;
         }
+        debug_assert!(b.len() == a.len() && out.len() == a.len());
         unsafe {
-            if let (Some(a), Some(b)) = (as_slice::<T, f32>(a), as_slice::<T, f32>(b)) {
-                let mut out = vec![0.0f32; a.len()];
-                crate::simd::f32k::elementwise(a, b, op, &mut out);
-                return Some(out.into_iter().map(from_f32).collect());
+            if let (Some(a), Some(b), Some(out)) = (
+                as_slice::<T, f32>(a),
+                as_slice::<T, f32>(b),
+                as_slice_mut::<T, f32>(out),
+            ) {
+                crate::simd::f32k::elementwise(a, b, op, out);
+                return true;
             }
-            if let (Some(a), Some(b)) = (as_slice::<T, f64>(a), as_slice::<T, f64>(b)) {
-                let mut out = vec![0.0f64; a.len()];
-                crate::simd::f64k::elementwise(a, b, op, &mut out);
-                return Some(out.into_iter().map(from_f64).collect());
+            if let (Some(a), Some(b), Some(out)) = (
+                as_slice::<T, f64>(a),
+                as_slice::<T, f64>(b),
+                as_slice_mut::<T, f64>(out),
+            ) {
+                crate::simd::f64k::elementwise(a, b, op, out);
+                return true;
             }
         }
-        None
+        false
     }
 
+    /// Writes the tensor/scalar broadcast into `out`, returning whether the SIMD
+    /// path ran. Allocation-free for the same reason as [`elementwise`].
     pub fn broadcast<T: Coefficient>(
         values: &[T],
         scalar: T,
         op: BinaryOp,
         scalar_left: bool,
-    ) -> Option<Vec<T>> {
+        out: &mut [T],
+    ) -> bool {
         if values.len() < MIN_ELEMENTS || op == BinaryOp::Rem {
-            return None;
+            return false;
         }
+        debug_assert_eq!(out.len(), values.len());
         unsafe {
-            if let (Some(v), Some(s)) = (
+            if let (Some(v), Some(s), Some(out)) = (
                 as_slice::<T, f32>(values),
                 as_slice::<T, f32>(std::slice::from_ref(&scalar)),
+                as_slice_mut::<T, f32>(out),
             ) {
-                let mut out = vec![0.0f32; v.len()];
-                crate::simd::f32k::broadcast(v, s[0], op, scalar_left, &mut out);
-                return Some(out.into_iter().map(from_f32).collect());
+                crate::simd::f32k::broadcast(v, s[0], op, scalar_left, out);
+                return true;
             }
-            if let (Some(v), Some(s)) = (
+            if let (Some(v), Some(s), Some(out)) = (
                 as_slice::<T, f64>(values),
                 as_slice::<T, f64>(std::slice::from_ref(&scalar)),
+                as_slice_mut::<T, f64>(out),
             ) {
-                let mut out = vec![0.0f64; v.len()];
-                crate::simd::f64k::broadcast(v, s[0], op, scalar_left, &mut out);
-                return Some(out.into_iter().map(from_f64).collect());
+                crate::simd::f64k::broadcast(v, s[0], op, scalar_left, out);
+                return true;
             }
         }
-        None
+        false
     }
 
+    /// Writes `a·b` into `out`, returning whether the SIMD path ran.
+    ///
+    /// `out` is the caller's final storage, so the product lands in its
+    /// destination directly. The earlier shape of this function returned an
+    /// owned `Matrix` built from a `vec![0.0; R * C]` scratch buffer, which cost
+    /// an allocation plus a second element-by-element pass to copy out — at
+    /// `R = K = C = 8` that overhead was roughly twice the arithmetic itself.
     pub fn matmul<T: Coefficient, const R: usize, const K: usize, const C: usize>(
         a: &[[T; K]; R],
         b: &[[T; C]; K],
-    ) -> Option<Matrix<T, R, C>> {
+        out: &mut [[T; C]; R],
+    ) -> bool {
         if R.saturating_mul(K).saturating_mul(C) < MIN_MATMUL_OPS {
-            return None;
+            return false;
         }
+        let (a_flat, b_flat) = (a.as_flattened(), b.as_flattened());
+        let out_flat = out.as_flattened_mut();
         unsafe {
-            let a_flat = std::slice::from_raw_parts(a.as_ptr().cast::<T>(), R * K);
-            let b_flat = std::slice::from_raw_parts(b.as_ptr().cast::<T>(), K * C);
-            if let (Some(a), Some(b)) = (as_slice::<T, f32>(a_flat), as_slice::<T, f32>(b_flat)) {
-                let mut out = vec![0.0f32; R * C];
-                crate::simd::f32k::matmul(a, b, R, K, C, &mut out);
-                return Some(Matrix::from_rows(std::array::from_fn(|i| {
-                    std::array::from_fn(|j| from_f32(out[i * C + j]))
-                })));
+            if let (Some(a), Some(b), Some(out)) = (
+                as_slice::<T, f32>(a_flat),
+                as_slice::<T, f32>(b_flat),
+                as_slice_mut::<T, f32>(out_flat),
+            ) {
+                crate::simd::f32k::matmul(a, b, R, K, C, out);
+                return true;
             }
-            if let (Some(a), Some(b)) = (as_slice::<T, f64>(a_flat), as_slice::<T, f64>(b_flat)) {
-                let mut out = vec![0.0f64; R * C];
-                crate::simd::f64k::matmul(a, b, R, K, C, &mut out);
-                return Some(Matrix::from_rows(std::array::from_fn(|i| {
-                    std::array::from_fn(|j| from_f64(out[i * C + j]))
-                })));
+            if let (Some(a), Some(b), Some(out)) = (
+                as_slice::<T, f64>(a_flat),
+                as_slice::<T, f64>(b_flat),
+                as_slice_mut::<T, f64>(out_flat),
+            ) {
+                crate::simd::f64k::matmul(a, b, R, K, C, out);
+                return true;
             }
         }
-        None
+        false
     }
 
     pub fn matmul_add<T: Coefficient, const R: usize, const K: usize, const C: usize>(
@@ -199,13 +226,9 @@ mod simd_dispatch {
         if R.saturating_mul(K).saturating_mul(C) < MIN_MATMUL_OPS {
             return false;
         }
+        let (a_flat, b_flat) = (a.as_flattened(), b.as_flattened());
+        let addend_flat = addend.as_flattened_mut();
         unsafe {
-            let a_flat = std::slice::from_raw_parts(a.as_ptr().cast::<T>(), R * K);
-            let b_flat = std::slice::from_raw_parts(b.as_ptr().cast::<T>(), K * C);
-            let addend_flat = std::slice::from_raw_parts_mut(
-                addend.as_mut_ptr().cast::<T>(),
-                R.saturating_mul(C),
-            );
             if let (Some(a), Some(b), Some(addend)) = (
                 as_slice::<T, f32>(a_flat),
                 as_slice::<T, f32>(b_flat),
@@ -235,8 +258,10 @@ mod simd_dispatch {
         }
         // Row-times-vector: each output is a dot product of a matrix row with
         // the vector, so the per-row reduction kernel is the right shape here.
+        // `from_fn` writes straight into the returned vector's storage, so there
+        // is no scratch buffer to remove here.
+        let m = matrix.as_flattened();
         unsafe {
-            let m = std::slice::from_raw_parts(matrix.as_ptr().cast::<T>(), R * C);
             if let (Some(m), Some(v)) = (as_slice::<T, f32>(m), as_slice::<T, f32>(vector)) {
                 return Some(Vector::new(std::array::from_fn(|i| {
                     from_f32(crate::simd::f32k::dot(&m[i * C..i * C + C], v))
@@ -259,8 +284,8 @@ mod simd_dispatch {
         if R.saturating_mul(C) < MIN_MATMUL_OPS {
             return None;
         }
+        let m = matrix.as_flattened();
         unsafe {
-            let m = std::slice::from_raw_parts(matrix.as_ptr().cast::<T>(), R * C);
             if let (Some(m), Some(v), Some(addend)) = (
                 as_slice::<T, f32>(m),
                 as_slice::<T, f32>(vector),
@@ -283,28 +308,36 @@ mod simd_dispatch {
         None
     }
 
+    /// Writes `vectorᵀ·matrix` into `out`, returning whether the SIMD path ran.
     pub fn vecmat<T: Coefficient, const R: usize, const C: usize>(
         vector: &[T; R],
         matrix: &[[T; C]; R],
-    ) -> Option<Vector<T, C>> {
+        out: &mut [T; C],
+    ) -> bool {
         if R.saturating_mul(C) < MIN_MATMUL_OPS {
-            return None;
+            return false;
         }
         // (1×R)·(R×C): the broadcast-A matmul vectorizes across the C columns.
+        let m = matrix.as_flattened();
         unsafe {
-            let m = std::slice::from_raw_parts(matrix.as_ptr().cast::<T>(), R * C);
-            if let (Some(v), Some(m)) = (as_slice::<T, f32>(vector), as_slice::<T, f32>(m)) {
-                let mut out = vec![0.0f32; C];
-                crate::simd::f32k::matmul(v, m, 1, R, C, &mut out);
-                return Some(Vector::new(std::array::from_fn(|j| from_f32(out[j]))));
+            if let (Some(v), Some(m), Some(out)) = (
+                as_slice::<T, f32>(vector),
+                as_slice::<T, f32>(m),
+                as_slice_mut::<T, f32>(out),
+            ) {
+                crate::simd::f32k::matmul(v, m, 1, R, C, out);
+                return true;
             }
-            if let (Some(v), Some(m)) = (as_slice::<T, f64>(vector), as_slice::<T, f64>(m)) {
-                let mut out = vec![0.0f64; C];
-                crate::simd::f64k::matmul(v, m, 1, R, C, &mut out);
-                return Some(Vector::new(std::array::from_fn(|j| from_f64(out[j]))));
+            if let (Some(v), Some(m), Some(out)) = (
+                as_slice::<T, f64>(vector),
+                as_slice::<T, f64>(m),
+                as_slice_mut::<T, f64>(out),
+            ) {
+                crate::simd::f64k::matmul(v, m, 1, R, C, out);
+                return true;
             }
         }
-        None
+        false
     }
 
     /// In-place radix-2 FFT for power-of-two `f32` lengths. Returns `false` (so
@@ -483,8 +516,11 @@ impl<T: Coefficient, const N: usize> Vector<T, N> {
     #[doc(hidden)]
     pub fn broadcast_right(&self, scalar: T, op: BinaryOp) -> Self {
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
-        if let Some(output) = simd_dispatch::broadcast(&self.data, scalar, op, false) {
-            return Vector::new(std::array::from_fn(|index| output[index]));
+        {
+            let mut out = [T::zero(); N];
+            if simd_dispatch::broadcast(&self.data, scalar, op, false, &mut out) {
+                return Vector::new(out);
+            }
         }
         self.map(|&value| match op {
             BinaryOp::Add => value + scalar,
@@ -499,8 +535,11 @@ impl<T: Coefficient, const N: usize> Vector<T, N> {
     #[doc(hidden)]
     pub fn broadcast_left(&self, scalar: T, op: BinaryOp) -> Self {
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
-        if let Some(output) = simd_dispatch::broadcast(&self.data, scalar, op, true) {
-            return Vector::new(std::array::from_fn(|index| output[index]));
+        {
+            let mut out = [T::zero(); N];
+            if simd_dispatch::broadcast(&self.data, scalar, op, true, &mut out) {
+                return Vector::new(out);
+            }
         }
         self.map(|&value| match op {
             BinaryOp::Add => scalar + value,
@@ -528,8 +567,11 @@ impl<T: Coefficient, const N: usize> Vector<T, N> {
     /// Row vector times matrix: `(1×N)·(N×C) = (1×C)`.
     pub fn vecmat<const C: usize>(&self, m: &Matrix<T, N, C>) -> Vector<T, C> {
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
-        if let Some(output) = simd_dispatch::vecmat(&self.data, &m.data) {
-            return output;
+        {
+            let mut out = [T::zero(); C];
+            if simd_dispatch::vecmat(&self.data, &m.data, &mut out) {
+                return Vector::new(out);
+            }
         }
         Vector {
             data: std::array::from_fn(|j| {
@@ -1382,14 +1424,15 @@ impl<T: Coefficient, const R: usize, const C: usize> Matrix<T, R, C> {
     pub fn broadcast_right(&self, scalar: T, op: BinaryOp) -> Self {
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         {
-            // SAFETY: nested arrays are contiguous and hold exactly R*C `T`.
-            let input = unsafe {
-                std::slice::from_raw_parts(self.data.as_ptr().cast::<T>(), R.saturating_mul(C))
-            };
-            if let Some(output) = simd_dispatch::broadcast(input, scalar, op, false) {
-                return Matrix::from_rows(std::array::from_fn(|row| {
-                    std::array::from_fn(|col| output[row * C + col])
-                }));
+            let mut out = [[T::zero(); C]; R];
+            if simd_dispatch::broadcast(
+                self.data.as_flattened(),
+                scalar,
+                op,
+                false,
+                out.as_flattened_mut(),
+            ) {
+                return Matrix::from_rows(out);
             }
         }
         self.map(|&value| match op {
@@ -1406,14 +1449,15 @@ impl<T: Coefficient, const R: usize, const C: usize> Matrix<T, R, C> {
     pub fn broadcast_left(&self, scalar: T, op: BinaryOp) -> Self {
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         {
-            // SAFETY: nested arrays are contiguous and hold exactly R*C `T`.
-            let input = unsafe {
-                std::slice::from_raw_parts(self.data.as_ptr().cast::<T>(), R.saturating_mul(C))
-            };
-            if let Some(output) = simd_dispatch::broadcast(input, scalar, op, true) {
-                return Matrix::from_rows(std::array::from_fn(|row| {
-                    std::array::from_fn(|col| output[row * C + col])
-                }));
+            let mut out = [[T::zero(); C]; R];
+            if simd_dispatch::broadcast(
+                self.data.as_flattened(),
+                scalar,
+                op,
+                true,
+                out.as_flattened_mut(),
+            ) {
+                return Matrix::from_rows(out);
             }
         }
         self.map(|&value| match op {
@@ -1429,8 +1473,11 @@ impl<T: Coefficient, const R: usize, const C: usize> Matrix<T, R, C> {
     /// enforced by the type: a mismatch does not compile.
     pub fn matmul<const C2: usize>(&self, other: &Matrix<T, C, C2>) -> Matrix<T, R, C2> {
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
-        if let Some(output) = simd_dispatch::matmul(&self.data, &other.data) {
-            return output;
+        {
+            let mut out = [[T::zero(); C2]; R];
+            if simd_dispatch::matmul(&self.data, &other.data, &mut out) {
+                return Matrix { data: out };
+            }
         }
         Matrix {
             data: std::array::from_fn(|i| {
@@ -1655,8 +1702,11 @@ impl<T: Coefficient, const N: usize> Mul for Vector<T, N> {
 
     fn mul(self, rhs: Self) -> Self::Output {
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
-        if let Some(output) = simd_dispatch::elementwise(&self.data, &rhs.data, BinaryOp::Mul) {
-            return Vector::new(std::array::from_fn(|index| output[index]));
+        {
+            let mut out = [T::zero(); N];
+            if simd_dispatch::elementwise(&self.data, &rhs.data, BinaryOp::Mul, &mut out) {
+                return Vector::new(out);
+            }
         }
         self.zip_with(&rhs, |a, b| a * b)
     }
@@ -1668,17 +1718,14 @@ impl<T: Coefficient, const R: usize, const C: usize> Mul for Matrix<T, R, C> {
     fn mul(self, rhs: Self) -> Self::Output {
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         {
-            // SAFETY: nested arrays are contiguous and hold exactly R*C `T`.
-            let left = unsafe {
-                std::slice::from_raw_parts(self.data.as_ptr().cast::<T>(), R.saturating_mul(C))
-            };
-            let right = unsafe {
-                std::slice::from_raw_parts(rhs.data.as_ptr().cast::<T>(), R.saturating_mul(C))
-            };
-            if let Some(output) = simd_dispatch::elementwise(left, right, BinaryOp::Mul) {
-                return Matrix::from_rows(std::array::from_fn(|row| {
-                    std::array::from_fn(|col| output[row * C + col])
-                }));
+            let mut out = [[T::zero(); C]; R];
+            if simd_dispatch::elementwise(
+                self.data.as_flattened(),
+                rhs.data.as_flattened(),
+                BinaryOp::Mul,
+                out.as_flattened_mut(),
+            ) {
+                return Matrix::from_rows(out);
             }
         }
         self.zip_with(&rhs, |a, b| a * b)
