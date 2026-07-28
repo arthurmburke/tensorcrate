@@ -9,14 +9,14 @@
 //! 3. the `Metal` backend against the `Host` backend, which must agree because
 //!    they run the same code over different memory.
 
-use rinterp::numbers::Dual;
-use rinterp::tensors::dual::{
+use tensorcrate::numbers::Dual;
+use tensorcrate::tensors::dual::{
     DualMatrix, DualVector, gradient, gradient_wrt_matrix, jacobian, jacobian_wrt_matrix,
 };
-use rinterp::tensors::{Analytic, BinaryOp, Host, Kernels, Matrix, Vector};
+use tensorcrate::tensors::{Analytic, BinaryOp, Host, Kernels, Matrix, Vector};
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
-use rinterp::tensors::Metal;
+use tensorcrate::tensors::Metal;
 
 /// Loose enough for `f32` GPU transcendentals (the shaders compile with Metal's
 /// default fast-math), tight enough to catch a wrong derivative.
@@ -120,7 +120,7 @@ fn every_analytic_function_matches_the_scalar_dual_path() {
     let dual = DualVector::<8>::new(a, da);
     let oracle = dual.to_dual_vector();
 
-    use rinterp::numbers::{
+    use tensorcrate::numbers::{
         Arccos, Arcsin, Arctan, Cos, Cosh, Csc, Exp, Ln, Sec, Sin, Sinh, Tan, Tanh,
     };
 
@@ -668,7 +668,7 @@ fn matrix_derivatives_agree_between_the_backends() {
 
 #[test]
 fn comparisons_carry_the_tangent_of_whichever_operand_won() {
-    use rinterp::tensors::Compare;
+    use tensorcrate::tensors::Compare;
 
     let a = Vector::new([0.5f32, -1.0, 2.0]);
     let b = Vector::new([1.5f32, -2.0, 2.0]); // the last pair ties

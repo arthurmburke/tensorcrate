@@ -34,7 +34,7 @@
 //! what reverse mode exists to avoid.
 //!
 //! ```
-//! use rinterp::tensors::{DualMatrix, Matrix, Vector, gradient};
+//! use tensorcrate::tensors::{DualMatrix, Matrix, Vector, gradient};
 //!
 //! // ∇‖x‖² = 2x
 //! let x = Vector::new([1.0f32, 2.0, 3.0]);
@@ -815,7 +815,7 @@ pub fn jacobian<const IN: usize, const OUT: usize, B: Kernels>(
 /// implementation.
 ///
 /// ```
-/// use rinterp::tensors::{DualVector, Matrix, Vector, gradient_wrt_matrix};
+/// use tensorcrate::tensors::{DualVector, Matrix, Vector, gradient_wrt_matrix};
 ///
 /// // f(A) = ‖A·x‖², whose gradient is 2(Ax)xᵀ.
 /// let a = Matrix::<f32, 2, 3>::from_rows([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]);
@@ -859,7 +859,7 @@ pub fn gradient_wrt_matrix<const R: usize, const C: usize, B: Kernels>(
 /// `(OR·OC) × (R·C)`:
 ///
 /// ```
-/// # use rinterp::tensors::{DualMatrix, Matrix, jacobian_wrt_matrix};
+/// # use tensorcrate::tensors::{DualMatrix, Matrix, jacobian_wrt_matrix};
 /// # let a = Matrix::<f32, 2, 2>::identity();
 /// # let b = Matrix::<f32, 2, 2>::from_rows([[1.0, 2.0], [3.0, 4.0]]);
 /// let jacobian: Matrix<f32, 4, 4> = jacobian_wrt_matrix::<2, 2, 4, _>(&a, |m| {

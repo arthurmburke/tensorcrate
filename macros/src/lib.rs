@@ -92,12 +92,12 @@ impl Ty {
     /// The Rust type of a single element.
     fn element_type(self) -> TokenStream {
         let coefficient = if self.complex {
-            quote!(::rinterp::numbers::Complex<f64>)
+            quote!(::tensorcrate::numbers::Complex<f64>)
         } else {
             quote!(f64)
         };
         if self.dual {
-            quote!(::rinterp::numbers::Dual<#coefficient>)
+            quote!(::tensorcrate::numbers::Dual<#coefficient>)
         } else {
             coefficient
         }
@@ -108,8 +108,8 @@ impl Ty {
         let element = self.element_type();
         match self.shape {
             Shape::Scalar => element,
-            Shape::Vector(n) => quote!(::rinterp::tensors::Vector<#element, #n>),
-            Shape::Matrix(r, c) => quote!(::rinterp::tensors::Matrix<#element, #r, #c>),
+            Shape::Vector(n) => quote!(::tensorcrate::tensors::Vector<#element, #n>),
+            Shape::Matrix(r, c) => quote!(::tensorcrate::tensors::Matrix<#element, #r, #c>),
         }
     }
 
@@ -158,7 +158,7 @@ fn rewrite_matmul_operator(input: TokenStream) -> TokenStream {
                 slash.set_span(span);
                 output.extend([TokenTree::Punct(slash.clone())]);
                 output.extend([TokenTree::Ident(Ident::new(
-                    "__rinterp_matmul_operator__",
+                    "__tensorcrate_matmul_operator__",
                     span,
                 ))]);
                 output.extend([TokenTree::Punct(slash)]);
@@ -176,7 +176,7 @@ fn rewrite_matmul_operator(input: TokenStream) -> TokenStream {
 }
 
 fn is_matmul_marker(expr: &Expr) -> bool {
-    matches!(expr, Expr::Path(path) if path.path.is_ident("__rinterp_matmul_operator__"))
+    matches!(expr, Expr::Path(path) if path.path.is_ident("__tensorcrate_matmul_operator__"))
 }
 
 /// Recover the operands from the reserved `(lhs / marker) / rhs` AST shape.
@@ -230,7 +230,7 @@ fn expand(input: TokenStream) -> syn::Result<TokenStream> {
 
     Ok(if fallible {
         quote! {
-            (|| -> ::core::result::Result<#annotated, ::rinterp::errors::Error> {
+            (|| -> ::core::result::Result<#annotated, ::tensorcrate::errors::Error> {
                 #(#out)*
                 let __math_result: #annotated = #body;
                 ::core::result::Result::Ok(__math_result)
@@ -599,10 +599,10 @@ fn lower(expr: &Expr, target: Ty, env: &Env) -> syn::Result<TokenStream> {
                 })
                 .collect::<syn::Result<Vec<_>>>()?;
             Ok(if literal.is_matrix {
-                quote!(::rinterp::tensors::Matrix::from_rows([#([#(#rows),*]),*]))
+                quote!(::tensorcrate::tensors::Matrix::from_rows([#([#(#rows),*]),*]))
             } else {
                 let values = &rows[0];
-                quote!(::rinterp::tensors::Vector::new([#(#values),*]))
+                quote!(::tensorcrate::tensors::Vector::new([#(#values),*]))
             })
         }
         Expr::Path(p) => {
@@ -643,9 +643,9 @@ fn lower_literal(lit: &syn::ExprLit, target: Ty) -> syn::Result<TokenStream> {
     // real.
     let coefficient = if target.complex {
         if kind == LitKind::Imaginary {
-            quote!(::rinterp::numbers::Complex::imaginary(#value))
+            quote!(::tensorcrate::numbers::Complex::imaginary(#value))
         } else {
-            quote!(::rinterp::numbers::Complex::constant(#value))
+            quote!(::tensorcrate::numbers::Complex::constant(#value))
         }
     } else {
         quote!(#value)
@@ -655,9 +655,9 @@ fn lower_literal(lit: &syn::ExprLit, target: Ty) -> syn::Result<TokenStream> {
     Ok(if target.dual {
         if kind == LitKind::Epsilon {
             let zero = zero_of(target.complex);
-            quote!(::rinterp::numbers::Dual::new(#zero, #coefficient))
+            quote!(::tensorcrate::numbers::Dual::new(#zero, #coefficient))
         } else {
-            quote!(::rinterp::numbers::Dual::constant(#coefficient))
+            quote!(::tensorcrate::numbers::Dual::constant(#coefficient))
         }
     } else {
         coefficient
@@ -715,11 +715,11 @@ fn lower_binary(b: &syn::ExprBinary, target: Ty, env: &Env) -> syn::Result<Token
         }
     };
     let broadcast_op = match b.op {
-        BinOp::Add(_) => quote!(::rinterp::tensors::BinaryOp::Add),
-        BinOp::Sub(_) => quote!(::rinterp::tensors::BinaryOp::Sub),
-        BinOp::Mul(_) => quote!(::rinterp::tensors::BinaryOp::Mul),
-        BinOp::Div(_) => quote!(::rinterp::tensors::BinaryOp::Div),
-        BinOp::Rem(_) => quote!(::rinterp::tensors::BinaryOp::Rem),
+        BinOp::Add(_) => quote!(::tensorcrate::tensors::BinaryOp::Add),
+        BinOp::Sub(_) => quote!(::tensorcrate::tensors::BinaryOp::Sub),
+        BinOp::Mul(_) => quote!(::tensorcrate::tensors::BinaryOp::Mul),
+        BinOp::Div(_) => quote!(::tensorcrate::tensors::BinaryOp::Div),
+        BinOp::Rem(_) => quote!(::tensorcrate::tensors::BinaryOp::Rem),
         _ => unreachable!("unsupported operators returned above"),
     };
 
@@ -778,20 +778,20 @@ fn lower_call(call: &syn::ExprCall, target: Ty, env: &Env) -> syn::Result<TokenS
                     let exponent = lower(args[1], element, env)?;
                     Ok(quote!({
                         let __exponent = #exponent;
-                        (#base).map(|&__x| ::rinterp::numbers::Power::power(__x, __exponent))
+                        (#base).map(|&__x| ::tensorcrate::numbers::Power::power(__x, __exponent))
                     }))
                 } else {
                     let base = lower(args[0], element, env)?;
                     let exponent = lower(args[1], target, env)?;
                     Ok(quote!({
                         let __base = #base;
-                        (#exponent).map(|&__x| ::rinterp::numbers::Power::power(__base, __x))
+                        (#exponent).map(|&__x| ::tensorcrate::numbers::Power::power(__base, __x))
                     }))
                 }
             } else {
                 let base = lower(args[0], target, env)?;
                 let exponent = lower(args[1], target, env)?;
-                Ok(quote!(::rinterp::numbers::Power::power(#base, #exponent)))
+                Ok(quote!(::tensorcrate::numbers::Power::power(#base, #exponent)))
             }
         }
         ("dot", 2) => {
@@ -826,9 +826,9 @@ fn lower_call(call: &syn::ExprCall, target: Ty, env: &Env) -> syn::Result<TokenS
                 let conjugate_dual = |value: TokenStream| {
                     quote!({
                         let __dual = #value;
-                        ::rinterp::numbers::Dual::new(
-                            ::rinterp::numbers::Complex::conj(__dual.real),
-                            ::rinterp::numbers::Complex::conj(__dual.dual),
+                        ::tensorcrate::numbers::Dual::new(
+                            ::tensorcrate::numbers::Complex::conj(__dual.real),
+                            ::tensorcrate::numbers::Complex::conj(__dual.dual),
                         )
                     })
                 };
@@ -840,7 +840,7 @@ fn lower_call(call: &syn::ExprCall, target: Ty, env: &Env) -> syn::Result<TokenS
                 })
             } else {
                 Ok(elementwise(
-                    quote!(::rinterp::numbers::Complex::conj),
+                    quote!(::tensorcrate::numbers::Complex::conj),
                     inner,
                     target,
                 ))
@@ -852,7 +852,7 @@ fn lower_call(call: &syn::ExprCall, target: Ty, env: &Env) -> syn::Result<TokenS
             let method = syn::Ident::new(&name, call.func.span());
             let inner = lower(args[0], target, env)?;
             Ok(elementwise(
-                quote!(::rinterp::numbers::#trait_ident::#method),
+                quote!(::tensorcrate::numbers::#trait_ident::#method),
                 inner,
                 target,
             ))
@@ -877,7 +877,7 @@ fn elementwise(function: TokenStream, value: TokenStream, target: Ty) -> TokenSt
 /// Zero of the coefficient type.
 fn zero_of(complex: bool) -> TokenStream {
     if complex {
-        quote!(::rinterp::numbers::Complex::constant(0f64))
+        quote!(::tensorcrate::numbers::Complex::constant(0f64))
     } else {
         quote!(0f64)
     }
@@ -906,13 +906,13 @@ fn widen_scalar(value: TokenStream, from: Ty, to: Ty) -> TokenStream {
     if to.complex && !from.complex {
         out = if from.dual {
             // Dual<f64> -> Dual<Complex<f64>>: convert both coefficients.
-            quote!((#out).map(::rinterp::numbers::Complex::constant))
+            quote!((#out).map(::tensorcrate::numbers::Complex::constant))
         } else {
-            quote!(::rinterp::numbers::Complex::constant(#out))
+            quote!(::tensorcrate::numbers::Complex::constant(#out))
         };
     }
     if to.dual && !from.dual {
-        out = quote!(::rinterp::numbers::Dual::constant(#out));
+        out = quote!(::tensorcrate::numbers::Dual::constant(#out));
     }
     out
 }

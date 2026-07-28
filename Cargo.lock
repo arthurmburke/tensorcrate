@@ -120,27 +120,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rinterp"
-version = "0.1.0"
-dependencies = [
- "num-traits",
- "objc2",
- "objc2-foundation",
- "objc2-metal",
- "rinterp-macros",
- "typenum",
-]
-
-[[package]]
-name = "rinterp-macros"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "syn"
 version = "2.0.119"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -149,6 +128,27 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "tensorcrate"
+version = "0.1.0"
+dependencies = [
+ "num-traits",
+ "objc2",
+ "objc2-foundation",
+ "objc2-metal",
+ "tensorcrate-macros",
+ "typenum",
+]
+
+[[package]]
+name = "tensorcrate-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

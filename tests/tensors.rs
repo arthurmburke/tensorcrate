@@ -1,8 +1,8 @@
 //! Const-generic vector and matrix operations.
 
-use rinterp::errors::Error;
-use rinterp::numbers::{Complex, Dual};
-use rinterp::tensors::{BinaryOp, Matrix, MatrixOperand, Vector};
+use tensorcrate::errors::Error;
+use tensorcrate::numbers::{Complex, Dual};
+use tensorcrate::tensors::{BinaryOp, Matrix, MatrixOperand, Vector};
 
 fn close(a: f64, b: f64) -> bool {
     (a - b).abs() < 1e-9

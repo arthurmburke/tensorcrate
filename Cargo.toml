@@ -2,12 +2,12 @@
 members = ["macros"]
 
 [package]
-name = "rinterp"
+name = "tensorcrate"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rinterp-macros = { path = "macros" }
+tensorcrate-macros = { path = "macros" }
 num-traits = "0.2"
 typenum = "1.20"
 

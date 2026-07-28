@@ -17,7 +17,7 @@
 //! | log-cosh | `r.cosh().ln().sum()` | heavy tails: quadratic near zero, linear far out |
 //! | absolute error | `r.abs().sum()` | Laplace noise: fits the median, ignores outlier magnitude |
 
-use rinterp::tensors::{Matrix, Tape, Vector};
+use tensorcrate::tensors::{Matrix, Tape, Vector};
 
 const SAMPLES: usize = 24;
 const FEATURES: usize = 2;

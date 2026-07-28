@@ -10,7 +10,7 @@
 
 #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
 fn main() {
-    use rinterp::simd::f32k;
+    use tensorcrate::simd::f32k;
     use std::time::Instant;
 
     fn bench(label: &str, iters: u32, mut f: impl FnMut()) -> f64 {

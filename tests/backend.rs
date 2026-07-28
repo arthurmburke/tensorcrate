@@ -8,7 +8,7 @@
 
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
-use rinterp::tensors::{Backend, BinaryOp, Host, Matrix, Metal, Vector};
+use tensorcrate::tensors::{Backend, BinaryOp, Host, Matrix, Metal, Vector};
 
 /// Deterministic filler with a mix of signs and magnitudes, all integral so
 /// GPU and CPU accumulation orders agree exactly.

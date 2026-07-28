@@ -15,7 +15,7 @@
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 fn main() {
-    use rinterp::tensors::{Host, Matrix, Metal, Vector};
+    use tensorcrate::tensors::{Host, Matrix, Metal, Vector};
     use std::time::Instant;
 
     fn bench(label: &str, iters: u32, mut f: impl FnMut()) -> f64 {

@@ -1,4 +1,4 @@
-use rinterp::numbers::{
+use tensorcrate::numbers::{
     Arccos, Arcsin, Arctan, Cos, Cosh, Csc, Dual, Exp, Ln, Power, Sec, Sin, Sinh, Tan, Tanh,
 };
 

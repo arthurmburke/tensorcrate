@@ -20,7 +20,7 @@
 //!
 //! ```
 //! # #[cfg(all(feature = "metal", target_os = "macos"))] {
-//! use rinterp::tensors::{Host, Matrix, Metal};
+//! use tensorcrate::tensors::{Host, Matrix, Metal};
 //!
 //! let m: Matrix<f32, 2, 2> = Matrix::from_rows([[1.0, 2.0], [3.0, 4.0]]);
 //! let resident = m.to_backend::<Metal>(); // one upload

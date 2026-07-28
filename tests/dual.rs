@@ -1,4 +1,4 @@
-use rinterp::numbers::Dual;
+use tensorcrate::numbers::Dual;
 
 #[test]
 fn epsilon_squared_is_zero_but_epsilon_is_not() {

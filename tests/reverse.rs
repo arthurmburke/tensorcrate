@@ -6,14 +6,14 @@
 //! that way, then the pieces forward mode cannot express — `%`, and gradient
 //! accumulation across a shared subexpression — are checked directly.
 
-use rinterp::numbers::Dual;
-use rinterp::tensors::dual::{DualMatrix, DualVector, gradient, gradient_wrt_matrix};
-use rinterp::tensors::{
+use tensorcrate::numbers::Dual;
+use tensorcrate::tensors::dual::{DualMatrix, DualVector, gradient, gradient_wrt_matrix};
+use tensorcrate::tensors::{
     Analytic, BinaryOp, Host, Kernels, Matrix, MatrixVar, ScalarVar, Tape, Vector, VectorVar,
 };
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
-use rinterp::tensors::Metal;
+use tensorcrate::tensors::Metal;
 
 const TOLERANCE: f32 = 2e-3;
 
@@ -101,7 +101,7 @@ fn analytic_functions_compose_through_the_chain_rule() {
 
 #[test]
 fn scalar_analytic_functions_agree_with_the_dual_scalars() {
-    use rinterp::numbers::{Exp, Sin};
+    use tensorcrate::numbers::{Exp, Sin};
 
     // The scalar `Dual` path is the oracle: evaluating on the seed `x + 1·ε`
     // carries the derivative in the ε part.
@@ -767,8 +767,8 @@ fn sin_of_a_matrix_product_has_the_closed_form_gradient() {
 
 #[test]
 fn the_two_modes_produce_the_same_jacobian() {
-    use rinterp::tensors::dual::jacobian as forward_jacobian;
-    use rinterp::tensors::tape::jacobian as reverse_jacobian;
+    use tensorcrate::tensors::dual::jacobian as forward_jacobian;
+    use tensorcrate::tensors::tape::jacobian as reverse_jacobian;
 
     // f(x) = tanh(M·(x ⊙ x)): 4 inputs, 3 outputs, so reverse needs 3 passes
     // where forward needs 4 — and they must agree to the last useful digit.
@@ -800,8 +800,8 @@ fn the_two_modes_produce_the_same_jacobian() {
 
 #[test]
 fn jacobians_with_respect_to_a_matrix_agree_between_the_modes() {
-    use rinterp::tensors::dual::jacobian_wrt_matrix as forward_jacobian;
-    use rinterp::tensors::tape::jacobian_wrt_matrix as reverse_jacobian;
+    use tensorcrate::tensors::dual::jacobian_wrt_matrix as forward_jacobian;
+    use tensorcrate::tensors::tape::jacobian_wrt_matrix as reverse_jacobian;
 
     // f(A) = A·x, whose Jacobian is 3 × 12 with ∂(Ax)ᵢ/∂Aⱼₖ = δᵢⱼxₖ.
     let a = matrix::<3, 4>();
@@ -826,7 +826,7 @@ fn jacobians_with_respect_to_a_matrix_agree_between_the_modes() {
 
 #[test]
 fn a_matrix_valued_function_flattens_into_a_full_jacobian() {
-    use rinterp::tensors::tape::jacobian_wrt_matrix;
+    use tensorcrate::tensors::tape::jacobian_wrt_matrix;
 
     // Y = sin(A·B) with A 2×3 and B 3×2: the Jacobian is 4 × 6, and
     // ∂Y[i][j]/∂A[k][l] = δᵢₖ·cos(Z[i][j])·B[l][j].
@@ -898,7 +898,7 @@ fn outer_products_differentiate_in_both_operands() {
 
 #[test]
 fn the_jacobian_of_an_outer_product_is_the_rank_one_pattern() {
-    use rinterp::tensors::tape::jacobian;
+    use tensorcrate::tensors::tape::jacobian;
 
     // Y = u ⊗ v flattened is 12 outputs over 4 inputs, with
     // ∂Y[i][j]/∂u[k] = δᵢₖ·v[j].
@@ -955,7 +955,7 @@ fn matvec_gradients_are_the_outer_product_of_adjoint_and_input() {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn jacobians_and_outer_products_agree_between_the_backends() {
-    use rinterp::tensors::tape::jacobian_wrt_matrix;
+    use tensorcrate::tensors::tape::jacobian_wrt_matrix;
 
     let a = matrix::<4, 4>();
     let b = other_matrix::<4, 4>();
@@ -1032,7 +1032,7 @@ fn the_squared_error_reductions_are_all_the_same_scalar() {
 
 #[test]
 fn comparisons_pick_the_right_operand_and_split_ties() {
-    use rinterp::tensors::Compare;
+    use tensorcrate::tensors::Compare;
 
     // A deliberate tie in the middle: [.., 0.5 vs 0.5, ..].
     let a = Vector::new([0.5f32, -1.0, 2.0, 0.5]);
@@ -1250,7 +1250,7 @@ fn softmax_and_cross_entropy_work_end_to_end() {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn comparisons_and_reductions_agree_between_the_backends() {
-    use rinterp::tensors::Compare;
+    use tensorcrate::tensors::Compare;
 
     let a = matrix::<6, 5>();
     let b = other_matrix::<6, 5>();

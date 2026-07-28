@@ -15,7 +15,7 @@
 //! evaluation — reusing it across steps would append every step's nodes to the
 //! same graph and grow without bound.
 
-use rinterp::tensors::{Matrix, Tape, Vector};
+use tensorcrate::tensors::{Matrix, Tape, Vector};
 
 /// Rows of a small, well-conditioned design matrix.
 const SAMPLES: usize = 12;

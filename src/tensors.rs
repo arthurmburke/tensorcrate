@@ -380,7 +380,7 @@ impl<const N: usize, B: Backend> Vector<f32, N, B> {
     ///
     /// ```
     /// # #[cfg(all(feature = "metal", target_os = "macos"))] {
-    /// use rinterp::tensors::{Host, Metal, Vector};
+    /// use tensorcrate::tensors::{Host, Metal, Vector};
     ///
     /// let v = Vector::new([1.0f32, 2.0, 3.0]);
     /// let resident = v.to_backend::<Metal>();

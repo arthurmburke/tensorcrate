@@ -6,8 +6,8 @@
 
 #![cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
 
-use rinterp::simd::{f32k, f64k, fft_f32};
-use rinterp::tensors::{BinaryOp, Matrix, Vector};
+use tensorcrate::simd::{f32k, f64k, fft_f32};
+use tensorcrate::tensors::{BinaryOp, Matrix, Vector};
 
 fn approx(a: f32, b: f32, tol: f32) -> bool {
     (a - b).abs() <= tol * (1.0 + a.abs().max(b.abs()))

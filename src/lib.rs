@@ -6,7 +6,7 @@
 //! concrete Rust type that the compiler checks.
 //!
 //! ```
-//! use rinterp::math;
+//! use tensorcrate::math;
 //!
 //! let z = math! {
 //!     let x = 1 + 2i;
@@ -23,7 +23,7 @@
 /// statically-typed Rust using [`numbers`] and [`tensors`]. Matrix and
 /// matrix/vector products use `@`, vector `*` vector is a dot product, and
 /// analytic functions map elementwise over tensors.
-pub use rinterp_macros::math;
+pub use tensorcrate_macros::math;
 
 pub mod errors;
 #[cfg(all(feature = "metal", target_os = "macos"))]

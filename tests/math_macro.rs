@@ -1,5 +1,5 @@
-use rinterp::math;
-use rinterp::numbers::{Complex, Dual};
+use tensorcrate::math;
+use tensorcrate::numbers::{Complex, Dual};
 
 fn close(a: f64, b: f64) -> bool {
     (a - b).abs() < 1e-9
@@ -216,7 +216,7 @@ fn analytic_functions_and_power_preserve_complex_duals() {
 
 // ---- tensors ----------------------------------------------------------------
 
-use rinterp::tensors::{Matrix, Vector};
+use tensorcrate::tensors::{Matrix, Vector};
 
 #[test]
 fn vector_and_matrix_literals() {

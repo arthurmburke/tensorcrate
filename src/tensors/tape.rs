@@ -9,7 +9,7 @@
 //! # Using it
 //!
 //! ```
-//! use rinterp::tensors::{Matrix, Tape, Vector};
+//! use tensorcrate::tensors::{Matrix, Tape, Vector};
 //!
 //! let tape = Tape::new();
 //! let a = tape.matrix(Matrix::<f32, 2, 3>::from_rows([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]));
@@ -1220,8 +1220,8 @@ pub fn gradient_wrt_matrix<const R: usize, const C: usize, B: Kernels>(
 /// prefer reverse, and they agree to within floating-point error either way.
 ///
 /// ```
-/// use rinterp::tensors::Vector;
-/// use rinterp::tensors::tape::jacobian;
+/// use tensorcrate::tensors::Vector;
+/// use tensorcrate::tensors::tape::jacobian;
 ///
 /// // An elementwise map has a diagonal Jacobian: d sin(x)ᵢ/dxⱼ = δᵢⱼ cos(xᵢ).
 /// let at = Vector::new([0.5f32, 2.0]);
