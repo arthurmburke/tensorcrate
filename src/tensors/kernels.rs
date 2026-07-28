@@ -372,6 +372,50 @@ pub trait Kernels: Backend {
     fn transpose<const R: usize, const C: usize>(
         m: &Matrix<f32, R, C, Self>,
     ) -> Matrix<f32, C, R, Self>;
+
+    /// Valid cross-correlation: output `(i, j)` is the `KR × KC` window of
+    /// `input` at `(i, j)` dotted with `window`.
+    ///
+    /// `flip` reverses the window, which is the difference between correlation
+    /// (the machine-learning convention) and convolution (the signal-processing
+    /// one) — and is also what the input-side gradient of either needs.
+    fn correlate<const R: usize, const C: usize, const KR: usize, const KC: usize>(
+        input: &Matrix<f32, R, C, Self>,
+        window: &Matrix<f32, KR, KC, Self>,
+        flip: bool,
+    ) -> Matrix<f32, { R - KR + 1 }, { C - KC + 1 }, Self>;
+
+    /// `∂L/∂window` for a valid correlation: the input windowed by the output
+    /// adjoint, which comes out exactly the window's shape.
+    ///
+    /// The result shape is *named* rather than computed, which is the point.
+    /// Writing it as `correlate::<R, C, {R−KR+1}, {C−KC+1}>` would leave the
+    /// compiler needing to prove `R − (R−KR+1) + 1 == KR`, and const-expression
+    /// equality is beyond what `generic_const_exprs` can do.
+    fn correlate_window_gradient<const R: usize, const C: usize, const KR: usize, const KC: usize>(
+        input: &Matrix<f32, R, C, Self>,
+        adjoint: &Matrix<f32, { R - KR + 1 }, { C - KC + 1 }, Self>,
+    ) -> Matrix<f32, KR, KC, Self>;
+
+    /// `∂L/∂input` for a valid correlation: the full correlation of the adjoint
+    /// with the window, which is the padded one. `forward_flip` says which
+    /// convention the forward pass used; the gradient applies the window the
+    /// other way round.
+    fn correlate_input_gradient<const R: usize, const C: usize, const KR: usize, const KC: usize>(
+        adjoint: &Matrix<f32, { R - KR + 1 }, { C - KC + 1 }, Self>,
+        window: &Matrix<f32, KR, KC, Self>,
+        forward_flip: bool,
+    ) -> Matrix<f32, R, C, Self>;
+
+    /// Surround a matrix with zeros.
+    fn pad<const R: usize, const C: usize, const PR: usize, const PC: usize>(
+        input: &Matrix<f32, R, C, Self>,
+    ) -> Matrix<f32, { R + 2 * PR }, { C + 2 * PC }, Self>;
+
+    /// Reverse both axes.
+    fn flip<const R: usize, const C: usize>(
+        input: &Matrix<f32, R, C, Self>,
+    ) -> Matrix<f32, R, C, Self>;
 }
 
 /// Every operation here already exists as an inherent method or an operator on
@@ -566,6 +610,119 @@ impl Kernels for Host {
     ) -> Matrix<f32, C, R, Self> {
         m.transpose()
     }
+
+    fn correlate<const R: usize, const C: usize, const KR: usize, const KC: usize>(
+        input: &Matrix<f32, R, C, Self>,
+        window: &Matrix<f32, KR, KC, Self>,
+        flip: bool,
+    ) -> Matrix<f32, { R - KR + 1 }, { C - KC + 1 }, Self> {
+        let (values, taps) = (input.data(), window.data());
+        Matrix::from_rows(std::array::from_fn(|row| {
+            std::array::from_fn(|col| {
+                let mut sum = 0.0;
+                for window_row in 0..KR {
+                    for window_col in 0..KC {
+                        let (tap_row, tap_col) = if flip {
+                            (KR - 1 - window_row, KC - 1 - window_col)
+                        } else {
+                            (window_row, window_col)
+                        };
+                        sum += values[row + window_row][col + window_col] * taps[tap_row][tap_col];
+                    }
+                }
+                sum
+            })
+        }))
+    }
+
+    fn flip<const R: usize, const C: usize>(
+        input: &Matrix<f32, R, C, Self>,
+    ) -> Matrix<f32, R, C, Self> {
+        let values = input.data();
+        Matrix::from_rows(std::array::from_fn(|row| {
+            std::array::from_fn(|col| values[R - 1 - row][C - 1 - col])
+        }))
+    }
+
+    fn correlate_window_gradient<
+        const R: usize,
+        const C: usize,
+        const KR: usize,
+        const KC: usize,
+    >(
+        input: &Matrix<f32, R, C, Self>,
+        adjoint: &Matrix<f32, { R - KR + 1 }, { C - KC + 1 }, Self>,
+    ) -> Matrix<f32, KR, KC, Self> {
+        // K̄[a][b] = Σᵢⱼ Ȳ[i][j]·X[i+a][j+b]
+        let (values, upstream) = (input.data(), adjoint.data());
+        Matrix::from_rows(std::array::from_fn(|tap_row| {
+            std::array::from_fn(|tap_col| {
+                let mut sum = 0.0;
+                for row in 0..R - KR + 1 {
+                    for col in 0..C - KC + 1 {
+                        sum += upstream[row][col] * values[row + tap_row][col + tap_col];
+                    }
+                }
+                sum
+            })
+        }))
+    }
+
+    fn correlate_input_gradient<
+        const R: usize,
+        const C: usize,
+        const KR: usize,
+        const KC: usize,
+    >(
+        adjoint: &Matrix<f32, { R - KR + 1 }, { C - KC + 1 }, Self>,
+        window: &Matrix<f32, KR, KC, Self>,
+        forward_flip: bool,
+    ) -> Matrix<f32, R, C, Self> {
+        // X̄[p][q] = Σᵤᵥ Ȳ[p−u][q−v]·K[u][v], with the taps reversed when the
+        // forward pass reversed them. Out-of-range adjoint indices are the zeros
+        // a full correlation pads with.
+        let (upstream, taps) = (adjoint.data(), window.data());
+        let (out_rows, out_cols) = (R - KR + 1, C - KC + 1);
+        Matrix::from_rows(std::array::from_fn(|row| {
+            std::array::from_fn(|col| {
+                let mut sum = 0.0;
+                for window_row in 0..KR {
+                    for window_col in 0..KC {
+                        if row < window_row || col < window_col {
+                            continue;
+                        }
+                        let (source_row, source_col) = (row - window_row, col - window_col);
+                        if source_row >= out_rows || source_col >= out_cols {
+                            continue;
+                        }
+                        let (tap_row, tap_col) = if forward_flip {
+                            (KR - 1 - window_row, KC - 1 - window_col)
+                        } else {
+                            (window_row, window_col)
+                        };
+                        sum += upstream[source_row][source_col] * taps[tap_row][tap_col];
+                    }
+                }
+                sum
+            })
+        }))
+    }
+
+    fn pad<const R: usize, const C: usize, const PR: usize, const PC: usize>(
+        input: &Matrix<f32, R, C, Self>,
+    ) -> Matrix<f32, { R + 2 * PR }, { C + 2 * PC }, Self> {
+        let values = input.data();
+        Matrix::from_rows(std::array::from_fn(|row| {
+            std::array::from_fn(|col| {
+                let inside = row >= PR && row < PR + R && col >= PC && col < PC + C;
+                if inside {
+                    values[row - PR][col - PC]
+                } else {
+                    0.0
+                }
+            })
+        }))
+    }
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -748,6 +905,89 @@ mod gpu {
             m: &Matrix<f32, R, C, Self>,
         ) -> Matrix<f32, C, R, Self> {
             m.transpose()
+        }
+
+        fn correlate<const R: usize, const C: usize, const KR: usize, const KC: usize>(
+            input: &Matrix<f32, R, C, Self>,
+            window: &Matrix<f32, KR, KC, Self>,
+            flip: bool,
+        ) -> Matrix<f32, { R - KR + 1 }, { C - KC + 1 }, Self> {
+            match input.data.correlate(&window.data, R, C, KR, KC, flip) {
+                Some(data) => Matrix { data },
+                None => Host::correlate(
+                    &input.to_backend::<Host>(),
+                    &window.to_backend::<Host>(),
+                    flip,
+                )
+                .to_backend(),
+            }
+        }
+
+        fn flip<const R: usize, const C: usize>(
+            input: &Matrix<f32, R, C, Self>,
+        ) -> Matrix<f32, R, C, Self> {
+            match input.data.flip(R, C) {
+                Some(data) => Matrix { data },
+                None => Host::flip(&input.to_backend::<Host>()).to_backend(),
+            }
+        }
+
+        fn correlate_window_gradient<
+            const R: usize,
+            const C: usize,
+            const KR: usize,
+            const KC: usize,
+        >(
+            input: &Matrix<f32, R, C, Self>,
+            adjoint: &Matrix<f32, { R - KR + 1 }, { C - KC + 1 }, Self>,
+        ) -> Matrix<f32, KR, KC, Self> {
+            // Correlating the input with the adjoint as the window leaves
+            // exactly `KR × KC`, and the storage layer takes those as numbers.
+            match input
+                .data
+                .correlate(&adjoint.data, R, C, R - KR + 1, C - KC + 1, false)
+            {
+                Some(data) => Matrix { data },
+                None => Host::correlate_window_gradient::<R, C, KR, KC>(
+                    &input.to_backend::<Host>(),
+                    &adjoint.to_backend::<Host>(),
+                )
+                .to_backend(),
+            }
+        }
+
+        fn correlate_input_gradient<
+            const R: usize,
+            const C: usize,
+            const KR: usize,
+            const KC: usize,
+        >(
+            adjoint: &Matrix<f32, { R - KR + 1 }, { C - KC + 1 }, Self>,
+            window: &Matrix<f32, KR, KC, Self>,
+            forward_flip: bool,
+        ) -> Matrix<f32, R, C, Self> {
+            let padded = adjoint.data.pad(R - KR + 1, C - KC + 1, KR - 1, KC - 1);
+            let full = padded.and_then(|padded| {
+                padded.correlate(&window.data, R + KR - 1, C + KC - 1, KR, KC, !forward_flip)
+            });
+            match full {
+                Some(data) => Matrix { data },
+                None => Host::correlate_input_gradient::<R, C, KR, KC>(
+                    &adjoint.to_backend::<Host>(),
+                    &window.to_backend::<Host>(),
+                    forward_flip,
+                )
+                .to_backend(),
+            }
+        }
+
+        fn pad<const R: usize, const C: usize, const PR: usize, const PC: usize>(
+            input: &Matrix<f32, R, C, Self>,
+        ) -> Matrix<f32, { R + 2 * PR }, { C + 2 * PC }, Self> {
+            match input.data.pad(R, C, PR, PC) {
+                Some(data) => Matrix { data },
+                None => Host::pad::<R, C, PR, PC>(&input.to_backend::<Host>()).to_backend(),
+            }
         }
     }
 }

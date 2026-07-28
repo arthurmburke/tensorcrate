@@ -517,6 +517,59 @@ impl<const R: usize, const C: usize, B: Kernels> DualMatrix<R, C, B> {
         }
     }
 
+    /// Valid cross-correlation with a dual window.
+    ///
+    /// Correlation is bilinear, exactly like a matrix product, so the tangent is
+    /// the same two-term rule: `Ẋ ⋆ K + X ⋆ K̇`.
+    pub fn correlate<const KR: usize, const KC: usize>(
+        &self,
+        window: &DualMatrix<KR, KC, B>,
+    ) -> DualMatrix<{ R - KR + 1 }, { C - KC + 1 }, B> {
+        self.correlate_with(window, false)
+    }
+
+    /// Convolution proper, with the window reversed; see
+    /// [`MatrixVar::convolve`](super::tape::MatrixVar::convolve).
+    pub fn convolve<const KR: usize, const KC: usize>(
+        &self,
+        window: &DualMatrix<KR, KC, B>,
+    ) -> DualMatrix<{ R - KR + 1 }, { C - KC + 1 }, B> {
+        self.correlate_with(window, true)
+    }
+
+    fn correlate_with<const KR: usize, const KC: usize>(
+        &self,
+        window: &DualMatrix<KR, KC, B>,
+        flip: bool,
+    ) -> DualMatrix<{ R - KR + 1 }, { C - KC + 1 }, B> {
+        DualMatrix {
+            value: B::correlate(&self.value, &window.value, flip),
+            tangent: B::matrix_elementwise(
+                &B::correlate(&self.tangent, &window.value, flip),
+                &B::correlate(&self.value, &window.tangent, flip),
+                BinaryOp::Add,
+            ),
+        }
+    }
+
+    /// Surround both parts with zeros.
+    pub fn pad<const PR: usize, const PC: usize>(
+        &self,
+    ) -> DualMatrix<{ R + 2 * PR }, { C + 2 * PC }, B> {
+        DualMatrix {
+            value: B::pad::<R, C, PR, PC>(&self.value),
+            tangent: B::pad::<R, C, PR, PC>(&self.tangent),
+        }
+    }
+
+    /// Reverse both axes of both parts.
+    pub fn flipped(&self) -> Self {
+        DualMatrix {
+            value: B::flip(&self.value),
+            tangent: B::flip(&self.tangent),
+        }
+    }
+
     /// Sum along each row, giving one entry per row.
     ///
     /// This is `A·1`, so it needs no reduction kernel of its own — and on the

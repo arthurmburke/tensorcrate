@@ -195,6 +195,70 @@ kernel void compare_scalar(
     C[i] = compare_values(op, a, b);
 }
 
+// Valid cross-correlation: every output element is the window of `input` under
+// `weights`, summed. `flip` reverses the window, which turns cross-correlation
+// into convolution proper — and is what the input-side gradient needs.
+kernel void correlate(
+    device const float* input   [[buffer(0)]],
+    device const float* weights [[buffer(1)]],
+    device float* output        [[buffer(2)]],
+    constant uint& rows         [[buffer(3)]],
+    constant uint& cols         [[buffer(4)]],
+    constant uint& window_rows  [[buffer(5)]],
+    constant uint& window_cols  [[buffer(6)]],
+    constant uint& flip         [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint out_rows = rows - window_rows + 1;
+    uint out_cols = cols - window_cols + 1;
+    if (gid.y >= out_rows || gid.x >= out_cols) return;
+
+    float acc = 0.0f;
+    for (uint wr = 0; wr < window_rows; wr++) {
+        for (uint wc = 0; wc < window_cols; wc++) {
+            uint tap_row = flip ? window_rows - 1 - wr : wr;
+            uint tap_col = flip ? window_cols - 1 - wc : wc;
+            acc += input[(gid.y + wr) * cols + (gid.x + wc)]
+                 * weights[tap_row * window_cols + tap_col];
+        }
+    }
+    output[gid.y * out_cols + gid.x] = acc;
+}
+
+// Reverse both axes. The kernel-side gradient of a convolution is the flip of
+// the correlation's, so this is what lets both conventions differentiate.
+kernel void flip_both(
+    device const float* input [[buffer(0)]],
+    device float* output      [[buffer(1)]],
+    constant uint& rows       [[buffer(2)]],
+    constant uint& cols       [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.y >= rows || gid.x >= cols) return;
+    output[gid.y * cols + gid.x] = input[(rows - 1 - gid.y) * cols + (cols - 1 - gid.x)];
+}
+
+// Surround a matrix with zeros. The input-side gradient of a valid correlation
+// is a full one, and padding is how a full correlation is spelled.
+kernel void pad_zeros(
+    device const float* input [[buffer(0)]],
+    device float* output      [[buffer(1)]],
+    constant uint& rows       [[buffer(2)]],
+    constant uint& cols       [[buffer(3)]],
+    constant uint& pad_rows   [[buffer(4)]],
+    constant uint& pad_cols   [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint out_rows = rows + 2 * pad_rows;
+    uint out_cols = cols + 2 * pad_cols;
+    if (gid.y >= out_rows || gid.x >= out_cols) return;
+
+    bool inside = gid.y >= pad_rows && gid.y < pad_rows + rows
+               && gid.x >= pad_cols && gid.x < pad_cols + cols;
+    output[gid.y * out_cols + gid.x] =
+        inside ? input[(gid.y - pad_rows) * cols + (gid.x - pad_cols)] : 0.0f;
+}
+
 // Copy one input vector into a row or column of a row-major output matrix.
 // `output_stride == 1` writes a contiguous row; otherwise it scatters a column.
 kernel void stack_vector(
@@ -457,6 +521,9 @@ struct Gpu {
     concat_horizontal: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     merge_horizontal: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     transpose: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    correlate: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pad_zeros: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    flip_both: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     unary: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     unary_dual: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     fft_bit_reverse: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -507,6 +574,9 @@ fn build_gpu() -> Option<Gpu> {
         concat_horizontal: pipeline("concat_horizontal")?,
         merge_horizontal: pipeline("merge_horizontal")?,
         transpose: pipeline("transpose_tiled")?,
+        correlate: pipeline("correlate")?,
+        pad_zeros: pipeline("pad_zeros")?,
+        flip_both: pipeline("flip_both")?,
         unary: pipeline("unary")?,
         unary_dual: pipeline("unary_dual")?,
         fft_bit_reverse: pipeline("fft_bit_reverse")?,
@@ -716,6 +786,71 @@ impl MetalBuffer {
             with_gpu(|gpu| {
                 encode_elementwise(gpu, &self.raw, &rhs.raw, &output.raw, self.len, op)
             })?;
+        }
+        Some(output)
+    }
+
+    /// Valid cross-correlation of an `rows × cols` input with a
+    /// `window_rows × window_cols` kernel, both already resident.
+    ///
+    /// `flip` reverses the window, giving convolution rather than correlation.
+    pub fn correlate(
+        &self,
+        weights: &Self,
+        rows: usize,
+        cols: usize,
+        window_rows: usize,
+        window_cols: usize,
+        flip: bool,
+    ) -> Option<Self> {
+        if self.len != rows.checked_mul(cols)?
+            || weights.len != window_rows.checked_mul(window_cols)?
+        {
+            return None;
+        }
+        let out_rows = rows.checked_sub(window_rows)? + 1;
+        let out_cols = cols.checked_sub(window_cols)? + 1;
+        let output = Self::allocate(out_rows.checked_mul(out_cols)?)?;
+        if output.len != 0 {
+            with_gpu(|gpu| {
+                encode_correlate(
+                    gpu,
+                    &self.raw,
+                    &weights.raw,
+                    &output.raw,
+                    rows,
+                    cols,
+                    window_rows,
+                    window_cols,
+                    flip,
+                )
+            })?;
+        }
+        Some(output)
+    }
+
+    /// Surround an `rows × cols` matrix with `pad_rows`/`pad_cols` zeros.
+    pub fn pad(&self, rows: usize, cols: usize, pad_rows: usize, pad_cols: usize) -> Option<Self> {
+        if self.len != rows.checked_mul(cols)? {
+            return None;
+        }
+        let output = Self::allocate((rows + 2 * pad_rows).checked_mul(cols + 2 * pad_cols)?)?;
+        if output.len != 0 {
+            with_gpu(|gpu| {
+                encode_pad(gpu, &self.raw, &output.raw, rows, cols, pad_rows, pad_cols)
+            })?;
+        }
+        Some(output)
+    }
+
+    /// Reverse both axes of an `rows × cols` matrix.
+    pub fn flip(&self, rows: usize, cols: usize) -> Option<Self> {
+        if self.len != rows.checked_mul(cols)? {
+            return None;
+        }
+        let output = Self::allocate(self.len)?;
+        if self.len != 0 {
+            with_gpu(|gpu| encode_flip(gpu, &self.raw, &output.raw, rows, cols))?;
         }
         Some(output)
     }
@@ -1564,6 +1699,112 @@ fn fourier_transform_f32_interleaved(input: &[f32], inverse: bool) -> Option<Vec
         pool.release(values, false);
         Some(out)
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_correlate(
+    gpu: &Gpu,
+    input: &ProtocolObject<dyn MTLBuffer>,
+    weights: &ProtocolObject<dyn MTLBuffer>,
+    output: &ProtocolObject<dyn MTLBuffer>,
+    rows: usize,
+    cols: usize,
+    window_rows: usize,
+    window_cols: usize,
+    flip: bool,
+) -> Option<()> {
+    let command = gpu.queue.commandBuffer()?;
+    let encoder = command.computeCommandEncoder()?;
+    encoder.setComputePipelineState(&gpu.correlate);
+    let shape = [
+        u32::try_from(rows).ok()?,
+        u32::try_from(cols).ok()?,
+        u32::try_from(window_rows).ok()?,
+        u32::try_from(window_cols).ok()?,
+    ];
+    let flip = u32::from(flip);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(weights), 0, 1);
+        encoder.setBuffer_offset_atIndex(Some(output), 0, 2);
+        for (index, value) in shape.iter().enumerate() {
+            encoder.setBytes_length_atIndex(NonNull::from(value).cast(), 4, 3 + index);
+        }
+        encoder.setBytes_length_atIndex(NonNull::from(&flip).cast(), 4, 7);
+    }
+    dispatch_2d(&encoder, cols - window_cols + 1, rows - window_rows + 1);
+    encoder.endEncoding();
+    commit(gpu, command)
+}
+
+fn encode_pad(
+    gpu: &Gpu,
+    input: &ProtocolObject<dyn MTLBuffer>,
+    output: &ProtocolObject<dyn MTLBuffer>,
+    rows: usize,
+    cols: usize,
+    pad_rows: usize,
+    pad_cols: usize,
+) -> Option<()> {
+    let command = gpu.queue.commandBuffer()?;
+    let encoder = command.computeCommandEncoder()?;
+    encoder.setComputePipelineState(&gpu.pad_zeros);
+    let shape = [
+        u32::try_from(rows).ok()?,
+        u32::try_from(cols).ok()?,
+        u32::try_from(pad_rows).ok()?,
+        u32::try_from(pad_cols).ok()?,
+    ];
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
+        for (index, value) in shape.iter().enumerate() {
+            encoder.setBytes_length_atIndex(NonNull::from(value).cast(), 4, 2 + index);
+        }
+    }
+    dispatch_2d(&encoder, cols + 2 * pad_cols, rows + 2 * pad_rows);
+    encoder.endEncoding();
+    commit(gpu, command)
+}
+
+fn encode_flip(
+    gpu: &Gpu,
+    input: &ProtocolObject<dyn MTLBuffer>,
+    output: &ProtocolObject<dyn MTLBuffer>,
+    rows: usize,
+    cols: usize,
+) -> Option<()> {
+    let command = gpu.queue.commandBuffer()?;
+    let encoder = command.computeCommandEncoder()?;
+    encoder.setComputePipelineState(&gpu.flip_both);
+    let (rows_u, cols_u) = (u32::try_from(rows).ok()?, u32::try_from(cols).ok()?);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
+        encoder.setBytes_length_atIndex(NonNull::from(&rows_u).cast(), 4, 2);
+        encoder.setBytes_length_atIndex(NonNull::from(&cols_u).cast(), 4, 3);
+    }
+    dispatch_2d(&encoder, cols, rows);
+    encoder.endEncoding();
+    commit(gpu, command)
+}
+
+fn dispatch_2d(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    width: usize,
+    height: usize,
+) {
+    let grid = MTLSize {
+        width,
+        height,
+        depth: 1,
+    };
+    let per_group = MTLSize {
+        width: 16.min(width.max(1)),
+        height: 16.min(height.max(1)),
+        depth: 1,
+    };
+    encoder.dispatchThreads_threadsPerThreadgroup(grid, per_group);
 }
 
 fn dispatch_1d(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, len: usize) {

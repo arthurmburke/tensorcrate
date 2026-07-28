@@ -579,6 +579,44 @@ mod gpu {
             ))
         }
 
+        /// Valid cross-correlation, on the GPU.
+        pub(crate) fn correlate(
+            &self,
+            weights: &Self,
+            rows: usize,
+            cols: usize,
+            window_rows: usize,
+            window_cols: usize,
+            flip: bool,
+        ) -> Option<Self> {
+            let output = self.device()?.correlate(
+                weights.device()?,
+                rows,
+                cols,
+                window_rows,
+                window_cols,
+                flip,
+            )?;
+            Some(Self(Residency::Device(output)))
+        }
+
+        /// Reversal of both axes, on the GPU.
+        pub(crate) fn flip(&self, rows: usize, cols: usize) -> Option<Self> {
+            Some(Self(Residency::Device(self.device()?.flip(rows, cols)?)))
+        }
+
+        /// Zero padding, on the GPU.
+        pub(crate) fn pad(
+            &self,
+            rows: usize,
+            cols: usize,
+            pad_rows: usize,
+            pad_cols: usize,
+        ) -> Option<Self> {
+            let output = self.device()?.pad(rows, cols, pad_rows, pad_cols)?;
+            Some(Self(Residency::Device(output)))
+        }
+
         /// Elementwise comparison with another shared allocation.
         pub(crate) fn compare(&self, rhs: &Self, op: Compare) -> Option<Self> {
             let output = self.device()?.compare(rhs.device()?, op)?;

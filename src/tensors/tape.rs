@@ -1057,6 +1057,91 @@ impl<'t, const R: usize, const C: usize, B: Kernels> MatrixVar<'t, R, C, B> {
         self.binary(other, BinaryOp::Mul).sum()
     }
 
+    /// Valid cross-correlation with a recorded window — the "convolution" of a
+    /// convolutional layer, where the window is usually the parameter.
+    ///
+    /// Both gradients are correlations of their own, so the backward pass needs
+    /// no new kernel:
+    ///
+    /// - `K̄ += correlate(X, Ȳ)`, the input windowed by the output adjoint;
+    /// - `X̄ += correlate(pad(Ȳ, KR−1, KC−1), K, flipped)`, a *full*
+    ///   correlation, which is what the zero padding spells.
+    pub fn correlate<const KR: usize, const KC: usize>(
+        &self,
+        window: &MatrixVar<'t, KR, KC, B>,
+    ) -> MatrixVar<'t, { R - KR + 1 }, { C - KC + 1 }, B> {
+        self.correlate_with(window, false)
+    }
+
+    /// Convolution proper: the window is reversed before it is applied.
+    ///
+    /// This is the signal-processing convention. Machine learning calls
+    /// [`correlate`](Self::correlate) "convolution"; the two differ only by that
+    /// reversal, and both differentiate here.
+    pub fn convolve<const KR: usize, const KC: usize>(
+        &self,
+        window: &MatrixVar<'t, KR, KC, B>,
+    ) -> MatrixVar<'t, { R - KR + 1 }, { C - KC + 1 }, B> {
+        self.correlate_with(window, true)
+    }
+
+    fn correlate_with<const KR: usize, const KC: usize>(
+        &self,
+        window: &MatrixVar<'t, KR, KC, B>,
+        flip: bool,
+    ) -> MatrixVar<'t, { R - KR + 1 }, { C - KC + 1 }, B> {
+        let value = B::correlate(self.value(), window.value(), flip);
+        let (input, taps) = (self.node.clone(), window.node.clone());
+        self.record(value, move |adjoint| {
+            // The window's gradient is the input correlated with the adjoint,
+            // reversed when the forward pass reversed the window.
+            let window_gradient =
+                B::correlate_window_gradient::<R, C, KR, KC>(&input.value, adjoint);
+            taps.accumulate(if flip {
+                B::flip(&window_gradient)
+            } else {
+                window_gradient
+            });
+
+            // The input's gradient is the full correlation of the adjoint with
+            // the window, applied the other way round.
+            input.accumulate(B::correlate_input_gradient::<R, C, KR, KC>(
+                adjoint,
+                &taps.value,
+                flip,
+            ));
+        })
+    }
+
+    /// Surround with zeros; the adjoint of the padding is discarded, and the
+    /// interior flows straight back.
+    pub fn pad<const PR: usize, const PC: usize>(
+        &self,
+    ) -> MatrixVar<'t, { R + 2 * PR }, { C + 2 * PC }, B> {
+        let value = B::pad::<R, C, PR, PC>(self.value());
+        let parent = self.node.clone();
+        self.record(value, move |adjoint| {
+            let interior = adjoint.as_slice();
+            let mut inner = Vec::with_capacity(R * C);
+            for row in 0..R {
+                let start = (row + PR) * (C + 2 * PC) + PC;
+                inner.extend_from_slice(&interior[start..start + C]);
+            }
+            parent.accumulate(Matrix {
+                data: B::store_matrix::<R, C>(&inner),
+            });
+        })
+    }
+
+    /// Reverse both axes; the adjoint reverses back.
+    pub fn flipped(&self) -> Self {
+        let value = B::flip(self.value());
+        let parent = self.node.clone();
+        self.record(value, move |adjoint| {
+            parent.accumulate(B::flip(adjoint));
+        })
+    }
+
     /// Row-major flattening, and its exact inverse on the way back.
     pub fn flattened(&self) -> VectorVar<'t, { R * C }, B> {
         let value = Vector {
