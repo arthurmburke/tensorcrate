@@ -52,6 +52,63 @@ impl TryFrom<u16> for BinaryOp {
     }
 }
 
+/// An elementwise comparison.
+///
+/// Like [`BinaryOp`], the representation is part of the Metal shader ABI: keep
+/// existing discriminants stable and only append.
+///
+/// `Min` and `Max` are not differentiable where the operands tie, so a
+/// convention is needed. This one splits the subgradient evenly, which is what
+/// [`MaxShare`](Compare::MaxShare) computes — and it is the choice that keeps
+/// `max(a, b)` and `max(b, a)` giving mirror-image gradients. Two consequences
+/// worth knowing: `|x|` differentiates to `sign(x)` with `sign(0) = 0`, and
+/// `relu` has slope `½` exactly at the kink rather than the `0` some frameworks
+/// pick.
+#[repr(u16)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Compare {
+    /// The smaller of the two operands.
+    Min = 0,
+    /// The larger of the two operands.
+    Max = 1,
+    /// `∂max(a, b)/∂a`: one where `a` is larger, zero where it is smaller, and a
+    /// half where they tie. The rule for `Min` is its complement, `1 − share`.
+    MaxShare = 2,
+}
+
+impl Compare {
+    /// Every comparison, in discriminant order.
+    pub const ALL: [Compare; 3] = [Compare::Min, Compare::Max, Compare::MaxShare];
+
+    /// Apply the comparison to a pair of values — the CPU counterpart of the
+    /// `compare` shader, and the definition the GPU is tested against.
+    pub fn value(self, a: f32, b: f32) -> f32 {
+        match self {
+            Compare::Min => a.min(b),
+            Compare::Max => a.max(b),
+            Compare::MaxShare => match a.partial_cmp(&b) {
+                Some(std::cmp::Ordering::Greater) => 1.0,
+                Some(std::cmp::Ordering::Less) => 0.0,
+                _ => 0.5,
+            },
+        }
+    }
+}
+
+impl From<Compare> for u16 {
+    fn from(op: Compare) -> Self {
+        op as u16
+    }
+}
+
+impl TryFrom<u16> for Compare {
+    type Error = u16;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        Self::ALL.get(value as usize).copied().ok_or(value)
+    }
+}
+
 /// The analytic functions, paired with their derivatives.
 ///
 /// This is the operation enum for the GPU `unary`/`unary_dual` kernels and the
@@ -205,6 +262,21 @@ pub trait Kernels: Backend {
         scalar_left: bool,
     ) -> Vector<f32, N, Self>;
 
+    /// Elementwise comparison of two vectors.
+    fn vector_compare<const N: usize>(
+        a: &Vector<f32, N, Self>,
+        b: &Vector<f32, N, Self>,
+        op: Compare,
+    ) -> Vector<f32, N, Self>;
+
+    /// Elementwise comparison against a scalar.
+    fn vector_compare_scalar<const N: usize>(
+        a: &Vector<f32, N, Self>,
+        scalar: f32,
+        op: Compare,
+        scalar_left: bool,
+    ) -> Vector<f32, N, Self>;
+
     /// `f(a)`, elementwise.
     fn vector_unary<const N: usize>(a: &Vector<f32, N, Self>, f: Analytic) -> Vector<f32, N, Self>;
 
@@ -246,6 +318,21 @@ pub trait Kernels: Backend {
         a: &Matrix<f32, R, C, Self>,
         scalar: f32,
         op: BinaryOp,
+        scalar_left: bool,
+    ) -> Matrix<f32, R, C, Self>;
+
+    /// Elementwise comparison of two matrices.
+    fn matrix_compare<const R: usize, const C: usize>(
+        a: &Matrix<f32, R, C, Self>,
+        b: &Matrix<f32, R, C, Self>,
+        op: Compare,
+    ) -> Matrix<f32, R, C, Self>;
+
+    /// Elementwise comparison against a scalar.
+    fn matrix_compare_scalar<const R: usize, const C: usize>(
+        a: &Matrix<f32, R, C, Self>,
+        scalar: f32,
+        op: Compare,
         scalar_left: bool,
     ) -> Matrix<f32, R, C, Self>;
 
@@ -311,6 +398,30 @@ impl Kernels for Host {
         } else {
             a.broadcast_right(scalar, op)
         }
+    }
+
+    fn vector_compare<const N: usize>(
+        a: &Vector<f32, N, Self>,
+        b: &Vector<f32, N, Self>,
+        op: Compare,
+    ) -> Vector<f32, N, Self> {
+        let (left, right) = (a.data(), b.data());
+        Vector::new(std::array::from_fn(|i| op.value(left[i], right[i])))
+    }
+
+    fn vector_compare_scalar<const N: usize>(
+        a: &Vector<f32, N, Self>,
+        scalar: f32,
+        op: Compare,
+        scalar_left: bool,
+    ) -> Vector<f32, N, Self> {
+        a.map(|&x| {
+            if scalar_left {
+                op.value(scalar, x)
+            } else {
+                op.value(x, scalar)
+            }
+        })
     }
 
     fn vector_unary<const N: usize>(a: &Vector<f32, N, Self>, f: Analytic) -> Vector<f32, N, Self> {
@@ -384,6 +495,32 @@ impl Kernels for Host {
         }
     }
 
+    fn matrix_compare<const R: usize, const C: usize>(
+        a: &Matrix<f32, R, C, Self>,
+        b: &Matrix<f32, R, C, Self>,
+        op: Compare,
+    ) -> Matrix<f32, R, C, Self> {
+        let (left, right) = (a.data(), b.data());
+        Matrix::from_rows(std::array::from_fn(|row| {
+            std::array::from_fn(|col| op.value(left[row][col], right[row][col]))
+        }))
+    }
+
+    fn matrix_compare_scalar<const R: usize, const C: usize>(
+        a: &Matrix<f32, R, C, Self>,
+        scalar: f32,
+        op: Compare,
+        scalar_left: bool,
+    ) -> Matrix<f32, R, C, Self> {
+        a.map(|&x| {
+            if scalar_left {
+                op.value(scalar, x)
+            } else {
+                op.value(x, scalar)
+            }
+        })
+    }
+
     fn matrix_unary<const R: usize, const C: usize>(
         a: &Matrix<f32, R, C, Self>,
         f: Analytic,
@@ -429,7 +566,7 @@ impl Kernels for Host {
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod gpu {
-    use super::{Analytic, BinaryOp, Kernels, Matrix, Vector};
+    use super::{Analytic, BinaryOp, Compare, Kernels, Matrix, Vector};
     use crate::tensors::metal_backend::{matrix_elementwise, vector_elementwise};
     use crate::tensors::{Host, Metal};
 
@@ -455,6 +592,23 @@ mod gpu {
             } else {
                 a.broadcast_right(scalar, op)
             }
+        }
+
+        fn vector_compare<const N: usize>(
+            a: &Vector<f32, N, Self>,
+            b: &Vector<f32, N, Self>,
+            op: Compare,
+        ) -> Vector<f32, N, Self> {
+            a.compare(b, op)
+        }
+
+        fn vector_compare_scalar<const N: usize>(
+            a: &Vector<f32, N, Self>,
+            scalar: f32,
+            op: Compare,
+            scalar_left: bool,
+        ) -> Vector<f32, N, Self> {
+            a.compare_scalar(scalar, op, scalar_left)
         }
 
         fn vector_unary<const N: usize>(
@@ -527,6 +681,23 @@ mod gpu {
             } else {
                 a.broadcast_right(scalar, op)
             }
+        }
+
+        fn matrix_compare<const R: usize, const C: usize>(
+            a: &Matrix<f32, R, C, Self>,
+            b: &Matrix<f32, R, C, Self>,
+            op: Compare,
+        ) -> Matrix<f32, R, C, Self> {
+            a.compare(b, op)
+        }
+
+        fn matrix_compare_scalar<const R: usize, const C: usize>(
+            a: &Matrix<f32, R, C, Self>,
+            scalar: f32,
+            op: Compare,
+            scalar_left: bool,
+        ) -> Matrix<f32, R, C, Self> {
+            a.compare_scalar(scalar, op, scalar_left)
         }
 
         fn matrix_unary<const R: usize, const C: usize>(

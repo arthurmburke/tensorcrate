@@ -15,11 +15,10 @@ typenum = "1.20"
 default = ["metal", "simd"]
 # GPU-accelerated tensor ops via Apple Metal (macOS only).
 metal = ["dep:objc2", "dep:objc2-metal", "dep:objc2-foundation"]
-# NEON-vectorized CPU math kernels (aarch64 only; a no-op on other targets).
+# NEON on aarch64; runtime-selected AVX2/FMA or SSE2 on x86_64.
 simd = []
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6", optional = true }
 objc2-metal = { version = "0.3", optional = true }
 objc2-foundation = { version = "0.3", optional = true }
-

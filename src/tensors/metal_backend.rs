@@ -28,7 +28,7 @@
 use std::fmt::{self, Display};
 use std::ops::{Add, Div, Mul, Neg, Rem, Sub};
 
-use super::{Analytic, BinaryOp, Host, Kernels, Matrix, Metal, Vector};
+use super::{Analytic, BinaryOp, Compare, Host, Kernels, Matrix, Metal, Vector};
 
 impl<const N: usize> Vector<f32, N, Metal> {
     /// Whether the elements really are in GPU-shared memory.
@@ -78,6 +78,28 @@ impl<const N: usize> Vector<f32, N, Metal> {
         match self.data.unary(f) {
             Some(data) => Vector { data },
             None => Host::vector_unary(&self.to_backend::<Host>(), f).to_backend(),
+        }
+    }
+
+    /// Elementwise comparison with another resident vector, on the GPU.
+    pub fn compare(&self, other: &Self, op: Compare) -> Self {
+        match self.data.compare(&other.data, op) {
+            Some(data) => Vector { data },
+            None => {
+                Host::vector_compare(&self.to_backend::<Host>(), &other.to_backend::<Host>(), op)
+                    .to_backend()
+            }
+        }
+    }
+
+    /// Elementwise comparison against a scalar, on the GPU.
+    pub fn compare_scalar(&self, scalar: f32, op: Compare, scalar_left: bool) -> Self {
+        match self.data.compare_scalar(scalar, op, scalar_left) {
+            Some(data) => Vector { data },
+            None => {
+                Host::vector_compare_scalar(&self.to_backend::<Host>(), scalar, op, scalar_left)
+                    .to_backend()
+            }
         }
     }
 
@@ -206,6 +228,28 @@ impl<const R: usize, const C: usize> Matrix<f32, R, C, Metal> {
         }
     }
 
+    /// Elementwise comparison with another resident matrix, on the GPU.
+    pub fn compare(&self, other: &Self, op: Compare) -> Self {
+        match self.data.compare(&other.data, op) {
+            Some(data) => Matrix { data },
+            None => {
+                Host::matrix_compare(&self.to_backend::<Host>(), &other.to_backend::<Host>(), op)
+                    .to_backend()
+            }
+        }
+    }
+
+    /// Elementwise comparison against a scalar, on the GPU.
+    pub fn compare_scalar(&self, scalar: f32, op: Compare, scalar_left: bool) -> Self {
+        match self.data.compare_scalar(scalar, op, scalar_left) {
+            Some(data) => Matrix { data },
+            None => {
+                Host::matrix_compare_scalar(&self.to_backend::<Host>(), scalar, op, scalar_left)
+                    .to_backend()
+            }
+        }
+    }
+
     /// Multiply every element by `scalar`, on the GPU.
     pub fn scale(&self, scalar: f32) -> Self {
         self.broadcast_right(scalar, BinaryOp::Mul)
@@ -238,11 +282,11 @@ impl<const R: usize, const C: usize> Matrix<f32, R, C, Metal> {
 
 /// Sum of products over two CPU-readable slices, vectorized where possible.
 fn reduce_dot(a: &[f32], b: &[f32]) -> f32 {
-    #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+    #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         crate::simd::f32k::dot(a, b)
     }
-    #[cfg(not(all(feature = "simd", target_arch = "aarch64")))]
+    #[cfg(not(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64"))))]
     {
         a.iter().zip(b).map(|(x, y)| x * y).sum()
     }

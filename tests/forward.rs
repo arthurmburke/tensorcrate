@@ -663,3 +663,67 @@ fn matrix_derivatives_agree_between_the_backends() {
         "resident flattening",
     );
 }
+
+// ---- comparisons and axis reductions ------------------------------------------
+
+#[test]
+fn comparisons_carry_the_tangent_of_whichever_operand_won() {
+    use rinterp::tensors::Compare;
+
+    let a = Vector::new([0.5f32, -1.0, 2.0]);
+    let b = Vector::new([1.5f32, -2.0, 2.0]); // the last pair ties
+    let (da, db) = (
+        Vector::new([1.0f32, 2.0, 3.0]),
+        Vector::new([10.0f32, 20.0, 30.0]),
+    );
+
+    let dual_a = DualVector::<3>::new(a, da);
+    let dual_b = DualVector::<3>::new(b, db);
+
+    let largest = dual_a.maximum(&dual_b);
+    assert_eq!(largest.value().to_array(), [1.5, -1.0, 2.0]);
+    // b wins, a wins, then a tie splits the two tangents evenly.
+    assert_eq!(largest.tangent().to_array(), [10.0, 2.0, 16.5]);
+
+    let smallest = dual_a.minimum(&dual_b);
+    assert_eq!(smallest.value().to_array(), [0.5, -2.0, 2.0]);
+    assert_eq!(smallest.tangent().to_array(), [1.0, 20.0, 16.5]);
+
+    // |x| and relu, with the conventions the tie implies.
+    let point = DualVector::<5>::new(
+        Vector::new([-2.0f32, -0.5, 0.0, 0.5, 2.0]),
+        Vector::filled(1.0),
+    );
+    assert_eq!(
+        point.abs().tangent().to_array(),
+        [-1.0, -1.0, 0.0, 1.0, 1.0]
+    );
+    assert_eq!(point.relu().tangent().to_array(), [0.0, 0.0, 0.5, 1.0, 1.0]);
+    assert_eq!(
+        point.clamp(-1.0, 1.0).value().to_array(),
+        [-1.0, -0.5, 0.0, 0.5, 1.0]
+    );
+
+    // The CPU table the shader mirrors.
+    assert_eq!(Compare::Max.value(1.0, 2.0), 2.0);
+    assert_eq!(Compare::Min.value(1.0, 2.0), 1.0);
+}
+
+#[test]
+fn axis_reductions_are_linear_in_the_tangent() {
+    let (m, dm) = (matrix::<3, 4>(), matrix_direction::<3, 4>());
+    let dual = DualMatrix::<3, 4>::new(m, dm);
+
+    let rows = dual.row_sums();
+    let columns = dual.column_sums();
+    for row in 0..3 {
+        let value: f32 = (0..4).map(|col| m.data()[row][col]).sum();
+        let tangent: f32 = (0..4).map(|col| dm.data()[row][col]).sum();
+        assert!(close(rows.value().as_slice()[row], value));
+        assert!(close(rows.tangent().as_slice()[row], tangent));
+    }
+    for col in 0..4 {
+        let value: f32 = (0..3).map(|row| m.data()[row][col]).sum();
+        assert!(close(columns.value().as_slice()[col], value));
+    }
+}

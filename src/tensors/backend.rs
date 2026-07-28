@@ -231,6 +231,7 @@ mod gpu {
 
     use super::{Backend, sealed};
     use crate::metal::MetalBuffer;
+    use crate::tensors::Compare;
     use crate::tensors::{Analytic, BinaryOp};
 
     /// A backend that keeps `f32` elements in GPU-shared memory, so the Metal
@@ -576,6 +577,23 @@ mod gpu {
                 Self(Residency::Device(value)),
                 Self(Residency::Device(tangent)),
             ))
+        }
+
+        /// Elementwise comparison with another shared allocation.
+        pub(crate) fn compare(&self, rhs: &Self, op: Compare) -> Option<Self> {
+            let output = self.device()?.compare(rhs.device()?, op)?;
+            Some(Self(Residency::Device(output)))
+        }
+
+        /// Elementwise comparison against a scalar.
+        pub(crate) fn compare_scalar(
+            &self,
+            scalar: f32,
+            op: Compare,
+            scalar_left: bool,
+        ) -> Option<Self> {
+            let output = self.device()?.compare_scalar(scalar, op, scalar_left)?;
+            Some(Self(Residency::Device(output)))
         }
 
         /// Analytic function applied elementwise; `op` is an

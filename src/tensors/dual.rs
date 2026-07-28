@@ -18,6 +18,8 @@
 //! | [`matmul`](DualMatrix::matmul) | `AB` | `ȦB + AḂ` |
 //! | [`dot`](DualVector::dot) | `u·v` | `u̇·v + u·v̇` |
 //! | [`analytic`](DualVector::analytic) | `f(a)` | `f'(a) ⊙ ȧ` |
+//! | [`maximum`](DualVector::maximum) | `max(a, b)` | the winner's tangent, split at a tie |
+//! | [`row_sums`](DualMatrix::row_sums) | `A·1` | `Ȧ·1` |
 //!
 //! Nothing here names a backend, because it is written against
 //! [`Kernels`]: the same code runs on `Host` arrays and in
@@ -49,7 +51,7 @@ use std::ops::{Add, Div, Mul, Neg, Sub};
 
 use crate::numbers::Dual;
 
-use super::{Analytic, BinaryOp, Host, Kernels, Matrix, Vector};
+use super::{Analytic, BinaryOp, Compare, Host, Kernels, Matrix, Vector};
 
 /// A length-`N` vector and its tangent, for forward-mode differentiation.
 pub struct DualVector<const N: usize, B: Kernels = Host> {
@@ -199,6 +201,86 @@ impl<const N: usize, B: Kernels> DualVector<N, B> {
             elementwise_vector(&expanded, self, op)
         } else {
             elementwise_vector(self, &expanded, op)
+        }
+    }
+
+    /// Elementwise larger of two dual vectors.
+    ///
+    /// The value picks the larger operand and the tangent follows it, split
+    /// evenly where they tie — see [`Compare`] for that convention.
+    pub fn maximum(&self, other: &Self) -> Self {
+        self.select(other, true)
+    }
+
+    /// Elementwise smaller of two dual vectors.
+    pub fn minimum(&self, other: &Self) -> Self {
+        self.select(other, false)
+    }
+
+    /// The shared body of [`maximum`](Self::maximum) and
+    /// [`minimum`](Self::minimum): the tangent is a convex combination of the two
+    /// operands' tangents, weighted by which one the value came from.
+    fn select(&self, other: &Self, largest: bool) -> Self {
+        let op = if largest { Compare::Max } else { Compare::Min };
+        let value = B::vector_compare(&self.value, &other.value, op);
+        let share = B::vector_compare(&self.value, &other.value, Compare::MaxShare);
+        let complement = B::vector_broadcast(&share, 1.0, BinaryOp::Sub, true);
+        let (mine, theirs) = if largest {
+            (&share, &complement)
+        } else {
+            (&complement, &share)
+        };
+        DualVector {
+            value,
+            tangent: B::vector_elementwise(
+                &B::vector_elementwise(mine, &self.tangent, BinaryOp::Mul),
+                &B::vector_elementwise(theirs, &other.tangent, BinaryOp::Mul),
+                BinaryOp::Add,
+            ),
+        }
+    }
+
+    /// Elementwise maximum against a constant — `clamp_min(0.0)` is a rectifier.
+    pub fn clamp_min(&self, floor: f32) -> Self {
+        self.select_scalar(floor, true)
+    }
+
+    /// Elementwise minimum against a constant.
+    pub fn clamp_max(&self, ceiling: f32) -> Self {
+        self.select_scalar(ceiling, false)
+    }
+
+    /// Confine every element to `[floor, ceiling]`.
+    pub fn clamp(&self, floor: f32, ceiling: f32) -> Self {
+        self.clamp_min(floor).clamp_max(ceiling)
+    }
+
+    /// The rectifier `max(a, 0)`, whose slope is `½` exactly at the kink.
+    pub fn relu(&self) -> Self {
+        self.clamp_min(0.0)
+    }
+
+    /// Elementwise absolute value, as `max(a, −a)`.
+    ///
+    /// The tangent works out to `sign(a) ⊙ ȧ`, with `sign(0) = 0` because the tie
+    /// splits the subgradient between `+1` and `−1`.
+    pub fn abs(&self) -> Self {
+        self.maximum(&self.scale(-1.0))
+    }
+
+    fn select_scalar(&self, scalar: f32, largest: bool) -> Self {
+        let op = if largest { Compare::Max } else { Compare::Min };
+        let value = B::vector_compare_scalar(&self.value, scalar, op, false);
+        let share = B::vector_compare_scalar(&self.value, scalar, Compare::MaxShare, false);
+        // A constant contributes no tangent, so only this operand's share counts.
+        let weight = if largest {
+            share
+        } else {
+            B::vector_broadcast(&share, 1.0, BinaryOp::Sub, true)
+        };
+        DualVector {
+            value,
+            tangent: B::vector_elementwise(&weight, &self.tangent, BinaryOp::Mul),
         }
     }
 
@@ -362,6 +444,97 @@ impl<const R: usize, const C: usize, B: Kernels> DualMatrix<R, C, B> {
             elementwise_matrix(&expanded, self, op)
         } else {
             elementwise_matrix(self, &expanded, op)
+        }
+    }
+
+    /// Elementwise larger of two dual matrices; see [`DualVector::maximum`].
+    pub fn maximum(&self, other: &Self) -> Self {
+        self.select(other, true)
+    }
+
+    /// Elementwise smaller of two dual matrices.
+    pub fn minimum(&self, other: &Self) -> Self {
+        self.select(other, false)
+    }
+
+    fn select(&self, other: &Self, largest: bool) -> Self {
+        let op = if largest { Compare::Max } else { Compare::Min };
+        let value = B::matrix_compare(&self.value, &other.value, op);
+        let share = B::matrix_compare(&self.value, &other.value, Compare::MaxShare);
+        let complement = B::matrix_broadcast(&share, 1.0, BinaryOp::Sub, true);
+        let (mine, theirs) = if largest {
+            (&share, &complement)
+        } else {
+            (&complement, &share)
+        };
+        DualMatrix {
+            value,
+            tangent: B::matrix_elementwise(
+                &B::matrix_elementwise(mine, &self.tangent, BinaryOp::Mul),
+                &B::matrix_elementwise(theirs, &other.tangent, BinaryOp::Mul),
+                BinaryOp::Add,
+            ),
+        }
+    }
+
+    /// Elementwise maximum against a constant.
+    pub fn clamp_min(&self, floor: f32) -> Self {
+        self.select_scalar(floor, true)
+    }
+
+    /// Elementwise minimum against a constant.
+    pub fn clamp_max(&self, ceiling: f32) -> Self {
+        self.select_scalar(ceiling, false)
+    }
+
+    /// Confine every element to `[floor, ceiling]`.
+    pub fn clamp(&self, floor: f32, ceiling: f32) -> Self {
+        self.clamp_min(floor).clamp_max(ceiling)
+    }
+
+    /// The rectifier `max(A, 0)`.
+    pub fn relu(&self) -> Self {
+        self.clamp_min(0.0)
+    }
+
+    /// Elementwise absolute value; see [`DualVector::abs`].
+    pub fn abs(&self) -> Self {
+        self.maximum(&self.scale(-1.0))
+    }
+
+    fn select_scalar(&self, scalar: f32, largest: bool) -> Self {
+        let op = if largest { Compare::Max } else { Compare::Min };
+        let value = B::matrix_compare_scalar(&self.value, scalar, op, false);
+        let share = B::matrix_compare_scalar(&self.value, scalar, Compare::MaxShare, false);
+        let weight = if largest {
+            share
+        } else {
+            B::matrix_broadcast(&share, 1.0, BinaryOp::Sub, true)
+        };
+        DualMatrix {
+            value,
+            tangent: B::matrix_elementwise(&weight, &self.tangent, BinaryOp::Mul),
+        }
+    }
+
+    /// Sum along each row, giving one entry per row.
+    ///
+    /// This is `A·1`, so it needs no reduction kernel of its own — and on the
+    /// `Metal` backend it stays resident like any other product.
+    pub fn row_sums(&self) -> DualVector<R, B> {
+        let ones = Vector::<f32, C, B>::filled(1.0);
+        DualVector {
+            value: B::matvec(&self.value, &ones),
+            tangent: B::matvec(&self.tangent, &Vector::<f32, C, B>::filled(1.0)),
+        }
+    }
+
+    /// Sum along each column, giving one entry per column: `1ᵀ·A`.
+    pub fn column_sums(&self) -> DualVector<C, B> {
+        let ones = Vector::<f32, R, B>::filled(1.0);
+        DualVector {
+            value: B::vecmat(&ones, &self.value),
+            tangent: B::vecmat(&Vector::<f32, R, B>::filled(1.0), &self.tangent),
         }
     }
 

@@ -1,5 +1,5 @@
-//! Rough throughput comparison of the NEON kernels against equivalent scalar
-//! loops. Run with:
+//! Rough throughput comparison of the architecture-specific SIMD kernels
+//! against equivalent scalar loops. Run with:
 //!
 //! ```text
 //! cargo run --release --example simd_bench --no-default-features --features simd
@@ -8,7 +8,7 @@
 //! These are wall-clock microbenchmarks, not statistically rigorous — they exist
 //! to show the kernels are pulling their weight, and where the crossover lands.
 
-#[cfg(all(feature = "simd", target_arch = "aarch64"))]
+#[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
 fn main() {
     use rinterp::simd::f32k;
     use std::time::Instant;
@@ -36,7 +36,7 @@ fn main() {
         }
         sink += s;
     });
-    let simd = bench("neon", 2_000, || sink += f32k::dot(&a, &b));
+    let simd = bench("simd", 2_000, || sink += f32k::dot(&a, &b));
     println!("  speedup: {:.2}×\n", scalar / simd);
 
     println!("matmul (128 × 128 × 128)");
@@ -55,7 +55,7 @@ fn main() {
         }
         sink += out[0];
     });
-    let simd = bench("neon (broadcast-A)", 40, || {
+    let simd = bench("simd (broadcast-A)", 40, || {
         f32k::matmul(&m, &m, N, N, N, &mut out);
         sink += out[0];
     });
@@ -64,7 +64,7 @@ fn main() {
     std::hint::black_box(sink);
 }
 
-#[cfg(not(all(feature = "simd", target_arch = "aarch64")))]
+#[cfg(not(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64"))))]
 fn main() {
-    eprintln!("build with --features simd on aarch64 to run this benchmark");
+    eprintln!("build with --features simd on aarch64 or x86_64 to run this benchmark");
 }

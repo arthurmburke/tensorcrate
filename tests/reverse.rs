@@ -1027,3 +1027,267 @@ fn the_squared_error_reductions_are_all_the_same_scalar() {
     r.sum().backward();
     assert_eq!(r.grad().to_rows(), [[1.0f32; 4]; 3]);
 }
+
+// ---- comparisons and the losses they unlock ----------------------------------
+
+#[test]
+fn comparisons_pick_the_right_operand_and_split_ties() {
+    use rinterp::tensors::Compare;
+
+    // A deliberate tie in the middle: [.., 0.5 vs 0.5, ..].
+    let a = Vector::new([0.5f32, -1.0, 2.0, 0.5]);
+    let b = Vector::new([1.5f32, -2.0, 2.0, 0.5]);
+
+    let tape = Tape::new();
+    let left = tape.vector(a);
+    let right = tape.vector(b);
+    let largest = left.maximum(&right);
+    assert_eq!(largest.value().to_array(), [1.5, -1.0, 2.0, 0.5]);
+    assert_eq!(
+        left.minimum(&right).value().to_array(),
+        [0.5, -2.0, 2.0, 0.5]
+    );
+
+    largest.sum().backward();
+    // b wins the first, a wins the second, and the last two tie.
+    assert_eq!(left.grad().to_array(), [0.0, 1.0, 0.5, 0.5]);
+    assert_eq!(right.grad().to_array(), [1.0, 0.0, 0.5, 0.5]);
+
+    // `Min` routes the adjoint the other way.
+    let tape = Tape::new();
+    let left = tape.vector(a);
+    let right = tape.vector(b);
+    left.minimum(&right).sum().backward();
+    assert_eq!(left.grad().to_array(), [1.0, 0.0, 0.5, 0.5]);
+    assert_eq!(right.grad().to_array(), [0.0, 1.0, 0.5, 0.5]);
+
+    // The CPU table is the definition the shader has to match.
+    assert_eq!(Compare::MaxShare.value(2.0, 1.0), 1.0);
+    assert_eq!(Compare::MaxShare.value(1.0, 2.0), 0.0);
+    assert_eq!(Compare::MaxShare.value(1.0, 1.0), 0.5);
+}
+
+#[test]
+fn abs_relu_and_clamp_have_the_conventional_derivatives() {
+    let at = Vector::new([-2.0f32, -0.5, 0.0, 0.5, 2.0]);
+
+    // |x|' = sign(x), and the tie at zero splits ±1 into 0.
+    let tape = Tape::new();
+    let x = tape.vector(at);
+    let absolute = x.abs();
+    assert_eq!(absolute.value().to_array(), [2.0, 0.5, 0.0, 0.5, 2.0]);
+    absolute.sum().backward();
+    assert_eq!(x.grad().to_array(), [-1.0, -1.0, 0.0, 1.0, 1.0]);
+
+    // relu' is 1 above the kink, 0 below, ½ exactly at it.
+    let tape = Tape::new();
+    let x = tape.vector(at);
+    let rectified = x.relu();
+    assert_eq!(rectified.value().to_array(), [0.0, 0.0, 0.0, 0.5, 2.0]);
+    rectified.sum().backward();
+    assert_eq!(x.grad().to_array(), [0.0, 0.0, 0.5, 1.0, 1.0]);
+
+    // Clamping pins the ends, and a pinned element has no gradient.
+    let tape = Tape::new();
+    let x = tape.vector(at);
+    let confined = x.clamp(-1.0, 1.0);
+    assert_eq!(confined.value().to_array(), [-1.0, -0.5, 0.0, 0.5, 1.0]);
+    confined.sum().backward();
+    assert_eq!(x.grad().to_array(), [0.0, 1.0, 1.0, 1.0, 0.0]);
+}
+
+#[test]
+fn comparison_gradients_agree_with_forward_mode() {
+    // Away from ties both modes must agree exactly, including through a chain.
+    let a = vector::<6>();
+    let b = other_vector::<6>();
+
+    let reverse = reverse_gradient(a, |x| {
+        let tape = x.tape();
+        let other = tape.vector(b);
+        x.maximum(&other).minimum(&x.abs().scale(3.0)).sum()
+    });
+    let forward = gradient(&a, |x| {
+        let other = DualVector::constant(b);
+        x.maximum(&other).minimum(&x.abs().scale(3.0)).sum()
+    });
+    assert_slice_close(reverse.as_slice(), forward.as_slice(), "min/max/abs chain");
+
+    // And relu through a matrix product, which is the shape a network uses.
+    let m = matrix::<4, 6>();
+    let reverse = reverse_gradient(a, |x| {
+        let tape = x.tape();
+        tape.matrix(m).matvec(x).relu().sum()
+    });
+    let forward = gradient(&a, |x| DualMatrix::constant(m).matvec(x).relu().sum());
+    assert_slice_close(reverse.as_slice(), forward.as_slice(), "relu after matvec");
+}
+
+#[test]
+fn absolute_error_is_now_expressible_as_a_loss() {
+    // L1: Σ|Ax − y|, whose gradient is Aᵀ·sign(Ax − y) — the estimator that
+    // squared error could not express.
+    let a = matrix::<5, 3>();
+    let x = vector::<3>();
+    let targets = other_vector::<5>();
+
+    let tape = Tape::new();
+    let parameters = tape.vector(x);
+    let residual = &tape.matrix(a).matvec(&parameters) - &tape.vector(targets);
+    residual.abs().sum().backward();
+
+    let signs = Vector::new(std::array::from_fn::<f32, 5, _>(|i| {
+        let r = a.matvec(&x).data()[i] - targets.data()[i];
+        if r > 0.0 {
+            1.0
+        } else if r < 0.0 {
+            -1.0
+        } else {
+            0.0
+        }
+    }));
+    assert_slice_close(
+        parameters.grad().as_slice(),
+        signs.vecmat(&a).as_slice(),
+        "∂Σ|Ax−y|/∂x",
+    );
+}
+
+// ---- row and column reductions ------------------------------------------------
+
+#[test]
+fn row_and_column_sums_spread_their_adjoint_back_along_the_axis() {
+    let m = matrix::<3, 4>();
+
+    let tape = Tape::new();
+    let recorded = tape.matrix(m);
+    let rows = recorded.row_sums();
+    for row in 0..3 {
+        let expected: f32 = (0..4).map(|col| m.data()[row][col]).sum();
+        assert!(close(rows.value().as_slice()[row], expected));
+    }
+
+    // Seeding one row's sum credits exactly that row.
+    rows.backward_with(Vector::new([0.0, 1.0, 0.0]));
+    assert_eq!(recorded.grad().to_rows(), [[0.0; 4], [1.0; 4], [0.0; 4]]);
+
+    let tape = Tape::new();
+    let recorded = tape.matrix(m);
+    let columns = recorded.column_sums();
+    for col in 0..4 {
+        let expected: f32 = (0..3).map(|row| m.data()[row][col]).sum();
+        assert!(close(columns.value().as_slice()[col], expected));
+    }
+    columns.backward_with(Vector::new([0.0, 0.0, 1.0, 0.0]));
+    for row in 0..3 {
+        assert_eq!(recorded.grad().data()[row], [0.0, 0.0, 1.0, 0.0]);
+    }
+
+    // Both modes agree on a chain that reduces along an axis.
+    let reverse = {
+        let tape = Tape::new();
+        let recorded = tape.matrix(m);
+        recorded.tanh().row_sums().sum().backward();
+        recorded.grad()
+    };
+    let forward = gradient_wrt_matrix(&m, |d| d.tanh().row_sums().sum());
+    assert_slice_close(reverse.as_slice(), forward.as_slice(), "row_sums chain");
+}
+
+#[test]
+fn softmax_and_cross_entropy_work_end_to_end() {
+    // Row-wise softmax needs a per-row denominator, which `row_sums` supplies and
+    // an outer product with ones broadcasts back across the row.
+    const CLASSES: usize = 4;
+    const BATCH: usize = 3;
+
+    let logits = Matrix::<f32, BATCH, CLASSES>::from_rows([
+        [1.0, 2.0, 0.5, -1.0],
+        [0.2, -0.3, 1.4, 0.9],
+        [-0.7, 0.1, 0.3, 2.0],
+    ]);
+    // One-hot targets: class 1, class 2, class 3.
+    let targets = Matrix::<f32, BATCH, CLASSES>::from_rows([
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]);
+
+    let tape = Tape::new();
+    let recorded = tape.matrix(logits);
+    let exponentials = recorded.exp();
+    let denominators = exponentials.row_sums();
+    let probabilities =
+        &exponentials / &denominators.outer(&tape.vector(Vector::<f32, CLASSES>::filled(1.0)));
+    let loss = probabilities
+        .ln()
+        .frobenius_dot(&tape.matrix(targets))
+        .scale(-1.0 / BATCH as f32);
+    loss.backward();
+
+    // The rows are probabilities.
+    for row in 0..BATCH {
+        let total: f32 = (0..CLASSES)
+            .map(|col| probabilities.value().data()[row][col])
+            .sum();
+        assert!(close(total, 1.0), "row {row} sums to {total}");
+    }
+
+    // Cross-entropy has the textbook gradient (p − target)/batch.
+    for row in 0..BATCH {
+        for col in 0..CLASSES {
+            let expected =
+                (probabilities.value().data()[row][col] - targets.data()[row][col]) / BATCH as f32;
+            assert!(
+                close(recorded.grad().data()[row][col], expected),
+                "∂L/∂logit[{row},{col}]: {} vs {expected}",
+                recorded.grad().data()[row][col]
+            );
+        }
+    }
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+fn comparisons_and_reductions_agree_between_the_backends() {
+    use rinterp::tensors::Compare;
+
+    let a = matrix::<6, 5>();
+    let b = other_matrix::<6, 5>();
+
+    // Every comparison arm of the shader against the CPU table.
+    for op in Compare::ALL {
+        let host = Host::matrix_compare(&a, &b, op);
+        let resident = Metal::matrix_compare(&a.to_backend(), &b.to_backend(), op);
+        assert_slice_close(resident.as_slice(), host.as_slice(), &format!("{op:?}"));
+
+        let host = Host::matrix_compare_scalar(&a, 0.5, op, false);
+        let resident = Metal::matrix_compare_scalar(&a.to_backend(), 0.5, op, false);
+        assert_slice_close(
+            resident.as_slice(),
+            host.as_slice(),
+            &format!("{op:?} against a scalar"),
+        );
+    }
+
+    // A gradient through relu and a row reduction, on both backends.
+    let host_tape = Tape::<Host>::new();
+    let host_m = host_tape.matrix(a);
+    host_m.relu().row_sums().sum().backward();
+
+    let gpu_tape = Tape::<Metal>::new();
+    let gpu_m = gpu_tape.matrix(a.to_backend::<Metal>());
+    gpu_m.relu().row_sums().sum().backward();
+
+    assert_slice_close(
+        gpu_m.grad().as_slice(),
+        host_m.grad().as_slice(),
+        "relu + row_sums gradient",
+    );
+    if a.to_backend::<Metal>().is_device_resident() {
+        assert!(
+            gpu_m.grad().is_device_resident(),
+            "the gradient stays resident"
+        );
+    }
+}

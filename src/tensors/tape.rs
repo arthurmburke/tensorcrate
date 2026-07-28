@@ -56,11 +56,20 @@
 //!
 //! - all thirteen [`Analytic`] functions, elementwise;
 //! - the binary operations `+ - * / %`, elementwise, and as operators on `&Var`;
+//! - the comparisons [`maximum`](VectorVar::maximum) and
+//!   [`minimum`](VectorVar::minimum), against another tensor or a constant, and
+//!   the [`abs`](VectorVar::abs), [`relu`](VectorVar::relu) and
+//!   [`clamp`](VectorVar::clamp) built on them — the nonsmooth family behind L1,
+//!   Huber and hinge losses, with ties splitting the subgradient (see
+//!   [`Compare`]);
 //! - negation, and scaling or shifting by a constant;
 //! - products: [`matmul`](MatrixVar::matmul), [`matvec`](MatrixVar::matvec),
 //!   their fused multiply-add forms, [`vecmat`](VectorVar::vecmat), and
 //!   [`dot`](VectorVar::dot);
 //! - reductions to a scalar: [`sum`](VectorVar::sum), [`dot`](VectorVar::dot);
+//! - reductions along one axis: [`row_sums`](MatrixVar::row_sums) and
+//!   [`column_sums`](MatrixVar::column_sums), which together with
+//!   [`outer`](VectorVar::outer) express a row-wise softmax and cross-entropy;
 //! - reshaping: [`transpose`](MatrixVar::transpose),
 //!   [`flattened`](MatrixVar::flattened), [`into_row`](VectorVar::into_row),
 //!   [`into_column`](VectorVar::into_column);
@@ -74,7 +83,7 @@ use std::marker::PhantomData;
 use std::ops::{Add, Div, Mul, Rem, Sub};
 use std::rc::Rc;
 
-use super::{Analytic, BinaryOp, Host, Kernels, Matrix, Vector};
+use super::{Analytic, BinaryOp, Compare, Host, Kernels, Matrix, Vector};
 
 // ---- what a node can hold ---------------------------------------------------
 
@@ -447,6 +456,43 @@ impl<'t, B: Kernels> ScalarVar<'t, B> {
         })
     }
 
+    /// The larger of two recorded scalars, with the adjoint split at a tie.
+    pub fn maximum(&self, other: &Self) -> Self {
+        self.select(other, true)
+    }
+
+    /// The smaller of two recorded scalars.
+    pub fn minimum(&self, other: &Self) -> Self {
+        self.select(other, false)
+    }
+
+    fn select(&self, other: &Self, largest: bool) -> Self {
+        let (x, y) = (self.node.value, other.node.value);
+        let op = if largest { Compare::Max } else { Compare::Min };
+        let (left, right) = (self.node.clone(), other.node.clone());
+        self.record(op.value(x, y), move |adjoint| {
+            let share = Compare::MaxShare.value(x, y);
+            let (mine, theirs) = if largest {
+                (share, 1.0 - share)
+            } else {
+                (1.0 - share, share)
+            };
+            left.accumulate(adjoint * mine);
+            right.accumulate(adjoint * theirs);
+        })
+    }
+
+    /// Absolute value, differentiating to `sign(x)` with `sign(0) = 0`.
+    pub fn abs(&self) -> Self {
+        self.maximum(&self.scale(-1.0))
+    }
+
+    /// `max(x, 0)`.
+    pub fn relu(&self) -> Self {
+        let zero = self.tape.scalar(0.0);
+        self.maximum(&zero)
+    }
+
     /// Negate.
     pub fn neg(&self) -> Self {
         self.scale(-1.0)
@@ -528,6 +574,79 @@ impl<'t, const N: usize, B: Kernels> VectorVar<'t, N, B> {
                 let scaled = vector_op(adjoint, &Vector { data: quotient }, BinaryOp::Mul);
                 right.accumulate(negated_vector(&scaled));
             }
+        })
+    }
+
+    /// Elementwise larger of two recorded vectors.
+    ///
+    /// The adjoint goes to whichever operand supplied the value, and splits
+    /// evenly where they tie — the convention [`Compare`] documents. The mask is
+    /// one `MaxShare` dispatch, so the rule stays on the backend.
+    pub fn maximum(&self, other: &Self) -> Self {
+        self.select(other, true)
+    }
+
+    /// Elementwise smaller of two recorded vectors.
+    pub fn minimum(&self, other: &Self) -> Self {
+        self.select(other, false)
+    }
+
+    fn select(&self, other: &Self, largest: bool) -> Self {
+        let op = if largest { Compare::Max } else { Compare::Min };
+        let value = B::vector_compare(self.value(), other.value(), op);
+        let (left, right) = (self.node.clone(), other.node.clone());
+        self.record(value, move |adjoint| {
+            let share = B::vector_compare(&left.value, &right.value, Compare::MaxShare);
+            let complement = B::vector_broadcast(&share, 1.0, BinaryOp::Sub, true);
+            let (mine, theirs) = if largest {
+                (&share, &complement)
+            } else {
+                (&complement, &share)
+            };
+            left.accumulate(B::vector_elementwise(adjoint, mine, BinaryOp::Mul));
+            right.accumulate(B::vector_elementwise(adjoint, theirs, BinaryOp::Mul));
+        })
+    }
+
+    /// Elementwise maximum against a constant.
+    pub fn clamp_min(&self, floor: f32) -> Self {
+        self.select_scalar(floor, true)
+    }
+
+    /// Elementwise minimum against a constant.
+    pub fn clamp_max(&self, ceiling: f32) -> Self {
+        self.select_scalar(ceiling, false)
+    }
+
+    /// Confine every element to `[floor, ceiling]`; the gradient is zero wherever
+    /// an element is pinned to a bound.
+    pub fn clamp(&self, floor: f32, ceiling: f32) -> Self {
+        self.clamp_min(floor).clamp_max(ceiling)
+    }
+
+    /// The rectifier `max(a, 0)`.
+    pub fn relu(&self) -> Self {
+        self.clamp_min(0.0)
+    }
+
+    /// Elementwise absolute value, as `max(a, −a)`, which differentiates to
+    /// `sign(a)` with `sign(0) = 0`.
+    pub fn abs(&self) -> Self {
+        self.maximum(&self.scale(-1.0))
+    }
+
+    fn select_scalar(&self, scalar: f32, largest: bool) -> Self {
+        let op = if largest { Compare::Max } else { Compare::Min };
+        let value = B::vector_compare_scalar(self.value(), scalar, op, false);
+        let parent = self.node.clone();
+        self.record(value, move |adjoint| {
+            let share = B::vector_compare_scalar(&parent.value, scalar, Compare::MaxShare, false);
+            let weight = if largest {
+                share
+            } else {
+                B::vector_broadcast(&share, 1.0, BinaryOp::Sub, true)
+            };
+            parent.accumulate(B::vector_elementwise(adjoint, &weight, BinaryOp::Mul));
         })
     }
 
@@ -706,6 +825,95 @@ impl<'t, const R: usize, const C: usize, B: Kernels> MatrixVar<'t, R, C, B> {
                 let scaled = matrix_op(adjoint, &Matrix { data: quotient }, BinaryOp::Mul);
                 right.accumulate(negated_matrix(&scaled));
             }
+        })
+    }
+
+    /// Elementwise larger of two recorded matrices; see [`VectorVar::maximum`].
+    pub fn maximum(&self, other: &Self) -> Self {
+        self.select(other, true)
+    }
+
+    /// Elementwise smaller of two recorded matrices.
+    pub fn minimum(&self, other: &Self) -> Self {
+        self.select(other, false)
+    }
+
+    fn select(&self, other: &Self, largest: bool) -> Self {
+        let op = if largest { Compare::Max } else { Compare::Min };
+        let value = B::matrix_compare(self.value(), other.value(), op);
+        let (left, right) = (self.node.clone(), other.node.clone());
+        self.record(value, move |adjoint| {
+            let share = B::matrix_compare(&left.value, &right.value, Compare::MaxShare);
+            let complement = B::matrix_broadcast(&share, 1.0, BinaryOp::Sub, true);
+            let (mine, theirs) = if largest {
+                (&share, &complement)
+            } else {
+                (&complement, &share)
+            };
+            left.accumulate(B::matrix_elementwise(adjoint, mine, BinaryOp::Mul));
+            right.accumulate(B::matrix_elementwise(adjoint, theirs, BinaryOp::Mul));
+        })
+    }
+
+    /// Elementwise maximum against a constant.
+    pub fn clamp_min(&self, floor: f32) -> Self {
+        self.select_scalar(floor, true)
+    }
+
+    /// Elementwise minimum against a constant.
+    pub fn clamp_max(&self, ceiling: f32) -> Self {
+        self.select_scalar(ceiling, false)
+    }
+
+    /// Confine every element to `[floor, ceiling]`.
+    pub fn clamp(&self, floor: f32, ceiling: f32) -> Self {
+        self.clamp_min(floor).clamp_max(ceiling)
+    }
+
+    /// The rectifier `max(A, 0)`.
+    pub fn relu(&self) -> Self {
+        self.clamp_min(0.0)
+    }
+
+    /// Elementwise absolute value; see [`VectorVar::abs`].
+    pub fn abs(&self) -> Self {
+        self.maximum(&self.scale(-1.0))
+    }
+
+    fn select_scalar(&self, scalar: f32, largest: bool) -> Self {
+        let op = if largest { Compare::Max } else { Compare::Min };
+        let value = B::matrix_compare_scalar(self.value(), scalar, op, false);
+        let parent = self.node.clone();
+        self.record(value, move |adjoint| {
+            let share = B::matrix_compare_scalar(&parent.value, scalar, Compare::MaxShare, false);
+            let weight = if largest {
+                share
+            } else {
+                B::matrix_broadcast(&share, 1.0, BinaryOp::Sub, true)
+            };
+            parent.accumulate(B::matrix_elementwise(adjoint, &weight, BinaryOp::Mul));
+        })
+    }
+
+    /// Sum along each row, one entry per row.
+    ///
+    /// This is `A·1`, so it reuses the product kernels rather than needing a
+    /// reduction of its own, and the adjoint spreads straight back along each
+    /// row: `Ā += ȳ ⊗ 1`.
+    pub fn row_sums(&self) -> VectorVar<'t, R, B> {
+        let value = B::matvec(self.value(), &Vector::<f32, C, B>::filled(1.0));
+        let parent = self.node.clone();
+        self.record(value, move |adjoint| {
+            parent.accumulate(outer(adjoint, &Vector::<f32, C, B>::filled(1.0)));
+        })
+    }
+
+    /// Sum along each column, one entry per column: `1ᵀ·A`, with `Ā += 1 ⊗ ȳ`.
+    pub fn column_sums(&self) -> VectorVar<'t, C, B> {
+        let value = B::vecmat(&Vector::<f32, R, B>::filled(1.0), self.value());
+        let parent = self.node.clone();
+        self.record(value, move |adjoint| {
+            parent.accumulate(outer(&Vector::<f32, R, B>::filled(1.0), adjoint));
         })
     }
 

@@ -38,7 +38,7 @@ use objc2_metal::{
     MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
 };
 
-use crate::tensors::{Analytic, BinaryOp};
+use crate::tensors::{Analytic, BinaryOp, Compare};
 
 /// Threadgroup tile edge; must match `TILE` in the shader. 16×16 = 256 threads.
 const TILE: usize = 16;
@@ -60,6 +60,16 @@ enum class BinaryOp : ushort {
     Mul = 2,
     Div = 3,
     Rem = 4
+};
+
+// Comparisons and the subgradient they imply. `MaxShare` is the derivative of
+// `Max` with respect to its left operand: one where the left is larger, zero
+// where it is smaller, and a half where they tie, so a tied maximum splits its
+// gradient evenly between the two.
+enum class CompareOp : ushort {
+    Min = 0,
+    Max = 1,
+    MaxShare = 2
 };
 
 enum class AnalyticOp : ushort {
@@ -151,6 +161,37 @@ kernel void broadcast(
         case BinaryOp::Mul: C[i] = a * b; break;
         default: C[i] = a / b; break;
     }
+}
+
+inline float compare_values(CompareOp op, float a, float b) {
+    switch (op) {
+        case CompareOp::Min: return fmin(a, b);
+        case CompareOp::Max: return fmax(a, b);
+        default: return a > b ? 1.0f : (a < b ? 0.0f : 0.5f);
+    }
+}
+
+kernel void compare(
+    device const float* A  [[buffer(0)]],
+    device const float* B  [[buffer(1)]],
+    device float* C        [[buffer(2)]],
+    constant CompareOp& op [[buffer(3)]],
+    uint i [[thread_position_in_grid]])
+{
+    C[i] = compare_values(op, A[i], B[i]);
+}
+
+kernel void compare_scalar(
+    device const float* A      [[buffer(0)]],
+    device float* C            [[buffer(1)]],
+    constant float& scalar     [[buffer(2)]],
+    constant CompareOp& op     [[buffer(3)]],
+    constant uint& scalar_left [[buffer(4)]],
+    uint i [[thread_position_in_grid]])
+{
+    float a = scalar_left ? scalar : A[i];
+    float b = scalar_left ? A[i] : scalar;
+    C[i] = compare_values(op, a, b);
 }
 
 // Copy one input vector into a row or column of a row-major output matrix.
@@ -407,6 +448,8 @@ struct Gpu {
     matmul: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     elementwise: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     broadcast: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    compare: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    compare_scalar: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     stack_vector: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     concat_horizontal: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     merge_horizontal: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -455,6 +498,8 @@ fn build_gpu() -> Option<Gpu> {
         matmul: pipeline("matmul_tiled")?,
         elementwise: pipeline("elementwise")?,
         broadcast: pipeline("broadcast")?,
+        compare: pipeline("compare")?,
+        compare_scalar: pipeline("compare_scalar")?,
         stack_vector: pipeline("stack_vector")?,
         concat_horizontal: pipeline("concat_horizontal")?,
         merge_horizontal: pipeline("merge_horizontal")?,
@@ -667,6 +712,38 @@ impl MetalBuffer {
         if self.len != 0 {
             with_gpu(|gpu| {
                 encode_elementwise(gpu, &self.raw, &rhs.raw, &output.raw, self.len, op)
+            })?;
+        }
+        Some(output)
+    }
+
+    /// Elementwise comparison with another shared buffer.
+    pub fn compare(&self, rhs: &Self, op: Compare) -> Option<Self> {
+        if self.len != rhs.len {
+            return None;
+        }
+        let output = Self::allocate(self.len)?;
+        if self.len != 0 {
+            with_gpu(|gpu| encode_compare(gpu, &self.raw, &rhs.raw, &output.raw, self.len, op))?;
+        }
+        Some(output)
+    }
+
+    /// Elementwise comparison against a scalar; `scalar_left` puts the scalar on
+    /// the left, which matters for [`Compare::MaxShare`].
+    pub fn compare_scalar(&self, scalar: f32, op: Compare, scalar_left: bool) -> Option<Self> {
+        let output = Self::allocate(self.len)?;
+        if self.len != 0 {
+            with_gpu(|gpu| {
+                encode_compare_scalar(
+                    gpu,
+                    &self.raw,
+                    &output.raw,
+                    self.len,
+                    scalar,
+                    op,
+                    scalar_left,
+                )
             })?;
         }
         Some(output)
@@ -948,6 +1025,53 @@ fn encode_elementwise(
         encoder.setBuffer_offset_atIndex(Some(b), 0, 1);
         encoder.setBuffer_offset_atIndex(Some(output), 0, 2);
         encoder.setBytes_length_atIndex(NonNull::from(&op).cast(), size_of::<BinaryOp>(), 3);
+    }
+    dispatch_1d(&encoder, len);
+    encoder.endEncoding();
+    commit(gpu, command)
+}
+
+fn encode_compare(
+    gpu: &Gpu,
+    a: &ProtocolObject<dyn MTLBuffer>,
+    b: &ProtocolObject<dyn MTLBuffer>,
+    output: &ProtocolObject<dyn MTLBuffer>,
+    len: usize,
+    op: Compare,
+) -> Option<()> {
+    let command = gpu.queue.commandBuffer()?;
+    let encoder = command.computeCommandEncoder()?;
+    encoder.setComputePipelineState(&gpu.compare);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(a), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(b), 0, 1);
+        encoder.setBuffer_offset_atIndex(Some(output), 0, 2);
+        encoder.setBytes_length_atIndex(NonNull::from(&op).cast(), size_of::<Compare>(), 3);
+    }
+    dispatch_1d(&encoder, len);
+    encoder.endEncoding();
+    commit(gpu, command)
+}
+
+fn encode_compare_scalar(
+    gpu: &Gpu,
+    input: &ProtocolObject<dyn MTLBuffer>,
+    output: &ProtocolObject<dyn MTLBuffer>,
+    len: usize,
+    scalar: f32,
+    op: Compare,
+    scalar_left: bool,
+) -> Option<()> {
+    let command = gpu.queue.commandBuffer()?;
+    let encoder = command.computeCommandEncoder()?;
+    encoder.setComputePipelineState(&gpu.compare_scalar);
+    let scalar_left = u32::from(scalar_left);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
+        encoder.setBytes_length_atIndex(NonNull::from(&scalar).cast(), 4, 2);
+        encoder.setBytes_length_atIndex(NonNull::from(&op).cast(), size_of::<Compare>(), 3);
+        encoder.setBytes_length_atIndex(NonNull::from(&scalar_left).cast(), 4, 4);
     }
     dispatch_1d(&encoder, len);
     encoder.endEncoding();

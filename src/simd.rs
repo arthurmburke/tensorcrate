@@ -1,4 +1,4 @@
-//! NEON SIMD kernels for the CPU math paths.
+//! Architecture-specific SIMD kernels for the CPU math paths.
 //!
 //! These are the *middle tier* between the naive generic scalar loops in
 //! [`tensors`](crate::tensors) and the Metal GPU path. Metal only pays off once
@@ -7,21 +7,19 @@
 //! matmuls and every short FFT — the generic path runs one scalar multiply at a
 //! time. These kernels vectorize that gap.
 //!
-//! Everything here is `aarch64`-only and hand-written against
-//! [`core::arch::aarch64`]. NEON is part of the aarch64 baseline (it is always
-//! present in `target_feature`), so no runtime feature detection is needed. The
-//! kernels operate on concrete `f32`/`f64` slices; the generic-to-concrete
-//! bridge (via `TypeId`) lives in `tensors::simd_dispatch`, which keeps the
-//! scalar path as the correctness oracle for every non-float element type
-//! (integers, `Complex`, `Dual`).
-
-#![cfg(target_arch = "aarch64")]
+//! On `aarch64`, NEON is part of the architecture baseline. On `x86_64`, the
+//! implementation selects AVX2+FMA at runtime and retains an SSE2 baseline for
+//! older processors. The kernels operate on concrete `f32`/`f64` slices; the
+//! generic-to-concrete bridge (via `TypeId`) lives in
+//! `tensors::simd_dispatch`, which keeps the scalar path as the correctness
+//! oracle for every non-float element type (integers, `Complex`, `Dual`).
 
 /// Generates the elementwise / reduction / matmul kernels for one float type.
 ///
 /// The four floating intrinsics differ only in name between `f32` (4-lane
 /// `float32x4_t`) and `f64` (2-lane `float64x2_t`), so the bodies are shared and
 /// the intrinsic set is passed in.
+#[cfg(target_arch = "aarch64")]
 macro_rules! neon_kernels {
     (
         mod $modname:ident, ty = $t:ty, vec = $v:ty, lanes = $lanes:expr,
@@ -254,6 +252,7 @@ macro_rules! neon_kernels {
     };
 }
 
+#[cfg(target_arch = "aarch64")]
 neon_kernels! {
     mod f32k, ty = f32, vec = float32x4_t, lanes = 4,
     load = vld1q_f32, store = vst1q_f32, dup = vdupq_n_f32,
@@ -261,6 +260,7 @@ neon_kernels! {
     fma = vfmaq_f32, addv = vaddvq_f32
 }
 
+#[cfg(target_arch = "aarch64")]
 neon_kernels! {
     mod f64k, ty = f64, vec = float64x2_t, lanes = 2,
     load = vld1q_f64, store = vst1q_f64, dup = vdupq_n_f64,
@@ -278,6 +278,7 @@ neon_kernels! {
 /// real/imag arrays) rather than iterated with a running complex product, so the
 /// vector lanes stay independent. Stages too short to fill a vector (len 2 and 4)
 /// and any ragged tail fall back to scalar butterflies.
+#[cfg(target_arch = "aarch64")]
 pub mod fft_f32 {
     use core::arch::aarch64::*;
 
@@ -368,3 +369,9 @@ pub mod fft_f32 {
         }
     }
 }
+
+#[cfg(target_arch = "x86_64")]
+#[path = "simd_x86.rs"]
+mod x86;
+#[cfg(target_arch = "x86_64")]
+pub use x86::{f32k, f64k, fft_f32};

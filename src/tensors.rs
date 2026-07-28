@@ -47,17 +47,17 @@ pub use dual::{
     DualMatrix, DualVector, gradient, gradient_wrt_matrix, jacobian, jacobian_wrt_matrix,
     matrix_gradient,
 };
-pub use kernels::{Analytic, BinaryOp, Kernels};
+pub use kernels::{Analytic, BinaryOp, Compare, Kernels};
 pub use tape::{MatrixVar, ScalarVar, Tape, Var, VectorVar};
 
-#[cfg(all(feature = "simd", target_arch = "aarch64"))]
+#[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
 mod simd_dispatch {
     //! CPU SIMD tier: sits between `metal_dispatch` and the generic scalar
     //! loops. Each entry point downcasts the generic element type to a concrete
     //! float via `TypeId` (returning `None` — i.e. defer to scalar — for every
-    //! other type), then calls the NEON kernels in [`crate::simd`]. The size
-    //! gates are deliberately small: NEON has almost no fixed cost, so it wins
-    //! far below the Metal thresholds.
+    //! other type), then calls the architecture-specific kernels in
+    //! [`crate::simd`]. The size gates are deliberately small: CPU SIMD has
+    //! almost no fixed cost, so it wins far below the Metal thresholds.
 
     use std::any::TypeId;
 
@@ -482,7 +482,7 @@ impl<T: Coefficient, const N: usize> Vector<T, N> {
     /// Implementation hook used by `math!` for tensor/scalar broadcasting.
     #[doc(hidden)]
     pub fn broadcast_right(&self, scalar: T, op: BinaryOp) -> Self {
-        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         if let Some(output) = simd_dispatch::broadcast(&self.data, scalar, op, false) {
             return Vector::new(std::array::from_fn(|index| output[index]));
         }
@@ -498,7 +498,7 @@ impl<T: Coefficient, const N: usize> Vector<T, N> {
     /// Implementation hook used by `math!` for scalar/tensor broadcasting.
     #[doc(hidden)]
     pub fn broadcast_left(&self, scalar: T, op: BinaryOp) -> Self {
-        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         if let Some(output) = simd_dispatch::broadcast(&self.data, scalar, op, true) {
             return Vector::new(std::array::from_fn(|index| output[index]));
         }
@@ -514,7 +514,7 @@ impl<T: Coefficient, const N: usize> Vector<T, N> {
     /// Dot product with a vector of the same length — the length match is
     /// enforced by the type.
     pub fn dot(&self, other: &Vector<T, N>) -> T {
-        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         if let Some(output) = simd_dispatch::dot(&self.data, &other.data) {
             return output;
         }
@@ -527,7 +527,7 @@ impl<T: Coefficient, const N: usize> Vector<T, N> {
 
     /// Row vector times matrix: `(1×N)·(N×C) = (1×C)`.
     pub fn vecmat<const C: usize>(&self, m: &Matrix<T, N, C>) -> Vector<T, C> {
-        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         if let Some(output) = simd_dispatch::vecmat(&self.data, &m.data) {
             return output;
         }
@@ -569,7 +569,7 @@ impl<T: Coefficient, const N: usize> Vector<T, N> {
             return Vector::new(output);
         }
 
-        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         if simd_dispatch::radix2_fft(&mut output, -1.0) {
             return Vector::new(output);
         }
@@ -593,9 +593,12 @@ impl<T: Float + Coefficient, const N: usize> Vector<Complex<T>, N> {
 
         let mut output = self.data;
         if N.is_power_of_two() {
-            #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+            #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
             let vectorized = simd_dispatch::radix2_fft(&mut output, 1.0);
-            #[cfg(not(all(feature = "simd", target_arch = "aarch64")))]
+            #[cfg(not(all(
+                feature = "simd",
+                any(target_arch = "aarch64", target_arch = "x86_64")
+            )))]
             let vectorized = false;
             if !vectorized {
                 radix2_fft(&mut output, true);
@@ -1377,7 +1380,7 @@ impl<T: Coefficient, const R: usize, const C: usize> Matrix<T, R, C> {
     /// Implementation hook used by `math!` for tensor/scalar broadcasting.
     #[doc(hidden)]
     pub fn broadcast_right(&self, scalar: T, op: BinaryOp) -> Self {
-        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         {
             // SAFETY: nested arrays are contiguous and hold exactly R*C `T`.
             let input = unsafe {
@@ -1401,7 +1404,7 @@ impl<T: Coefficient, const R: usize, const C: usize> Matrix<T, R, C> {
     /// Implementation hook used by `math!` for scalar/tensor broadcasting.
     #[doc(hidden)]
     pub fn broadcast_left(&self, scalar: T, op: BinaryOp) -> Self {
-        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         {
             // SAFETY: nested arrays are contiguous and hold exactly R*C `T`.
             let input = unsafe {
@@ -1425,7 +1428,7 @@ impl<T: Coefficient, const R: usize, const C: usize> Matrix<T, R, C> {
     /// Matrix product `(R×C)·(C×C2) = (R×C2)`. The shared inner dimension `C` is
     /// enforced by the type: a mismatch does not compile.
     pub fn matmul<const C2: usize>(&self, other: &Matrix<T, C, C2>) -> Matrix<T, R, C2> {
-        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         if let Some(output) = simd_dispatch::matmul(&self.data, &other.data) {
             return output;
         }
@@ -1452,7 +1455,7 @@ impl<T: Coefficient, const R: usize, const C: usize> Matrix<T, R, C> {
         addend: Matrix<T, R, C2>,
     ) -> Matrix<T, R, C2> {
         let mut output = addend;
-        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         if simd_dispatch::matmul_add(&self.data, &other.data, &mut output.data) {
             return output;
         }
@@ -1468,7 +1471,7 @@ impl<T: Coefficient, const R: usize, const C: usize> Matrix<T, R, C> {
 
     /// Matrix times column vector: `(R×C)·(C×1) = (R×1)`.
     pub fn matvec(&self, v: &Vector<T, C>) -> Vector<T, R> {
-        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         if let Some(output) = simd_dispatch::matvec(&self.data, &v.data) {
             return output;
         }
@@ -1488,7 +1491,7 @@ impl<T: Coefficient, const R: usize, const C: usize> Matrix<T, R, C> {
     /// Each row uses the SIMD dot-product kernel when available, and the owned
     /// addend is updated in place.
     pub fn matvec_add(&self, v: &Vector<T, C>, addend: Vector<T, R>) -> Vector<T, R> {
-        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         if let Some(output) = simd_dispatch::matvec_add(&self.data, &v.data, &addend.data) {
             return output;
         }
@@ -1651,7 +1654,7 @@ impl<T: Coefficient, const N: usize> Mul for Vector<T, N> {
     type Output = Vector<T, N>;
 
     fn mul(self, rhs: Self) -> Self::Output {
-        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         if let Some(output) = simd_dispatch::elementwise(&self.data, &rhs.data, BinaryOp::Mul) {
             return Vector::new(std::array::from_fn(|index| output[index]));
         }
@@ -1663,7 +1666,7 @@ impl<T: Coefficient, const R: usize, const C: usize> Mul for Matrix<T, R, C> {
     type Output = Matrix<T, R, C>;
 
     fn mul(self, rhs: Self) -> Self::Output {
-        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         {
             // SAFETY: nested arrays are contiguous and hold exactly R*C `T`.
             let left = unsafe {
