@@ -3,8 +3,7 @@
 //! Forward mode ([`dual`](super::dual)) carries a tangent alongside every value
 //! and costs one pass per *input*. Reverse mode records the computation and then
 //! walks it backwards, costing one pass per *output* — so a scalar loss over a
-//! whole weight matrix takes a single backward pass instead of `R * C` forward
-//! ones.
+//! whole weight matrix takes a single backward pass instead of one per element.
 //!
 //! # Using it
 //!
@@ -12,7 +11,7 @@
 //! use tensorcrate::tensors::{Matrix, Tape, Vector};
 //!
 //! let tape = Tape::new();
-//! let a = tape.matrix(Matrix::<f32, 2, 3>::from_rows([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]));
+//! let a = tape.matrix(Matrix::<f32>::from_rows([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]));
 //! let x = tape.vector(Vector::new([1.0f32, 0.5, -1.0]));
 //!
 //! let mapped = a.matvec(&x);        // y = A·x
@@ -23,8 +22,8 @@
 //! let projected = a.value().matvec(x.value());
 //! for row in 0..2 {
 //!     for col in 0..3 {
-//!         let expected = 2.0 * projected.data()[row] * x.value().data()[col];
-//!         assert!((a.grad().data()[row][col] - expected).abs() < 1e-5);
+//!         let expected = 2.0 * projected[row] * x.value()[col];
+//!         assert!((a.grad()[(row, col)] - expected).abs() < 1e-5);
 //!     }
 //! }
 //! ```
@@ -37,10 +36,12 @@
 //! copies nothing.
 //!
 //! Each node stores a closure that pushes adjoints into its operands. Those
-//! closures are built where the operation is written, so the shapes are static
-//! there and the rules need no runtime shape checks; the tape itself only sees
-//! `dyn Backprop`. Adjoints start as `None` rather than zeros, which keeps
-//! untouched nodes from allocating (and, on `Metal`, from dispatching).
+//! closures capture their operands' nodes, so a rule reads whatever shapes it
+//! needs from the values recorded there rather than re-deriving them. Adjoints
+//! start as `None` rather than zeros, which keeps untouched nodes from
+//! allocating (and, on `Metal`, from dispatching) — and is why the zero an
+//! adjoint falls back to is built *from* a recorded value, by
+//! [`Adjoint::zeros_like`], instead of from a type.
 //!
 //! Every rule is expressed with the [`Kernels`] trait, so reverse mode runs on
 //! either backend and a `Metal` graph stays resident from the forward pass right
@@ -93,8 +94,12 @@ use super::{Analytic, BinaryOp, Compare, Host, Kernels, Matrix, Vector};
 /// and a sum — expressed without a `Clone` bound, which on a generic backend
 /// would infect every signature that touches a node.
 pub trait Adjoint<B: Kernels>: Sized + 'static {
-    /// The additive identity of this shape.
-    fn zeros() -> Self;
+    /// The additive identity of *this value's* shape.
+    ///
+    /// A zero adjoint has to match the value it belongs to, and with runtime
+    /// dimensions the type no longer says what that shape is — so the zero is
+    /// built from an existing value rather than conjured from nothing.
+    fn zeros_like(&self) -> Self;
 
     /// A second copy of this value on the same backend.
     fn duplicate(&self) -> Self;
@@ -104,7 +109,7 @@ pub trait Adjoint<B: Kernels>: Sized + 'static {
 }
 
 impl<B: Kernels> Adjoint<B> for f32 {
-    fn zeros() -> Self {
+    fn zeros_like(&self) -> Self {
         0.0
     }
 
@@ -117,9 +122,9 @@ impl<B: Kernels> Adjoint<B> for f32 {
     }
 }
 
-impl<const N: usize, B: Kernels> Adjoint<B> for Vector<f32, N, B> {
-    fn zeros() -> Self {
-        Vector::filled(0.0)
+impl<B: Kernels> Adjoint<B> for Vector<f32, B> {
+    fn zeros_like(&self) -> Self {
+        Vector::filled(self.len(), 0.0)
     }
 
     fn duplicate(&self) -> Self {
@@ -131,9 +136,10 @@ impl<const N: usize, B: Kernels> Adjoint<B> for Vector<f32, N, B> {
     }
 }
 
-impl<const R: usize, const C: usize, B: Kernels> Adjoint<B> for Matrix<f32, R, C, B> {
-    fn zeros() -> Self {
-        Matrix::filled(0.0)
+impl<B: Kernels> Adjoint<B> for Matrix<f32, B> {
+    fn zeros_like(&self) -> Self {
+        let (rows, cols) = self.shape();
+        Matrix::filled(rows, cols, 0.0)
     }
 
     fn duplicate(&self) -> Self {
@@ -175,6 +181,15 @@ impl<T: Adjoint<B>, B: Kernels> Node<T, B> {
             Some(current) => current.add(&delta),
             None => delta,
         });
+    }
+
+    /// The adjoint accumulated so far, or a fresh zero of this node's shape —
+    /// the starting point for an accumulating matmul.
+    fn current_or_zeros(&self) -> T {
+        match self.adjoint.borrow().as_ref() {
+            Some(current) => current.duplicate(),
+            None => self.value.zeros_like(),
+        }
     }
 }
 
@@ -223,15 +238,12 @@ impl<B: Kernels> Tape<B> {
     }
 
     /// Record a vector input.
-    pub fn vector<const N: usize>(&self, value: Vector<f32, N, B>) -> VectorVar<'_, N, B> {
+    pub fn vector(&self, value: Vector<f32, B>) -> VectorVar<'_, B> {
         self.push(value, None)
     }
 
     /// Record a matrix input.
-    pub fn matrix<const R: usize, const C: usize>(
-        &self,
-        value: Matrix<f32, R, C, B>,
-    ) -> MatrixVar<'_, R, C, B> {
+    pub fn matrix(&self, value: Matrix<f32, B>) -> MatrixVar<'_, B> {
         self.push(value, None)
     }
 
@@ -288,10 +300,10 @@ impl<T, B: Kernels> Clone for Var<'_, T, B> {
 
 /// A recorded scalar.
 pub type ScalarVar<'t, B = Host> = Var<'t, f32, B>;
-/// A recorded length-`N` vector.
-pub type VectorVar<'t, const N: usize, B = Host> = Var<'t, Vector<f32, N, B>, B>;
-/// A recorded `R × C` matrix.
-pub type MatrixVar<'t, const R: usize, const C: usize, B = Host> = Var<'t, Matrix<f32, R, C, B>, B>;
+/// A recorded vector.
+pub type VectorVar<'t, B = Host> = Var<'t, Vector<f32, B>, B>;
+/// A recorded matrix.
+pub type MatrixVar<'t, B = Host> = Var<'t, Matrix<f32, B>, B>;
 
 impl<'t, T: Adjoint<B>, B: Kernels> Var<'t, T, B> {
     /// The value computed in the forward pass.
@@ -299,12 +311,12 @@ impl<'t, T: Adjoint<B>, B: Kernels> Var<'t, T, B> {
         &self.node.value
     }
 
-    /// The gradient accumulated by the last backward pass — zeros if this value
-    /// did not reach the output that was seeded.
+    /// The gradient accumulated by the last backward pass — zeros of this
+    /// value's shape if it did not reach the output that was seeded.
     pub fn grad(&self) -> T {
         match self.node.adjoint.borrow().as_ref() {
             Some(adjoint) => adjoint.duplicate(),
-            None => T::zeros(),
+            None => self.node.value.zeros_like(),
         }
     }
 
@@ -368,29 +380,19 @@ impl<B: Kernels> ScalarVar<'_, B> {
 
 // ---- helpers ----------------------------------------------------------------
 
-fn vector_op<const N: usize, B: Kernels>(
-    a: &Vector<f32, N, B>,
-    b: &Vector<f32, N, B>,
-    op: BinaryOp,
-) -> Vector<f32, N, B> {
+fn vector_op<B: Kernels>(a: &Vector<f32, B>, b: &Vector<f32, B>, op: BinaryOp) -> Vector<f32, B> {
     B::vector_elementwise(a, b, op)
 }
 
-fn matrix_op<const R: usize, const C: usize, B: Kernels>(
-    a: &Matrix<f32, R, C, B>,
-    b: &Matrix<f32, R, C, B>,
-    op: BinaryOp,
-) -> Matrix<f32, R, C, B> {
+fn matrix_op<B: Kernels>(a: &Matrix<f32, B>, b: &Matrix<f32, B>, op: BinaryOp) -> Matrix<f32, B> {
     B::matrix_elementwise(a, b, op)
 }
 
-fn negated_vector<const N: usize, B: Kernels>(v: &Vector<f32, N, B>) -> Vector<f32, N, B> {
+fn negated_vector<B: Kernels>(v: &Vector<f32, B>) -> Vector<f32, B> {
     B::vector_broadcast(v, -1.0, BinaryOp::Mul, false)
 }
 
-fn negated_matrix<const R: usize, const C: usize, B: Kernels>(
-    m: &Matrix<f32, R, C, B>,
-) -> Matrix<f32, R, C, B> {
+fn negated_matrix<B: Kernels>(m: &Matrix<f32, B>) -> Matrix<f32, B> {
     B::matrix_broadcast(m, -1.0, BinaryOp::Mul, false)
 }
 
@@ -514,27 +516,40 @@ impl<'t, B: Kernels> ScalarVar<'t, B> {
         })
     }
 
-    /// Broadcast this scalar across a length-`N` vector. Its gradient is the sum
-    /// of the vector's adjoint, since it reaches every element.
-    pub fn expand<const N: usize>(&self) -> VectorVar<'t, N, B> {
+    /// Broadcast this scalar across a length-`len` vector. Its gradient is the
+    /// sum of the vector's adjoint, since it reaches every element.
+    pub fn expand(&self, len: usize) -> VectorVar<'t, B> {
         let parent = self.node.clone();
-        self.record(Vector::filled(self.node.value), move |adjoint| {
+        self.record(Vector::filled(len, self.node.value), move |adjoint| {
             parent.accumulate(adjoint.as_slice().iter().sum());
         })
     }
 
-    /// Broadcast this scalar across an `R × C` matrix.
-    pub fn expand_matrix<const R: usize, const C: usize>(&self) -> MatrixVar<'t, R, C, B> {
+    /// Broadcast this scalar across a `rows × cols` matrix.
+    pub fn expand_matrix(&self, rows: usize, cols: usize) -> MatrixVar<'t, B> {
         let parent = self.node.clone();
-        self.record(Matrix::filled(self.node.value), move |adjoint| {
-            parent.accumulate(adjoint.as_slice().iter().sum());
-        })
+        self.record(
+            Matrix::filled(rows, cols, self.node.value),
+            move |adjoint| {
+                parent.accumulate(adjoint.as_slice().iter().sum());
+            },
+        )
     }
 }
 
 // ---- vectors ----------------------------------------------------------------
 
-impl<'t, const N: usize, B: Kernels> VectorVar<'t, N, B> {
+impl<'t, B: Kernels> VectorVar<'t, B> {
+    /// The number of elements.
+    pub fn len(&self) -> usize {
+        self.node.value.len()
+    }
+
+    /// Whether this vector holds no elements.
+    pub fn is_empty(&self) -> bool {
+        self.node.value.is_empty()
+    }
+
     fn binary(&self, rhs: &Self, op: BinaryOp) -> Self {
         self.assert_same_tape(rhs);
         let value = vector_op(self.value(), rhs.value(), op);
@@ -567,11 +582,11 @@ impl<'t, const N: usize, B: Kernels> VectorVar<'t, N, B> {
             // c = a % b: the quotient is locally constant, so b̄ −= c̄·trunc(a/b)
             BinaryOp::Rem => {
                 left.accumulate(adjoint.duplicate());
-                let quotient = B::store_vector::<N>(&truncated_quotient(
+                let quotient = Vector::<f32, B>::build(&truncated_quotient(
                     left.value.as_slice(),
                     right.value.as_slice(),
                 ));
-                let scaled = vector_op(adjoint, &Vector { data: quotient }, BinaryOp::Mul);
+                let scaled = vector_op(adjoint, &quotient, BinaryOp::Mul);
                 right.accumulate(negated_vector(&scaled));
             }
         })
@@ -691,7 +706,7 @@ impl<'t, const N: usize, B: Kernels> VectorVar<'t, N, B> {
         let total: f32 = self.value().as_slice().iter().sum();
         let parent = self.node.clone();
         self.record(total, move |adjoint| {
-            parent.accumulate(Vector::filled(*adjoint));
+            parent.accumulate(Vector::filled(parent.value.len(), *adjoint));
         })
     }
 
@@ -718,7 +733,7 @@ impl<'t, const N: usize, B: Kernels> VectorVar<'t, N, B> {
     }
 
     /// Row vector times matrix, `(1×N)·(N×C)`: `x̄ += A·ȳ` and `Ā += x ⊗ ȳ`.
-    pub fn vecmat<const C: usize>(&self, m: &MatrixVar<'t, N, C, B>) -> VectorVar<'t, C, B> {
+    pub fn vecmat(&self, m: &MatrixVar<'t, B>) -> VectorVar<'t, B> {
         self.assert_same_tape(m);
         let value = B::vecmat(self.value(), m.value());
         let (vector, matrix) = (self.node.clone(), m.node.clone());
@@ -729,15 +744,16 @@ impl<'t, const N: usize, B: Kernels> VectorVar<'t, N, B> {
     }
 
     /// View as a `1 × N` matrix; the adjoint flows straight back.
-    pub fn into_row(&self) -> MatrixVar<'t, 1, N, B> {
-        let value = Matrix {
-            data: B::vector_into_row::<N>(self.value().duplicate().data),
-        };
+    pub fn into_row(&self) -> MatrixVar<'t, B> {
+        let len = self.len();
+        let value = Matrix::from_storage(
+            1,
+            len,
+            B::vector_into_matrix(self.value().duplicate().into_storage()),
+        );
         let parent = self.node.clone();
         self.record(value, move |adjoint| {
-            parent.accumulate(Vector {
-                data: B::store_vector::<N>(adjoint.as_slice()),
-            });
+            parent.accumulate(Vector::build(adjoint.as_slice()));
         })
     }
 
@@ -747,7 +763,7 @@ impl<'t, const N: usize, B: Kernels> VectorVar<'t, N, B> {
     /// it is what `matvec` accumulates into its matrix operand, and what a
     /// weight update looks like. Its own rules are the two contractions of the
     /// adjoint: `ū = Ȳ·v` and `v̄ = uᵀ·Ȳ`.
-    pub fn outer<const M: usize>(&self, other: &VectorVar<'t, M, B>) -> MatrixVar<'t, N, M, B> {
+    pub fn outer(&self, other: &VectorVar<'t, B>) -> MatrixVar<'t, B> {
         self.assert_same_tape(other);
         let value = outer(self.value(), other.value());
         let (left, right) = (self.node.clone(), other.node.clone());
@@ -758,37 +774,54 @@ impl<'t, const N: usize, B: Kernels> VectorVar<'t, N, B> {
     }
 
     /// View as an `N × 1` matrix; the adjoint flows straight back.
-    pub fn into_column(&self) -> MatrixVar<'t, N, 1, B> {
-        let value = Matrix {
-            data: B::vector_into_column::<N>(self.value().duplicate().data),
-        };
+    pub fn into_column(&self) -> MatrixVar<'t, B> {
+        let len = self.len();
+        let value = Matrix::from_storage(
+            len,
+            1,
+            B::vector_into_matrix(self.value().duplicate().into_storage()),
+        );
         let parent = self.node.clone();
         self.record(value, move |adjoint| {
-            parent.accumulate(Vector {
-                data: B::store_vector::<N>(adjoint.as_slice()),
-            });
+            parent.accumulate(Vector::build(adjoint.as_slice()));
         })
     }
 }
 
-/// The outer product `u ⊗ v` as an `R × C` matrix, built from the column/row
-/// views the backend already provides.
-fn outer<const R: usize, const C: usize, B: Kernels>(
-    u: &Vector<f32, R, B>,
-    v: &Vector<f32, C, B>,
-) -> Matrix<f32, R, C, B> {
-    let column: Matrix<f32, R, 1, B> = Matrix {
-        data: B::vector_into_column::<R>(u.to_backend::<B>().data),
-    };
-    let row: Matrix<f32, 1, C, B> = Matrix {
-        data: B::vector_into_row::<C>(v.to_backend::<B>().data),
-    };
+/// The outer product `u ⊗ v` as a `u.len() × v.len()` matrix, built from the
+/// column/row views the backend already provides.
+fn outer<B: Kernels>(u: &Vector<f32, B>, v: &Vector<f32, B>) -> Matrix<f32, B> {
+    let column = Matrix::from_storage(
+        u.len(),
+        1,
+        B::vector_into_matrix(u.to_backend::<B>().into_storage()),
+    );
+    let row = Matrix::from_storage(
+        1,
+        v.len(),
+        B::vector_into_matrix(v.to_backend::<B>().into_storage()),
+    );
     B::matmul(&column, &row)
 }
 
 // ---- matrices ---------------------------------------------------------------
 
-impl<'t, const R: usize, const C: usize, B: Kernels> MatrixVar<'t, R, C, B> {
+impl<'t, B: Kernels> MatrixVar<'t, B> {
+    /// The `(rows, columns)` extents.
+    pub fn shape(&self) -> (usize, usize) {
+        self.node.value.shape()
+    }
+
+    /// The number of rows.
+    pub fn rows(&self) -> usize {
+        self.node.value.rows()
+    }
+
+    /// The number of columns.
+    pub fn cols(&self) -> usize {
+        self.node.value.cols()
+    }
+
     fn binary(&self, rhs: &Self, op: BinaryOp) -> Self {
         self.assert_same_tape(rhs);
         let value = matrix_op(self.value(), rhs.value(), op);
@@ -818,11 +851,13 @@ impl<'t, const R: usize, const C: usize, B: Kernels> MatrixVar<'t, R, C, B> {
             }
             BinaryOp::Rem => {
                 left.accumulate(adjoint.duplicate());
-                let quotient = B::store_matrix::<R, C>(&truncated_quotient(
-                    left.value.as_slice(),
-                    right.value.as_slice(),
-                ));
-                let scaled = matrix_op(adjoint, &Matrix { data: quotient }, BinaryOp::Mul);
+                let (rows, cols) = left.value.shape();
+                let quotient = Matrix::<f32, B>::build(
+                    rows,
+                    cols,
+                    &truncated_quotient(left.value.as_slice(), right.value.as_slice()),
+                );
+                let scaled = matrix_op(adjoint, &quotient, BinaryOp::Mul);
                 right.accumulate(negated_matrix(&scaled));
             }
         })
@@ -900,20 +935,22 @@ impl<'t, const R: usize, const C: usize, B: Kernels> MatrixVar<'t, R, C, B> {
     /// This is `A·1`, so it reuses the product kernels rather than needing a
     /// reduction of its own, and the adjoint spreads straight back along each
     /// row: `Ā += ȳ ⊗ 1`.
-    pub fn row_sums(&self) -> VectorVar<'t, R, B> {
-        let value = B::matvec(self.value(), &Vector::<f32, C, B>::filled(1.0));
+    pub fn row_sums(&self) -> VectorVar<'t, B> {
+        let cols = self.cols();
+        let value = B::matvec(self.value(), &Vector::<f32, B>::filled(cols, 1.0));
         let parent = self.node.clone();
         self.record(value, move |adjoint| {
-            parent.accumulate(outer(adjoint, &Vector::<f32, C, B>::filled(1.0)));
+            parent.accumulate(outer(adjoint, &Vector::<f32, B>::filled(cols, 1.0)));
         })
     }
 
     /// Sum along each column, one entry per column: `1ᵀ·A`, with `Ā += 1 ⊗ ȳ`.
-    pub fn column_sums(&self) -> VectorVar<'t, C, B> {
-        let value = B::vecmat(&Vector::<f32, R, B>::filled(1.0), self.value());
+    pub fn column_sums(&self) -> VectorVar<'t, B> {
+        let rows = self.rows();
+        let value = B::vecmat(&Vector::<f32, B>::filled(rows, 1.0), self.value());
         let parent = self.node.clone();
         self.record(value, move |adjoint| {
-            parent.accumulate(outer(&Vector::<f32, R, B>::filled(1.0), adjoint));
+            parent.accumulate(outer(&Vector::<f32, B>::filled(rows, 1.0), adjoint));
         })
     }
 
@@ -954,10 +991,7 @@ impl<'t, const R: usize, const C: usize, B: Kernels> MatrixVar<'t, R, C, B> {
     ///
     /// Both use the accumulating matmul, so each contribution is one dispatch
     /// rather than a product followed by a sum.
-    pub fn matmul<const C2: usize>(
-        &self,
-        other: &MatrixVar<'t, C, C2, B>,
-    ) -> MatrixVar<'t, R, C2, B> {
+    pub fn matmul(&self, other: &MatrixVar<'t, B>) -> MatrixVar<'t, B> {
         self.assert_same_tape(other);
         let value = B::matmul(self.value(), other.value());
         let (left, right) = (self.node.clone(), other.node.clone());
@@ -965,25 +999,25 @@ impl<'t, const R: usize, const C: usize, B: Kernels> MatrixVar<'t, R, C, B> {
             let left_adjoint = B::matmul_add(
                 adjoint,
                 &B::transpose(&right.value),
-                current_or_zeros(&left.adjoint),
+                left.current_or_zeros(),
             );
             *left.adjoint.borrow_mut() = Some(left_adjoint);
 
             let right_adjoint = B::matmul_add(
                 &B::transpose(&left.value),
                 adjoint,
-                current_or_zeros(&right.adjoint),
+                right.current_or_zeros(),
             );
             *right.adjoint.borrow_mut() = Some(right_adjoint);
         })
     }
 
     /// Fused matrix multiply-add: `self·other + addend`.
-    pub fn matmul_add<const C2: usize>(
+    pub fn matmul_add(
         &self,
-        other: &MatrixVar<'t, C, C2, B>,
-        addend: &MatrixVar<'t, R, C2, B>,
-    ) -> MatrixVar<'t, R, C2, B> {
+        other: &MatrixVar<'t, B>,
+        addend: &MatrixVar<'t, B>,
+    ) -> MatrixVar<'t, B> {
         self.assert_same_tape(other);
         self.assert_same_tape(addend);
         let value = B::matmul_add(self.value(), other.value(), addend.value().duplicate());
@@ -992,14 +1026,14 @@ impl<'t, const R: usize, const C: usize, B: Kernels> MatrixVar<'t, R, C, B> {
             let left_adjoint = B::matmul_add(
                 adjoint,
                 &B::transpose(&right.value),
-                current_or_zeros(&left.adjoint),
+                left.current_or_zeros(),
             );
             *left.adjoint.borrow_mut() = Some(left_adjoint);
 
             let right_adjoint = B::matmul_add(
                 &B::transpose(&left.value),
                 adjoint,
-                current_or_zeros(&right.adjoint),
+                right.current_or_zeros(),
             );
             *right.adjoint.borrow_mut() = Some(right_adjoint);
             bias.accumulate(adjoint.duplicate());
@@ -1007,7 +1041,7 @@ impl<'t, const R: usize, const C: usize, B: Kernels> MatrixVar<'t, R, C, B> {
     }
 
     /// Matrix times vector: `Ā += ȳ ⊗ x` and `x̄ += Aᵀ·ȳ`.
-    pub fn matvec(&self, v: &VectorVar<'t, C, B>) -> VectorVar<'t, R, B> {
+    pub fn matvec(&self, v: &VectorVar<'t, B>) -> VectorVar<'t, B> {
         self.assert_same_tape(v);
         let value = B::matvec(self.value(), v.value());
         let (matrix, vector) = (self.node.clone(), v.node.clone());
@@ -1018,11 +1052,7 @@ impl<'t, const R: usize, const C: usize, B: Kernels> MatrixVar<'t, R, C, B> {
     }
 
     /// Fused matrix-vector multiply-add: `self·v + addend`.
-    pub fn matvec_add(
-        &self,
-        v: &VectorVar<'t, C, B>,
-        addend: &VectorVar<'t, R, B>,
-    ) -> VectorVar<'t, R, B> {
+    pub fn matvec_add(&self, v: &VectorVar<'t, B>, addend: &VectorVar<'t, B>) -> VectorVar<'t, B> {
         self.assert_same_tape(v);
         self.assert_same_tape(addend);
         let value = B::matvec_add(self.value(), v.value(), addend.value().duplicate());
@@ -1035,7 +1065,7 @@ impl<'t, const R: usize, const C: usize, B: Kernels> MatrixVar<'t, R, C, B> {
     }
 
     /// Transpose; the adjoint transposes back.
-    pub fn transpose(&self) -> MatrixVar<'t, C, R, B> {
+    pub fn transpose(&self) -> MatrixVar<'t, B> {
         let value = B::transpose(self.value());
         let parent = self.node.clone();
         self.record(value, move |adjoint| {
@@ -1048,7 +1078,8 @@ impl<'t, const R: usize, const C: usize, B: Kernels> MatrixVar<'t, R, C, B> {
         let total: f32 = self.value().as_slice().iter().sum();
         let parent = self.node.clone();
         self.record(total, move |adjoint| {
-            parent.accumulate(Matrix::filled(*adjoint));
+            let (rows, cols) = parent.value.shape();
+            parent.accumulate(Matrix::filled(rows, cols, *adjoint));
         })
     }
 
@@ -1066,10 +1097,7 @@ impl<'t, const R: usize, const C: usize, B: Kernels> MatrixVar<'t, R, C, B> {
     /// - `K̄ += correlate(X, Ȳ)`, the input windowed by the output adjoint;
     /// - `X̄ += correlate(pad(Ȳ, KR−1, KC−1), K, flipped)`, a *full*
     ///   correlation, which is what the zero padding spells.
-    pub fn correlate<const KR: usize, const KC: usize>(
-        &self,
-        window: &MatrixVar<'t, KR, KC, B>,
-    ) -> MatrixVar<'t, { R - KR + 1 }, { C - KC + 1 }, B> {
+    pub fn correlate(&self, window: &MatrixVar<'t, B>) -> MatrixVar<'t, B> {
         self.correlate_with(window, false)
     }
 
@@ -1078,25 +1106,17 @@ impl<'t, const R: usize, const C: usize, B: Kernels> MatrixVar<'t, R, C, B> {
     /// This is the signal-processing convention. Machine learning calls
     /// [`correlate`](Self::correlate) "convolution"; the two differ only by that
     /// reversal, and both differentiate here.
-    pub fn convolve<const KR: usize, const KC: usize>(
-        &self,
-        window: &MatrixVar<'t, KR, KC, B>,
-    ) -> MatrixVar<'t, { R - KR + 1 }, { C - KC + 1 }, B> {
+    pub fn convolve(&self, window: &MatrixVar<'t, B>) -> MatrixVar<'t, B> {
         self.correlate_with(window, true)
     }
 
-    fn correlate_with<const KR: usize, const KC: usize>(
-        &self,
-        window: &MatrixVar<'t, KR, KC, B>,
-        flip: bool,
-    ) -> MatrixVar<'t, { R - KR + 1 }, { C - KC + 1 }, B> {
+    fn correlate_with(&self, window: &MatrixVar<'t, B>, flip: bool) -> MatrixVar<'t, B> {
         let value = B::correlate(self.value(), window.value(), flip);
         let (input, taps) = (self.node.clone(), window.node.clone());
         self.record(value, move |adjoint| {
             // The window's gradient is the input correlated with the adjoint,
             // reversed when the forward pass reversed the window.
-            let window_gradient =
-                B::correlate_window_gradient::<R, C, KR, KC>(&input.value, adjoint);
+            let window_gradient = B::correlate_window_gradient(&input.value, adjoint);
             taps.accumulate(if flip {
                 B::flip(&window_gradient)
             } else {
@@ -1105,31 +1125,25 @@ impl<'t, const R: usize, const C: usize, B: Kernels> MatrixVar<'t, R, C, B> {
 
             // The input's gradient is the full correlation of the adjoint with
             // the window, applied the other way round.
-            input.accumulate(B::correlate_input_gradient::<R, C, KR, KC>(
-                adjoint,
-                &taps.value,
-                flip,
-            ));
+            input.accumulate(B::correlate_input_gradient(adjoint, &taps.value, flip));
         })
     }
 
     /// Surround with zeros; the adjoint of the padding is discarded, and the
     /// interior flows straight back.
-    pub fn pad<const PR: usize, const PC: usize>(
-        &self,
-    ) -> MatrixVar<'t, { R + 2 * PR }, { C + 2 * PC }, B> {
-        let value = B::pad::<R, C, PR, PC>(self.value());
+    pub fn pad(&self, pad_rows: usize, pad_cols: usize) -> MatrixVar<'t, B> {
+        let value = B::pad(self.value(), pad_rows, pad_cols);
         let parent = self.node.clone();
         self.record(value, move |adjoint| {
+            let (rows, cols) = parent.value.shape();
+            let padded_cols = cols + 2 * pad_cols;
             let interior = adjoint.as_slice();
-            let mut inner = Vec::with_capacity(R * C);
-            for row in 0..R {
-                let start = (row + PR) * (C + 2 * PC) + PC;
-                inner.extend_from_slice(&interior[start..start + C]);
+            let mut inner = Vec::with_capacity(rows * cols);
+            for row in 0..rows {
+                let start = (row + pad_rows) * padded_cols + pad_cols;
+                inner.extend_from_slice(&interior[start..start + cols]);
             }
-            parent.accumulate(Matrix {
-                data: B::store_matrix::<R, C>(&inner),
-            });
+            parent.accumulate(Matrix::build(rows, cols, &inner));
         })
     }
 
@@ -1143,25 +1157,16 @@ impl<'t, const R: usize, const C: usize, B: Kernels> MatrixVar<'t, R, C, B> {
     }
 
     /// Row-major flattening, and its exact inverse on the way back.
-    pub fn flattened(&self) -> VectorVar<'t, { R * C }, B> {
-        let value = Vector {
-            data: B::matrix_into_flattened::<R, C>(self.value().duplicate().data),
-        };
+    pub fn flattened(&self) -> VectorVar<'t, B> {
+        let (rows, cols) = self.shape();
+        let value = Vector::from_storage(
+            rows * cols,
+            B::matrix_into_flattened(self.value().duplicate().into_storage()),
+        );
         let parent = self.node.clone();
         self.record(value, move |adjoint| {
-            parent.accumulate(Matrix {
-                data: B::store_matrix::<R, C>(adjoint.as_slice()),
-            });
+            parent.accumulate(Matrix::build(rows, cols, adjoint.as_slice()));
         })
-    }
-}
-
-/// The adjoint accumulated so far, or a fresh zero — the starting point for an
-/// accumulating matmul.
-fn current_or_zeros<T: Adjoint<B>, B: Kernels>(slot: &RefCell<Option<T>>) -> T {
-    match slot.borrow().as_ref() {
-        Some(current) => current.duplicate(),
-        None => T::zeros(),
     }
 }
 
@@ -1177,14 +1182,14 @@ macro_rules! binary_methods {
             )+
         }
 
-        impl<'t, const N: usize, B: Kernels> VectorVar<'t, N, B> {
+        impl<'t, B: Kernels> VectorVar<'t, B> {
             $(
                 #[doc = concat!("Elementwise `", stringify!($method), "`, differentiated.")]
                 pub fn $method(&self, rhs: &Self) -> Self { self.binary(rhs, $op) }
             )+
         }
 
-        impl<'t, const R: usize, const C: usize, B: Kernels> MatrixVar<'t, R, C, B> {
+        impl<'t, B: Kernels> MatrixVar<'t, B> {
             $(
                 #[doc = concat!("Elementwise `", stringify!($method), "`, differentiated.")]
                 pub fn $method(&self, rhs: &Self) -> Self { self.binary(rhs, $op) }
@@ -1197,15 +1202,13 @@ macro_rules! binary_methods {
                 fn $trait_method(self, rhs: Self) -> Self::Output { self.binary(rhs, $op) }
             }
 
-            impl<'t, const N: usize, B: Kernels> $trait for &VectorVar<'t, N, B> {
-                type Output = VectorVar<'t, N, B>;
+            impl<'t, B: Kernels> $trait for &VectorVar<'t, B> {
+                type Output = VectorVar<'t, B>;
                 fn $trait_method(self, rhs: Self) -> Self::Output { self.binary(rhs, $op) }
             }
 
-            impl<'t, const R: usize, const C: usize, B: Kernels> $trait
-                for &MatrixVar<'t, R, C, B>
-            {
-                type Output = MatrixVar<'t, R, C, B>;
+            impl<'t, B: Kernels> $trait for &MatrixVar<'t, B> {
+                type Output = MatrixVar<'t, B>;
                 fn $trait_method(self, rhs: Self) -> Self::Output { self.binary(rhs, $op) }
             }
         )+
@@ -1230,14 +1233,14 @@ macro_rules! analytic_methods {
             )+
         }
 
-        impl<'t, const N: usize, B: Kernels> VectorVar<'t, N, B> {
+        impl<'t, B: Kernels> VectorVar<'t, B> {
             $(
                 #[doc = concat!("Elementwise `", stringify!($method), "`, differentiated.")]
                 pub fn $method(&self) -> Self { self.analytic(Analytic::$variant) }
             )+
         }
 
-        impl<'t, const R: usize, const C: usize, B: Kernels> MatrixVar<'t, R, C, B> {
+        impl<'t, B: Kernels> MatrixVar<'t, B> {
             $(
                 #[doc = concat!("Elementwise `", stringify!($method), "`, differentiated.")]
                 pub fn $method(&self) -> Self { self.analytic(Analytic::$variant) }
@@ -1269,10 +1272,10 @@ analytic_methods!(
 /// The counterpart to [`dual::gradient`](super::dual::gradient), which needs one
 /// forward pass per input element. This one runs the function once whatever the
 /// input size.
-pub fn gradient<const IN: usize, B: Kernels>(
-    at: &Vector<f32, IN, B>,
-    f: impl for<'t> FnOnce(&VectorVar<'t, IN, B>) -> ScalarVar<'t, B>,
-) -> Vector<f32, IN, B> {
+pub fn gradient<B: Kernels>(
+    at: &Vector<f32, B>,
+    f: impl for<'t> FnOnce(&VectorVar<'t, B>) -> ScalarVar<'t, B>,
+) -> Vector<f32, B> {
     let tape = Tape::<B>::new();
     let input = tape.vector(at.to_backend::<B>());
     f(&input).backward();
@@ -1281,12 +1284,12 @@ pub fn gradient<const IN: usize, B: Kernels>(
 
 /// The gradient of a scalar-valued `f` with respect to a matrix input, in one
 /// backward pass — where
-/// [`dual::gradient_wrt_matrix`](super::dual::gradient_wrt_matrix) needs `R * C`
-/// forward ones.
-pub fn gradient_wrt_matrix<const R: usize, const C: usize, B: Kernels>(
-    at: &Matrix<f32, R, C, B>,
-    f: impl for<'t> FnOnce(&MatrixVar<'t, R, C, B>) -> ScalarVar<'t, B>,
-) -> Matrix<f32, R, C, B> {
+/// [`dual::gradient_wrt_matrix`](super::dual::gradient_wrt_matrix) needs one
+/// forward pass per element.
+pub fn gradient_wrt_matrix<B: Kernels>(
+    at: &Matrix<f32, B>,
+    f: impl for<'t> FnOnce(&MatrixVar<'t, B>) -> ScalarVar<'t, B>,
+) -> Matrix<f32, B> {
     let tape = Tape::<B>::new();
     let input = tape.matrix(at.to_backend::<B>());
     f(&input).backward();
@@ -1300,8 +1303,8 @@ pub fn gradient_wrt_matrix<const R: usize, const C: usize, B: Kernels>(
 /// computation is shared — that is the difference from
 /// [`dual::jacobian`](super::dual::jacobian), which re-runs `f` for every input.
 ///
-/// Which mode is cheaper is a matter of shape: forward costs `IN` passes,
-/// reverse costs `OUT`. For a tall Jacobian prefer forward, for a wide one
+/// Which mode is cheaper is a matter of shape: forward costs one pass per input,
+/// reverse one per output. For a tall Jacobian prefer forward, for a wide one
 /// prefer reverse, and they agree to within floating-point error either way.
 ///
 /// ```
@@ -1312,56 +1315,58 @@ pub fn gradient_wrt_matrix<const R: usize, const C: usize, B: Kernels>(
 /// let at = Vector::new([0.5f32, 2.0]);
 /// let computed = jacobian(&at, |x| x.sin());
 ///
-/// assert!((computed.data()[0][0] - 0.5f32.cos()).abs() < 1e-6);
-/// assert!((computed.data()[1][1] - 2.0f32.cos()).abs() < 1e-6);
-/// assert_eq!(computed.data()[0][1], 0.0);
-/// assert_eq!(computed.data()[1][0], 0.0);
+/// assert!((computed[(0, 0)] - 0.5f32.cos()).abs() < 1e-6);
+/// assert!((computed[(1, 1)] - 2.0f32.cos()).abs() < 1e-6);
+/// assert_eq!(computed[(0, 1)], 0.0);
+/// assert_eq!(computed[(1, 0)], 0.0);
 /// ```
-pub fn jacobian<const IN: usize, const OUT: usize, B: Kernels>(
-    at: &Vector<f32, IN, B>,
-    f: impl for<'t> FnOnce(&VectorVar<'t, IN, B>) -> VectorVar<'t, OUT, B>,
-) -> Matrix<f32, OUT, IN, B> {
+pub fn jacobian<B: Kernels>(
+    at: &Vector<f32, B>,
+    f: impl for<'t> FnOnce(&VectorVar<'t, B>) -> VectorVar<'t, B>,
+) -> Matrix<f32, B> {
     let tape = Tape::<B>::new();
     let input = tape.vector(at.to_backend::<B>());
     let output = f(&input);
-    let rows = std::array::from_fn(|row| {
-        output.backward_with(basis_vector::<OUT, B>(row));
-        input.grad().data
-    });
-    Matrix {
-        data: B::vstack::<OUT, IN>(rows),
-    }
+    let (inputs, outputs) = (input.len(), output.len());
+    let rows = (0..outputs)
+        .map(|row| {
+            output.backward_with(basis_vector::<B>(outputs, row));
+            input.grad().into_storage()
+        })
+        .collect::<Vec<_>>();
+    Matrix::from_storage(outputs, inputs, B::vstack(&rows, inputs))
 }
 
 /// The full Jacobian of a vector-valued `f` with respect to a matrix input, as
-/// `OUT × (R·C)` with columns in the row-major order of the input.
+/// `OUT × (rows·cols)` with columns in the row-major order of the input.
 ///
 /// A matrix-valued `f` needs no separate driver: flatten its output with
 /// [`MatrixVar::flattened`] and the result is the standard
-/// `(OR·OC) × (R·C)` Jacobian.
-pub fn jacobian_wrt_matrix<const R: usize, const C: usize, const OUT: usize, B: Kernels>(
-    at: &Matrix<f32, R, C, B>,
-    f: impl for<'t> FnOnce(&MatrixVar<'t, R, C, B>) -> VectorVar<'t, OUT, B>,
-) -> Matrix<f32, OUT, { R * C }, B> {
+/// `(OR·OC) × (rows·cols)` Jacobian.
+pub fn jacobian_wrt_matrix<B: Kernels>(
+    at: &Matrix<f32, B>,
+    f: impl for<'t> FnOnce(&MatrixVar<'t, B>) -> VectorVar<'t, B>,
+) -> Matrix<f32, B> {
     let tape = Tape::<B>::new();
     let input = tape.matrix(at.to_backend::<B>());
     let output = f(&input);
-    let rows = std::array::from_fn(|row| {
-        output.backward_with(basis_vector::<OUT, B>(row));
-        B::matrix_into_flattened::<R, C>(input.grad().data)
-    });
-    Matrix {
-        data: B::vstack::<OUT, { R * C }>(rows),
-    }
+    let inputs = at.rows() * at.cols();
+    let outputs = output.len();
+    let rows = (0..outputs)
+        .map(|row| {
+            output.backward_with(basis_vector::<B>(outputs, row));
+            B::matrix_into_flattened(input.grad().into_storage())
+        })
+        .collect::<Vec<_>>();
+    Matrix::from_storage(outputs, inputs, B::vstack(&rows, inputs))
 }
 
-/// The `index`th standard basis vector, the seed that extracts one Jacobian row.
-fn basis_vector<const N: usize, B: Kernels>(index: usize) -> Vector<f32, N, B> {
-    let mut seed = vec![0.0f32; N];
+/// The `index`th standard basis vector of length `len`, the seed that extracts
+/// one Jacobian row.
+fn basis_vector<B: Kernels>(len: usize, index: usize) -> Vector<f32, B> {
+    let mut seed = vec![0.0f32; len];
     if let Some(slot) = seed.get_mut(index) {
         *slot = 1.0;
     }
-    Vector {
-        data: B::store_vector::<N>(&seed),
-    }
+    Vector::build(&seed)
 }

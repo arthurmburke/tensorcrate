@@ -37,33 +37,30 @@ fn ill_conditioned() {
         "rule", "rate", "loss", "distance"
     );
 
-    let report = |name: &str, rate: f32, parameters: Vector<f32, FEATURES>| {
-        let offset = parameters - centre;
+    let report = |name: &str, rate: f32, parameters: Vector<f32>| {
+        let offset = parameters - centre.clone();
         let loss: f32 = (0..FEATURES)
-            .map(|i| curvature.data()[i] * offset.data()[i].powi(2))
+            .map(|i| curvature[i] * offset[i].powi(2))
             .sum();
-        let distance = (0..FEATURES)
-            .map(|i| offset.data()[i].powi(2))
-            .sum::<f32>()
-            .sqrt();
+        let distance = (0..FEATURES).map(|i| offset[i].powi(2)).sum::<f32>().sqrt();
         println!("  {name:<24} {rate:>7} {loss:>12.3e} {distance:>12.4}");
     };
 
     // The largest step plain descent can take here: 2/λmax with λmax = 200.
     let rate = 0.009;
 
-    let mut parameters = Vector::<f32, FEATURES>::zeros();
+    let mut parameters = Vector::<f32>::zeros(FEATURES);
     minimize(&mut parameters, &mut Sgd::new(rate), steps, |x, _| {
-        bowl(x, centre, curvature)
+        bowl(x, centre.clone(), curvature.clone())
     });
     report("plain descent", rate, parameters);
 
-    let mut parameters = Vector::<f32, FEATURES>::zeros();
+    let mut parameters = Vector::<f32>::zeros(FEATURES);
     minimize(
         &mut parameters,
         &mut Momentum::new(rate, 0.9),
         steps,
-        |x, _| bowl(x, centre, curvature),
+        |x, _| bowl(x, centre.clone(), curvature.clone()),
     );
     report("momentum (0.9)", rate, parameters);
 
@@ -71,38 +68,38 @@ fn ill_conditioned() {
     // times heavy-ball's and it goes unstable where classical momentum is fine —
     // at 0.009 this diverges to NaN in a few dozen steps.
     let nesterov_rate = 0.005;
-    let mut parameters = Vector::<f32, FEATURES>::zeros();
+    let mut parameters = Vector::<f32>::zeros(FEATURES);
     minimize(
         &mut parameters,
         &mut Momentum::nesterov(nesterov_rate, 0.9),
         steps,
-        |x, _| bowl(x, centre, curvature),
+        |x, _| bowl(x, centre.clone(), curvature.clone()),
     );
     report("nesterov (0.9)", nesterov_rate, parameters);
 
-    let mut parameters = Vector::<f32, FEATURES>::zeros();
+    let mut parameters = Vector::<f32>::zeros(FEATURES);
     minimize(&mut parameters, &mut AdaGrad::new(0.5), steps, |x, _| {
-        bowl(x, centre, curvature)
+        bowl(x, centre.clone(), curvature.clone())
     });
     report("adagrad", 0.5, parameters);
 
-    let mut parameters = Vector::<f32, FEATURES>::zeros();
+    let mut parameters = Vector::<f32>::zeros(FEATURES);
     minimize(&mut parameters, &mut RmsProp::new(0.05), steps, |x, _| {
-        bowl(x, centre, curvature)
+        bowl(x, centre.clone(), curvature.clone())
     });
     report("rmsprop", 0.05, parameters);
 
-    let mut parameters = Vector::<f32, FEATURES>::zeros();
+    let mut parameters = Vector::<f32>::zeros(FEATURES);
     minimize(&mut parameters, &mut Adam::new(0.1), steps, |x, _| {
-        bowl(x, centre, curvature)
+        bowl(x, centre.clone(), curvature.clone())
     });
     report("adam", 0.1, parameters);
 }
 
 fn bowl<'t>(
-    x: &tensorcrate::tensors::VectorVar<'t, FEATURES>,
-    centre: Vector<f32, FEATURES>,
-    curvature: Vector<f32, FEATURES>,
+    x: &tensorcrate::tensors::VectorVar<'t>,
+    centre: Vector<f32>,
+    curvature: Vector<f32>,
 ) -> tensorcrate::tensors::ScalarVar<'t> {
     let tape = x.tape();
     let offset = x - &tape.vector(centre);
@@ -118,31 +115,34 @@ fn stochastic_against_full_batch() {
     const SAMPLES: usize = 32;
     const BATCH: usize = 8;
 
-    let design = Matrix::<f32, SAMPLES, FEATURES>::from_rows(std::array::from_fn(|row| {
-        [1.0, (row as f32 / SAMPLES as f32) * 2.0 - 1.0]
-    }));
+    let design = Matrix::<f32>::from_rows(
+        (0..SAMPLES).map(|row| vec![1.0, (row as f32 / SAMPLES as f32) * 2.0 - 1.0]),
+    );
     let truth = Vector::new([-0.75f32, 1.25]);
     let targets = design.matvec(&truth);
 
     println!("linear fit, {SAMPLES} samples, adam at 0.05");
 
-    let mut full = Vector::<f32, FEATURES>::zeros();
+    let mut full = Vector::<f32>::zeros(FEATURES);
     minimize(&mut full, &mut Adam::new(0.05), 600, |x, _| {
         let tape = x.tape();
-        let residual = &tape.matrix(design).matvec(x) - &tape.vector(targets);
+        let residual = &tape.matrix(design.clone()).matvec(x) - &tape.vector(targets.clone());
         residual.dot(&residual).scale(1.0 / SAMPLES as f32)
     });
     println!("  full batch, 600 steps      {full}");
 
-    let mut stochastic = Vector::<f32, FEATURES>::zeros();
+    let mut stochastic = Vector::<f32>::zeros(FEATURES);
     minimize(&mut stochastic, &mut Adam::new(0.05), 600, |x, step| {
         // The step number chooses the mini-batch; nothing else differs.
         let start = (step % (SAMPLES / BATCH)) * BATCH;
         let tape = x.tape();
-        let rows: Matrix<f32, BATCH, FEATURES> =
-            Matrix::from_rows(std::array::from_fn(|row| design.data()[start + row]));
-        let wanted: Vector<f32, BATCH> =
-            Vector::new(std::array::from_fn(|row| targets.data()[start + row]));
+        let rows: Matrix<f32> =
+            Matrix::from_rows((0..BATCH).map(|row| design.row(start + row).to_vec()));
+        let wanted: Vector<f32> = Vector::new(
+            (0..BATCH)
+                .map(|row| targets[start + row])
+                .collect::<Vec<_>>(),
+        );
         let residual = &tape.matrix(rows).matvec(x) - &tape.vector(wanted);
         residual.dot(&residual).scale(1.0 / BATCH as f32)
     });
@@ -161,29 +161,29 @@ fn two_parameters_two_rules() {
     const OUT: usize = 2;
     const BATCH: usize = 8;
 
-    let inputs = Matrix::<f32, IN, BATCH>::from_rows(std::array::from_fn(|row| {
-        std::array::from_fn(|col| ((row * 7 + col * 3) % 11) as f32 * 0.2 - 1.0)
+    let inputs = Matrix::<f32>::from_rows((0..IN).map(|row| {
+        (0..BATCH)
+            .map(|col| ((row * 7 + col * 3) % 11) as f32 * 0.2 - 1.0)
+            .collect::<Vec<_>>()
     }));
-    let true_weights = Matrix::<f32, OUT, IN>::from_rows([[0.6, -0.9, 0.3], [1.4, 0.2, -0.5]]);
+    let true_weights = Matrix::<f32>::from_rows([[0.6, -0.9, 0.3], [1.4, 0.2, -0.5]]);
     let true_bias = Vector::new([0.25f32, -0.4]);
     let targets = true_weights.matmul(&inputs)
-        + Matrix::from_rows(std::array::from_fn(|row| {
-            std::array::from_fn(|_| true_bias.data()[row])
-        }));
+        + Matrix::from_rows((0..OUT).map(|row| vec![true_bias[row]; BATCH]));
 
-    let mut weights = Matrix::<f32, OUT, IN>::zeros();
-    let mut bias = Vector::<f32, OUT>::zeros();
+    let mut weights = Matrix::<f32>::zeros(OUT, IN);
+    let mut bias = Vector::<f32>::zeros(OUT);
     let mut weight_rule = Adam::new(0.05);
     let mut bias_rule = Momentum::new(0.05, 0.9);
 
     for _ in 0..2000 {
         let tape = Tape::new();
-        let weight_var = tape.matrix(weights);
-        let bias_var = tape.vector(bias);
+        let weight_var = tape.matrix(weights.clone());
+        let bias_var = tape.vector(bias.clone());
 
-        let predicted = &weight_var.matmul(&tape.matrix(inputs))
-            + &bias_var.outer(&tape.vector(Vector::<f32, BATCH>::filled(1.0)));
-        let residual = &predicted - &tape.matrix(targets);
+        let predicted = &weight_var.matmul(&tape.matrix(inputs.clone()))
+            + &bias_var.outer(&tape.vector(Vector::<f32>::filled(BATCH, 1.0)));
+        let residual = &predicted - &tape.matrix(targets.clone());
         let loss = residual
             .frobenius_dot(&residual)
             .scale(1.0 / (OUT * BATCH) as f32);

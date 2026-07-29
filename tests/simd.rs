@@ -122,25 +122,27 @@ fn matmul_matches_triple_loop() {
 fn public_api_dispatch_is_correct_above_thresholds() {
     // N and the matmul op-count both clear the SIMD gates, so these calls route
     // through the NEON kernels rather than the scalar fallback.
-    let a: Vector<f32, 64> = Vector::new(std::array::from_fn(|i| (i as f32) * 0.25 - 4.0));
-    let b: Vector<f32, 64> = Vector::new(std::array::from_fn(|i| (i as f32).cos()));
-    let want: f32 = (0..64).map(|i| a.data()[i] * b.data()[i]).sum();
+    let a: Vector<f32> = Vector::new((0..64).map(|i| (i as f32) * 0.25 - 4.0).collect::<Vec<_>>());
+    let b: Vector<f32> = Vector::new((0..64).map(|i| (i as f32).cos()).collect::<Vec<_>>());
+    let want: f32 = (0..64).map(|i| a[i] * b[i]).sum();
     assert!(approx(a.dot(&b), want, 1e-3));
 
-    let m1: Matrix<f32, 8, 8> = Matrix::from_rows(std::array::from_fn(|i| {
-        std::array::from_fn(|j| ((i * 8 + j) as f32) * 0.1)
+    let m1: Matrix<f32> = Matrix::from_rows((0..8).map(|i| {
+        (0..8)
+            .map(|j| ((i * 8 + j) as f32) * 0.1)
+            .collect::<Vec<_>>()
     }));
-    let m2: Matrix<f32, 8, 8> = Matrix::from_rows(std::array::from_fn(|i| {
-        std::array::from_fn(|j| ((i + j) as f32) - 3.0)
-    }));
+    let m2: Matrix<f32> = Matrix::from_rows(
+        (0..8).map(|i| (0..8).map(|j| ((i + j) as f32) - 3.0).collect::<Vec<_>>()),
+    );
     let product = m1.matmul(&m2);
     for i in 0..8 {
         for j in 0..8 {
             let mut want = 0.0f32;
             for p in 0..8 {
-                want += m1.data()[i][p] * m2.data()[p][j];
+                want += m1[(i, p)] * m2[(p, j)];
             }
-            assert!(approx(product.data()[i][j], want, 1e-3), "i={i} j={j}");
+            assert!(approx(product[(i, j)], want, 1e-3), "i={i} j={j}");
         }
     }
 }

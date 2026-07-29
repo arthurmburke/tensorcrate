@@ -11,7 +11,7 @@
 //!
 //! There is no interpreter and no dynamically-typed value: the macro works out
 //! each binding's type at expansion time and emits concrete Rust (`f64`,
-//! `Complex<f64>`, `Dual<f64>`, `Vector<_, N>`, `Matrix<_, R, C>`), so the Rust
+//! `Complex<f64>`, `Dual<f64>`, `Vector<_>`, `Matrix<_>`), so the Rust
 //! compiler type-checks the result and the optimizer sees straight-line
 //! arithmetic.
 //!
@@ -108,8 +108,12 @@ impl Ty {
         let element = self.element_type();
         match self.shape {
             Shape::Scalar => element,
-            Shape::Vector(n) => quote!(::tensorcrate::tensors::Vector<#element, #n>),
-            Shape::Matrix(r, c) => quote!(::tensorcrate::tensors::Matrix<#element, #r, #c>),
+            // The dimensions are runtime values now, so they are not part of
+            // the type. The macro still *knows* them — that is what selects the
+            // right product below and rejects a mismatched literal at expansion
+            // time — they simply have nowhere to go in the emitted type.
+            Shape::Vector(_) => quote!(::tensorcrate::tensors::Vector<#element>),
+            Shape::Matrix(_, _) => quote!(::tensorcrate::tensors::Matrix<#element>),
         }
     }
 

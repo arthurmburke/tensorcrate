@@ -18,10 +18,10 @@ fn close(actual: f32, expected: f32) -> bool {
 
 /// A quadratic bowl with a known minimum at `centre`, and curvature `scale` per
 /// axis: `L(x) = Σ scaleᵢ(xᵢ − centreᵢ)²`.
-fn bowl<'t, const N: usize>(
-    x: &tensorcrate::tensors::VectorVar<'t, N>,
-    centre: Vector<f32, N>,
-    curvature: Vector<f32, N>,
+fn bowl<'t>(
+    x: &tensorcrate::tensors::VectorVar<'t>,
+    centre: Vector<f32>,
+    curvature: Vector<f32>,
 ) -> tensorcrate::tensors::ScalarVar<'t> {
     let tape = x.tape();
     let offset = x - &tape.vector(centre);
@@ -37,7 +37,7 @@ fn plain_descent_takes_exactly_the_gradient_step() {
     let mut rule = Sgd::new(0.1);
 
     rule.update(&mut parameters, &gradient);
-    assert_eq!(parameters.to_array(), [1.0 - 0.05, -2.0 - 0.4]);
+    assert_eq!(parameters.to_vec(), [1.0 - 0.05, -2.0 - 0.4]);
 }
 
 #[test]
@@ -49,22 +49,22 @@ fn momentum_accumulates_a_velocity_and_nesterov_looks_ahead() {
     let mut rule = Momentum::new(0.1, 0.9);
 
     rule.update(&mut parameters, &gradient);
-    assert!(close(parameters.data()[0], -0.1));
+    assert!(close(parameters[0], -0.1));
     rule.update(&mut parameters, &gradient);
-    assert!(close(parameters.data()[0], -0.1 - 0.19)); // rate·(0.9 + 1)
+    assert!(close(parameters[0], -0.1 - 0.19)); // rate·(0.9 + 1)
 
     // Nesterov applies the momentum term to where the step is heading:
     // first update is rate·(g + μg).
     let mut parameters = Vector::new([0.0f32]);
     let mut rule = Momentum::nesterov(0.1, 0.9);
     rule.update(&mut parameters, &gradient);
-    assert!(close(parameters.data()[0], -0.19));
+    assert!(close(parameters[0], -0.19));
 
     // `reset` forgets the velocity but keeps the hyperparameters.
     rule.reset();
     let mut fresh = Vector::new([0.0f32]);
     rule.update(&mut fresh, &gradient);
-    assert!(close(fresh.data()[0], -0.19));
+    assert!(close(fresh[0], -0.19));
 }
 
 #[test]
@@ -76,9 +76,9 @@ fn the_adaptive_rules_normalize_by_the_gradient_scale() {
         let mut rule = AdaGrad::new(0.1);
         rule.update(&mut parameters, &Vector::new([magnitude]));
         assert!(
-            close(parameters.data()[0], -0.1),
+            close(parameters[0], -0.1),
             "AdaGrad first step with gradient {magnitude}: {}",
-            parameters.data()[0]
+            parameters[0]
         );
 
         // RMSProp also cancels the magnitude, but its first step is inflated by
@@ -89,16 +89,16 @@ fn the_adaptive_rules_normalize_by_the_gradient_scale() {
         let mut rule = RmsProp::new(0.1);
         rule.update(&mut parameters, &Vector::new([magnitude]));
         assert!(
-            close(parameters.data()[0], -0.1 / (1.0f32 - 0.9).sqrt()),
+            close(parameters[0], -0.1 / (1.0f32 - 0.9).sqrt()),
             "RMSProp first step with gradient {magnitude}: {}",
-            parameters.data()[0]
+            parameters[0]
         );
 
         // Adam has no such bias: m̂/√v̂ is exactly ±1 on step one.
         let mut parameters = Vector::new([0.0f32]);
         let mut rule = Adam::new(0.1);
         rule.update(&mut parameters, &Vector::new([magnitude]));
-        assert!(close(parameters.data()[0], -0.1), "Adam first step");
+        assert!(close(parameters[0], -0.1), "Adam first step");
     }
 
     // AdaGrad's denominator only grows, so equal gradients give shrinking steps.
@@ -107,18 +107,18 @@ fn the_adaptive_rules_normalize_by_the_gradient_scale() {
     let mut previous = 0.0;
     for step in 1..5 {
         rule.update(&mut parameters, &Vector::new([1.0]));
-        let taken = previous - parameters.data()[0];
+        let taken = previous - parameters[0];
         assert!(
             close(taken, 0.1 / (step as f32).sqrt()),
             "step {step} moved {taken}"
         );
-        previous = parameters.data()[0];
+        previous = parameters[0];
     }
 }
 
 #[test]
 fn a_gradient_of_zero_leaves_every_rule_where_it_started() {
-    let zero = Vector::<f32, 3>::zeros();
+    let zero = Vector::<f32>::zeros(3);
     let start = Vector::new([1.0f32, 2.0, 3.0]);
 
     let mut sgd = Sgd::new(0.5);
@@ -128,27 +128,27 @@ fn a_gradient_of_zero_leaves_every_rule_where_it_started() {
     let mut adam = Adam::new(0.5);
 
     for _ in 0..3 {
-        let mut parameters = start;
+        let mut parameters = start.clone();
         sgd.update(&mut parameters, &zero);
-        assert_eq!(parameters.to_array(), start.to_array(), "sgd");
+        assert_eq!(parameters.to_vec(), start.to_vec(), "sgd");
 
-        let mut parameters = start;
+        let mut parameters = start.clone();
         momentum.update(&mut parameters, &zero);
-        assert_eq!(parameters.to_array(), start.to_array(), "momentum");
+        assert_eq!(parameters.to_vec(), start.to_vec(), "momentum");
 
         // The adaptive denominators are guarded by epsilon, so 0/ε is 0 rather
         // than a division by zero.
-        let mut parameters = start;
+        let mut parameters = start.clone();
         adagrad.update(&mut parameters, &zero);
-        assert_eq!(parameters.to_array(), start.to_array(), "adagrad");
+        assert_eq!(parameters.to_vec(), start.to_vec(), "adagrad");
 
-        let mut parameters = start;
+        let mut parameters = start.clone();
         rmsprop.update(&mut parameters, &zero);
-        assert_eq!(parameters.to_array(), start.to_array(), "rmsprop");
+        assert_eq!(parameters.to_vec(), start.to_vec(), "rmsprop");
 
-        let mut parameters = start;
+        let mut parameters = start.clone();
         adam.update(&mut parameters, &zero);
-        assert_eq!(parameters.to_array(), start.to_array(), "adam");
+        assert_eq!(parameters.to_vec(), start.to_vec(), "adam");
     }
 }
 
@@ -158,56 +158,57 @@ fn a_gradient_of_zero_leaves_every_rule_where_it_started() {
 fn every_rule_reaches_the_minimum_of_a_well_behaved_bowl() {
     let centre = Vector::new([1.5f32, -0.5, 2.0]);
     let curvature = Vector::new([1.0f32, 1.0, 1.0]);
-    let mut parameters = Vector::<f32, 3>::zeros();
+    let mut parameters = Vector::<f32>::zeros(3);
     minimize(&mut parameters, &mut Sgd::new(0.1), 400, |x, _| {
-        bowl(x, centre, curvature)
+        bowl(x, centre.clone(), curvature.clone())
     });
     assert_slice(&parameters, &centre, "sgd");
 
-    let mut parameters = Vector::<f32, 3>::zeros();
+    let mut parameters = Vector::<f32>::zeros(3);
     minimize(
         &mut parameters,
         &mut Momentum::new(0.05, 0.9),
         400,
-        |x, _| bowl(x, centre, curvature),
+        |x, _| bowl(x, centre.clone(), curvature.clone()),
     );
     assert_slice(&parameters, &centre, "momentum");
 
-    let mut parameters = Vector::<f32, 3>::zeros();
+    let mut parameters = Vector::<f32>::zeros(3);
     minimize(
         &mut parameters,
         &mut Momentum::nesterov(0.05, 0.9),
         400,
-        |x, _| bowl(x, centre, curvature),
+        |x, _| bowl(x, centre.clone(), curvature.clone()),
     );
     assert_slice(&parameters, &centre, "nesterov");
 
-    let mut parameters = Vector::<f32, 3>::zeros();
+    let mut parameters = Vector::<f32>::zeros(3);
     minimize(&mut parameters, &mut AdaGrad::new(0.5), 4000, |x, _| {
-        bowl(x, centre, curvature)
+        bowl(x, centre.clone(), curvature.clone())
     });
     assert_slice(&parameters, &centre, "adagrad");
 
-    let mut parameters = Vector::<f32, 3>::zeros();
+    let mut parameters = Vector::<f32>::zeros(3);
     minimize(&mut parameters, &mut RmsProp::new(0.05), 2000, |x, _| {
-        bowl(x, centre, curvature)
+        bowl(x, centre.clone(), curvature.clone())
     });
     assert_slice(&parameters, &centre, "rmsprop");
 
-    let mut parameters = Vector::<f32, 3>::zeros();
+    let mut parameters = Vector::<f32>::zeros(3);
     minimize(&mut parameters, &mut Adam::new(0.1), 2000, |x, _| {
-        bowl(x, centre, curvature)
+        bowl(x, centre.clone(), curvature.clone())
     });
     assert_slice(&parameters, &centre, "adam");
 }
 
-fn assert_slice<const N: usize>(actual: &Vector<f32, N>, expected: &Vector<f32, N>, what: &str) {
-    for index in 0..N {
+fn assert_slice(actual: &Vector<f32>, expected: &Vector<f32>, what: &str) {
+    assert_eq!(actual.len(), expected.len(), "{what}: lengths differ");
+    for index in 0..actual.len() {
         assert!(
-            close(actual.data()[index], expected.data()[index]),
+            close(actual[index], expected[index]),
             "{what} at {index}: {} vs {}",
-            actual.data()[index],
-            expected.data()[index]
+            actual[index],
+            expected[index]
         );
     }
 }
@@ -222,26 +223,25 @@ fn momentum_and_adam_beat_plain_descent_on_an_ill_conditioned_bowl() {
     let rate = 0.009;
     let steps = 300;
 
-    let mut plain = Vector::<f32, 2>::zeros();
+    let mut plain = Vector::<f32>::zeros(2);
     minimize(&mut plain, &mut Sgd::new(rate), steps, |x, _| {
-        bowl(x, centre, curvature)
+        bowl(x, centre.clone(), curvature.clone())
     });
 
-    let mut accelerated = Vector::<f32, 2>::zeros();
+    let mut accelerated = Vector::<f32>::zeros(2);
     minimize(
         &mut accelerated,
         &mut Momentum::new(rate, 0.9),
         steps,
-        |x, _| bowl(x, centre, curvature),
+        |x, _| bowl(x, centre.clone(), curvature.clone()),
     );
 
-    let mut adaptive = Vector::<f32, 2>::zeros();
+    let mut adaptive = Vector::<f32>::zeros(2);
     minimize(&mut adaptive, &mut Adam::new(0.1), steps, |x, _| {
-        bowl(x, centre, curvature)
+        bowl(x, centre.clone(), curvature.clone())
     });
 
-    let distance =
-        |x: &Vector<f32, 2>| ((x.data()[0] - 1.0).powi(2) + (x.data()[1] - 1.0).powi(2)).sqrt();
+    let distance = |x: &Vector<f32>| ((x[0] - 1.0).powi(2) + (x[1] - 1.0).powi(2)).sqrt();
     let (plain, accelerated, adaptive) = (
         distance(&plain),
         distance(&accelerated),
@@ -264,28 +264,28 @@ fn momentum_and_adam_beat_plain_descent_on_an_ill_conditioned_bowl() {
 fn the_same_rule_serves_different_objectives() {
     // One outlier, three objectives, one optimizer type: the estimator changes,
     // the machinery does not.
-    let design = Matrix::<f32, 9, 2>::from_rows(std::array::from_fn(|row| [1.0, row as f32 / 9.0]));
+    let design = Matrix::<f32>::from_rows((0..10).map(|row| vec![1.0, row as f32 / 9.0]));
     let truth = Vector::new([0.5f32, 2.0]);
-    let mut targets = *design.matvec(&truth).data();
+    let mut targets = design.matvec(&truth).data().to_vec();
     targets[4] += 6.0;
     let targets = Vector::new(targets);
 
-    let mut least_squares = Vector::<f32, 2>::zeros();
+    let mut least_squares = Vector::<f32>::zeros(2);
     minimize(&mut least_squares, &mut Adam::new(0.05), 3000, |x, _| {
         let tape = x.tape();
-        let residual = &tape.matrix(design).matvec(x) - &tape.vector(targets);
+        let residual = &tape.matrix(design.clone()).matvec(x) - &tape.vector(targets.clone());
         residual.dot(&residual).scale(1.0 / 9.0)
     });
 
-    let mut least_absolute = Vector::<f32, 2>::zeros();
+    let mut least_absolute = Vector::<f32>::zeros(2);
     minimize(&mut least_absolute, &mut Adam::new(0.05), 3000, |x, _| {
         let tape = x.tape();
-        let residual = &tape.matrix(design).matvec(x) - &tape.vector(targets);
+        let residual = &tape.matrix(design.clone()).matvec(x) - &tape.vector(targets.clone());
         residual.abs().sum().scale(1.0 / 9.0)
     });
 
     // The robust fit stays nearer the truth; squared error chases the outlier.
-    let error = |x: &Vector<f32, 2>| (x.data()[0] - 0.5).abs().max((x.data()[1] - 2.0).abs());
+    let error = |x: &Vector<f32>| (x[0] - 0.5).abs().max((x[1] - 2.0).abs());
     assert!(
         error(&least_absolute) < error(&least_squares),
         "absolute {} should beat squared {}",
@@ -297,18 +297,18 @@ fn the_same_rule_serves_different_objectives() {
 #[test]
 fn a_matrix_parameter_optimizes_the_same_way() {
     // Recover a 2×3 matrix from ‖W·X − Y‖², with the driver unchanged.
-    let inputs = Matrix::<f32, 3, 4>::from_rows([
+    let inputs = Matrix::<f32>::from_rows([
         [1.0, 0.2, -0.4, 0.9],
         [-0.3, 1.1, 0.5, -0.7],
         [0.6, -0.8, 1.0, 0.1],
     ]);
-    let truth = Matrix::<f32, 2, 3>::from_rows([[0.5, -1.0, 0.25], [2.0, 0.1, -0.75]]);
+    let truth = Matrix::<f32>::from_rows([[0.5, -1.0, 0.25], [2.0, 0.1, -0.75]]);
     let targets = truth.matmul(&inputs);
 
-    let mut weights = Matrix::<f32, 2, 3>::zeros();
+    let mut weights = Matrix::<f32>::zeros(2, 3);
     let final_loss = minimize(&mut weights, &mut Adam::new(0.05), 4000, |w, _| {
         let tape = w.tape();
-        let residual = &w.matmul(&tape.matrix(inputs)) - &tape.matrix(targets);
+        let residual = &w.matmul(&tape.matrix(inputs.clone())) - &tape.matrix(targets.clone());
         residual.frobenius_dot(&residual)
     });
 
@@ -316,10 +316,10 @@ fn a_matrix_parameter_optimizes_the_same_way() {
     for row in 0..2 {
         for col in 0..3 {
             assert!(
-                close(weights.data()[row][col], truth.data()[row][col]),
+                close(weights[(row, col)], truth[(row, col)]),
                 "W[{row},{col}]: {} vs {}",
-                weights.data()[row][col],
-                truth.data()[row][col]
+                weights[(row, col)],
+                truth[(row, col)]
             );
         }
     }
@@ -333,30 +333,33 @@ fn stochastic_steps_reach_the_same_place_as_full_batch_ones() {
     const SAMPLES: usize = 12;
     const BATCH: usize = 4;
 
-    let design = Matrix::<f32, SAMPLES, 2>::from_rows(std::array::from_fn(|row| {
-        [1.0, (row as f32 / SAMPLES as f32) * 2.0 - 1.0]
-    }));
+    let design = Matrix::<f32>::from_rows(
+        (0..SAMPLES).map(|row| vec![1.0, (row as f32 / SAMPLES as f32) * 2.0 - 1.0]),
+    );
     let truth = Vector::new([-0.75f32, 1.25]);
     let targets = design.matvec(&truth);
 
-    let mut stochastic = Vector::<f32, 2>::zeros();
+    let mut stochastic = Vector::<f32>::zeros(2);
     minimize(&mut stochastic, &mut Adam::new(0.05), 3000, |x, step| {
         // The step number picks the batch; nothing else changes.
         let start = (step % (SAMPLES / BATCH)) * BATCH;
         let tape = x.tape();
-        let rows: Matrix<f32, BATCH, 2> =
-            Matrix::from_rows(std::array::from_fn(|row| design.data()[start + row]));
-        let wanted: Vector<f32, BATCH> =
-            Vector::new(std::array::from_fn(|row| targets.data()[start + row]));
+        let rows: Matrix<f32> =
+            Matrix::from_rows((0..BATCH).map(|row| design.row(start + row).to_vec()));
+        let wanted: Vector<f32> = Vector::new(
+            (0..BATCH)
+                .map(|row| targets[start + row])
+                .collect::<Vec<_>>(),
+        );
         let residual = &tape.matrix(rows).matvec(x) - &tape.vector(wanted);
         residual.dot(&residual).scale(1.0 / BATCH as f32)
     });
     assert_slice(&stochastic, &truth, "stochastic");
 
-    let mut full = Vector::<f32, 2>::zeros();
+    let mut full = Vector::<f32>::zeros(2);
     minimize(&mut full, &mut Adam::new(0.05), 3000, |x, _| {
         let tape = x.tape();
-        let residual = &tape.matrix(design).matvec(x) - &tape.vector(targets);
+        let residual = &tape.matrix(design.clone()).matvec(x) - &tape.vector(targets.clone());
         residual.dot(&residual).scale(1.0 / SAMPLES as f32)
     });
     assert_slice(&full, &truth, "full batch");
@@ -384,15 +387,15 @@ fn a_scalar_parameter_works_too() {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn optimizing_a_resident_parameter_stays_on_the_backend() {
-    let inputs = Matrix::<f32, 3, 4>::from_rows([
+    let inputs = Matrix::<f32>::from_rows([
         [1.0, 0.2, -0.4, 0.9],
         [-0.3, 1.1, 0.5, -0.7],
         [0.6, -0.8, 1.0, 0.1],
     ]);
-    let truth = Matrix::<f32, 2, 3>::from_rows([[0.5, -1.0, 0.25], [2.0, 0.1, -0.75]]);
+    let truth = Matrix::<f32>::from_rows([[0.5, -1.0, 0.25], [2.0, 0.1, -0.75]]);
     let targets = truth.matmul(&inputs);
 
-    let mut weights = Matrix::<f32, 2, 3, Metal>::filled(0.0);
+    let mut weights = Matrix::<f32, Metal>::filled(2, 3, 0.0);
     minimize(&mut weights, &mut Adam::new(0.05), 3000, |w, _| {
         let tape = w.tape();
         let residual = &w.matmul(&tape.matrix(inputs.to_backend::<Metal>()))
@@ -404,16 +407,16 @@ fn optimizing_a_resident_parameter_stays_on_the_backend() {
     for row in 0..2 {
         for col in 0..3 {
             assert!(
-                close(host.data()[row][col], truth.data()[row][col]),
+                close(host[(row, col)], truth[(row, col)]),
                 "W[{row},{col}]: {} vs {}",
-                host.data()[row][col],
-                truth.data()[row][col]
+                host[(row, col)],
+                truth[(row, col)]
             );
         }
     }
     // The update arithmetic — including Adam's moments and the square root —
     // never left shared memory.
-    if Matrix::<f32, 2, 3, Metal>::filled(0.0).is_device_resident() {
+    if Matrix::<f32, Metal>::filled(2, 3, 0.0).is_device_resident() {
         assert!(weights.is_device_resident(), "the parameters stay resident");
     }
 }
@@ -431,9 +434,9 @@ fn rules_are_generic_over_the_parameter_shape() {
 
     let mut vector = Vector::new([1.0f32, 1.0]);
     takes_any(&mut Sgd::new(0.5), &mut vector, &Vector::new([2.0, 4.0]));
-    assert_eq!(vector.to_array(), [0.0, -1.0]);
+    assert_eq!(vector.to_vec(), [0.0, -1.0]);
 
-    let mut matrix = Matrix::<f32, 1, 2>::from_rows([[1.0, 1.0]]);
+    let mut matrix = Matrix::<f32>::from_rows([[1.0, 1.0]]);
     takes_any(
         &mut Sgd::new(0.5),
         &mut matrix,
@@ -450,19 +453,19 @@ fn the_driver_and_a_hand_written_loop_agree() {
     let centre = Vector::new([2.0f32, -1.0]);
     let curvature = Vector::new([1.0f32, 3.0]);
 
-    let mut driven = Vector::<f32, 2>::zeros();
+    let mut driven = Vector::<f32>::zeros(2);
     minimize(&mut driven, &mut Momentum::new(0.05, 0.9), 200, |x, _| {
-        bowl(x, centre, curvature)
+        bowl(x, centre.clone(), curvature.clone())
     });
 
-    let mut manual = Vector::<f32, 2>::zeros();
+    let mut manual = Vector::<f32>::zeros(2);
     let mut rule = Momentum::new(0.05, 0.9);
     for _ in 0..200 {
         let tape = Tape::new();
-        let recorded = tape.vector(manual);
-        bowl(&recorded, centre, curvature).backward();
+        let recorded = tape.vector(manual.clone());
+        bowl(&recorded, centre.clone(), curvature.clone()).backward();
         rule.update(&mut manual, &recorded.grad());
     }
 
-    assert_eq!(driven.to_array(), manual.to_array());
+    assert_eq!(driven.to_vec(), manual.to_vec());
 }

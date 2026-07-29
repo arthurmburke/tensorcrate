@@ -1,28 +1,35 @@
-//! Statically-shaped vectors and matrices.
+//! Dynamically-shaped vectors and matrices.
 //!
-//! [`Vector<T, N>`] and [`Matrix<T, R, C>`] carry their dimensions as const
-//! generic parameters, so the shapes are part of the type and the compiler
-//! checks them. A matrix product `Matrix<R, K> · Matrix<K, C>` only type-checks
-//! when the inner dimensions agree; adding a `Matrix<2, 3>` to a `Matrix<3, 2>`
-//! is a compile error, not a runtime one. The only operation that can still fail
-//! at runtime is [`Matrix::inverse`], because singularity is a property of the
-//! values, not the shape.
+//! [`Vector<T>`] and [`Matrix<T>`] carry their dimensions as ordinary fields, so
+//! a shape can be computed at runtime: reading a length from a file, sizing a
+//! layer from a batch, or building a matrix whose extent nobody knows until the
+//! program runs. Storage is a flat row-major [`Vec`], so the tensors live on the
+//! heap, are [`Clone`] rather than [`Copy`], and hand out contiguous slices that
+//! the SIMD and GPU kernels read directly.
 //!
-//! Storage is a fixed-size array (`[T; N]` / `[[T; C]; R]`), so these live on the
-//! stack and are `Copy` when `T` is. `+ - * /` are elementwise; the
-//! linear-algebra products are the named methods.
+//! Shapes are checked where the operation happens. A matrix product
+//! `(R×K)·(K′×C)` panics unless `K == K′`, and adding a `2×3` to a `3×2` panics
+//! too — the message names both shapes. The operators `+ - * /` cannot return a
+//! `Result` (their signatures are fixed by `std`), so every shape-dependent
+//! operation is consistent with them and panics. The operations that can fail
+//! for reasons other than shape keep returning [`Result`]: [`Matrix::inverse`],
+//! because singularity is a property of the values, and [`chained_matmul`],
+//! which validates a whole chain before multiplying anything.
 //!
-//! Both types take a third parameter, the storage [`Backend`], which defaults to
-//! [`Host`] — the fixed-size array just described. On macOS with the `metal`
-//! feature, `f32` tensors can instead be placed on the [`Metal`] backend, whose
-//! elements live in GPU-shared memory so a chain of operations runs without
-//! copying between CPU and GPU pools. [`Vector::to_backend`] and
-//! [`Matrix::to_backend`] move between the two; see the [`backend`] module for
-//! the details.
+//! `+ - * /` are elementwise; the linear-algebra products are the named methods.
+//! Each is implemented for owned and borrowed operands, so `&a + &b` leaves both
+//! usable.
+//!
+//! Both types take a second parameter, the storage [`Backend`], which defaults
+//! to [`Host`] — the `Vec` just described. On macOS with the `metal` feature,
+//! `f32` tensors can instead be placed on the [`Metal`] backend, whose elements
+//! live in GPU-shared memory so a chain of operations runs without copying
+//! between CPU and GPU pools. [`Vector::to_backend`] and [`Matrix::to_backend`]
+//! move between the two; see the [`backend`] module for the details.
 
 use std::cmp::Ordering;
 use std::fmt::{self, Display};
-use std::ops::{Add, Div, Mul, Neg, Rem, Sub};
+use std::ops::{Add, Div, Index, Mul, Neg, Rem, Sub};
 
 use num_traits::{Float, NumCast};
 
@@ -50,6 +57,43 @@ pub use dual::{
 pub use kernels::{Analytic, BinaryOp, Compare, Kernels};
 pub use tape::{MatrixVar, ScalarVar, Tape, Var, VectorVar};
 
+// ---- shape checking ---------------------------------------------------------
+
+/// Panics unless two tensors have the same length.
+#[track_caller]
+fn assert_same_len(left: usize, right: usize, operation: &str) {
+    assert!(
+        left == right,
+        "{operation}: vector lengths differ, {left} and {right}"
+    );
+}
+
+/// Panics unless two matrices have the same shape.
+#[track_caller]
+fn assert_same_shape(left: (usize, usize), right: (usize, usize), operation: &str) {
+    assert!(
+        left == right,
+        "{operation}: matrix shapes differ, {}×{} and {}×{}",
+        left.0,
+        left.1,
+        right.0,
+        right.1
+    );
+}
+
+/// Panics unless the inner dimensions of a product agree.
+#[track_caller]
+fn assert_inner(left: (usize, usize), right: (usize, usize), operation: &str) {
+    assert!(
+        left.1 == right.0,
+        "{operation}: inner dimensions differ, {}×{} times {}×{}",
+        left.0,
+        left.1,
+        right.0,
+        right.1
+    );
+}
+
 #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
 mod simd_dispatch {
     //! CPU SIMD tier: sits between `metal_dispatch` and the generic scalar
@@ -58,10 +102,15 @@ mod simd_dispatch {
     //! other type), then calls the architecture-specific kernels in
     //! [`crate::simd`]. The size gates are deliberately small: CPU SIMD has
     //! almost no fixed cost, so it wins far below the Metal thresholds.
+    //!
+    //! Every entry point takes flat slices and runtime extents, which is what
+    //! the kernels underneath wanted all along — the shapes used to be const
+    //! parameters threaded down from the tensor types purely to be read back out
+    //! as numbers here.
 
     use std::any::TypeId;
 
-    use super::{BinaryOp, Complex, Vector};
+    use super::{BinaryOp, Complex};
     use crate::numbers::Coefficient;
 
     // Below these lengths the generic scalar loop is already fine (and the
@@ -99,10 +148,11 @@ mod simd_dispatch {
         unsafe { std::ptr::read((&v as *const f64).cast::<T>()) }
     }
 
-    pub fn dot<T: Coefficient, const N: usize>(a: &[T; N], b: &[T; N]) -> Option<T> {
-        if N < MIN_ELEMENTS {
+    pub fn dot<T: Coefficient>(a: &[T], b: &[T]) -> Option<T> {
+        if a.len() < MIN_ELEMENTS {
             return None;
         }
+        debug_assert_eq!(a.len(), b.len());
         unsafe {
             if let (Some(a), Some(b)) = (as_slice::<T, f32>(a), as_slice::<T, f32>(b)) {
                 return Some(from_f32(crate::simd::f32k::dot(a, b)));
@@ -187,225 +237,241 @@ mod simd_dispatch {
     /// owned `Matrix` built from a `vec![0.0; R * C]` scratch buffer, which cost
     /// an allocation plus a second element-by-element pass to copy out — at
     /// `R = K = C = 8` that overhead was roughly twice the arithmetic itself.
-    pub fn matmul<T: Coefficient, const R: usize, const K: usize, const C: usize>(
-        a: &[[T; K]; R],
-        b: &[[T; C]; K],
-        out: &mut [[T; C]; R],
+    pub fn matmul<T: Coefficient>(
+        a: &[T],
+        b: &[T],
+        rows: usize,
+        inner: usize,
+        cols: usize,
+        out: &mut [T],
     ) -> bool {
-        if R.saturating_mul(K).saturating_mul(C) < MIN_MATMUL_OPS {
+        if rows.saturating_mul(inner).saturating_mul(cols) < MIN_MATMUL_OPS {
             return false;
         }
-        let (a_flat, b_flat) = (a.as_flattened(), b.as_flattened());
-        let out_flat = out.as_flattened_mut();
         unsafe {
             if let (Some(a), Some(b), Some(out)) = (
-                as_slice::<T, f32>(a_flat),
-                as_slice::<T, f32>(b_flat),
-                as_slice_mut::<T, f32>(out_flat),
+                as_slice::<T, f32>(a),
+                as_slice::<T, f32>(b),
+                as_slice_mut::<T, f32>(out),
             ) {
-                crate::simd::f32k::matmul(a, b, R, K, C, out);
+                crate::simd::f32k::matmul(a, b, rows, inner, cols, out);
                 return true;
             }
             if let (Some(a), Some(b), Some(out)) = (
-                as_slice::<T, f64>(a_flat),
-                as_slice::<T, f64>(b_flat),
-                as_slice_mut::<T, f64>(out_flat),
+                as_slice::<T, f64>(a),
+                as_slice::<T, f64>(b),
+                as_slice_mut::<T, f64>(out),
             ) {
-                crate::simd::f64k::matmul(a, b, R, K, C, out);
+                crate::simd::f64k::matmul(a, b, rows, inner, cols, out);
                 return true;
             }
         }
         false
     }
 
-    pub fn matmul_add<T: Coefficient, const R: usize, const K: usize, const C: usize>(
-        a: &[[T; K]; R],
-        b: &[[T; C]; K],
-        addend: &mut [[T; C]; R],
+    pub fn matmul_add<T: Coefficient>(
+        a: &[T],
+        b: &[T],
+        rows: usize,
+        inner: usize,
+        cols: usize,
+        addend: &mut [T],
     ) -> bool {
-        if R.saturating_mul(K).saturating_mul(C) < MIN_MATMUL_OPS {
+        if rows.saturating_mul(inner).saturating_mul(cols) < MIN_MATMUL_OPS {
             return false;
         }
-        let (a_flat, b_flat) = (a.as_flattened(), b.as_flattened());
-        let addend_flat = addend.as_flattened_mut();
         unsafe {
             if let (Some(a), Some(b), Some(addend)) = (
-                as_slice::<T, f32>(a_flat),
-                as_slice::<T, f32>(b_flat),
-                as_slice_mut::<T, f32>(addend_flat),
+                as_slice::<T, f32>(a),
+                as_slice::<T, f32>(b),
+                as_slice_mut::<T, f32>(addend),
             ) {
-                crate::simd::f32k::matmul_accumulate(a, b, R, K, C, addend);
+                crate::simd::f32k::matmul_accumulate(a, b, rows, inner, cols, addend);
                 return true;
             }
             if let (Some(a), Some(b), Some(addend)) = (
-                as_slice::<T, f64>(a_flat),
-                as_slice::<T, f64>(b_flat),
-                as_slice_mut::<T, f64>(addend_flat),
+                as_slice::<T, f64>(a),
+                as_slice::<T, f64>(b),
+                as_slice_mut::<T, f64>(addend),
             ) {
-                crate::simd::f64k::matmul_accumulate(a, b, R, K, C, addend);
+                crate::simd::f64k::matmul_accumulate(a, b, rows, inner, cols, addend);
                 return true;
             }
         }
         false
     }
 
-    pub fn matvec<T: Coefficient, const R: usize, const C: usize>(
-        matrix: &[[T; C]; R],
-        vector: &[T; C],
-    ) -> Option<Vector<T, R>> {
-        if R.saturating_mul(C) < MIN_MATMUL_OPS {
-            return None;
+    /// Writes `matrix·vector` into `out`, returning whether the SIMD path ran.
+    ///
+    /// Row-times-vector: each output is a dot product of a matrix row with the
+    /// vector, so the per-row reduction kernel is the right shape here.
+    pub fn matvec<T: Coefficient>(
+        matrix: &[T],
+        vector: &[T],
+        rows: usize,
+        cols: usize,
+        out: &mut [T],
+    ) -> bool {
+        if rows.saturating_mul(cols) < MIN_MATMUL_OPS {
+            return false;
         }
-        // Row-times-vector: each output is a dot product of a matrix row with
-        // the vector, so the per-row reduction kernel is the right shape here.
-        // `from_fn` writes straight into the returned vector's storage, so there
-        // is no scratch buffer to remove here.
-        let m = matrix.as_flattened();
         unsafe {
-            if let (Some(m), Some(v)) = (as_slice::<T, f32>(m), as_slice::<T, f32>(vector)) {
-                return Some(Vector::new(std::array::from_fn(|i| {
-                    from_f32(crate::simd::f32k::dot(&m[i * C..i * C + C], v))
-                })));
-            }
-            if let (Some(m), Some(v)) = (as_slice::<T, f64>(m), as_slice::<T, f64>(vector)) {
-                return Some(Vector::new(std::array::from_fn(|i| {
-                    from_f64(crate::simd::f64k::dot(&m[i * C..i * C + C], v))
-                })));
-            }
-        }
-        None
-    }
-
-    pub fn matvec_add<T: Coefficient, const R: usize, const C: usize>(
-        matrix: &[[T; C]; R],
-        vector: &[T; C],
-        addend: &[T; R],
-    ) -> Option<Vector<T, R>> {
-        if R.saturating_mul(C) < MIN_MATMUL_OPS {
-            return None;
-        }
-        let m = matrix.as_flattened();
-        unsafe {
-            if let (Some(m), Some(v), Some(addend)) = (
-                as_slice::<T, f32>(m),
+            if let (Some(m), Some(v), Some(out)) = (
+                as_slice::<T, f32>(matrix),
                 as_slice::<T, f32>(vector),
-                as_slice::<T, f32>(addend),
+                as_slice_mut::<T, f32>(out),
             ) {
-                return Some(Vector::new(std::array::from_fn(|i| {
-                    from_f32(crate::simd::f32k::dot(&m[i * C..i * C + C], v) + addend[i])
-                })));
+                for (row, slot) in out.iter_mut().enumerate() {
+                    *slot = crate::simd::f32k::dot(&m[row * cols..row * cols + cols], v);
+                }
+                return true;
             }
-            if let (Some(m), Some(v), Some(addend)) = (
-                as_slice::<T, f64>(m),
+            if let (Some(m), Some(v), Some(out)) = (
+                as_slice::<T, f64>(matrix),
                 as_slice::<T, f64>(vector),
-                as_slice::<T, f64>(addend),
+                as_slice_mut::<T, f64>(out),
             ) {
-                return Some(Vector::new(std::array::from_fn(|i| {
-                    from_f64(crate::simd::f64k::dot(&m[i * C..i * C + C], v) + addend[i])
-                })));
+                for (row, slot) in out.iter_mut().enumerate() {
+                    *slot = crate::simd::f64k::dot(&m[row * cols..row * cols + cols], v);
+                }
+                return true;
             }
         }
-        None
+        false
+    }
+
+    /// Adds `matrix·vector` into `addend`, returning whether the SIMD path ran.
+    pub fn matvec_add<T: Coefficient>(
+        matrix: &[T],
+        vector: &[T],
+        rows: usize,
+        cols: usize,
+        addend: &mut [T],
+    ) -> bool {
+        if rows.saturating_mul(cols) < MIN_MATMUL_OPS {
+            return false;
+        }
+        unsafe {
+            if let (Some(m), Some(v), Some(addend)) = (
+                as_slice::<T, f32>(matrix),
+                as_slice::<T, f32>(vector),
+                as_slice_mut::<T, f32>(addend),
+            ) {
+                for (row, slot) in addend.iter_mut().enumerate() {
+                    *slot += crate::simd::f32k::dot(&m[row * cols..row * cols + cols], v);
+                }
+                return true;
+            }
+            if let (Some(m), Some(v), Some(addend)) = (
+                as_slice::<T, f64>(matrix),
+                as_slice::<T, f64>(vector),
+                as_slice_mut::<T, f64>(addend),
+            ) {
+                for (row, slot) in addend.iter_mut().enumerate() {
+                    *slot += crate::simd::f64k::dot(&m[row * cols..row * cols + cols], v);
+                }
+                return true;
+            }
+        }
+        false
     }
 
     /// Writes `vectorᵀ·matrix` into `out`, returning whether the SIMD path ran.
-    pub fn vecmat<T: Coefficient, const R: usize, const C: usize>(
-        vector: &[T; R],
-        matrix: &[[T; C]; R],
-        out: &mut [T; C],
+    pub fn vecmat<T: Coefficient>(
+        vector: &[T],
+        matrix: &[T],
+        rows: usize,
+        cols: usize,
+        out: &mut [T],
     ) -> bool {
-        if R.saturating_mul(C) < MIN_MATMUL_OPS {
+        if rows.saturating_mul(cols) < MIN_MATMUL_OPS {
             return false;
         }
         // (1×R)·(R×C): the broadcast-A matmul vectorizes across the C columns.
-        let m = matrix.as_flattened();
-        unsafe {
-            if let (Some(v), Some(m), Some(out)) = (
-                as_slice::<T, f32>(vector),
-                as_slice::<T, f32>(m),
-                as_slice_mut::<T, f32>(out),
-            ) {
-                crate::simd::f32k::matmul(v, m, 1, R, C, out);
-                return true;
-            }
-            if let (Some(v), Some(m), Some(out)) = (
-                as_slice::<T, f64>(vector),
-                as_slice::<T, f64>(m),
-                as_slice_mut::<T, f64>(out),
-            ) {
-                crate::simd::f64k::matmul(v, m, 1, R, C, out);
-                return true;
-            }
-        }
-        false
+        matmul(vector, matrix, 1, rows, cols, out)
     }
 
     /// In-place radix-2 FFT for power-of-two `f32` lengths. Returns `false` (so
     /// the caller keeps the generic path) for every other element type or shape.
     /// `direction` is `-1.0` forward, `+1.0` inverse; normalization stays with
     /// the caller.
-    pub fn radix2_fft<T: Coefficient, const N: usize>(
-        output: &mut [Complex<T>; N],
-        direction: f64,
-    ) -> bool {
-        if N < MIN_FFT_LENGTH || !N.is_power_of_two() || !is::<T, f32>() {
+    pub fn radix2_fft<T: Coefficient>(output: &mut [Complex<T>], direction: f64) -> bool {
+        let n = output.len();
+        if n < MIN_FFT_LENGTH || !n.is_power_of_two() || !is::<T, f32>() {
             return false;
         }
         // SAFETY: T is f32 and `Complex` is `#[repr(C)]`, so the buffer is
-        // exactly `[re, im, …]` — `2*N` contiguous f32.
+        // exactly `[re, im, …]` — `2*n` contiguous f32.
         let buf =
-            unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr().cast::<f32>(), 2 * N) };
-        crate::simd::fft_f32::radix2(buf, N, direction as f32);
+            unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr().cast::<f32>(), 2 * n) };
+        crate::simd::fft_f32::radix2(buf, n, direction as f32);
         true
     }
 }
 
 // ---- vectors ----------------------------------------------------------------
 
-/// A length-`N` vector, backed by `[T; N]` on the default [`Host`] backend.
-pub struct Vector<T, const N: usize, B: Backend = Host> {
-    data: B::Vector<T, N>,
+/// A vector whose length is fixed when it is built, backed by a `Vec<T>` on the
+/// default [`Host`] backend.
+pub struct Vector<T, B: Backend = Host> {
+    len: usize,
+    data: B::Vector<T>,
 }
 
 // The storage type varies with the backend, so these are the derives written by
-// hand: a `Host` tensor is `Copy` because an array of `Copy` elements is, and a
-// `Metal` tensor is not because a shared allocation is not.
-impl<T, const N: usize, B: Backend> Copy for Vector<T, N, B> where B::Vector<T, N>: Copy {}
-
-impl<T, const N: usize, B: Backend> Clone for Vector<T, N, B>
+// hand: which of them a tensor gets depends on what its storage supports.
+impl<T, B: Backend> Clone for Vector<T, B>
 where
-    B::Vector<T, N>: Clone,
+    B::Vector<T>: Clone,
 {
     fn clone(&self) -> Self {
         Vector {
+            len: self.len,
             data: self.data.clone(),
         }
     }
 }
 
-impl<T, const N: usize, B: Backend> PartialEq for Vector<T, N, B>
+impl<T, B: Backend> PartialEq for Vector<T, B>
 where
-    B::Vector<T, N>: PartialEq,
+    B::Vector<T>: PartialEq,
 {
     fn eq(&self, other: &Self) -> bool {
-        self.data == other.data
+        self.len == other.len && self.data == other.data
     }
 }
 
-impl<T, const N: usize, B: Backend> Eq for Vector<T, N, B> where B::Vector<T, N>: Eq {}
+impl<T, B: Backend> Eq for Vector<T, B> where B::Vector<T>: Eq {}
 
-impl<T, const N: usize, B: Backend> fmt::Debug for Vector<T, N, B>
+impl<T, B: Backend> fmt::Debug for Vector<T, B>
 where
-    B::Vector<T, N>: fmt::Debug,
+    B::Vector<T>: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Vector").field("data", &self.data).finish()
+        f.debug_struct("Vector")
+            .field("len", &self.len)
+            .field("data", &self.data)
+            .finish()
+    }
+}
+
+/// The shape queries, which read a field and so need nothing of the backend or
+/// the element type.
+impl<T, B: Backend> Vector<T, B> {
+    /// The number of elements.
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether this vector holds no elements.
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
     }
 }
 
 /// `f32` vectors on any backend. These are the operations that do not depend on
 /// where the elements live — everything else is implemented per backend.
-impl<const N: usize, B: Backend> Vector<f32, N, B> {
+impl<B: Backend> Vector<f32, B> {
     /// Move this vector's elements onto backend `B2`.
     ///
     /// This is the operation that copies: onto [`Metal`] it is an upload into
@@ -420,90 +486,160 @@ impl<const N: usize, B: Backend> Vector<f32, N, B> {
     /// assert_eq!(resident.to_backend::<Host>(), v);
     /// # }
     /// ```
-    pub fn to_backend<B2: Backend>(&self) -> Vector<f32, N, B2> {
+    pub fn to_backend<B2: Backend>(&self) -> Vector<f32, B2> {
         Vector {
-            data: B2::store_vector::<N>(B::vector_slice::<N>(&self.data)),
+            len: self.len,
+            data: B2::store_vector(B::vector_slice(&self.data)),
         }
     }
 
-    /// Every element set to `value`, allocated directly on backend `B`.
-    ///
-    /// The values are staged on the heap rather than written as an `[f32; N]`
-    /// literal, so on a GPU backend this is how to build a tensor too large to
-    /// sit on the stack: `Vector::<f32, 1_000_000, Metal>::filled(0.0)`.
-    pub fn filled(value: f32) -> Self {
+    /// A vector of `len` elements, every one set to `value`, allocated directly
+    /// on backend `B`.
+    pub fn filled(len: usize, value: f32) -> Self {
         Vector {
-            data: B::store_vector::<N>(&vec![value; N]),
+            len,
+            data: B::store_vector(&vec![value; len]),
         }
     }
 
     /// Borrow the elements as a slice, without copying.
     pub fn as_slice(&self) -> &[f32] {
-        B::vector_slice::<N>(&self.data)
+        B::vector_slice(&self.data)
     }
 
-    /// Copy the elements into an array.
-    pub fn to_array(&self) -> [f32; N] {
-        let values = self.as_slice();
-        std::array::from_fn(|index| values[index])
-    }
-
-    /// Consume this vector and view its elements as a `1 × N` row matrix.
-    ///
-    /// On the Metal backend this only changes the static shape; the existing
-    /// allocation is reused without a copy or kernel dispatch.
-    pub fn into_row_matrix(self) -> Matrix<f32, 1, N, B> {
-        Matrix {
-            data: B::vector_into_row(self.data),
+    /// Build from `f32` values on backend `B`. The length is the slice's.
+    pub(crate) fn build(values: &[f32]) -> Self {
+        Vector {
+            len: values.len(),
+            data: B::store_vector(values),
         }
     }
 
-    /// Consume this vector and view its elements as an `N × 1` column matrix.
+    /// Attach a length to storage that already holds exactly that many values —
+    /// how a tensor is rebuilt from the result of a kernel dispatch.
+    pub(crate) fn from_storage(len: usize, data: B::Vector<f32>) -> Self {
+        Vector { len, data }
+    }
+
+    /// The backend storage itself, which the kernels hand straight to a
+    /// dispatch.
+    pub(crate) fn storage(&self) -> &B::Vector<f32> {
+        &self.data
+    }
+
+    /// The backend storage itself, for a dispatch that accumulates in place.
+    pub(crate) fn storage_mut(&mut self) -> &mut B::Vector<f32> {
+        &mut self.data
+    }
+
+    /// Consume this vector and take its storage, which is how a reshape moves
+    /// the elements instead of copying them.
+    pub(crate) fn into_storage(self) -> B::Vector<f32> {
+        self.data
+    }
+
+    /// Copy the elements into a `Vec`.
+    pub fn to_vec(&self) -> Vec<f32> {
+        self.as_slice().to_vec()
+    }
+
+    /// Consume this vector and view its elements as a `1 × len` row matrix.
+    ///
+    /// On the Metal backend this only changes the recorded shape; the existing
+    /// allocation is reused without a copy or kernel dispatch.
+    pub fn into_row_matrix(self) -> Matrix<f32, B> {
+        Matrix {
+            rows: 1,
+            cols: self.len,
+            data: B::vector_into_matrix(self.data),
+        }
+    }
+
+    /// Consume this vector and view its elements as a `len × 1` column matrix.
     ///
     /// As with [`into_row_matrix`](Self::into_row_matrix), Metal reuses the
     /// existing allocation.
-    pub fn into_column_matrix(self) -> Matrix<f32, N, 1, B> {
+    pub fn into_column_matrix(self) -> Matrix<f32, B> {
         Matrix {
-            data: B::vector_into_column(self.data),
+            rows: self.len,
+            cols: 1,
+            data: B::vector_into_matrix(self.data),
         }
     }
 }
 
-impl<T, const N: usize> Vector<T, N> {
+impl<T> Vector<T, Host> {
     /// A vector from its elements.
-    pub const fn new(data: [T; N]) -> Self {
-        Vector { data }
+    ///
+    /// Both a fixed-size array and a `Vec` are accepted, so a length known in
+    /// source and one computed at runtime are written the same way:
+    ///
+    /// ```
+    /// use tensorcrate::tensors::Vector;
+    ///
+    /// let literal = Vector::new([1.0, 2.0, 3.0]);
+    /// let computed = Vector::new((0..3).map(|i| i as f64 + 1.0).collect::<Vec<_>>());
+    /// assert_eq!(literal, computed);
+    /// ```
+    pub fn new(data: impl Into<Vec<T>>) -> Self {
+        let data = data.into();
+        Vector {
+            len: data.len(),
+            data,
+        }
     }
 
-    pub fn data(&self) -> &[T; N] {
+    /// Borrow the elements as a slice.
+    pub fn data(&self) -> &[T] {
         &self.data
+    }
+
+    /// Borrow the elements as a mutable slice.
+    pub fn data_mut(&mut self) -> &mut [T] {
+        &mut self.data
+    }
+
+    /// Consume this vector and take its elements.
+    pub fn into_vec(self) -> Vec<T> {
+        self.data
     }
 
     pub fn get(&self, i: usize) -> Option<&T> {
         self.data.get(i)
     }
 
-    pub const fn len(&self) -> usize {
-        N
-    }
-
-    pub const fn is_empty(&self) -> bool {
-        N == 0
-    }
-
     /// Apply `f` to every element, producing a vector of the new element type —
-    /// e.g. lifting a `Vector<f64, N>` into a `Vector<Complex<f64>, N>`.
-    pub fn map<U>(&self, f: impl Fn(&T) -> U) -> Vector<U, N> {
+    /// e.g. lifting a `Vector<f64>` into a `Vector<Complex<f64>>`.
+    pub fn map<U>(&self, f: impl Fn(&T) -> U) -> Vector<U, Host> {
         Vector {
-            data: std::array::from_fn(|i| f(&self.data[i])),
+            len: self.len,
+            data: self.data.iter().map(f).collect(),
         }
     }
 }
 
-impl<T: Coefficient, const N: usize> Vector<T, N> {
-    pub fn zeros() -> Self {
+impl<T> Index<usize> for Vector<T, Host> {
+    type Output = T;
+
+    fn index(&self, index: usize) -> &T {
+        &self.data[index]
+    }
+}
+
+impl<T: Coefficient> Vector<T, Host> {
+    /// A vector of `len` zeros.
+    pub fn zeros(len: usize) -> Self {
         Vector {
-            data: std::array::from_fn(|_| T::zero()),
+            len,
+            data: vec![T::zero(); len],
+        }
+    }
+
+    /// A vector of `len` elements, every one set to `value`.
+    pub fn repeat(len: usize, value: T) -> Self {
+        Vector {
+            len,
+            data: vec![value; len],
         }
     }
 
@@ -517,7 +653,7 @@ impl<T: Coefficient, const N: usize> Vector<T, N> {
     pub fn broadcast_right(&self, scalar: T, op: BinaryOp) -> Self {
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         {
-            let mut out = [T::zero(); N];
+            let mut out = vec![T::zero(); self.len];
             if simd_dispatch::broadcast(&self.data, scalar, op, false, &mut out) {
                 return Vector::new(out);
             }
@@ -536,7 +672,7 @@ impl<T: Coefficient, const N: usize> Vector<T, N> {
     pub fn broadcast_left(&self, scalar: T, op: BinaryOp) -> Self {
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         {
-            let mut out = [T::zero(); N];
+            let mut out = vec![T::zero(); self.len];
             if simd_dispatch::broadcast(&self.data, scalar, op, true, &mut out) {
                 return Vector::new(out);
             }
@@ -550,38 +686,49 @@ impl<T: Coefficient, const N: usize> Vector<T, N> {
         })
     }
 
-    /// Dot product with a vector of the same length — the length match is
-    /// enforced by the type.
-    pub fn dot(&self, other: &Vector<T, N>) -> T {
+    /// Dot product.
+    ///
+    /// # Panics
+    ///
+    /// If the two lengths differ.
+    #[track_caller]
+    pub fn dot(&self, other: &Vector<T, Host>) -> T {
+        assert_same_len(self.len, other.len, "dot");
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         if let Some(output) = simd_dispatch::dot(&self.data, &other.data) {
             return output;
         }
         let mut sum = T::zero();
-        for i in 0..N {
+        for i in 0..self.len {
             sum = sum + self.data[i] * other.data[i];
         }
         sum
     }
 
     /// Row vector times matrix: `(1×N)·(N×C) = (1×C)`.
-    pub fn vecmat<const C: usize>(&self, m: &Matrix<T, N, C>) -> Vector<T, C> {
+    ///
+    /// # Panics
+    ///
+    /// If this vector's length is not the matrix's row count.
+    #[track_caller]
+    pub fn vecmat(&self, m: &Matrix<T, Host>) -> Vector<T, Host> {
+        assert_inner((1, self.len), m.shape(), "vecmat");
+        let (rows, cols) = (m.rows, m.cols);
+        let mut out = vec![T::zero(); cols];
+
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
-        {
-            let mut out = [T::zero(); C];
-            if simd_dispatch::vecmat(&self.data, &m.data, &mut out) {
-                return Vector::new(out);
+        if simd_dispatch::vecmat(&self.data, &m.data, rows, cols, &mut out) {
+            return Vector::new(out);
+        }
+
+        for (j, slot) in out.iter_mut().enumerate() {
+            let mut sum = T::zero();
+            for p in 0..rows {
+                sum = sum + self.data[p] * m.data[p * cols + j];
             }
+            *slot = sum;
         }
-        Vector {
-            data: std::array::from_fn(|j| {
-                let mut sum = T::zero();
-                for p in 0..N {
-                    sum = sum + self.data[p] * m.data[p][j];
-                }
-                sum
-            }),
-        }
+        Vector::new(out)
     }
 
     /// Discrete Fourier transform.
@@ -589,23 +736,27 @@ impl<T: Coefficient, const N: usize> Vector<T, N> {
     /// Power-of-two lengths use iterative radix-2 Cooley–Tukey (`O(N log N)`).
     /// Other composite lengths use a recursive mixed-radix Cooley–Tukey
     /// decomposition for radices up to 15. Sub-transforms without a factor in
-    /// that range use the definition directly, so every const length—including
-    /// zero and one—is supported.
+    /// that range use the definition directly, so every length—including zero
+    /// and one—is supported.
     ///
     /// This is the conventional unnormalized forward transform:
     /// `X[k] = Σ x[n] exp(-2πikn/N)`.
-    pub fn fft(&self) -> Vector<Complex<T>, N>
+    pub fn fft(&self) -> Vector<Complex<T>, Host>
     where
         T: Float,
     {
-        let mut output =
-            std::array::from_fn(|i| Complex::new(self.data[i], <T as num_traits::Zero>::zero()));
+        let n = self.len;
+        let mut output = self
+            .data
+            .iter()
+            .map(|&x| Complex::new(x, <T as num_traits::Zero>::zero()))
+            .collect::<Vec<_>>();
 
-        if N <= 1 {
+        if n <= 1 {
             return Vector::new(output);
         }
 
-        if !N.is_power_of_two() {
+        if !n.is_power_of_two() {
             mixed_radix_fft(&mut output, false);
             return Vector::new(output);
         }
@@ -620,20 +771,21 @@ impl<T: Coefficient, const N: usize> Vector<T, N> {
     }
 }
 
-impl<T: Float + Coefficient, const N: usize> Vector<Complex<T>, N> {
+impl<T: Float + Coefficient> Vector<Complex<T>, Host> {
     /// Inverse discrete Fourier transform.
     ///
     /// This uses the same radix-2 and mixed-radix Cooley–Tukey paths as
     /// [`Vector::fft`], with a direct DFT for leaves whose smallest factor
     /// exceeds 15. It is the conventional normalized inverse transform:
     /// `x[n] = (1/N) Σ X[k] exp(2πikn/N)`.
-    pub fn ifft(&self) -> Vector<Complex<T>, N> {
-        if N <= 1 {
-            return *self;
+    pub fn ifft(&self) -> Vector<Complex<T>, Host> {
+        let n = self.len;
+        if n <= 1 {
+            return self.clone();
         }
 
-        let mut output = self.data;
-        if N.is_power_of_two() {
+        let mut output = self.data.clone();
+        if n.is_power_of_two() {
             #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
             let vectorized = simd_dispatch::radix2_fft(&mut output, 1.0);
             #[cfg(not(all(
@@ -648,7 +800,7 @@ impl<T: Float + Coefficient, const N: usize> Vector<Complex<T>, N> {
             mixed_radix_fft(&mut output, true);
         }
 
-        let normalization = cast::<T>(N);
+        let normalization = cast::<T>(n);
         for value in &mut output {
             value.real = value.real / normalization;
             value.im = value.im / normalization;
@@ -800,8 +952,7 @@ fn transform<T: Float + Coefficient>(
             let mut sum = zero;
             for residue in 0..radix {
                 sum = sum
-                    + workspace[residue * quotient + low]
-                        * unit[residue * frequency % m * stride];
+                    + workspace[residue * quotient + low] * unit[residue * frequency % m * stride];
             }
             data[frequency] = sum;
         }
@@ -852,93 +1003,150 @@ mod fft_tests {
 
 // ---- matrices ---------------------------------------------------------------
 
-/// An `R × C` matrix, backed by `[[T; C]; R]` in row-major order on the default
-/// [`Host`] backend.
-pub struct Matrix<T, const R: usize, const C: usize, B: Backend = Host> {
-    data: B::Matrix<T, R, C>,
+/// A matrix whose shape is fixed when it is built, backed by a flat row-major
+/// `Vec<T>` on the default [`Host`] backend.
+pub struct Matrix<T, B: Backend = Host> {
+    rows: usize,
+    cols: usize,
+    data: B::Matrix<T>,
 }
 
 // As for `Vector`: hand-written derives, because the storage type — and so which
 // of these a tensor gets — depends on the backend.
-impl<T, const R: usize, const C: usize, B: Backend> Copy for Matrix<T, R, C, B> where
-    B::Matrix<T, R, C>: Copy
-{
-}
-
-impl<T, const R: usize, const C: usize, B: Backend> Clone for Matrix<T, R, C, B>
+impl<T, B: Backend> Clone for Matrix<T, B>
 where
-    B::Matrix<T, R, C>: Clone,
+    B::Matrix<T>: Clone,
 {
     fn clone(&self) -> Self {
         Matrix {
+            rows: self.rows,
+            cols: self.cols,
             data: self.data.clone(),
         }
     }
 }
 
-impl<T, const R: usize, const C: usize, B: Backend> PartialEq for Matrix<T, R, C, B>
+impl<T, B: Backend> PartialEq for Matrix<T, B>
 where
-    B::Matrix<T, R, C>: PartialEq,
+    B::Matrix<T>: PartialEq,
 {
     fn eq(&self, other: &Self) -> bool {
-        self.data == other.data
+        self.shape() == other.shape() && self.data == other.data
     }
 }
 
-impl<T, const R: usize, const C: usize, B: Backend> Eq for Matrix<T, R, C, B> where
-    B::Matrix<T, R, C>: Eq
-{
-}
+impl<T, B: Backend> Eq for Matrix<T, B> where B::Matrix<T>: Eq {}
 
-impl<T, const R: usize, const C: usize, B: Backend> fmt::Debug for Matrix<T, R, C, B>
+impl<T, B: Backend> fmt::Debug for Matrix<T, B>
 where
-    B::Matrix<T, R, C>: fmt::Debug,
+    B::Matrix<T>: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Matrix").field("data", &self.data).finish()
+        f.debug_struct("Matrix")
+            .field("rows", &self.rows)
+            .field("cols", &self.cols)
+            .field("data", &self.data)
+            .finish()
+    }
+}
+
+/// The shape queries, as for [`Vector`].
+impl<T, B: Backend> Matrix<T, B> {
+    /// The `(rows, columns)` extents.
+    pub const fn shape(&self) -> (usize, usize) {
+        (self.rows, self.cols)
+    }
+
+    /// The number of rows.
+    pub const fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// The number of columns.
+    pub const fn cols(&self) -> usize {
+        self.cols
+    }
+
+    /// Whether this matrix holds no elements.
+    pub const fn is_empty(&self) -> bool {
+        self.rows == 0 || self.cols == 0
+    }
+
+    /// Whether this matrix is square, which the determinant and inverse need.
+    pub const fn is_square(&self) -> bool {
+        self.rows == self.cols
     }
 }
 
 /// `f32` matrices on any backend, as for [`Vector`] above.
-impl<const R: usize, const C: usize, B: Backend> Matrix<f32, R, C, B> {
+impl<B: Backend> Matrix<f32, B> {
     /// Move this matrix's elements onto backend `B2`.
     ///
     /// The counterpart to [`Vector::to_backend`], and the only place a
     /// `Metal`-backed chain copies between CPU and GPU memory.
-    pub fn to_backend<B2: Backend>(&self) -> Matrix<f32, R, C, B2> {
+    pub fn to_backend<B2: Backend>(&self) -> Matrix<f32, B2> {
         Matrix {
-            data: B2::store_matrix::<R, C>(B::matrix_slice::<R, C>(&self.data)),
+            rows: self.rows,
+            cols: self.cols,
+            data: B2::store_matrix(B::matrix_slice(&self.data)),
         }
     }
 
-    /// Every element set to `value`, allocated directly on backend `B`, staged on
-    /// the heap rather than as a `[[f32; C]; R]` literal — see
-    /// [`Vector::filled`].
-    pub fn filled(value: f32) -> Self {
+    /// A `rows × cols` matrix with every element set to `value`, allocated
+    /// directly on backend `B`.
+    pub fn filled(rows: usize, cols: usize, value: f32) -> Self {
         Matrix {
-            data: B::store_matrix::<R, C>(&vec![value; R * C]),
+            rows,
+            cols,
+            data: B::store_matrix(&vec![value; rows * cols]),
         }
     }
 
     /// Borrow the elements as one flat row-major slice, without copying.
     pub fn as_slice(&self) -> &[f32] {
-        B::matrix_slice::<R, C>(&self.data)
+        B::matrix_slice(&self.data)
     }
 
-    /// Copy the elements into an array of rows.
-    pub fn to_rows(&self) -> [[f32; C]; R] {
-        let values = self.as_slice();
-        std::array::from_fn(|row| std::array::from_fn(|col| values[row * C + col]))
+    /// Build from row-major `f32` values on backend `B`.
+    pub(crate) fn build(rows: usize, cols: usize, values: &[f32]) -> Self {
+        debug_assert_eq!(values.len(), rows * cols);
+        Matrix {
+            rows,
+            cols,
+            data: B::store_matrix(values),
+        }
+    }
+
+    /// Attach a shape to storage that already holds exactly `rows * cols`
+    /// values — how a tensor is rebuilt from the result of a kernel dispatch.
+    pub(crate) fn from_storage(rows: usize, cols: usize, data: B::Matrix<f32>) -> Self {
+        Matrix { rows, cols, data }
+    }
+
+    /// The backend storage itself, which the kernels hand straight to a
+    /// dispatch.
+    pub(crate) fn storage(&self) -> &B::Matrix<f32> {
+        &self.data
+    }
+
+    /// The backend storage itself, for a dispatch that accumulates in place.
+    pub(crate) fn storage_mut(&mut self) -> &mut B::Matrix<f32> {
+        &mut self.data
+    }
+
+    /// Consume this matrix and take its storage, which is how a reshape moves
+    /// the elements instead of copying them.
+    pub(crate) fn into_storage(self) -> B::Matrix<f32> {
+        self.data
     }
 }
 
-/// A type-erased matrix used to assemble a heterogeneous const-generic matrix
-/// chain. Construct one with `MatrixOperand::from(&matrix)`.
+/// A type-erased matrix used to assemble a heterogeneous matrix chain.
+/// Construct one with `MatrixOperand::from(&matrix)`.
 ///
-/// Rust slices cannot directly contain `Matrix<T, R, C>` values with differing
-/// `R` and `C` parameters. This small owned adapter erases those intermediate
-/// dimensions while [`chained_matmul`] restores the final dimensions in its
-/// return type.
+/// Rust slices cannot directly contain matrices whose shapes differ, because the
+/// values would have different sizes. This small owned adapter carries the
+/// shape alongside the elements so a chain can be held in one slice.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MatrixOperand<T> {
     rows: usize,
@@ -946,33 +1154,36 @@ pub struct MatrixOperand<T> {
     data: Vec<T>,
 }
 
-impl<T: Copy, const R: usize, const C: usize> From<&Matrix<T, R, C>> for MatrixOperand<T> {
-    fn from(matrix: &Matrix<T, R, C>) -> Self {
+impl<T: Copy> From<&Matrix<T, Host>> for MatrixOperand<T> {
+    fn from(matrix: &Matrix<T, Host>) -> Self {
         Self {
-            rows: R,
-            cols: C,
-            data: matrix.data.iter().flatten().copied().collect(),
+            rows: matrix.rows,
+            cols: matrix.cols,
+            data: matrix.data.clone(),
         }
+    }
+}
+
+impl<T> MatrixOperand<T> {
+    /// The `(rows, columns)` extents.
+    pub const fn shape(&self) -> (usize, usize) {
+        (self.rows, self.cols)
     }
 }
 
 /// Multiply a heterogeneous chain in the optimal parenthesization.
 ///
-/// The returned `R × C` shape is const-generic and is checked against the
-/// chain's endpoints. The optimal order is found with the classic matrix-chain
-/// dynamic program; use [`chained_matmul_cost`] when only the optimal cost is
-/// needed, since that function uses the `O(n log n)` Hu–Shing solver.
-pub fn chained_matmul<T: Coefficient, const R: usize, const C: usize>(
+/// The optimal order is found with the classic matrix-chain dynamic program; use
+/// [`chained_matmul_cost`] when only the optimal cost is needed, since that
+/// function uses the `O(n log n)` Hu–Shing solver.
+///
+/// Returns [`Error::Shape`] when consecutive operands do not meet, and
+/// [`Error::InvalidArgument`] for a chain shorter than two matrices or one with
+/// a zero extent.
+pub fn chained_matmul<T: Coefficient>(
     matrices: &[MatrixOperand<T>],
-) -> Result<Matrix<T, R, C>, Error> {
+) -> Result<Matrix<T, Host>, Error> {
     let dims = validate_chain(matrices)?;
-    if R != dims[0] || C != dims[dims.len() - 1] {
-        return Err(Error::shape(format!(
-            "chain result is {}×{}, but the requested Matrix type is {R}×{C}",
-            dims[0],
-            dims[dims.len() - 1]
-        )));
-    }
 
     let n = matrices.len();
     let mut costs = vec![vec![0u128; n]; n];
@@ -1012,9 +1223,11 @@ pub fn chained_matmul<T: Coefficient, const R: usize, const C: usize>(
     }
 
     let result = evaluate(matrices, &splits, 0, n - 1);
-    Ok(Matrix::from_rows(std::array::from_fn(|i| {
-        std::array::from_fn(|j| result.data[i * C + j])
-    })))
+    Ok(Matrix {
+        rows: result.rows,
+        cols: result.cols,
+        data: result.data,
+    })
 }
 
 /// Minimum scalar-multiplication cost for a matrix chain, computed by the
@@ -1412,33 +1625,147 @@ mod hu_shing_tests {
     }
 }
 
-impl<T, const R: usize, const C: usize> Matrix<T, R, C> {
+impl<T> Matrix<T, Host> {
     /// A matrix from its rows.
-    pub const fn from_rows(data: [[T; C]; R]) -> Self {
-        Matrix { data }
+    ///
+    /// Accepts anything that iterates over row-like values, so a literal and a
+    /// runtime-built `Vec<Vec<T>>` are written the same way:
+    ///
+    /// ```
+    /// use tensorcrate::tensors::Matrix;
+    ///
+    /// let literal = Matrix::from_rows([[1.0, 2.0], [3.0, 4.0]]);
+    /// let computed = Matrix::from_rows((0..2).map(|r| vec![2.0 * r as f64 + 1.0, 2.0 * r as f64 + 2.0]));
+    /// assert_eq!(literal, computed);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// If the rows are not all the same length.
+    #[track_caller]
+    pub fn from_rows<I, R>(rows: I) -> Self
+    where
+        I: IntoIterator<Item = R>,
+        R: Into<Vec<T>>,
+    {
+        let mut data = Vec::new();
+        let mut count = 0;
+        let mut cols = 0;
+        for row in rows {
+            let mut row = row.into();
+            if count == 0 {
+                cols = row.len();
+            } else {
+                assert!(
+                    row.len() == cols,
+                    "from_rows: row {count} has {} elements, but row 0 has {cols}",
+                    row.len()
+                );
+            }
+            data.append(&mut row);
+            count += 1;
+        }
+        Matrix {
+            rows: count,
+            cols,
+            data,
+        }
     }
 
-    pub fn data(&self) -> &[[T; C]; R] {
+    /// A matrix from its row-major elements and an explicit shape.
+    ///
+    /// # Panics
+    ///
+    /// If the element count is not `rows * cols`.
+    #[track_caller]
+    pub fn from_flat(rows: usize, cols: usize, data: impl Into<Vec<T>>) -> Self {
+        let data = data.into();
+        assert!(
+            data.len() == rows * cols,
+            "from_flat: {} elements cannot fill a {rows}×{cols} matrix",
+            data.len()
+        );
+        Matrix { rows, cols, data }
+    }
+
+    /// Borrow the elements as one flat row-major slice.
+    ///
+    /// Row `i`, column `j` is at `i * cols + j`; [`row`](Self::row) and the
+    /// `(row, column)` index do that arithmetic for you.
+    pub fn data(&self) -> &[T] {
         &self.data
     }
 
-    pub fn get(&self, row: usize, col: usize) -> Option<&T> {
-        self.data.get(row)?.get(col)
+    /// Borrow the elements as one flat row-major mutable slice.
+    pub fn data_mut(&mut self) -> &mut [T] {
+        &mut self.data
     }
 
-    pub const fn shape(&self) -> (usize, usize) {
-        (R, C)
+    /// Consume this matrix and take its row-major elements.
+    pub fn into_vec(self) -> Vec<T> {
+        self.data
+    }
+
+    /// Borrow one row.
+    #[track_caller]
+    pub fn row(&self, row: usize) -> &[T] {
+        assert!(
+            row < self.rows,
+            "row {row} is out of range for {} rows",
+            self.rows
+        );
+        &self.data[row * self.cols..(row + 1) * self.cols]
+    }
+
+    /// Iterate over the rows.
+    pub fn row_iter(&self) -> impl Iterator<Item = &[T]> {
+        (0..self.rows).map(move |row| self.row(row))
+    }
+
+    /// Copy the elements into a vector of rows.
+    ///
+    /// Host-only, since it hands back owned elements; a resident tensor reaches
+    /// it through [`to_backend::<Host>()`](Self::to_backend).
+    pub fn to_rows(&self) -> Vec<Vec<T>>
+    where
+        T: Clone,
+    {
+        self.row_iter().map(<[T]>::to_vec).collect()
+    }
+
+    pub fn get(&self, row: usize, col: usize) -> Option<&T> {
+        if row >= self.rows || col >= self.cols {
+            return None;
+        }
+        self.data.get(row * self.cols + col)
     }
 
     /// Apply `f` to every element, producing a matrix of the new element type.
-    pub fn map<U>(&self, f: impl Fn(&T) -> U) -> Matrix<U, R, C> {
+    pub fn map<U>(&self, f: impl Fn(&T) -> U) -> Matrix<U, Host> {
         Matrix {
-            data: std::array::from_fn(|i| std::array::from_fn(|j| f(&self.data[i][j]))),
+            rows: self.rows,
+            cols: self.cols,
+            data: self.data.iter().map(f).collect(),
         }
     }
 }
 
-impl<T: Coefficient, const R: usize, const C: usize> Matrix<T, R, C> {
+impl<T> Index<(usize, usize)> for Matrix<T, Host> {
+    type Output = T;
+
+    #[track_caller]
+    fn index(&self, (row, col): (usize, usize)) -> &T {
+        assert!(
+            row < self.rows && col < self.cols,
+            "index ({row}, {col}) is out of range for a {}×{} matrix",
+            self.rows,
+            self.cols
+        );
+        &self.data[row * self.cols + col]
+    }
+}
+
+impl<T: Coefficient> Matrix<T, Host> {
     /// Multiply a heterogeneous matrix chain in its optimal order.
     ///
     /// Convert each differently-shaped matrix with [`MatrixOperand::from`].
@@ -1451,9 +1778,21 @@ impl<T: Coefficient, const R: usize, const C: usize> Matrix<T, R, C> {
         crate::tensors::chained_matmul_cost(matrices)
     }
 
-    pub fn zeros() -> Self {
+    /// A `rows × cols` matrix of zeros.
+    pub fn zeros(rows: usize, cols: usize) -> Self {
         Matrix {
-            data: std::array::from_fn(|_| std::array::from_fn(|_| T::zero())),
+            rows,
+            cols,
+            data: vec![T::zero(); rows * cols],
+        }
+    }
+
+    /// A `rows × cols` matrix with every element set to `value`.
+    pub fn repeat(rows: usize, cols: usize, value: T) -> Self {
+        Matrix {
+            rows,
+            cols,
+            data: vec![value; rows * cols],
         }
     }
 
@@ -1467,15 +1806,9 @@ impl<T: Coefficient, const R: usize, const C: usize> Matrix<T, R, C> {
     pub fn broadcast_right(&self, scalar: T, op: BinaryOp) -> Self {
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         {
-            let mut out = [[T::zero(); C]; R];
-            if simd_dispatch::broadcast(
-                self.data.as_flattened(),
-                scalar,
-                op,
-                false,
-                out.as_flattened_mut(),
-            ) {
-                return Matrix::from_rows(out);
+            let mut out = vec![T::zero(); self.data.len()];
+            if simd_dispatch::broadcast(&self.data, scalar, op, false, &mut out) {
+                return Matrix::from_flat(self.rows, self.cols, out);
             }
         }
         self.map(|&value| match op {
@@ -1492,15 +1825,9 @@ impl<T: Coefficient, const R: usize, const C: usize> Matrix<T, R, C> {
     pub fn broadcast_left(&self, scalar: T, op: BinaryOp) -> Self {
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         {
-            let mut out = [[T::zero(); C]; R];
-            if simd_dispatch::broadcast(
-                self.data.as_flattened(),
-                scalar,
-                op,
-                true,
-                out.as_flattened_mut(),
-            ) {
-                return Matrix::from_rows(out);
+            let mut out = vec![T::zero(); self.data.len()];
+            if simd_dispatch::broadcast(&self.data, scalar, op, true, &mut out) {
+                return Matrix::from_flat(self.rows, self.cols, out);
             }
         }
         self.map(|&value| match op {
@@ -1512,47 +1839,59 @@ impl<T: Coefficient, const R: usize, const C: usize> Matrix<T, R, C> {
         })
     }
 
-    /// Matrix product `(R×C)·(C×C2) = (R×C2)`. The shared inner dimension `C` is
-    /// enforced by the type: a mismatch does not compile.
-    pub fn matmul<const C2: usize>(&self, other: &Matrix<T, C, C2>) -> Matrix<T, R, C2> {
+    /// Matrix product `(R×K)·(K×C) = (R×C)`.
+    ///
+    /// # Panics
+    ///
+    /// If this matrix's column count is not the other's row count.
+    #[track_caller]
+    pub fn matmul(&self, other: &Matrix<T, Host>) -> Matrix<T, Host> {
+        assert_inner(self.shape(), other.shape(), "matmul");
+        let (rows, inner, cols) = (self.rows, self.cols, other.cols);
+        let mut out = vec![T::zero(); rows * cols];
+
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
-        {
-            let mut out = [[T::zero(); C2]; R];
-            if simd_dispatch::matmul(&self.data, &other.data, &mut out) {
-                return Matrix { data: out };
+        if simd_dispatch::matmul(&self.data, &other.data, rows, inner, cols, &mut out) {
+            return Matrix::from_flat(rows, cols, out);
+        }
+
+        for i in 0..rows {
+            for j in 0..cols {
+                let mut sum = T::zero();
+                for p in 0..inner {
+                    sum = sum + self.data[i * inner + p] * other.data[p * cols + j];
+                }
+                out[i * cols + j] = sum;
             }
         }
-        Matrix {
-            data: std::array::from_fn(|i| {
-                std::array::from_fn(|j| {
-                    let mut sum = T::zero();
-                    for p in 0..C {
-                        sum = sum + self.data[i][p] * other.data[p][j];
-                    }
-                    sum
-                })
-            }),
-        }
+        Matrix::from_flat(rows, cols, out)
     }
 
     /// Fused matrix multiply-add: `self·other + addend`.
     ///
     /// `addend` is consumed and used as the accumulator, avoiding a separate
     /// product allocation and elementwise addition.
-    pub fn matmul_add<const C2: usize>(
-        &self,
-        other: &Matrix<T, C, C2>,
-        addend: Matrix<T, R, C2>,
-    ) -> Matrix<T, R, C2> {
+    ///
+    /// # Panics
+    ///
+    /// If the inner dimensions disagree, or `addend` is not `rows × other.cols`.
+    #[track_caller]
+    pub fn matmul_add(&self, other: &Matrix<T, Host>, addend: Matrix<T, Host>) -> Matrix<T, Host> {
+        assert_inner(self.shape(), other.shape(), "matmul_add");
+        assert_same_shape(addend.shape(), (self.rows, other.cols), "matmul_add addend");
+        let (rows, inner, cols) = (self.rows, self.cols, other.cols);
         let mut output = addend;
+
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
-        if simd_dispatch::matmul_add(&self.data, &other.data, &mut output.data) {
+        if simd_dispatch::matmul_add(&self.data, &other.data, rows, inner, cols, &mut output.data) {
             return output;
         }
-        for i in 0..R {
-            for p in 0..C {
-                for j in 0..C2 {
-                    output.data[i][j] = output.data[i][j] + self.data[i][p] * other.data[p][j];
+
+        for i in 0..rows {
+            for p in 0..inner {
+                for j in 0..cols {
+                    output.data[i * cols + j] = output.data[i * cols + j]
+                        + self.data[i * inner + p] * other.data[p * cols + j];
                 }
             }
         }
@@ -1560,36 +1899,56 @@ impl<T: Coefficient, const R: usize, const C: usize> Matrix<T, R, C> {
     }
 
     /// Matrix times column vector: `(R×C)·(C×1) = (R×1)`.
-    pub fn matvec(&self, v: &Vector<T, C>) -> Vector<T, R> {
+    ///
+    /// # Panics
+    ///
+    /// If the vector's length is not this matrix's column count.
+    #[track_caller]
+    pub fn matvec(&self, v: &Vector<T, Host>) -> Vector<T, Host> {
+        assert_inner(self.shape(), (v.len, 1), "matvec");
+        let (rows, cols) = (self.rows, self.cols);
+        let mut out = vec![T::zero(); rows];
+
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
-        if let Some(output) = simd_dispatch::matvec(&self.data, &v.data) {
-            return output;
+        if simd_dispatch::matvec(&self.data, &v.data, rows, cols, &mut out) {
+            return Vector::new(out);
         }
-        Vector {
-            data: std::array::from_fn(|i| {
-                let mut sum = T::zero();
-                for p in 0..C {
-                    sum = sum + self.data[i][p] * v.data[p];
-                }
-                sum
-            }),
+
+        for (i, slot) in out.iter_mut().enumerate() {
+            let mut sum = T::zero();
+            for p in 0..cols {
+                sum = sum + self.data[i * cols + p] * v.data[p];
+            }
+            *slot = sum;
         }
+        Vector::new(out)
     }
 
     /// Fused matrix-vector multiply-add: `self·v + addend`.
     ///
     /// Each row uses the SIMD dot-product kernel when available, and the owned
     /// addend is updated in place.
-    pub fn matvec_add(&self, v: &Vector<T, C>, addend: Vector<T, R>) -> Vector<T, R> {
+    ///
+    /// # Panics
+    ///
+    /// If the vector's length is not this matrix's column count, or the addend's
+    /// length is not its row count.
+    #[track_caller]
+    pub fn matvec_add(&self, v: &Vector<T, Host>, addend: Vector<T, Host>) -> Vector<T, Host> {
+        assert_inner(self.shape(), (v.len, 1), "matvec_add");
+        assert_same_len(addend.len, self.rows, "matvec_add addend");
+        let (rows, cols) = (self.rows, self.cols);
+        let mut output = addend;
+
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
-        if let Some(output) = simd_dispatch::matvec_add(&self.data, &v.data, &addend.data) {
+        if simd_dispatch::matvec_add(&self.data, &v.data, rows, cols, &mut output.data) {
             return output;
         }
-        let mut output = addend;
-        for i in 0..R {
+
+        for i in 0..rows {
             let mut sum = T::zero();
-            for p in 0..C {
-                sum = sum + self.data[i][p] * v.data[p];
+            for p in 0..cols {
+                sum = sum + self.data[i * cols + p] * v.data[p];
             }
             output.data[i] = output.data[i] + sum;
         }
@@ -1597,201 +1956,256 @@ impl<T: Coefficient, const R: usize, const C: usize> Matrix<T, R, C> {
     }
 
     /// Transpose: an `R×C` matrix becomes `C×R`.
-    pub fn transpose(&self) -> Matrix<T, C, R> {
-        Matrix {
-            data: std::array::from_fn(|i| std::array::from_fn(|j| self.data[j][i])),
+    pub fn transpose(&self) -> Matrix<T, Host> {
+        let (rows, cols) = (self.rows, self.cols);
+        let mut out = vec![T::zero(); rows * cols];
+        for i in 0..rows {
+            for j in 0..cols {
+                out[j * rows + i] = self.data[i * cols + j];
+            }
         }
+        Matrix::from_flat(cols, rows, out)
     }
-}
 
-impl<T: Coefficient, const N: usize> Matrix<T, N, N> {
-    /// The `N × N` identity matrix.
-    pub fn identity() -> Self {
-        Matrix {
-            data: std::array::from_fn(|i| {
-                std::array::from_fn(|j| if i == j { T::one() } else { T::zero() })
-            }),
+    /// The `n × n` identity matrix.
+    pub fn identity(n: usize) -> Self {
+        let mut data = vec![T::zero(); n * n];
+        for i in 0..n {
+            data[i * n + i] = T::one();
         }
+        Matrix::from_flat(n, n, data)
     }
 
     /// Determinant, by fraction-free (Bareiss) elimination — every division is
     /// exact, so an integer matrix keeps an exact integer determinant.
+    ///
+    /// # Panics
+    ///
+    /// If the matrix is not square.
+    #[track_caller]
     pub fn determinant(&self) -> T {
-        if N == 0 {
+        assert!(
+            self.is_square(),
+            "determinant: matrix is {}×{}, not square",
+            self.rows,
+            self.cols
+        );
+        let n = self.rows;
+        if n == 0 {
             return T::one();
         }
-        let mut m = self.data;
+        let mut m = self.data.clone();
+        let at = |i: usize, j: usize| i * n + j;
         let mut prev = T::one();
         let mut negate = false;
 
-        for k in 0..N - 1 {
-            if m[k][k].is_zero() {
-                match (k + 1..N).find(|&p| !m[p][k].is_zero()) {
+        for k in 0..n - 1 {
+            if m[at(k, k)].is_zero() {
+                match (k + 1..n).find(|&p| !m[at(p, k)].is_zero()) {
                     Some(p) => {
-                        m.swap(k, p);
+                        for j in 0..n {
+                            m.swap(at(k, j), at(p, j));
+                        }
                         negate = !negate;
                     }
                     None => return T::zero(),
                 }
             }
-            for i in k + 1..N {
-                for j in k + 1..N {
-                    let value = m[i][j] * m[k][k] - m[i][k] * m[k][j];
-                    m[i][j] = value / prev;
+            for i in k + 1..n {
+                for j in k + 1..n {
+                    let value = m[at(i, j)] * m[at(k, k)] - m[at(i, k)] * m[at(k, j)];
+                    m[at(i, j)] = value / prev;
                 }
             }
-            prev = m[k][k];
+            prev = m[at(k, k)];
         }
 
-        let det = m[N - 1][N - 1];
+        let det = m[at(n - 1, n - 1)];
         if negate { T::zero() - det } else { det }
     }
 
     /// Inverse, by Gauss–Jordan elimination with partial pivoting on
     /// [`Coefficient::magnitude`] (so complex and dual elements, which have no
     /// ordering, still pivot sensibly). Returns [`Error::Singular`] when the
-    /// matrix has no inverse. Coefficient domains with truncating division, such
-    /// as primitive integers and integer-based complex or dual numbers, return
+    /// matrix has no inverse, and [`Error::Shape`] when it is not square.
+    /// Coefficient domains with truncating division, such as primitive integers
+    /// and integer-based complex or dual numbers, return
     /// [`Error::InvalidArgument`] because Gauss–Jordan requires fractions.
     pub fn inverse(&self) -> Result<Self, Error> {
+        if !self.is_square() {
+            return Err(Error::shape(format!(
+                "matrix is {}×{}, so it has no inverse",
+                self.rows, self.cols
+            )));
+        }
         if !T::supports_fractional_division() {
             return Err(Error::InvalidArgument(
                 "matrix inversion requires coefficients with fractional division".to_string(),
             ));
         }
-        let mut a = self.data;
-        let mut inv = Self::identity().data;
+        let n = self.rows;
+        let at = |i: usize, j: usize| i * n + j;
+        let mut a = self.data.clone();
+        let mut inv = Self::identity(n).data;
 
-        for col in 0..N {
-            let pivot = (col..N)
+        for col in 0..n {
+            let pivot = (col..n)
                 .max_by(|&x, &y| {
-                    a[x][col]
+                    a[at(x, col)]
                         .magnitude()
-                        .partial_cmp(&a[y][col].magnitude())
+                        .partial_cmp(&a[at(y, col)].magnitude())
                         .unwrap_or(Ordering::Equal)
                 })
-                .expect("col < N, so the range is non-empty");
-            if a[pivot][col].is_zero() {
+                .expect("col < n, so the range is non-empty");
+            if a[at(pivot, col)].is_zero() {
                 return Err(Error::Singular);
             }
             if pivot != col {
-                a.swap(col, pivot);
-                inv.swap(col, pivot);
+                for j in 0..n {
+                    a.swap(at(col, j), at(pivot, j));
+                    inv.swap(at(col, j), at(pivot, j));
+                }
             }
 
-            let scale = a[col][col];
-            for j in 0..N {
-                a[col][j] = a[col][j] / scale;
-                inv[col][j] = inv[col][j] / scale;
+            let scale = a[at(col, col)];
+            for j in 0..n {
+                a[at(col, j)] = a[at(col, j)] / scale;
+                inv[at(col, j)] = inv[at(col, j)] / scale;
             }
-            for r in 0..N {
+            for r in 0..n {
                 if r == col {
                     continue;
                 }
-                let factor = a[r][col];
+                let factor = a[at(r, col)];
                 if factor.is_zero() {
                     continue;
                 }
-                for j in 0..N {
-                    a[r][j] = a[r][j] - factor * a[col][j];
-                    inv[r][j] = inv[r][j] - factor * inv[col][j];
+                for j in 0..n {
+                    a[at(r, j)] = a[at(r, j)] - factor * a[at(col, j)];
+                    inv[at(r, j)] = inv[at(r, j)] - factor * inv[at(col, j)];
                 }
             }
         }
-        Ok(Matrix { data: inv })
+        Ok(Matrix::from_flat(n, n, inv))
     }
 }
 
+// ---- elementwise operators --------------------------------------------------
+
+impl<T: Coefficient> Vector<T, Host> {
+    #[track_caller]
+    fn zip_with(&self, rhs: &Self, op: BinaryOp, f: impl Fn(T, T) -> T) -> Self {
+        assert_same_len(self.len, rhs.len, op.name());
+
+        #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            let mut out = vec![T::zero(); self.len];
+            if simd_dispatch::elementwise(&self.data, &rhs.data, op, &mut out) {
+                return Vector::new(out);
+            }
+        }
+
+        Vector::new(
+            self.data
+                .iter()
+                .zip(&rhs.data)
+                .map(|(&a, &b)| f(a, b))
+                .collect::<Vec<_>>(),
+        )
+    }
+}
+
+impl<T: Coefficient> Matrix<T, Host> {
+    #[track_caller]
+    fn zip_with(&self, rhs: &Self, op: BinaryOp, f: impl Fn(T, T) -> T) -> Self {
+        assert_same_shape(self.shape(), rhs.shape(), op.name());
+
+        #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            let mut out = vec![T::zero(); self.data.len()];
+            if simd_dispatch::elementwise(&self.data, &rhs.data, op, &mut out) {
+                return Matrix::from_flat(self.rows, self.cols, out);
+            }
+        }
+
+        Matrix::from_flat(
+            self.rows,
+            self.cols,
+            self.data
+                .iter()
+                .zip(&rhs.data)
+                .map(|(&a, &b)| f(a, b))
+                .collect::<Vec<_>>(),
+        )
+    }
+}
+
+/// One elementwise operator, for owned and borrowed operands.
+///
+/// Host tensors own a heap allocation, so they are not `Copy`; the reference
+/// forms are what most code wants, since `&a + &b` leaves both usable.
 macro_rules! elementwise {
-    ($Type:ident < $($dim:ident),+ >, $Trait:ident, $method:ident, $op:tt) => {
-        impl<T: Coefficient, $(const $dim: usize),+> $Trait for $Type<T, $($dim),+> {
-            type Output = $Type<T, $($dim),+>;
+    ($Type:ident, $Trait:ident, $method:ident, $op:expr, $apply:tt) => {
+        impl<T: Coefficient> $Trait for $Type<T, Host> {
+            type Output = $Type<T, Host>;
+            #[track_caller]
             fn $method(self, rhs: Self) -> Self::Output {
-                self.zip_with(&rhs, |a, b| a $op b)
+                self.zip_with(&rhs, $op, |a, b| a $apply b)
+            }
+        }
+
+        impl<T: Coefficient> $Trait<&$Type<T, Host>> for &$Type<T, Host> {
+            type Output = $Type<T, Host>;
+            #[track_caller]
+            fn $method(self, rhs: &$Type<T, Host>) -> Self::Output {
+                self.zip_with(rhs, $op, |a, b| a $apply b)
             }
         }
     };
 }
 
-impl<T: Coefficient, const N: usize> Vector<T, N> {
-    fn zip_with(&self, rhs: &Self, f: impl Fn(T, T) -> T) -> Self {
-        Vector {
-            data: std::array::from_fn(|i| f(self.data[i], rhs.data[i])),
-        }
-    }
-}
+elementwise!(Vector, Add, add, BinaryOp::Add, +);
+elementwise!(Vector, Sub, sub, BinaryOp::Sub, -);
+elementwise!(Vector, Mul, mul, BinaryOp::Mul, *);
+elementwise!(Vector, Div, div, BinaryOp::Div, /);
+elementwise!(Vector, Rem, rem, BinaryOp::Rem, %);
+elementwise!(Matrix, Add, add, BinaryOp::Add, +);
+elementwise!(Matrix, Sub, sub, BinaryOp::Sub, -);
+elementwise!(Matrix, Mul, mul, BinaryOp::Mul, *);
+elementwise!(Matrix, Div, div, BinaryOp::Div, /);
+elementwise!(Matrix, Rem, rem, BinaryOp::Rem, %);
 
-impl<T: Coefficient, const R: usize, const C: usize> Matrix<T, R, C> {
-    fn zip_with(&self, rhs: &Self, f: impl Fn(T, T) -> T) -> Self {
-        Matrix {
-            data: std::array::from_fn(|i| {
-                std::array::from_fn(|j| f(self.data[i][j], rhs.data[i][j]))
-            }),
-        }
-    }
-}
-
-elementwise!(Vector<N>, Add, add, +);
-elementwise!(Vector<N>, Sub, sub, -);
-elementwise!(Vector<N>, Div, div, /);
-elementwise!(Vector<N>, Rem, rem, %);
-elementwise!(Matrix<R, C>, Add, add, +);
-elementwise!(Matrix<R, C>, Sub, sub, -);
-elementwise!(Matrix<R, C>, Div, div, /);
-elementwise!(Matrix<R, C>, Rem, rem, %);
-
-impl<T: Coefficient, const N: usize> Mul for Vector<T, N> {
-    type Output = Vector<T, N>;
-
-    fn mul(self, rhs: Self) -> Self::Output {
-        #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
-        {
-            let mut out = [T::zero(); N];
-            if simd_dispatch::elementwise(&self.data, &rhs.data, BinaryOp::Mul, &mut out) {
-                return Vector::new(out);
-            }
-        }
-        self.zip_with(&rhs, |a, b| a * b)
-    }
-}
-
-impl<T: Coefficient, const R: usize, const C: usize> Mul for Matrix<T, R, C> {
-    type Output = Matrix<T, R, C>;
-
-    fn mul(self, rhs: Self) -> Self::Output {
-        #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
-        {
-            let mut out = [[T::zero(); C]; R];
-            if simd_dispatch::elementwise(
-                self.data.as_flattened(),
-                rhs.data.as_flattened(),
-                BinaryOp::Mul,
-                out.as_flattened_mut(),
-            ) {
-                return Matrix::from_rows(out);
-            }
-        }
-        self.zip_with(&rhs, |a, b| a * b)
-    }
-}
-
-impl<T: Coefficient + Neg<Output = T>, const N: usize> Neg for Vector<T, N> {
-    type Output = Vector<T, N>;
+impl<T: Coefficient + Neg<Output = T>> Neg for Vector<T, Host> {
+    type Output = Vector<T, Host>;
     fn neg(self) -> Self {
         self.map(|&x| -x)
     }
 }
 
-impl<T: Coefficient + Neg<Output = T>, const R: usize, const C: usize> Neg for Matrix<T, R, C> {
-    type Output = Matrix<T, R, C>;
+impl<T: Coefficient + Neg<Output = T>> Neg for &Vector<T, Host> {
+    type Output = Vector<T, Host>;
+    fn neg(self) -> Self::Output {
+        self.map(|&x| -x)
+    }
+}
+
+impl<T: Coefficient + Neg<Output = T>> Neg for Matrix<T, Host> {
+    type Output = Matrix<T, Host>;
     fn neg(self) -> Self {
+        self.map(|&x| -x)
+    }
+}
+
+impl<T: Coefficient + Neg<Output = T>> Neg for &Matrix<T, Host> {
+    type Output = Matrix<T, Host>;
+    fn neg(self) -> Self::Output {
         self.map(|&x| -x)
     }
 }
 
 // ---- display ----------------------------------------------------------------
 
-impl<T: Display, const N: usize> Display for Vector<T, N> {
+impl<T: Display> Display for Vector<T, Host> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "[")?;
         for x in &self.data {
@@ -1801,9 +2215,9 @@ impl<T: Display, const N: usize> Display for Vector<T, N> {
     }
 }
 
-impl<T: Display, const R: usize, const C: usize> Display for Matrix<T, R, C> {
+impl<T: Display> Display for Matrix<T, Host> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (r, row) in self.data.iter().enumerate() {
+        for (r, row) in self.row_iter().enumerate() {
             if r > 0 {
                 writeln!(f)?;
             }

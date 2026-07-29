@@ -1,9 +1,9 @@
 //! Forward-mode automatic differentiation over tensors.
 //!
 //! A [`Dual`] scalar carries `value + tangent·ε` in one struct. A dual *tensor*
-//! could do the same — `Vector<Dual<f32>, N>` already works on the host — but
-//! that layout is wrong for a GPU: the Metal shaders are 32-bit, so dual
-//! elements would need a second, parallel set of kernels, and the interleaved
+//! could do the same — `Vector<Dual<f32>>` already works on the host — but that
+//! layout is wrong for a GPU: the Metal shaders are 32-bit, so dual elements
+//! would need a second, parallel set of kernels, and the interleaved
 //! `[v, d, v, d, …]` access pattern coalesces worse than two flat buffers.
 //!
 //! So [`DualVector`] and [`DualMatrix`] keep the two parts in *separate* tensors
@@ -22,10 +22,14 @@
 //! | [`row_sums`](DualMatrix::row_sums) | `A·1` | `Ȧ·1` |
 //!
 //! Nothing here names a backend, because it is written against
-//! [`Kernels`]: the same code runs on `Host` arrays and in
+//! [`Kernels`]: the same code runs on `Host` vectors and in
 //! `Metal` shared memory, so a resident chain stays resident for the whole
 //! derivative computation — and the `Host` instantiation is the oracle the GPU
 //! one is tested against.
+//!
+//! Nothing here names a *dimension* either. The two parts of a dual tensor must
+//! agree in shape, which is checked when they are paired, and every rule below
+//! then takes its shapes from the operands.
 //!
 //! The tangent is a *direction*, not "the" derivative: one pass computes the
 //! directional derivative `J·v`. Seeding a one-hot direction
@@ -38,11 +42,11 @@
 //!
 //! // ∇‖x‖² = 2x
 //! let x = Vector::new([1.0f32, 2.0, 3.0]);
-//! assert_eq!(gradient(&x, |v| v.dot(v)).to_array(), [2.0, 4.0, 6.0]);
+//! assert_eq!(gradient(&x, |v| v.dot(v)).to_vec(), [2.0, 4.0, 6.0]);
 //!
 //! // d/dt (A·A) with A = tI is 2tI, so at t = 3 the tangent is 6I.
-//! let a = Matrix::<f32, 2, 2>::identity().scale(3.0);
-//! let squared = DualMatrix::new(a, Matrix::identity()).squared();
+//! let a = Matrix::<f32>::identity(2).scale(3.0);
+//! let squared = DualMatrix::new(a, Matrix::identity(2)).squared();
 //! assert_eq!(squared.value().to_rows(), [[9.0, 0.0], [0.0, 9.0]]);
 //! assert_eq!(squared.tangent().to_rows(), [[6.0, 0.0], [0.0, 6.0]]);
 //! ```
@@ -53,25 +57,21 @@ use crate::numbers::Dual;
 
 use super::{Analytic, BinaryOp, Compare, Host, Kernels, Matrix, Vector};
 
-/// A length-`N` vector and its tangent, for forward-mode differentiation.
-pub struct DualVector<const N: usize, B: Kernels = Host> {
-    value: Vector<f32, N, B>,
-    tangent: Vector<f32, N, B>,
+/// A vector and its tangent, for forward-mode differentiation.
+pub struct DualVector<B: Kernels = Host> {
+    value: Vector<f32, B>,
+    tangent: Vector<f32, B>,
 }
 
-/// An `R × C` matrix and its tangent, for forward-mode differentiation.
-pub struct DualMatrix<const R: usize, const C: usize, B: Kernels = Host> {
-    value: Matrix<f32, R, C, B>,
-    tangent: Matrix<f32, R, C, B>,
+/// A matrix and its tangent, for forward-mode differentiation.
+pub struct DualMatrix<B: Kernels = Host> {
+    value: Matrix<f32, B>,
+    tangent: Matrix<f32, B>,
 }
 
-// As elsewhere, these follow the storage: host-backed dual tensors are `Copy`,
-// resident ones are not.
-impl<const N: usize, B: Kernels> Copy for DualVector<N, B> where B::Vector<f32, N>: Copy {}
-
-impl<const N: usize, B: Kernels> Clone for DualVector<N, B>
+impl<B: Kernels> Clone for DualVector<B>
 where
-    B::Vector<f32, N>: Clone,
+    B::Vector<f32>: Clone,
 {
     fn clone(&self) -> Self {
         DualVector {
@@ -81,14 +81,9 @@ where
     }
 }
 
-impl<const R: usize, const C: usize, B: Kernels> Copy for DualMatrix<R, C, B> where
-    B::Matrix<f32, R, C>: Copy
-{
-}
-
-impl<const R: usize, const C: usize, B: Kernels> Clone for DualMatrix<R, C, B>
+impl<B: Kernels> Clone for DualMatrix<B>
 where
-    B::Matrix<f32, R, C>: Clone,
+    B::Matrix<f32>: Clone,
 {
     fn clone(&self) -> Self {
         DualMatrix {
@@ -98,45 +93,62 @@ where
     }
 }
 
-impl<const N: usize, B: Kernels> DualVector<N, B> {
+impl<B: Kernels> DualVector<B> {
     /// A vector paired with the direction to differentiate along.
-    pub fn new(value: Vector<f32, N, B>, tangent: Vector<f32, N, B>) -> Self {
+    ///
+    /// # Panics
+    ///
+    /// If the two lengths differ.
+    #[track_caller]
+    pub fn new(value: Vector<f32, B>, tangent: Vector<f32, B>) -> Self {
+        assert!(
+            value.len() == tangent.len(),
+            "DualVector::new: value has {} elements but the tangent has {}",
+            value.len(),
+            tangent.len()
+        );
         DualVector { value, tangent }
     }
 
     /// A vector held constant: its tangent is zero.
-    pub fn constant(value: Vector<f32, N, B>) -> Self {
-        DualVector {
-            value,
-            tangent: Vector::filled(0.0),
-        }
+    pub fn constant(value: Vector<f32, B>) -> Self {
+        let tangent = Vector::filled(value.len(), 0.0);
+        DualVector { value, tangent }
     }
 
     /// A vector seeded to differentiate with respect to element `index`, giving
     /// one column of a Jacobian. An out-of-range index seeds nothing.
-    pub fn seed(value: Vector<f32, N, B>, index: usize) -> Self {
-        let mut direction = vec![0.0f32; N];
+    pub fn seed(value: Vector<f32, B>, index: usize) -> Self {
+        let mut direction = vec![0.0f32; value.len()];
         if let Some(slot) = direction.get_mut(index) {
             *slot = 1.0;
         }
         DualVector {
             value,
-            tangent: Vector {
-                data: B::store_vector::<N>(&direction),
-            },
+            tangent: Vector::build(&direction),
         }
     }
 
-    pub fn value(&self) -> &Vector<f32, N, B> {
+    /// The number of elements.
+    pub fn len(&self) -> usize {
+        self.value.len()
+    }
+
+    /// Whether this vector holds no elements.
+    pub fn is_empty(&self) -> bool {
+        self.value.is_empty()
+    }
+
+    pub fn value(&self) -> &Vector<f32, B> {
         &self.value
     }
 
-    pub fn tangent(&self) -> &Vector<f32, N, B> {
+    pub fn tangent(&self) -> &Vector<f32, B> {
         &self.tangent
     }
 
     /// The two parts, by value.
-    pub fn into_parts(self) -> (Vector<f32, N, B>, Vector<f32, N, B>) {
+    pub fn into_parts(self) -> (Vector<f32, B>, Vector<f32, B>) {
         (self.value, self.tangent)
     }
 
@@ -155,7 +167,7 @@ impl<const N: usize, B: Kernels> DualVector<N, B> {
     }
 
     /// Row vector times matrix, `(1×N)·(N×C)`, differentiated.
-    pub fn vecmat<const C: usize>(&self, m: &DualMatrix<N, C, B>) -> DualVector<C, B> {
+    pub fn vecmat(&self, m: &DualMatrix<B>) -> DualVector<B> {
         DualVector {
             value: B::vecmat(&self.value, &m.value),
             tangent: B::vector_elementwise(
@@ -194,8 +206,8 @@ impl<const N: usize, B: Kernels> DualVector<N, B> {
     /// [`shift`]: Self::shift
     pub fn broadcast(&self, scalar: Dual<f32>, op: BinaryOp, scalar_left: bool) -> Self {
         let expanded = DualVector {
-            value: Vector::filled(scalar.real),
-            tangent: Vector::filled(scalar.dual),
+            value: Vector::filled(self.len(), scalar.real),
+            tangent: Vector::filled(self.len(), scalar.dual),
         };
         if scalar_left {
             elementwise_vector(&expanded, self, op)
@@ -305,45 +317,73 @@ impl<const N: usize, B: Kernels> DualVector<N, B> {
     }
 }
 
-impl<const R: usize, const C: usize, B: Kernels> DualMatrix<R, C, B> {
+impl<B: Kernels> DualMatrix<B> {
     /// A matrix paired with the direction to differentiate along.
-    pub fn new(value: Matrix<f32, R, C, B>, tangent: Matrix<f32, R, C, B>) -> Self {
+    ///
+    /// # Panics
+    ///
+    /// If the two shapes differ.
+    #[track_caller]
+    pub fn new(value: Matrix<f32, B>, tangent: Matrix<f32, B>) -> Self {
+        assert!(
+            value.shape() == tangent.shape(),
+            "DualMatrix::new: value is {}×{} but the tangent is {}×{}",
+            value.rows(),
+            value.cols(),
+            tangent.rows(),
+            tangent.cols()
+        );
         DualMatrix { value, tangent }
     }
 
     /// A matrix held constant: its tangent is zero.
-    pub fn constant(value: Matrix<f32, R, C, B>) -> Self {
+    pub fn constant(value: Matrix<f32, B>) -> Self {
+        let (rows, cols) = value.shape();
         DualMatrix {
             value,
-            tangent: Matrix::filled(0.0),
+            tangent: Matrix::filled(rows, cols, 0.0),
         }
     }
 
     /// A matrix seeded to differentiate with respect to element `(row, col)`,
     /// giving one column of a Jacobian. Out-of-range indices seed nothing.
-    pub fn seed(value: Matrix<f32, R, C, B>, row: usize, col: usize) -> Self {
-        let mut direction = vec![0.0f32; R * C];
-        if row < R && col < C {
-            direction[row * C + col] = 1.0;
+    pub fn seed(value: Matrix<f32, B>, row: usize, col: usize) -> Self {
+        let (rows, cols) = value.shape();
+        let mut direction = vec![0.0f32; rows * cols];
+        if row < rows && col < cols {
+            direction[row * cols + col] = 1.0;
         }
         DualMatrix {
             value,
-            tangent: Matrix {
-                data: B::store_matrix::<R, C>(&direction),
-            },
+            tangent: Matrix::build(rows, cols, &direction),
         }
     }
 
-    pub fn value(&self) -> &Matrix<f32, R, C, B> {
+    /// The `(rows, columns)` extents.
+    pub fn shape(&self) -> (usize, usize) {
+        self.value.shape()
+    }
+
+    /// The number of rows.
+    pub fn rows(&self) -> usize {
+        self.value.rows()
+    }
+
+    /// The number of columns.
+    pub fn cols(&self) -> usize {
+        self.value.cols()
+    }
+
+    pub fn value(&self) -> &Matrix<f32, B> {
         &self.value
     }
 
-    pub fn tangent(&self) -> &Matrix<f32, R, C, B> {
+    pub fn tangent(&self) -> &Matrix<f32, B> {
         &self.tangent
     }
 
     /// The two parts, by value.
-    pub fn into_parts(self) -> (Matrix<f32, R, C, B>, Matrix<f32, R, C, B>) {
+    pub fn into_parts(self) -> (Matrix<f32, B>, Matrix<f32, B>) {
         (self.value, self.tangent)
     }
 
@@ -352,7 +392,7 @@ impl<const R: usize, const C: usize, B: Kernels> DualMatrix<R, C, B> {
     /// Three products and a sum in principle; on a backend that can accumulate
     /// inside the product kernel the sum rides along in the second product, so
     /// the tangent costs two dispatches rather than three.
-    pub fn matmul<const C2: usize>(&self, other: &DualMatrix<C, C2, B>) -> DualMatrix<R, C2, B> {
+    pub fn matmul(&self, other: &DualMatrix<B>) -> DualMatrix<B> {
         DualMatrix {
             value: B::matmul(&self.value, &other.value),
             tangent: B::matmul_add(
@@ -365,11 +405,7 @@ impl<const R: usize, const C: usize, B: Kernels> DualMatrix<R, C, B> {
 
     /// Fused matrix multiply-add, differentiated:
     /// `AB + D + (ȦB + AḂ + Ḋ)ε`.
-    pub fn matmul_add<const C2: usize>(
-        &self,
-        other: &DualMatrix<C, C2, B>,
-        addend: &DualMatrix<R, C2, B>,
-    ) -> DualMatrix<R, C2, B> {
+    pub fn matmul_add(&self, other: &DualMatrix<B>, addend: &DualMatrix<B>) -> DualMatrix<B> {
         DualMatrix {
             value: B::matmul_add(&self.value, &other.value, duplicate_matrix(&addend.value)),
             tangent: B::matmul_add(
@@ -385,7 +421,7 @@ impl<const R: usize, const C: usize, B: Kernels> DualMatrix<R, C, B> {
     }
 
     /// Matrix times column vector, differentiated: `Av + (Ȧv + Av̇)ε`.
-    pub fn matvec(&self, v: &DualVector<C, B>) -> DualVector<R, B> {
+    pub fn matvec(&self, v: &DualVector<B>) -> DualVector<B> {
         DualVector {
             value: B::matvec(&self.value, &v.value),
             tangent: B::vector_elementwise(
@@ -398,7 +434,7 @@ impl<const R: usize, const C: usize, B: Kernels> DualMatrix<R, C, B> {
 
     /// Fused matrix-vector multiply-add, differentiated:
     /// `Av + b + (Ȧv + Av̇ + ḃ)ε`.
-    pub fn matvec_add(&self, v: &DualVector<C, B>, addend: &DualVector<R, B>) -> DualVector<R, B> {
+    pub fn matvec_add(&self, v: &DualVector<B>, addend: &DualVector<B>) -> DualVector<B> {
         DualVector {
             value: B::matvec_add(&self.value, &v.value, duplicate_vector(&addend.value)),
             tangent: B::matvec_add(
@@ -410,7 +446,7 @@ impl<const R: usize, const C: usize, B: Kernels> DualMatrix<R, C, B> {
     }
 
     /// Transpose, differentiated: both parts transpose.
-    pub fn transpose(&self) -> DualMatrix<C, R, B> {
+    pub fn transpose(&self) -> DualMatrix<B> {
         DualMatrix {
             value: B::transpose(&self.value),
             tangent: B::transpose(&self.tangent),
@@ -436,9 +472,10 @@ impl<const R: usize, const C: usize, B: Kernels> DualMatrix<R, C, B> {
     /// Combine with a *dual* scalar elementwise; see
     /// [`DualVector::broadcast`].
     pub fn broadcast(&self, scalar: Dual<f32>, op: BinaryOp, scalar_left: bool) -> Self {
+        let (rows, cols) = self.shape();
         let expanded = DualMatrix {
-            value: Matrix::filled(scalar.real),
-            tangent: Matrix::filled(scalar.dual),
+            value: Matrix::filled(rows, cols, scalar.real),
+            tangent: Matrix::filled(rows, cols, scalar.dual),
         };
         if scalar_left {
             elementwise_matrix(&expanded, self, op)
@@ -517,31 +554,22 @@ impl<const R: usize, const C: usize, B: Kernels> DualMatrix<R, C, B> {
         }
     }
 
-    /// Valid cross-correlation with a dual window.
+    /// Valid cross-correlation with a dual window, giving
+    /// `(R−KR+1) × (C−KC+1)`.
     ///
     /// Correlation is bilinear, exactly like a matrix product, so the tangent is
     /// the same two-term rule: `Ẋ ⋆ K + X ⋆ K̇`.
-    pub fn correlate<const KR: usize, const KC: usize>(
-        &self,
-        window: &DualMatrix<KR, KC, B>,
-    ) -> DualMatrix<{ R - KR + 1 }, { C - KC + 1 }, B> {
+    pub fn correlate(&self, window: &DualMatrix<B>) -> DualMatrix<B> {
         self.correlate_with(window, false)
     }
 
     /// Convolution proper, with the window reversed; see
     /// [`MatrixVar::convolve`](super::tape::MatrixVar::convolve).
-    pub fn convolve<const KR: usize, const KC: usize>(
-        &self,
-        window: &DualMatrix<KR, KC, B>,
-    ) -> DualMatrix<{ R - KR + 1 }, { C - KC + 1 }, B> {
+    pub fn convolve(&self, window: &DualMatrix<B>) -> DualMatrix<B> {
         self.correlate_with(window, true)
     }
 
-    fn correlate_with<const KR: usize, const KC: usize>(
-        &self,
-        window: &DualMatrix<KR, KC, B>,
-        flip: bool,
-    ) -> DualMatrix<{ R - KR + 1 }, { C - KC + 1 }, B> {
+    fn correlate_with(&self, window: &DualMatrix<B>, flip: bool) -> DualMatrix<B> {
         DualMatrix {
             value: B::correlate(&self.value, &window.value, flip),
             tangent: B::matrix_elementwise(
@@ -553,12 +581,10 @@ impl<const R: usize, const C: usize, B: Kernels> DualMatrix<R, C, B> {
     }
 
     /// Surround both parts with zeros.
-    pub fn pad<const PR: usize, const PC: usize>(
-        &self,
-    ) -> DualMatrix<{ R + 2 * PR }, { C + 2 * PC }, B> {
+    pub fn pad(&self, pad_rows: usize, pad_cols: usize) -> DualMatrix<B> {
         DualMatrix {
-            value: B::pad::<R, C, PR, PC>(&self.value),
-            tangent: B::pad::<R, C, PR, PC>(&self.tangent),
+            value: B::pad(&self.value, pad_rows, pad_cols),
+            tangent: B::pad(&self.tangent, pad_rows, pad_cols),
         }
     }
 
@@ -574,20 +600,20 @@ impl<const R: usize, const C: usize, B: Kernels> DualMatrix<R, C, B> {
     ///
     /// This is `A·1`, so it needs no reduction kernel of its own — and on the
     /// `Metal` backend it stays resident like any other product.
-    pub fn row_sums(&self) -> DualVector<R, B> {
-        let ones = Vector::<f32, C, B>::filled(1.0);
+    pub fn row_sums(&self) -> DualVector<B> {
+        let ones = Vector::<f32, B>::filled(self.cols(), 1.0);
         DualVector {
             value: B::matvec(&self.value, &ones),
-            tangent: B::matvec(&self.tangent, &Vector::<f32, C, B>::filled(1.0)),
+            tangent: B::matvec(&self.tangent, &ones),
         }
     }
 
     /// Sum along each column, giving one entry per column: `1ᵀ·A`.
-    pub fn column_sums(&self) -> DualVector<C, B> {
-        let ones = Vector::<f32, R, B>::filled(1.0);
+    pub fn column_sums(&self) -> DualVector<B> {
+        let ones = Vector::<f32, B>::filled(self.rows(), 1.0);
         DualVector {
             value: B::vecmat(&ones, &self.value),
-            tangent: B::vecmat(&Vector::<f32, R, B>::filled(1.0), &self.tangent),
+            tangent: B::vecmat(&ones, &self.tangent),
         }
     }
 
@@ -620,12 +646,21 @@ impl<const R: usize, const C: usize, B: Kernels> DualMatrix<R, C, B> {
     pub fn frobenius_dot(&self, other: &Self) -> Dual<f32> {
         elementwise_matrix(self, other, BinaryOp::Mul).sum()
     }
-}
 
-impl<const N: usize, B: Kernels> DualMatrix<N, N, B> {
     /// `A·A`, differentiated — the smallest case where the product rule shows up
     /// on both sides.
+    ///
+    /// # Panics
+    ///
+    /// If the matrix is not square.
+    #[track_caller]
     pub fn squared(&self) -> Self {
+        assert!(
+            self.rows() == self.cols(),
+            "squared: matrix is {}×{}, not square",
+            self.rows(),
+            self.cols()
+        );
         self.matmul(self)
     }
 }
@@ -638,20 +673,18 @@ fn sum(values: &[f32]) -> f32 {
 
 /// A second copy of a tensor's storage on the same backend. Moving to the backend
 /// it is already on is just that copy — within shared memory, when resident.
-fn duplicate_vector<const N: usize, B: Kernels>(v: &Vector<f32, N, B>) -> Vector<f32, N, B> {
+fn duplicate_vector<B: Kernels>(v: &Vector<f32, B>) -> Vector<f32, B> {
     v.to_backend::<B>()
 }
 
-fn duplicate_matrix<const R: usize, const C: usize, B: Kernels>(
-    m: &Matrix<f32, R, C, B>,
-) -> Matrix<f32, R, C, B> {
+fn duplicate_matrix<B: Kernels>(m: &Matrix<f32, B>) -> Matrix<f32, B> {
     m.to_backend::<B>()
 }
 
 /// The full set of analytic functions, as methods, for both dual tensor types.
 macro_rules! analytic_methods {
     ($($method:ident => $variant:ident),+ $(,)?) => {
-        impl<const N: usize, B: Kernels> DualVector<N, B> {
+        impl<B: Kernels> DualVector<B> {
             $(
                 #[doc = concat!("Elementwise `", stringify!($method), "`, differentiated.")]
                 pub fn $method(&self) -> Self {
@@ -660,7 +693,7 @@ macro_rules! analytic_methods {
             )+
         }
 
-        impl<const R: usize, const C: usize, B: Kernels> DualMatrix<R, C, B> {
+        impl<B: Kernels> DualMatrix<B> {
             $(
                 #[doc = concat!("Elementwise `", stringify!($method), "`, differentiated.")]
                 pub fn $method(&self) -> Self {
@@ -689,57 +722,60 @@ analytic_methods!(
 
 // ---- interoperating with `Dual` elements ------------------------------------
 
-impl<const N: usize, B: Kernels> DualVector<N, B> {
+impl<B: Kernels> DualVector<B> {
     /// Split a host vector of dual numbers into value and tangent parts on
     /// backend `B`.
-    pub fn from_dual_vector(duals: &Vector<Dual<f32>, N, Host>) -> Self {
-        let elements = *duals.data();
+    pub fn from_dual_vector(duals: &Vector<Dual<f32>, Host>) -> Self {
+        let elements = duals.data();
+        let value = elements.iter().map(|dual| dual.real).collect::<Vec<_>>();
+        let tangent = elements.iter().map(|dual| dual.dual).collect::<Vec<_>>();
         DualVector {
-            value: Vector {
-                data: B::store_vector::<N>(&elements.map(|dual| dual.real)),
-            },
-            tangent: Vector {
-                data: B::store_vector::<N>(&elements.map(|dual| dual.dual)),
-            },
+            value: Vector::build(&value),
+            tangent: Vector::build(&tangent),
         }
     }
 
     /// Recombine the two parts into a host vector of dual numbers — the form the
     /// scalar [`Dual`] operations in [`crate::numbers`] work on.
-    pub fn to_dual_vector(&self) -> Vector<Dual<f32>, N, Host> {
+    pub fn to_dual_vector(&self) -> Vector<Dual<f32>, Host> {
         let (value, tangent) = (self.value.as_slice(), self.tangent.as_slice());
-        Vector::new(std::array::from_fn(|i| Dual::new(value[i], tangent[i])))
+        Vector::new(
+            value
+                .iter()
+                .zip(tangent)
+                .map(|(&v, &t)| Dual::new(v, t))
+                .collect::<Vec<_>>(),
+        )
     }
 }
 
-impl<const R: usize, const C: usize, B: Kernels> DualMatrix<R, C, B> {
+impl<B: Kernels> DualMatrix<B> {
     /// Split a host matrix of dual numbers into value and tangent parts on
     /// backend `B`.
-    pub fn from_dual_matrix(duals: &Matrix<Dual<f32>, R, C, Host>) -> Self {
-        let mut value = Vec::with_capacity(R * C);
-        let mut tangent = Vec::with_capacity(R * C);
-        for row in duals.data() {
-            for dual in row {
-                value.push(dual.real);
-                tangent.push(dual.dual);
-            }
-        }
+    pub fn from_dual_matrix(duals: &Matrix<Dual<f32>, Host>) -> Self {
+        let (rows, cols) = duals.shape();
+        let elements = duals.data();
+        let value = elements.iter().map(|dual| dual.real).collect::<Vec<_>>();
+        let tangent = elements.iter().map(|dual| dual.dual).collect::<Vec<_>>();
         DualMatrix {
-            value: Matrix {
-                data: B::store_matrix::<R, C>(&value),
-            },
-            tangent: Matrix {
-                data: B::store_matrix::<R, C>(&tangent),
-            },
+            value: Matrix::build(rows, cols, &value),
+            tangent: Matrix::build(rows, cols, &tangent),
         }
     }
 
     /// Recombine the two parts into a host matrix of dual numbers.
-    pub fn to_dual_matrix(&self) -> Matrix<Dual<f32>, R, C, Host> {
+    pub fn to_dual_matrix(&self) -> Matrix<Dual<f32>, Host> {
+        let (rows, cols) = self.shape();
         let (value, tangent) = (self.value.as_slice(), self.tangent.as_slice());
-        Matrix::from_rows(std::array::from_fn(|row| {
-            std::array::from_fn(|col| Dual::new(value[row * C + col], tangent[row * C + col]))
-        }))
+        Matrix::from_flat(
+            rows,
+            cols,
+            value
+                .iter()
+                .zip(tangent)
+                .map(|(&v, &t)| Dual::new(v, t))
+                .collect::<Vec<_>>(),
+        )
     }
 }
 
@@ -748,37 +784,46 @@ impl<const R: usize, const C: usize, B: Kernels> DualMatrix<R, C, B> {
 /// Row-major flattening, in both directions.
 ///
 /// This is the adapter that makes matrix inputs and outputs work with the vector
-/// machinery: a matrix is `R * C` scalars, and once they are named as a vector,
-/// [`jacobian`] and [`gradient`] apply unchanged. On the `Metal` backend a vector
-/// and a matrix are the same allocation, so the by-value forms move rather than
-/// copy.
-impl<const R: usize, const C: usize, B: Kernels> DualMatrix<R, C, B> {
+/// machinery: a matrix is `rows * cols` scalars, and once they are named as a
+/// vector, [`jacobian`] and [`gradient`] apply unchanged. A vector and a matrix
+/// are the same run of elements on either backend, so the by-value forms move
+/// rather than copy.
+impl<B: Kernels> DualMatrix<B> {
     /// Flatten both parts into a dual vector, consuming this matrix.
-    pub fn into_flattened(self) -> DualVector<{ R * C }, B> {
+    pub fn into_flattened(self) -> DualVector<B> {
+        let len = self.rows() * self.cols();
+        let (value, tangent) = self.into_parts();
         DualVector {
-            value: Vector {
-                data: B::matrix_into_flattened::<R, C>(self.value.data),
-            },
-            tangent: Vector {
-                data: B::matrix_into_flattened::<R, C>(self.tangent.data),
-            },
+            value: Vector::from_storage(len, B::matrix_into_flattened(value.into_storage())),
+            tangent: Vector::from_storage(len, B::matrix_into_flattened(tangent.into_storage())),
         }
     }
 
     /// Flatten both parts into a dual vector, leaving this matrix intact.
-    pub fn flattened(&self) -> DualVector<{ R * C }, B> {
+    pub fn flattened(&self) -> DualVector<B> {
         self.clone_parts().into_flattened()
     }
 
-    /// Rebuild an `R × C` dual matrix from its row-major flattening.
-    pub fn from_flattened(vector: DualVector<{ R * C }, B>) -> Self {
+    /// Rebuild a `rows × cols` dual matrix from its row-major flattening.
+    ///
+    /// # Panics
+    ///
+    /// If the vector's length is not `rows * cols`.
+    #[track_caller]
+    pub fn from_flattened(rows: usize, cols: usize, vector: DualVector<B>) -> Self {
+        assert!(
+            vector.len() == rows * cols,
+            "from_flattened: {} elements cannot fill a {rows}×{cols} matrix",
+            vector.len()
+        );
+        let (value, tangent) = vector.into_parts();
         DualMatrix {
-            value: Matrix {
-                data: B::vector_into_matrix::<R, C>(vector.value.data),
-            },
-            tangent: Matrix {
-                data: B::vector_into_matrix::<R, C>(vector.tangent.data),
-            },
+            value: Matrix::from_storage(rows, cols, B::vector_into_matrix(value.into_storage())),
+            tangent: Matrix::from_storage(
+                rows,
+                cols,
+                B::vector_into_matrix(tangent.into_storage()),
+            ),
         }
     }
 
@@ -791,28 +836,24 @@ impl<const R: usize, const C: usize, B: Kernels> DualMatrix<R, C, B> {
     }
 }
 
-impl<const N: usize, B: Kernels> DualVector<N, B> {
+impl<B: Kernels> DualVector<B> {
     /// View as a `1 × N` dual matrix, consuming this vector.
-    pub fn into_row(self) -> DualMatrix<1, N, B> {
+    pub fn into_row(self) -> DualMatrix<B> {
+        let len = self.len();
+        let (value, tangent) = self.into_parts();
         DualMatrix {
-            value: Matrix {
-                data: B::vector_into_row::<N>(self.value.data),
-            },
-            tangent: Matrix {
-                data: B::vector_into_row::<N>(self.tangent.data),
-            },
+            value: Matrix::from_storage(1, len, B::vector_into_matrix(value.into_storage())),
+            tangent: Matrix::from_storage(1, len, B::vector_into_matrix(tangent.into_storage())),
         }
     }
 
     /// View as an `N × 1` dual matrix, consuming this vector.
-    pub fn into_column(self) -> DualMatrix<N, 1, B> {
+    pub fn into_column(self) -> DualMatrix<B> {
+        let len = self.len();
+        let (value, tangent) = self.into_parts();
         DualMatrix {
-            value: Matrix {
-                data: B::vector_into_column::<N>(self.value.data),
-            },
-            tangent: Matrix {
-                data: B::vector_into_column::<N>(self.tangent.data),
-            },
+            value: Matrix::from_storage(len, 1, B::vector_into_matrix(value.into_storage())),
+            tangent: Matrix::from_storage(len, 1, B::vector_into_matrix(tangent.into_storage())),
         }
     }
 }
@@ -821,150 +862,157 @@ impl<const N: usize, B: Kernels> DualVector<N, B> {
 
 /// The outer product of the gradient operator with the matrix.
 ///
-/// Columns [j..j+N] are the derivatives w.r.t. xj.
-pub fn matrix_gradient<const IN: usize, const OUT1: usize, const OUT2: usize, B: Kernels>(
-    at: &Vector<f32, IN, B>,
-    f: impl Fn(&DualVector<IN, B>) -> DualMatrix<OUT1, OUT2, B>,
-) -> Matrix<f32, OUT1, { IN * OUT2 }, B> {
-    let tangents = std::array::from_fn(|input| {
-        f(&DualVector::seed(duplicate_vector(at), input))
-            .tangent
-            .data
-    });
+/// With `f` producing an `OUT1 × OUT2` matrix from a length-`IN` input, the
+/// result is `OUT1 × (IN · OUT2)`: columns `[j·OUT2 .. (j+1)·OUT2]` are the
+/// derivatives with respect to `xⱼ`.
+pub fn matrix_gradient<B: Kernels>(
+    at: &Vector<f32, B>,
+    f: impl Fn(&DualVector<B>) -> DualMatrix<B>,
+) -> Matrix<f32, B> {
+    let mut shape = (0, 0);
+    let tangents = (0..at.len())
+        .map(|input| {
+            let tangent = f(&DualVector::seed(duplicate_vector(at), input)).tangent;
+            shape = tangent.shape();
+            tangent.into_storage()
+        })
+        .collect::<Vec<_>>();
 
-    Matrix {
-        data: B::hmerge(tangents),
-    }
+    let (rows, cols) = shape;
+    Matrix::from_storage(
+        rows,
+        cols * tangents.len(),
+        B::hmerge(&tangents, rows, cols),
+    )
 }
 
 /// The Jacobian of `f` at `at`, by one forward pass per input element.
 ///
-/// Column `j` is the tangent of `f` seeded along input `j`, so this costs `IN`
-/// evaluations of `f`. For many inputs and few outputs — a scalar loss over a
-/// parameter vector, say — that is the wrong way around, and reverse mode is the
-/// answer.
-pub fn jacobian<const IN: usize, const OUT: usize, B: Kernels>(
-    at: &Vector<f32, IN, B>,
-    f: impl Fn(&DualVector<IN, B>) -> DualVector<OUT, B>,
-) -> Matrix<f32, OUT, IN, B> {
-    let tangents = std::array::from_fn(|input| {
-        f(&DualVector::seed(duplicate_vector(at), input))
-            .tangent
-            .data
-    });
+/// Column `j` is the tangent of `f` seeded along input `j`, so this costs one
+/// evaluation of `f` per input and comes out `OUT × IN`. For many inputs and few
+/// outputs — a scalar loss over a parameter vector, say — that is the wrong way
+/// around, and reverse mode is the answer.
+pub fn jacobian<B: Kernels>(
+    at: &Vector<f32, B>,
+    f: impl Fn(&DualVector<B>) -> DualVector<B>,
+) -> Matrix<f32, B> {
+    let mut outputs = 0;
+    let tangents = (0..at.len())
+        .map(|input| {
+            let tangent = f(&DualVector::seed(duplicate_vector(at), input)).tangent;
+            outputs = tangent.len();
+            tangent.into_storage()
+        })
+        .collect::<Vec<_>>();
 
-    Matrix {
-        data: B::hstack::<OUT, IN>(tangents),
-    }
+    Matrix::from_storage(outputs, tangents.len(), B::hstack(&tangents, outputs))
 }
 
 /// The gradient of a scalar-valued `f` with respect to a *matrix* input.
 ///
 /// The result has the shape of the input, so `∂f/∂Aᵢⱼ` sits at `(i, j)` — this is
 /// the derivative meant by "differentiate the loss with respect to the weights".
-/// It costs `R * C` forward passes, one per element, since each pass extracts a
-/// single partial. A `256 × 256` input therefore means 65,536 evaluations of `f`;
-/// that asymmetry is the argument for reverse mode, not a defect of this
-/// implementation.
+/// It costs `rows * cols` forward passes, one per element, since each pass
+/// extracts a single partial. A `256 × 256` input therefore means 65,536
+/// evaluations of `f`; that asymmetry is the argument for reverse mode, not a
+/// defect of this implementation.
 ///
 /// ```
 /// use tensorcrate::tensors::{DualVector, Matrix, Vector, gradient_wrt_matrix};
 ///
 /// // f(A) = ‖A·x‖², whose gradient is 2(Ax)xᵀ.
-/// let a = Matrix::<f32, 2, 3>::from_rows([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]);
+/// let a = Matrix::<f32>::from_rows([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]);
 /// let x = Vector::new([1.0f32, 0.5, -1.0]);
 ///
 /// let gradient = gradient_wrt_matrix(&a, |m| {
-///     let mapped = m.matvec(&DualVector::constant(x));
+///     let mapped = m.matvec(&DualVector::constant(x.clone()));
 ///     mapped.dot(&mapped)
 /// });
 ///
 /// let projected = a.matvec(&x);
 /// for row in 0..2 {
 ///     for col in 0..3 {
-///         let expected = 2.0 * projected.data()[row] * x.data()[col];
-///         assert!((gradient.data()[row][col] - expected).abs() < 1e-4);
+///         let expected = 2.0 * projected[row] * x[col];
+///         assert!((gradient[(row, col)] - expected).abs() < 1e-4);
 ///     }
 /// }
 /// ```
-pub fn gradient_wrt_matrix<const R: usize, const C: usize, B: Kernels>(
-    at: &Matrix<f32, R, C, B>,
-    f: impl Fn(&DualMatrix<R, C, B>) -> Dual<f32>,
-) -> Matrix<f32, R, C, B> {
-    let rows = std::array::from_fn(|row| {
-        let partials: [f32; C] =
-            std::array::from_fn(|col| f(&DualMatrix::seed(duplicate_matrix(at), row, col)).dual);
-        B::store_vector::<C>(&partials)
-    });
-    Matrix {
-        data: B::vstack::<R, C>(rows),
-    }
+pub fn gradient_wrt_matrix<B: Kernels>(
+    at: &Matrix<f32, B>,
+    f: impl Fn(&DualMatrix<B>) -> Dual<f32>,
+) -> Matrix<f32, B> {
+    let (rows, cols) = at.shape();
+    let stacked = (0..rows)
+        .map(|row| {
+            let partials = (0..cols)
+                .map(|col| f(&DualMatrix::seed(duplicate_matrix(at), row, col)).dual)
+                .collect::<Vec<_>>();
+            Vector::<f32, B>::build(&partials).into_storage()
+        })
+        .collect::<Vec<_>>();
+    Matrix::from_storage(rows, cols, B::vstack(&stacked, cols))
 }
 
 /// The Jacobian of a vector-valued `f` with respect to a *matrix* input.
 ///
-/// Column `i * C + j` holds the derivatives with respect to `Aᵢⱼ`, matching the
-/// row-major flattening of the input, so the result is `OUT × (R·C)`. Like
-/// [`gradient_wrt_matrix`], it runs `R * C` passes.
+/// Column `i * cols + j` holds the derivatives with respect to `Aᵢⱼ`, matching
+/// the row-major flattening of the input, so the result is `OUT × (rows·cols)`.
+/// Like [`gradient_wrt_matrix`], it runs `rows * cols` passes.
 ///
 /// A matrix-valued `f` needs no separate driver — flatten its output with
 /// [`DualMatrix::into_flattened`] and the result is the standard Jacobian,
-/// `(OR·OC) × (R·C)`:
+/// `(OR·OC) × (rows·cols)`:
 ///
 /// ```
 /// # use tensorcrate::tensors::{DualMatrix, Matrix, jacobian_wrt_matrix};
-/// # let a = Matrix::<f32, 2, 2>::identity();
-/// # let b = Matrix::<f32, 2, 2>::from_rows([[1.0, 2.0], [3.0, 4.0]]);
-/// let jacobian: Matrix<f32, 4, 4> = jacobian_wrt_matrix::<2, 2, 4, _>(&a, |m| {
-///     m.matmul(&DualMatrix::constant(b)).into_flattened()
+/// # let a = Matrix::<f32>::identity(2);
+/// # let b = Matrix::<f32>::from_rows([[1.0, 2.0], [3.0, 4.0]]);
+/// let jacobian = jacobian_wrt_matrix(&a, |m| {
+///     m.matmul(&DualMatrix::constant(b.clone())).into_flattened()
 /// });
+/// assert_eq!(jacobian.shape(), (4, 4));
 /// ```
-///
-/// Writing that type down needs the turbofish: `{ R * C }` in the return type
-/// only normalizes to a literal once the parameters are given explicitly, which
-/// is a rough edge of `generic_const_exprs`. Code that lets inference name the
-/// type — `let j = jacobian_wrt_matrix(&a, f);` — needs no annotation and no
-/// turbofish.
-pub fn jacobian_wrt_matrix<const R: usize, const C: usize, const OUT: usize, B: Kernels>(
-    at: &Matrix<f32, R, C, B>,
-    f: impl Fn(&DualMatrix<R, C, B>) -> DualVector<OUT, B>,
-) -> Matrix<f32, OUT, { R * C }, B> {
-    let columns = std::array::from_fn(|input| {
-        f(&DualMatrix::seed(
-            duplicate_matrix(at),
-            input / C,
-            input % C,
-        ))
-        .tangent
-        .data
-    });
-    Matrix {
-        data: B::hstack::<OUT, { R * C }>(columns),
-    }
+pub fn jacobian_wrt_matrix<B: Kernels>(
+    at: &Matrix<f32, B>,
+    f: impl Fn(&DualMatrix<B>) -> DualVector<B>,
+) -> Matrix<f32, B> {
+    let (rows, cols) = at.shape();
+    let mut outputs = 0;
+    let columns = (0..rows * cols)
+        .map(|input| {
+            let tangent = f(&DualMatrix::seed(
+                duplicate_matrix(at),
+                input / cols,
+                input % cols,
+            ))
+            .tangent;
+            outputs = tangent.len();
+            tangent.into_storage()
+        })
+        .collect::<Vec<_>>();
+    Matrix::from_storage(outputs, rows * cols, B::hstack(&columns, outputs))
 }
 
 /// The gradient of a scalar-valued `f` at `at`, by one forward pass per input —
 /// the single-output case of [`jacobian`].
-pub fn gradient<const IN: usize, B: Kernels>(
-    at: &Vector<f32, IN, B>,
-    f: impl Fn(&DualVector<IN, B>) -> Dual<f32>,
-) -> Vector<f32, IN, B> {
-    let mut derivatives = vec![0.0f32; IN];
+pub fn gradient<B: Kernels>(
+    at: &Vector<f32, B>,
+    f: impl Fn(&DualVector<B>) -> Dual<f32>,
+) -> Vector<f32, B> {
+    let mut derivatives = vec![0.0f32; at.len()];
     for (input, slot) in derivatives.iter_mut().enumerate() {
         *slot = f(&DualVector::seed(duplicate_vector(at), input)).dual;
     }
-    Vector {
-        data: B::store_vector::<IN>(&derivatives),
-    }
+    Vector::build(&derivatives)
 }
 
 // ---- operators --------------------------------------------------------------
 
-fn elementwise_vector<const N: usize, B: Kernels>(
-    a: &DualVector<N, B>,
-    b: &DualVector<N, B>,
+fn elementwise_vector<B: Kernels>(
+    a: &DualVector<B>,
+    b: &DualVector<B>,
     op: BinaryOp,
-) -> DualVector<N, B> {
+) -> DualVector<B> {
     let value = B::vector_elementwise(&a.value, &b.value, op);
     let tangent = match op {
         // d(a ± b) = ȧ ± ḃ
@@ -993,11 +1041,11 @@ fn elementwise_vector<const N: usize, B: Kernels>(
     DualVector { value, tangent }
 }
 
-fn elementwise_matrix<const R: usize, const C: usize, B: Kernels>(
-    a: &DualMatrix<R, C, B>,
-    b: &DualMatrix<R, C, B>,
+fn elementwise_matrix<B: Kernels>(
+    a: &DualMatrix<B>,
+    b: &DualMatrix<B>,
     op: BinaryOp,
-) -> DualMatrix<R, C, B> {
+) -> DualMatrix<B> {
     let value = B::matrix_elementwise(&a.value, &b.value, op);
     let tangent = match op {
         BinaryOp::Add | BinaryOp::Sub => B::matrix_elementwise(&a.tangent, &b.tangent, op),
@@ -1023,60 +1071,59 @@ fn elementwise_matrix<const R: usize, const C: usize, B: Kernels>(
     DualMatrix { value, tangent }
 }
 
-/// One operator for a dual tensor, by value and by reference. The by-reference
-/// forms matter on the `Metal` backend, where the tensors are not `Copy`.
+/// One operator for a dual tensor, by value and by reference. Dual tensors own
+/// heap or shared allocations, so the by-reference forms are what most code
+/// wants.
 macro_rules! dual_operator {
-    ($Type:ident < $($dim:ident),+ >, $Trait:ident, $method:ident, $op:expr, $apply:ident) => {
-        impl<$(const $dim: usize),+, B: Kernels> $Trait for $Type<$($dim),+, B> {
+    ($Type:ident, $Trait:ident, $method:ident, $op:expr, $apply:ident) => {
+        impl<B: Kernels> $Trait for $Type<B> {
             type Output = Self;
             fn $method(self, rhs: Self) -> Self::Output {
                 $apply(&self, &rhs, $op)
             }
         }
 
-        impl<$(const $dim: usize),+, B: Kernels> $Trait<&$Type<$($dim),+, B>>
-            for &$Type<$($dim),+, B>
-        {
-            type Output = $Type<$($dim),+, B>;
-            fn $method(self, rhs: &$Type<$($dim),+, B>) -> Self::Output {
+        impl<B: Kernels> $Trait<&$Type<B>> for &$Type<B> {
+            type Output = $Type<B>;
+            fn $method(self, rhs: &$Type<B>) -> Self::Output {
                 $apply(self, rhs, $op)
             }
         }
     };
 }
 
-dual_operator!(DualVector<N>, Add, add, BinaryOp::Add, elementwise_vector);
-dual_operator!(DualVector<N>, Sub, sub, BinaryOp::Sub, elementwise_vector);
-dual_operator!(DualVector<N>, Mul, mul, BinaryOp::Mul, elementwise_vector);
-dual_operator!(DualVector<N>, Div, div, BinaryOp::Div, elementwise_vector);
-dual_operator!(DualMatrix<R, C>, Add, add, BinaryOp::Add, elementwise_matrix);
-dual_operator!(DualMatrix<R, C>, Sub, sub, BinaryOp::Sub, elementwise_matrix);
-dual_operator!(DualMatrix<R, C>, Mul, mul, BinaryOp::Mul, elementwise_matrix);
-dual_operator!(DualMatrix<R, C>, Div, div, BinaryOp::Div, elementwise_matrix);
+dual_operator!(DualVector, Add, add, BinaryOp::Add, elementwise_vector);
+dual_operator!(DualVector, Sub, sub, BinaryOp::Sub, elementwise_vector);
+dual_operator!(DualVector, Mul, mul, BinaryOp::Mul, elementwise_vector);
+dual_operator!(DualVector, Div, div, BinaryOp::Div, elementwise_vector);
+dual_operator!(DualMatrix, Add, add, BinaryOp::Add, elementwise_matrix);
+dual_operator!(DualMatrix, Sub, sub, BinaryOp::Sub, elementwise_matrix);
+dual_operator!(DualMatrix, Mul, mul, BinaryOp::Mul, elementwise_matrix);
+dual_operator!(DualMatrix, Div, div, BinaryOp::Div, elementwise_matrix);
 
-impl<const N: usize, B: Kernels> Neg for DualVector<N, B> {
+impl<B: Kernels> Neg for DualVector<B> {
     type Output = Self;
     fn neg(self) -> Self::Output {
         self.scale(-1.0)
     }
 }
 
-impl<const N: usize, B: Kernels> Neg for &DualVector<N, B> {
-    type Output = DualVector<N, B>;
+impl<B: Kernels> Neg for &DualVector<B> {
+    type Output = DualVector<B>;
     fn neg(self) -> Self::Output {
         self.scale(-1.0)
     }
 }
 
-impl<const R: usize, const C: usize, B: Kernels> Neg for DualMatrix<R, C, B> {
+impl<B: Kernels> Neg for DualMatrix<B> {
     type Output = Self;
     fn neg(self) -> Self::Output {
         self.scale(-1.0)
     }
 }
 
-impl<const R: usize, const C: usize, B: Kernels> Neg for &DualMatrix<R, C, B> {
-    type Output = DualMatrix<R, C, B>;
+impl<B: Kernels> Neg for &DualMatrix<B> {
+    type Output = DualMatrix<B>;
     fn neg(self) -> Self::Output {
         self.scale(-1.0)
     }

@@ -1,4 +1,4 @@
-//! Const-generic vector and matrix operations.
+//! Dynamically-shaped vector and matrix operations.
 
 use tensorcrate::errors::Error;
 use tensorcrate::numbers::{Complex, Dual};
@@ -9,10 +9,11 @@ fn close(a: f64, b: f64) -> bool {
 }
 
 #[test]
-fn vectors_are_statically_sized() {
-    let u: Vector<i64, 3> = Vector::new([1, 2, 3]);
-    let v: Vector<i64, 3> = Vector::new([4, 5, 6]);
-    assert_eq!(u + v, Vector::new([5, 7, 9]));
+fn vectors_carry_their_length() {
+    let u: Vector<i64> = Vector::new([1, 2, 3]);
+    let v: Vector<i64> = Vector::new([4, 5, 6]);
+    assert_eq!(u.len(), 3);
+    assert_eq!(&u + &v, Vector::new([5, 7, 9]));
     assert_eq!(u.dot(&v), 32);
     assert_eq!(u.scale(2), Vector::new([2, 4, 6]));
 }
@@ -54,13 +55,13 @@ fn fft_handles_power_of_two_and_general_lengths() {
 
 #[test]
 fn fft_supports_edge_lengths_and_f32() {
-    let empty = Vector::<f64, 0>::new([]).fft();
+    let empty = Vector::<f64>::new([]).fft();
     assert!(empty.is_empty());
 
     let singleton = Vector::new([7.0_f64]).fft();
     assert_eq!(singleton, Vector::new([Complex::new(7.0, 0.0)]));
 
-    let values: Vector<Complex<f32>, 2> = Vector::new([1.0_f32, -1.0]).fft();
+    let values: Vector<Complex<f32>> = Vector::new([1.0_f32, -1.0]).fft();
     assert!((values.get(0).unwrap().real - 0.0).abs() < 1e-6);
     assert!((values.get(1).unwrap().real - 2.0).abs() < 1e-6);
 }
@@ -75,10 +76,10 @@ fn assert_fft_matches_dft<const N: usize>(input: [f64; N]) {
             expected = expected + Complex::new(value * angle.cos(), value * angle.sin());
         }
         assert!(
-            close(actual.data()[frequency].real, expected.real)
-                && close(actual.data()[frequency].im, expected.im),
+            close(actual[frequency].real, expected.real)
+                && close(actual[frequency].im, expected.im),
             "N={N}, bin={frequency}: actual={:?}, expected={expected:?}",
-            actual.data()[frequency]
+            actual[frequency]
         );
     }
 }
@@ -149,10 +150,9 @@ fn assert_ifft_matches_idft<const N: usize>(input: [Complex<f64>; N]) {
         }
         expected = expected / N as f64;
         assert!(
-            close(actual.data()[index].real, expected.real)
-                && close(actual.data()[index].im, expected.im),
+            close(actual[index].real, expected.real) && close(actual[index].im, expected.im),
             "N={N}, sample={index}: actual={:?}, expected={expected:?}",
-            actual.data()[index]
+            actual[index]
         );
     }
 }
@@ -180,32 +180,34 @@ fn ifft_inverts_power_of_two_mixed_radix_and_prime_transforms() {
 
 #[test]
 fn ifft_supports_edge_lengths_and_f32() {
-    let empty = Vector::<Complex<f64>, 0>::new([]).ifft();
+    let empty = Vector::<Complex<f64>>::new([]).ifft();
     assert!(empty.is_empty());
 
     let singleton = Vector::new([Complex::new(7.0_f64, -2.0)]).ifft();
     assert_eq!(singleton, Vector::new([Complex::new(7.0, -2.0)]));
 
     let values = Vector::new([Complex::new(0.0_f32, 0.0), Complex::new(2.0, 0.0)]).ifft();
-    assert!((values.data()[0].real - 1.0).abs() < 1e-6);
-    assert!((values.data()[1].real + 1.0).abs() < 1e-6);
+    assert!((values[0].real - 1.0).abs() < 1e-6);
+    assert!((values[1].real + 1.0).abs() < 1e-6);
     assert!(values.data().iter().all(|value| value.im.abs() < 1e-6));
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn tensor_operations_use_metal_or_transparently_fall_back() {
-    let a = Matrix::<f32, 32, 32>::from_rows(std::array::from_fn(|row| {
-        std::array::from_fn(|col| (row + col) as f32 * 0.125)
+    let a = Matrix::<f32>::from_rows((0..32).map(|row| {
+        (0..32)
+            .map(|col| (row + col) as f32 * 0.125)
+            .collect::<Vec<_>>()
     }));
-    let identity = Matrix::<f32, 32, 32>::identity();
+    let identity = Matrix::<f32>::identity(32);
     assert_eq!(a.matmul(&identity), a);
 
-    let wide = Matrix::<f32, 128, 256>::from_rows([[1.0; 256]; 128]);
-    let row = Vector::<f32, 128>::new([1.0; 128]);
+    let wide = Matrix::<f32>::from_rows([[1.0f32; 256]; 128]);
+    let row = Vector::<f32>::new([1.0; 128]);
     assert!(row.vecmat(&wide).data().iter().all(|&value| value == 128.0));
     let tall = wide.transpose();
-    let column = Vector::<f32, 128>::new([1.0; 128]);
+    let column = Vector::<f32>::new([1.0; 128]);
     assert!(
         tall.matvec(&column)
             .data()
@@ -213,27 +215,36 @@ fn tensor_operations_use_metal_or_transparently_fall_back() {
             .all(|&value| value == 128.0)
     );
 
-    let dot_left = Vector::<f32, 32768>::new([1.0; 32768]);
-    let dot_right = Vector::<f32, 32768>::new([2.0; 32768]);
+    let dot_left = Vector::<f32>::new([1.0; 32768]);
+    let dot_right = Vector::<f32>::new([2.0; 32768]);
     assert_eq!(dot_left.dot(&dot_right), 65536.0);
 
-    let values = Vector::<f32, 4096>::new(std::array::from_fn(|index| index as f32 * 0.25));
-    let factors = Vector::<f32, 4096>::new(std::array::from_fn(|index| (index % 7) as f32 + 1.0));
-    let multiplied = values * factors;
+    let values = Vector::<f32>::new(
+        (0..4096)
+            .map(|index| index as f32 * 0.25)
+            .collect::<Vec<_>>(),
+    );
+    let factors = Vector::<f32>::new(
+        (0..4096)
+            .map(|index| (index % 7) as f32 + 1.0)
+            .collect::<Vec<_>>(),
+    );
+    let multiplied = &values * &factors;
     let scaled = values.scale(2.0);
     let shifted = values.broadcast_right(3.0, BinaryOp::Add);
     let reversed = values.broadcast_left(10.0, BinaryOp::Sub);
     for index in 0..4096 {
-        assert_eq!(
-            multiplied.data()[index],
-            values.data()[index] * factors.data()[index]
-        );
-        assert_eq!(scaled.data()[index], values.data()[index] * 2.0);
-        assert_eq!(shifted.data()[index], values.data()[index] + 3.0);
-        assert_eq!(reversed.data()[index], 10.0 - values.data()[index]);
+        assert_eq!(multiplied[index], values[index] * factors[index]);
+        assert_eq!(scaled[index], values[index] * 2.0);
+        assert_eq!(shifted[index], values[index] + 3.0);
+        assert_eq!(reversed[index], 10.0 - values[index]);
     }
 
-    let signal = Vector::<f32, 1024>::new(std::array::from_fn(|index| (index % 19) as f32 - 4.0));
+    let signal = Vector::<f32>::new(
+        (0..4096)
+            .map(|index| (index % 19) as f32 - 4.0)
+            .collect::<Vec<_>>(),
+    );
     let reconstructed = signal.fft().ifft();
     for (actual, expected) in reconstructed.data().iter().zip(signal.data()) {
         assert!((actual.real - expected).abs() < 2e-3);
@@ -243,50 +254,50 @@ fn tensor_operations_use_metal_or_transparently_fall_back() {
 
 #[test]
 fn matrices_are_statically_shaped() {
-    let a: Matrix<i32, 2, 3> = Matrix::from_rows([[1, 2, 3], [4, 5, 6]]);
-    let b: Matrix<i32, 3, 2> = Matrix::from_rows([[7, 8], [9, 10], [11, 12]]);
-    let product: Matrix<i32, 2, 2> = a.matmul(&b);
+    let a: Matrix<i32> = Matrix::from_rows([[1, 2, 3], [4, 5, 6]]);
+    let b: Matrix<i32> = Matrix::from_rows([[7, 8], [9, 10], [11, 12]]);
+    let product: Matrix<i32> = a.matmul(&b);
     assert_eq!(product, Matrix::from_rows([[58, 64], [139, 154]]));
     assert_eq!(a.transpose(), Matrix::from_rows([[1, 4], [2, 5], [3, 6]]));
 
-    let column: Vector<i32, 3> = Vector::new([1, 2, 3]);
+    let column: Vector<i32> = Vector::new([1, 2, 3]);
     assert_eq!(a.matvec(&column), Vector::new([14, 32]));
-    let row: Vector<i32, 2> = Vector::new([1, 2]);
+    let row: Vector<i32> = Vector::new([1, 2]);
     assert_eq!(row.vecmat(&a), Vector::new([9, 12, 15]));
 }
 
 #[test]
 fn chained_matmul_restores_optimal_order_and_const_result_shape() {
-    let a: Matrix<i64, 2, 3> = Matrix::from_rows([[1, 2, 3], [4, 5, 6]]);
-    let b: Matrix<i64, 3, 2> = Matrix::from_rows([[1, 0], [0, 1], [1, 1]]);
-    let c: Matrix<i64, 2, 4> = Matrix::from_rows([[1, 2, 3, 4], [5, 6, 7, 8]]);
+    let a: Matrix<i64> = Matrix::from_rows([[1, 2, 3], [4, 5, 6]]);
+    let b: Matrix<i64> = Matrix::from_rows([[1, 0], [0, 1], [1, 1]]);
+    let c: Matrix<i64> = Matrix::from_rows([[1, 2, 3, 4], [5, 6, 7, 8]]);
     let chain = [
         MatrixOperand::from(&a),
         MatrixOperand::from(&b),
         MatrixOperand::from(&c),
     ];
 
-    let product: Matrix<i64, 2, 4> = Matrix::chained_matmul(&chain).unwrap();
+    let product: Matrix<i64> = Matrix::chained_matmul(&chain).unwrap();
     assert_eq!(product, a.matmul(&b).matmul(&c));
-    assert_eq!(Matrix::<i64, 2, 4>::chained_matmul_cost(&chain), Ok(28));
+    assert_eq!(Matrix::<i64>::chained_matmul_cost(&chain), Ok(28));
 }
 
 #[test]
 fn hu_shing_cost_finds_the_classic_optimum() {
-    let a = Matrix::<i64, 10, 20>::zeros();
-    let b = Matrix::<i64, 20, 5>::zeros();
-    let c = Matrix::<i64, 5, 30>::zeros();
+    let a = Matrix::<i64>::zeros(10, 20);
+    let b = Matrix::<i64>::zeros(20, 5);
+    let c = Matrix::<i64>::zeros(5, 30);
     let chain = [
         MatrixOperand::from(&a),
         MatrixOperand::from(&b),
         MatrixOperand::from(&c),
     ];
-    assert_eq!(Matrix::<i64, 10, 30>::chained_matmul_cost(&chain), Ok(2500));
+    assert_eq!(Matrix::<i64>::chained_matmul_cost(&chain), Ok(2500));
 }
 
 #[test]
 fn determinant_and_inverse() {
-    let a: Matrix<f64, 2, 2> = Matrix::from_rows([[4.0, 7.0], [2.0, 6.0]]);
+    let a: Matrix<f64> = Matrix::from_rows([[4.0, 7.0], [2.0, 6.0]]);
     assert!(close(a.determinant(), 10.0));
     let identity = a.matmul(&a.inverse().unwrap());
     assert!(close(*identity.get(0, 0).unwrap(), 1.0));
@@ -298,7 +309,7 @@ fn determinant_and_inverse() {
 
     // Integer Gauss–Jordan division would truncate the first 1/2 to zero and
     // silently return the wrong answer, even though this matrix is unimodular.
-    let integer = Matrix::<i32, 2, 2>::from_rows([[2, 1], [1, 1]]);
+    let integer = Matrix::<i32>::from_rows([[2, 1], [1, 1]]);
     assert!(matches!(
         integer.inverse(),
         Err(Error::InvalidArgument(message))
@@ -310,13 +321,13 @@ fn determinant_and_inverse() {
 fn complex_and_dual_elements_work() {
     let i = Complex::new(0.0, 1.0);
     let z = Complex::new(0.0, 0.0);
-    let m: Matrix<Complex<f64>, 2, 2> = Matrix::from_rows([[i, z], [z, i]]);
+    let m: Matrix<Complex<f64>> = Matrix::from_rows([[i, z], [z, i]]);
     assert_eq!(m.matmul(&m).get(0, 0), Some(&Complex::new(-1.0, 0.0)));
 
     let x = Dual::variable(2.0);
     let one = Dual::constant(1.0);
     let zero = Dual::constant(0.0);
-    let a: Matrix<Dual<f64>, 2, 2> = Matrix::from_rows([[x, one], [zero, one]]);
+    let a: Matrix<Dual<f64>> = Matrix::from_rows([[x, one], [zero, one]]);
     let squared = a.matmul(&a);
     assert_eq!(
         (
@@ -329,7 +340,7 @@ fn complex_and_dual_elements_work() {
 
 #[test]
 fn all_vector_and_matrix_products_support_complex_coefficients() {
-    let gaussian: Vector<Complex<i32>, 1> = Vector::new([Complex::new(1, 2)]);
+    let gaussian: Vector<Complex<i32>> = Vector::new([Complex::new(1, 2)]);
     assert_eq!(gaussian.dot(&gaussian), Complex::new(-3, 4));
 
     let u = Vector::new([Complex::new(1.0, 1.0), Complex::new(3.0, 0.0)]);
@@ -349,13 +360,13 @@ fn all_vector_and_matrix_products_support_complex_coefficients() {
         Vector::new([Complex::new(7.0, 1.0), Complex::new(2.0, 1.0)])
     );
 
-    let identity = Matrix::<Complex<f64>, 2, 2>::identity();
+    let identity = Matrix::<Complex<f64>>::identity(2);
     assert_eq!(matrix.matmul(&identity), matrix);
 }
 
 #[test]
 fn all_vector_and_matrix_products_support_dual_coefficients() {
-    let integral: Vector<Dual<i64>, 1> = Vector::new([Dual::new(2, 1)]);
+    let integral: Vector<Dual<i64>> = Vector::new([Dual::new(2, 1)]);
     assert_eq!(integral.dot(&integral), Dual::new(4, 4));
 
     let x = Dual::variable(2.0_f64);
@@ -385,15 +396,16 @@ fn all_vector_and_matrix_products_support_dual_coefficients() {
 
 #[test]
 fn constructors_and_map_preserve_shape() {
-    let zeros: Matrix<i32, 2, 3> = Matrix::zeros();
-    assert_eq!(zeros.data(), &[[0, 0, 0], [0, 0, 0]]);
-    let identity: Matrix<f64, 3, 3> = Matrix::identity();
+    let zeros: Matrix<i32> = Matrix::zeros(2, 3);
+    assert_eq!(zeros.shape(), (2, 3));
+    assert_eq!(zeros.to_rows(), [[0, 0, 0], [0, 0, 0]]);
+    let identity: Matrix<f64> = Matrix::identity(3);
     assert_eq!(
-        identity.data(),
-        &[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        identity.to_rows(),
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
     );
 
-    let real: Vector<f64, 2> = Vector::new([1.0, 2.0]);
-    let lifted: Vector<Complex<f64>, 2> = real.map(|&x| Complex::constant(x));
+    let real: Vector<f64> = Vector::new([1.0, 2.0]);
+    let lifted: Vector<Complex<f64>> = real.map(|&x| Complex::constant(x));
     assert_eq!(lifted.get(1), Some(&Complex::new(2.0, 0.0)));
 }

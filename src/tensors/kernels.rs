@@ -2,11 +2,10 @@
 //!
 //! [`Vector`] and [`Matrix`] implement their products and elementwise
 //! operations as inherent methods, once for each backend, and nothing ties those
-//! two sets together — `Matrix<f32, R, C, Host>::matmul` and
-//! `Matrix<f32, R, C, Metal>::matmul` are unrelated functions that happen to
-//! share a name. [`Kernels`] is that missing link: one trait naming every
-//! operation both backends provide, so code written against it compiles for
-//! either.
+//! two sets together — `Matrix<f32, Host>::matmul` and
+//! `Matrix<f32, Metal>::matmul` are unrelated functions that happen to share a
+//! name. [`Kernels`] is that missing link: one trait naming every operation both
+//! backends provide, so code written against it compiles for either.
 //!
 //! Automatic differentiation is the reason it exists. The forward-mode layer in
 //! [`dual`](super::dual) is written once against `Kernels` and instantiates on
@@ -29,6 +28,19 @@ pub enum BinaryOp {
     Mul = 2,
     Div = 3,
     Rem = 4,
+}
+
+impl BinaryOp {
+    /// The operator's spelling, for the shape-mismatch messages.
+    pub fn name(self) -> &'static str {
+        match self {
+            BinaryOp::Add => "add",
+            BinaryOp::Sub => "subtract",
+            BinaryOp::Mul => "multiply",
+            BinaryOp::Div => "divide",
+            BinaryOp::Rem => "remainder",
+        }
+    }
 }
 
 impl From<BinaryOp> for u16 {
@@ -250,197 +262,188 @@ mod operation_tests {
 
 /// The `f32` tensor operations a [`Backend`] provides.
 ///
+/// Every method reads the shapes it needs from its operands, so the trait names
+/// the operations without naming any dimension. The shape *rules* still hold —
+/// a mismatch panics, exactly as it does on the inherent methods these forward
+/// to — they are simply checked when the call happens.
 pub trait Kernels: Backend {
     // ---- vectors ----
 
-    fn vector_elementwise<const N: usize>(
-        a: &Vector<f32, N, Self>,
-        b: &Vector<f32, N, Self>,
+    fn vector_elementwise(
+        a: &Vector<f32, Self>,
+        b: &Vector<f32, Self>,
         op: BinaryOp,
-    ) -> Vector<f32, N, Self>;
+    ) -> Vector<f32, Self>;
 
-    fn vector_broadcast<const N: usize>(
-        a: &Vector<f32, N, Self>,
+    fn vector_broadcast(
+        a: &Vector<f32, Self>,
         scalar: f32,
         op: BinaryOp,
         scalar_left: bool,
-    ) -> Vector<f32, N, Self>;
+    ) -> Vector<f32, Self>;
 
     /// Elementwise comparison of two vectors.
-    fn vector_compare<const N: usize>(
-        a: &Vector<f32, N, Self>,
-        b: &Vector<f32, N, Self>,
+    fn vector_compare(
+        a: &Vector<f32, Self>,
+        b: &Vector<f32, Self>,
         op: Compare,
-    ) -> Vector<f32, N, Self>;
+    ) -> Vector<f32, Self>;
 
     /// Elementwise comparison against a scalar.
-    fn vector_compare_scalar<const N: usize>(
-        a: &Vector<f32, N, Self>,
+    fn vector_compare_scalar(
+        a: &Vector<f32, Self>,
         scalar: f32,
         op: Compare,
         scalar_left: bool,
-    ) -> Vector<f32, N, Self>;
+    ) -> Vector<f32, Self>;
 
     /// `f(a)`, elementwise.
-    fn vector_unary<const N: usize>(a: &Vector<f32, N, Self>, f: Analytic) -> Vector<f32, N, Self>;
+    fn vector_unary(a: &Vector<f32, Self>, f: Analytic) -> Vector<f32, Self>;
 
     /// `(f(value), f'(value) ⊙ tangent)` — one forward-mode step.
-    fn vector_unary_dual<const N: usize>(
-        value: &Vector<f32, N, Self>,
-        tangent: &Vector<f32, N, Self>,
+    fn vector_unary_dual(
+        value: &Vector<f32, Self>,
+        tangent: &Vector<f32, Self>,
         f: Analytic,
-    ) -> (Vector<f32, N, Self>, Vector<f32, N, Self>);
+    ) -> (Vector<f32, Self>, Vector<f32, Self>);
 
-    fn dot<const N: usize>(a: &Vector<f32, N, Self>, b: &Vector<f32, N, Self>) -> f32;
+    fn dot(a: &Vector<f32, Self>, b: &Vector<f32, Self>) -> f32;
 
-    fn vecmat<const N: usize, const C: usize>(
-        v: &Vector<f32, N, Self>,
-        m: &Matrix<f32, N, C, Self>,
-    ) -> Vector<f32, C, Self>;
+    fn vecmat(v: &Vector<f32, Self>, m: &Matrix<f32, Self>) -> Vector<f32, Self>;
 
-    fn matvec<const R: usize, const C: usize>(
-        m: &Matrix<f32, R, C, Self>,
-        v: &Vector<f32, C, Self>,
-    ) -> Vector<f32, R, Self>;
+    fn matvec(m: &Matrix<f32, Self>, v: &Vector<f32, Self>) -> Vector<f32, Self>;
 
     /// `addend + m·v`, using `addend` as the accumulator when possible.
-    fn matvec_add<const R: usize, const C: usize>(
-        m: &Matrix<f32, R, C, Self>,
-        v: &Vector<f32, C, Self>,
-        addend: Vector<f32, R, Self>,
-    ) -> Vector<f32, R, Self>;
+    fn matvec_add(
+        m: &Matrix<f32, Self>,
+        v: &Vector<f32, Self>,
+        addend: Vector<f32, Self>,
+    ) -> Vector<f32, Self>;
 
     // ---- matrices ----
 
-    fn matrix_elementwise<const R: usize, const C: usize>(
-        a: &Matrix<f32, R, C, Self>,
-        b: &Matrix<f32, R, C, Self>,
+    fn matrix_elementwise(
+        a: &Matrix<f32, Self>,
+        b: &Matrix<f32, Self>,
         op: BinaryOp,
-    ) -> Matrix<f32, R, C, Self>;
+    ) -> Matrix<f32, Self>;
 
-    fn matrix_broadcast<const R: usize, const C: usize>(
-        a: &Matrix<f32, R, C, Self>,
+    fn matrix_broadcast(
+        a: &Matrix<f32, Self>,
         scalar: f32,
         op: BinaryOp,
         scalar_left: bool,
-    ) -> Matrix<f32, R, C, Self>;
+    ) -> Matrix<f32, Self>;
 
     /// Elementwise comparison of two matrices.
-    fn matrix_compare<const R: usize, const C: usize>(
-        a: &Matrix<f32, R, C, Self>,
-        b: &Matrix<f32, R, C, Self>,
+    fn matrix_compare(
+        a: &Matrix<f32, Self>,
+        b: &Matrix<f32, Self>,
         op: Compare,
-    ) -> Matrix<f32, R, C, Self>;
+    ) -> Matrix<f32, Self>;
 
     /// Elementwise comparison against a scalar.
-    fn matrix_compare_scalar<const R: usize, const C: usize>(
-        a: &Matrix<f32, R, C, Self>,
+    fn matrix_compare_scalar(
+        a: &Matrix<f32, Self>,
         scalar: f32,
         op: Compare,
         scalar_left: bool,
-    ) -> Matrix<f32, R, C, Self>;
+    ) -> Matrix<f32, Self>;
 
     /// `f(a)`, elementwise.
-    fn matrix_unary<const R: usize, const C: usize>(
-        a: &Matrix<f32, R, C, Self>,
-        f: Analytic,
-    ) -> Matrix<f32, R, C, Self>;
+    fn matrix_unary(a: &Matrix<f32, Self>, f: Analytic) -> Matrix<f32, Self>;
 
     /// `(f(value), f'(value) ⊙ tangent)` — one forward-mode step.
-    fn matrix_unary_dual<const R: usize, const C: usize>(
-        value: &Matrix<f32, R, C, Self>,
-        tangent: &Matrix<f32, R, C, Self>,
+    fn matrix_unary_dual(
+        value: &Matrix<f32, Self>,
+        tangent: &Matrix<f32, Self>,
         f: Analytic,
-    ) -> (Matrix<f32, R, C, Self>, Matrix<f32, R, C, Self>);
+    ) -> (Matrix<f32, Self>, Matrix<f32, Self>);
 
-    fn matmul<const R: usize, const K: usize, const C: usize>(
-        a: &Matrix<f32, R, K, Self>,
-        b: &Matrix<f32, K, C, Self>,
-    ) -> Matrix<f32, R, C, Self>;
+    fn matmul(a: &Matrix<f32, Self>, b: &Matrix<f32, Self>) -> Matrix<f32, Self>;
 
     /// `addend + a·b`.
     ///
     /// Backends that can accumulate inside the product kernel do so, which is
     /// what makes a dual matmul two dispatches instead of three. `addend` is
     /// consumed because it may become the accumulator.
-    fn matmul_add<const R: usize, const K: usize, const C: usize>(
-        a: &Matrix<f32, R, K, Self>,
-        b: &Matrix<f32, K, C, Self>,
-        addend: Matrix<f32, R, C, Self>,
-    ) -> Matrix<f32, R, C, Self>;
+    fn matmul_add(
+        a: &Matrix<f32, Self>,
+        b: &Matrix<f32, Self>,
+        addend: Matrix<f32, Self>,
+    ) -> Matrix<f32, Self>;
 
-    fn transpose<const R: usize, const C: usize>(
-        m: &Matrix<f32, R, C, Self>,
-    ) -> Matrix<f32, C, R, Self>;
+    fn transpose(m: &Matrix<f32, Self>) -> Matrix<f32, Self>;
 
-    /// Valid cross-correlation: output `(i, j)` is the `KR × KC` window of
-    /// `input` at `(i, j)` dotted with `window`.
+    /// Valid cross-correlation: output `(i, j)` is the window-shaped patch of
+    /// `input` at `(i, j)` dotted with `window`, so the result is
+    /// `(R−KR+1) × (C−KC+1)`.
     ///
     /// `flip` reverses the window, which is the difference between correlation
     /// (the machine-learning convention) and convolution (the signal-processing
     /// one) — and is also what the input-side gradient of either needs.
-    fn correlate<const R: usize, const C: usize, const KR: usize, const KC: usize>(
-        input: &Matrix<f32, R, C, Self>,
-        window: &Matrix<f32, KR, KC, Self>,
+    ///
+    /// Panics unless the window fits inside the input.
+    fn correlate(
+        input: &Matrix<f32, Self>,
+        window: &Matrix<f32, Self>,
         flip: bool,
-    ) -> Matrix<f32, { R - KR + 1 }, { C - KC + 1 }, Self>;
+    ) -> Matrix<f32, Self>;
 
     /// `∂L/∂window` for a valid correlation: the input windowed by the output
-    /// adjoint, which comes out exactly the window's shape.
+    /// adjoint, which comes out exactly the window's shape —
+    /// `(R − (R−KR+1) + 1) × (C − (C−KC+1) + 1)`.
     ///
-    /// The result shape is *named* rather than computed, which is the point.
-    /// Writing it as `correlate::<R, C, {R−KR+1}, {C−KC+1}>` would leave the
-    /// compiler needing to prove `R − (R−KR+1) + 1 == KR`, and const-expression
-    /// equality is beyond what `generic_const_exprs` can do.
-    fn correlate_window_gradient<const R: usize, const C: usize, const KR: usize, const KC: usize>(
-        input: &Matrix<f32, R, C, Self>,
-        adjoint: &Matrix<f32, { R - KR + 1 }, { C - KC + 1 }, Self>,
-    ) -> Matrix<f32, KR, KC, Self>;
+    /// With the extents now ordinary numbers this is just `correlate` with the
+    /// adjoint as the window. It stays a named operation because the backends
+    /// reach it by different routes, and because the pairing of `input` with
+    /// `adjoint` is what fixes the result shape.
+    fn correlate_window_gradient(
+        input: &Matrix<f32, Self>,
+        adjoint: &Matrix<f32, Self>,
+    ) -> Matrix<f32, Self>;
 
     /// `∂L/∂input` for a valid correlation: the full correlation of the adjoint
-    /// with the window, which is the padded one. `forward_flip` says which
-    /// convention the forward pass used; the gradient applies the window the
-    /// other way round.
-    fn correlate_input_gradient<const R: usize, const C: usize, const KR: usize, const KC: usize>(
-        adjoint: &Matrix<f32, { R - KR + 1 }, { C - KC + 1 }, Self>,
-        window: &Matrix<f32, KR, KC, Self>,
+    /// with the window, which is the padded one, giving back the input's shape
+    /// `(A+KR−1) × (B+KC−1)`. `forward_flip` says which convention the forward
+    /// pass used; the gradient applies the window the other way round.
+    fn correlate_input_gradient(
+        adjoint: &Matrix<f32, Self>,
+        window: &Matrix<f32, Self>,
         forward_flip: bool,
-    ) -> Matrix<f32, R, C, Self>;
+    ) -> Matrix<f32, Self>;
 
-    /// Surround a matrix with zeros.
-    fn pad<const R: usize, const C: usize, const PR: usize, const PC: usize>(
-        input: &Matrix<f32, R, C, Self>,
-    ) -> Matrix<f32, { R + 2 * PR }, { C + 2 * PC }, Self>;
+    /// Surround a matrix with `pad_rows` and `pad_cols` zeros on every side,
+    /// giving `(R + 2·PR) × (C + 2·PC)`.
+    fn pad(input: &Matrix<f32, Self>, pad_rows: usize, pad_cols: usize) -> Matrix<f32, Self>;
 
     /// Reverse both axes.
-    fn flip<const R: usize, const C: usize>(
-        input: &Matrix<f32, R, C, Self>,
-    ) -> Matrix<f32, R, C, Self>;
+    fn flip(input: &Matrix<f32, Self>) -> Matrix<f32, Self>;
 }
 
 /// Every operation here already exists as an inherent method or an operator on
 /// the host-backed tensors; this is pure forwarding.
 impl Kernels for Host {
-    fn vector_elementwise<const N: usize>(
-        a: &Vector<f32, N, Self>,
-        b: &Vector<f32, N, Self>,
+    fn vector_elementwise(
+        a: &Vector<f32, Self>,
+        b: &Vector<f32, Self>,
         op: BinaryOp,
-    ) -> Vector<f32, N, Self> {
+    ) -> Vector<f32, Self> {
         match op {
-            BinaryOp::Add => *a + *b,
-            BinaryOp::Sub => *a - *b,
-            BinaryOp::Mul => *a * *b,
-            BinaryOp::Div => *a / *b,
-            BinaryOp::Rem => *a % *b,
+            BinaryOp::Add => a + b,
+            BinaryOp::Sub => a - b,
+            BinaryOp::Mul => a * b,
+            BinaryOp::Div => a / b,
+            BinaryOp::Rem => a % b,
         }
     }
 
-    fn vector_broadcast<const N: usize>(
-        a: &Vector<f32, N, Self>,
+    fn vector_broadcast(
+        a: &Vector<f32, Self>,
         scalar: f32,
         op: BinaryOp,
         scalar_left: bool,
-    ) -> Vector<f32, N, Self> {
+    ) -> Vector<f32, Self> {
         if scalar_left {
             a.broadcast_left(scalar, op)
         } else {
@@ -448,21 +451,27 @@ impl Kernels for Host {
         }
     }
 
-    fn vector_compare<const N: usize>(
-        a: &Vector<f32, N, Self>,
-        b: &Vector<f32, N, Self>,
+    fn vector_compare(
+        a: &Vector<f32, Self>,
+        b: &Vector<f32, Self>,
         op: Compare,
-    ) -> Vector<f32, N, Self> {
+    ) -> Vector<f32, Self> {
+        assert_eq!(a.len(), b.len(), "compare: vector lengths differ");
         let (left, right) = (a.data(), b.data());
-        Vector::new(std::array::from_fn(|i| op.value(left[i], right[i])))
+        Vector::new(
+            left.iter()
+                .zip(right)
+                .map(|(&x, &y)| op.value(x, y))
+                .collect::<Vec<_>>(),
+        )
     }
 
-    fn vector_compare_scalar<const N: usize>(
-        a: &Vector<f32, N, Self>,
+    fn vector_compare_scalar(
+        a: &Vector<f32, Self>,
         scalar: f32,
         op: Compare,
         scalar_left: bool,
-    ) -> Vector<f32, N, Self> {
+    ) -> Vector<f32, Self> {
         a.map(|&x| {
             if scalar_left {
                 op.value(scalar, x)
@@ -472,70 +481,69 @@ impl Kernels for Host {
         })
     }
 
-    fn vector_unary<const N: usize>(a: &Vector<f32, N, Self>, f: Analytic) -> Vector<f32, N, Self> {
+    fn vector_unary(a: &Vector<f32, Self>, f: Analytic) -> Vector<f32, Self> {
         a.map(|&x| f.value(x))
     }
 
-    fn vector_unary_dual<const N: usize>(
-        value: &Vector<f32, N, Self>,
-        tangent: &Vector<f32, N, Self>,
+    fn vector_unary_dual(
+        value: &Vector<f32, Self>,
+        tangent: &Vector<f32, Self>,
         f: Analytic,
-    ) -> (Vector<f32, N, Self>, Vector<f32, N, Self>) {
-        let values = value.data();
-        (
-            value.map(|&x| f.value(x)),
-            Vector::new(std::array::from_fn(|i| {
-                f.derivative(values[i]) * tangent.data()[i]
-            })),
-        )
+    ) -> (Vector<f32, Self>, Vector<f32, Self>) {
+        assert_eq!(
+            value.len(),
+            tangent.len(),
+            "unary_dual: value and tangent lengths differ"
+        );
+        let derivatives = value
+            .data()
+            .iter()
+            .zip(tangent.data())
+            .map(|(&x, &d)| f.derivative(x) * d)
+            .collect::<Vec<_>>();
+        (value.map(|&x| f.value(x)), Vector::new(derivatives))
     }
 
-    fn dot<const N: usize>(a: &Vector<f32, N, Self>, b: &Vector<f32, N, Self>) -> f32 {
+    fn dot(a: &Vector<f32, Self>, b: &Vector<f32, Self>) -> f32 {
         a.dot(b)
     }
 
-    fn vecmat<const N: usize, const C: usize>(
-        v: &Vector<f32, N, Self>,
-        m: &Matrix<f32, N, C, Self>,
-    ) -> Vector<f32, C, Self> {
+    fn vecmat(v: &Vector<f32, Self>, m: &Matrix<f32, Self>) -> Vector<f32, Self> {
         v.vecmat(m)
     }
 
-    fn matvec<const R: usize, const C: usize>(
-        m: &Matrix<f32, R, C, Self>,
-        v: &Vector<f32, C, Self>,
-    ) -> Vector<f32, R, Self> {
+    fn matvec(m: &Matrix<f32, Self>, v: &Vector<f32, Self>) -> Vector<f32, Self> {
         m.matvec(v)
     }
 
-    fn matvec_add<const R: usize, const C: usize>(
-        m: &Matrix<f32, R, C, Self>,
-        v: &Vector<f32, C, Self>,
-        addend: Vector<f32, R, Self>,
-    ) -> Vector<f32, R, Self> {
+    fn matvec_add(
+        m: &Matrix<f32, Self>,
+        v: &Vector<f32, Self>,
+        addend: Vector<f32, Self>,
+    ) -> Vector<f32, Self> {
         m.matvec_add(v, addend)
     }
 
-    fn matrix_elementwise<const R: usize, const C: usize>(
-        a: &Matrix<f32, R, C, Self>,
-        b: &Matrix<f32, R, C, Self>,
+    fn matrix_elementwise(
+        a: &Matrix<f32, Self>,
+        b: &Matrix<f32, Self>,
         op: BinaryOp,
-    ) -> Matrix<f32, R, C, Self> {
+    ) -> Matrix<f32, Self> {
         match op {
-            BinaryOp::Add => *a + *b,
-            BinaryOp::Sub => *a - *b,
-            BinaryOp::Mul => *a * *b,
-            BinaryOp::Div => *a / *b,
-            BinaryOp::Rem => *a % *b,
+            BinaryOp::Add => a + b,
+            BinaryOp::Sub => a - b,
+            BinaryOp::Mul => a * b,
+            BinaryOp::Div => a / b,
+            BinaryOp::Rem => a % b,
         }
     }
 
-    fn matrix_broadcast<const R: usize, const C: usize>(
-        a: &Matrix<f32, R, C, Self>,
+    fn matrix_broadcast(
+        a: &Matrix<f32, Self>,
         scalar: f32,
         op: BinaryOp,
         scalar_left: bool,
-    ) -> Matrix<f32, R, C, Self> {
+    ) -> Matrix<f32, Self> {
         if scalar_left {
             a.broadcast_left(scalar, op)
         } else {
@@ -543,23 +551,28 @@ impl Kernels for Host {
         }
     }
 
-    fn matrix_compare<const R: usize, const C: usize>(
-        a: &Matrix<f32, R, C, Self>,
-        b: &Matrix<f32, R, C, Self>,
+    fn matrix_compare(
+        a: &Matrix<f32, Self>,
+        b: &Matrix<f32, Self>,
         op: Compare,
-    ) -> Matrix<f32, R, C, Self> {
-        let (left, right) = (a.data(), b.data());
-        Matrix::from_rows(std::array::from_fn(|row| {
-            std::array::from_fn(|col| op.value(left[row][col], right[row][col]))
-        }))
+    ) -> Matrix<f32, Self> {
+        assert_eq!(a.shape(), b.shape(), "compare: matrix shapes differ");
+        let (rows, cols) = a.shape();
+        let values = a
+            .data()
+            .iter()
+            .zip(b.data())
+            .map(|(&x, &y)| op.value(x, y))
+            .collect::<Vec<_>>();
+        Matrix::from_flat(rows, cols, values)
     }
 
-    fn matrix_compare_scalar<const R: usize, const C: usize>(
-        a: &Matrix<f32, R, C, Self>,
+    fn matrix_compare_scalar(
+        a: &Matrix<f32, Self>,
         scalar: f32,
         op: Compare,
         scalar_left: bool,
-    ) -> Matrix<f32, R, C, Self> {
+    ) -> Matrix<f32, Self> {
         a.map(|&x| {
             if scalar_left {
                 op.value(scalar, x)
@@ -569,125 +582,120 @@ impl Kernels for Host {
         })
     }
 
-    fn matrix_unary<const R: usize, const C: usize>(
-        a: &Matrix<f32, R, C, Self>,
-        f: Analytic,
-    ) -> Matrix<f32, R, C, Self> {
+    fn matrix_unary(a: &Matrix<f32, Self>, f: Analytic) -> Matrix<f32, Self> {
         a.map(|&x| f.value(x))
     }
 
-    fn matrix_unary_dual<const R: usize, const C: usize>(
-        value: &Matrix<f32, R, C, Self>,
-        tangent: &Matrix<f32, R, C, Self>,
+    fn matrix_unary_dual(
+        value: &Matrix<f32, Self>,
+        tangent: &Matrix<f32, Self>,
         f: Analytic,
-    ) -> (Matrix<f32, R, C, Self>, Matrix<f32, R, C, Self>) {
-        let (values, tangents) = (value.data(), tangent.data());
+    ) -> (Matrix<f32, Self>, Matrix<f32, Self>) {
+        assert_eq!(
+            value.shape(),
+            tangent.shape(),
+            "unary_dual: value and tangent shapes differ"
+        );
+        let (rows, cols) = value.shape();
+        let derivatives = value
+            .data()
+            .iter()
+            .zip(tangent.data())
+            .map(|(&x, &d)| f.derivative(x) * d)
+            .collect::<Vec<_>>();
         (
             value.map(|&x| f.value(x)),
-            Matrix::from_rows(std::array::from_fn(|row| {
-                std::array::from_fn(|col| f.derivative(values[row][col]) * tangents[row][col])
-            })),
+            Matrix::from_flat(rows, cols, derivatives),
         )
     }
 
-    fn matmul<const R: usize, const K: usize, const C: usize>(
-        a: &Matrix<f32, R, K, Self>,
-        b: &Matrix<f32, K, C, Self>,
-    ) -> Matrix<f32, R, C, Self> {
+    fn matmul(a: &Matrix<f32, Self>, b: &Matrix<f32, Self>) -> Matrix<f32, Self> {
         a.matmul(b)
     }
 
-    fn matmul_add<const R: usize, const K: usize, const C: usize>(
-        a: &Matrix<f32, R, K, Self>,
-        b: &Matrix<f32, K, C, Self>,
-        addend: Matrix<f32, R, C, Self>,
-    ) -> Matrix<f32, R, C, Self> {
+    fn matmul_add(
+        a: &Matrix<f32, Self>,
+        b: &Matrix<f32, Self>,
+        addend: Matrix<f32, Self>,
+    ) -> Matrix<f32, Self> {
         a.matmul_add(b, addend)
     }
 
-    fn transpose<const R: usize, const C: usize>(
-        m: &Matrix<f32, R, C, Self>,
-    ) -> Matrix<f32, C, R, Self> {
+    fn transpose(m: &Matrix<f32, Self>) -> Matrix<f32, Self> {
         m.transpose()
     }
 
-    fn correlate<const R: usize, const C: usize, const KR: usize, const KC: usize>(
-        input: &Matrix<f32, R, C, Self>,
-        window: &Matrix<f32, KR, KC, Self>,
+    fn correlate(
+        input: &Matrix<f32, Self>,
+        window: &Matrix<f32, Self>,
         flip: bool,
-    ) -> Matrix<f32, { R - KR + 1 }, { C - KC + 1 }, Self> {
+    ) -> Matrix<f32, Self> {
+        let cols = input.cols();
+        let (window_rows, window_cols) = window.shape();
+        let (out_rows, out_cols) = correlation_shape(input.shape(), window.shape());
         let (values, taps) = (input.data(), window.data());
-        Matrix::from_rows(std::array::from_fn(|row| {
-            std::array::from_fn(|col| {
+
+        let mut out = Vec::with_capacity(out_rows * out_cols);
+        for row in 0..out_rows {
+            for col in 0..out_cols {
                 let mut sum = 0.0;
-                for window_row in 0..KR {
-                    for window_col in 0..KC {
+                for window_row in 0..window_rows {
+                    for window_col in 0..window_cols {
                         let (tap_row, tap_col) = if flip {
-                            (KR - 1 - window_row, KC - 1 - window_col)
+                            (window_rows - 1 - window_row, window_cols - 1 - window_col)
                         } else {
                             (window_row, window_col)
                         };
-                        sum += values[row + window_row][col + window_col] * taps[tap_row][tap_col];
+                        sum += values[(row + window_row) * cols + col + window_col]
+                            * taps[tap_row * window_cols + tap_col];
                     }
                 }
-                sum
-            })
-        }))
+                out.push(sum);
+            }
+        }
+        Matrix::from_flat(out_rows, out_cols, out)
     }
 
-    fn flip<const R: usize, const C: usize>(
-        input: &Matrix<f32, R, C, Self>,
-    ) -> Matrix<f32, R, C, Self> {
+    fn flip(input: &Matrix<f32, Self>) -> Matrix<f32, Self> {
+        let (rows, cols) = input.shape();
         let values = input.data();
-        Matrix::from_rows(std::array::from_fn(|row| {
-            std::array::from_fn(|col| values[R - 1 - row][C - 1 - col])
-        }))
+        let mut out = Vec::with_capacity(rows * cols);
+        for row in 0..rows {
+            for col in 0..cols {
+                out.push(values[(rows - 1 - row) * cols + cols - 1 - col]);
+            }
+        }
+        Matrix::from_flat(rows, cols, out)
     }
 
-    fn correlate_window_gradient<
-        const R: usize,
-        const C: usize,
-        const KR: usize,
-        const KC: usize,
-    >(
-        input: &Matrix<f32, R, C, Self>,
-        adjoint: &Matrix<f32, { R - KR + 1 }, { C - KC + 1 }, Self>,
-    ) -> Matrix<f32, KR, KC, Self> {
-        // K̄[a][b] = Σᵢⱼ Ȳ[i][j]·X[i+a][j+b]
-        let (values, upstream) = (input.data(), adjoint.data());
-        Matrix::from_rows(std::array::from_fn(|tap_row| {
-            std::array::from_fn(|tap_col| {
-                let mut sum = 0.0;
-                for row in 0..R - KR + 1 {
-                    for col in 0..C - KC + 1 {
-                        sum += upstream[row][col] * values[row + tap_row][col + tap_col];
-                    }
-                }
-                sum
-            })
-        }))
+    fn correlate_window_gradient(
+        input: &Matrix<f32, Self>,
+        adjoint: &Matrix<f32, Self>,
+    ) -> Matrix<f32, Self> {
+        // K̄[a][b] = Σᵢⱼ Ȳ[i][j]·X[i+a][j+b] — the input correlated with the
+        // adjoint, which lands on exactly the window's shape.
+        Self::correlate(input, adjoint, false)
     }
 
-    fn correlate_input_gradient<
-        const R: usize,
-        const C: usize,
-        const KR: usize,
-        const KC: usize,
-    >(
-        adjoint: &Matrix<f32, { R - KR + 1 }, { C - KC + 1 }, Self>,
-        window: &Matrix<f32, KR, KC, Self>,
+    fn correlate_input_gradient(
+        adjoint: &Matrix<f32, Self>,
+        window: &Matrix<f32, Self>,
         forward_flip: bool,
-    ) -> Matrix<f32, R, C, Self> {
+    ) -> Matrix<f32, Self> {
         // X̄[p][q] = Σᵤᵥ Ȳ[p−u][q−v]·K[u][v], with the taps reversed when the
         // forward pass reversed them. Out-of-range adjoint indices are the zeros
         // a full correlation pads with.
+        let (out_rows, out_cols) = adjoint.shape();
+        let (window_rows, window_cols) = window.shape();
+        let (rows, cols) = (out_rows + window_rows - 1, out_cols + window_cols - 1);
         let (upstream, taps) = (adjoint.data(), window.data());
-        let (out_rows, out_cols) = (R - KR + 1, C - KC + 1);
-        Matrix::from_rows(std::array::from_fn(|row| {
-            std::array::from_fn(|col| {
+
+        let mut out = Vec::with_capacity(rows * cols);
+        for row in 0..rows {
+            for col in 0..cols {
                 let mut sum = 0.0;
-                for window_row in 0..KR {
-                    for window_col in 0..KC {
+                for window_row in 0..window_rows {
+                    for window_col in 0..window_cols {
                         if row < window_row || col < window_col {
                             continue;
                         }
@@ -696,58 +704,81 @@ impl Kernels for Host {
                             continue;
                         }
                         let (tap_row, tap_col) = if forward_flip {
-                            (KR - 1 - window_row, KC - 1 - window_col)
+                            (window_rows - 1 - window_row, window_cols - 1 - window_col)
                         } else {
                             (window_row, window_col)
                         };
-                        sum += upstream[source_row][source_col] * taps[tap_row][tap_col];
+                        sum += upstream[source_row * out_cols + source_col]
+                            * taps[tap_row * window_cols + tap_col];
                     }
                 }
-                sum
-            })
-        }))
+                out.push(sum);
+            }
+        }
+        Matrix::from_flat(rows, cols, out)
     }
 
-    fn pad<const R: usize, const C: usize, const PR: usize, const PC: usize>(
-        input: &Matrix<f32, R, C, Self>,
-    ) -> Matrix<f32, { R + 2 * PR }, { C + 2 * PC }, Self> {
+    fn pad(input: &Matrix<f32, Self>, pad_rows: usize, pad_cols: usize) -> Matrix<f32, Self> {
+        let (rows, cols) = input.shape();
+        let (padded_rows, padded_cols) = (rows + 2 * pad_rows, cols + 2 * pad_cols);
         let values = input.data();
-        Matrix::from_rows(std::array::from_fn(|row| {
-            std::array::from_fn(|col| {
-                let inside = row >= PR && row < PR + R && col >= PC && col < PC + C;
-                if inside {
-                    values[row - PR][col - PC]
+
+        let mut out = Vec::with_capacity(padded_rows * padded_cols);
+        for row in 0..padded_rows {
+            for col in 0..padded_cols {
+                let inside = row >= pad_rows
+                    && row < pad_rows + rows
+                    && col >= pad_cols
+                    && col < pad_cols + cols;
+                out.push(if inside {
+                    values[(row - pad_rows) * cols + col - pad_cols]
                 } else {
                     0.0
-                }
-            })
-        }))
+                });
+            }
+        }
+        Matrix::from_flat(padded_rows, padded_cols, out)
     }
+}
+
+/// The output shape of a valid correlation, which is also where the "does the
+/// window fit" check lives now that both shapes are runtime values.
+#[track_caller]
+pub(crate) fn correlation_shape(input: (usize, usize), window: (usize, usize)) -> (usize, usize) {
+    assert!(
+        window.0 <= input.0 && window.1 <= input.1,
+        "correlate: a {}×{} window does not fit in a {}×{} input",
+        window.0,
+        window.1,
+        input.0,
+        input.1
+    );
+    (input.0 - window.0 + 1, input.1 - window.1 + 1)
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod gpu {
-    use super::{Analytic, BinaryOp, Compare, Kernels, Matrix, Vector};
+    use super::{Analytic, BinaryOp, Compare, Kernels, Matrix, Vector, correlation_shape};
     use crate::tensors::metal_backend::{matrix_elementwise, vector_elementwise};
     use crate::tensors::{Host, Metal};
 
     /// Forwarding again, but to the resident operations: every one of these
     /// leaves its result in GPU-shared memory.
     impl Kernels for Metal {
-        fn vector_elementwise<const N: usize>(
-            a: &Vector<f32, N, Self>,
-            b: &Vector<f32, N, Self>,
+        fn vector_elementwise(
+            a: &Vector<f32, Self>,
+            b: &Vector<f32, Self>,
             op: BinaryOp,
-        ) -> Vector<f32, N, Self> {
+        ) -> Vector<f32, Self> {
             vector_elementwise(a, b, op)
         }
 
-        fn vector_broadcast<const N: usize>(
-            a: &Vector<f32, N, Self>,
+        fn vector_broadcast(
+            a: &Vector<f32, Self>,
             scalar: f32,
             op: BinaryOp,
             scalar_left: bool,
-        ) -> Vector<f32, N, Self> {
+        ) -> Vector<f32, Self> {
             if scalar_left {
                 a.broadcast_left(scalar, op)
             } else {
@@ -755,88 +786,82 @@ mod gpu {
             }
         }
 
-        fn vector_compare<const N: usize>(
-            a: &Vector<f32, N, Self>,
-            b: &Vector<f32, N, Self>,
+        fn vector_compare(
+            a: &Vector<f32, Self>,
+            b: &Vector<f32, Self>,
             op: Compare,
-        ) -> Vector<f32, N, Self> {
+        ) -> Vector<f32, Self> {
             a.compare(b, op)
         }
 
-        fn vector_compare_scalar<const N: usize>(
-            a: &Vector<f32, N, Self>,
+        fn vector_compare_scalar(
+            a: &Vector<f32, Self>,
             scalar: f32,
             op: Compare,
             scalar_left: bool,
-        ) -> Vector<f32, N, Self> {
+        ) -> Vector<f32, Self> {
             a.compare_scalar(scalar, op, scalar_left)
         }
 
-        fn vector_unary<const N: usize>(
-            a: &Vector<f32, N, Self>,
-            f: Analytic,
-        ) -> Vector<f32, N, Self> {
+        fn vector_unary(a: &Vector<f32, Self>, f: Analytic) -> Vector<f32, Self> {
             a.analytic(f)
         }
 
-        fn vector_unary_dual<const N: usize>(
-            value: &Vector<f32, N, Self>,
-            tangent: &Vector<f32, N, Self>,
+        fn vector_unary_dual(
+            value: &Vector<f32, Self>,
+            tangent: &Vector<f32, Self>,
             f: Analytic,
-        ) -> (Vector<f32, N, Self>, Vector<f32, N, Self>) {
-            match value.data.unary_dual(&tangent.data, f) {
-                Some((value, tangent)) => (Vector { data: value }, Vector { data: tangent }),
+        ) -> (Vector<f32, Self>, Vector<f32, Self>) {
+            match value.storage().unary_dual(tangent.storage(), f) {
+                Some((v, t)) => (
+                    Vector::from_storage(value.len(), v),
+                    Vector::from_storage(tangent.len(), t),
+                ),
                 None => {
-                    let (value, tangent) = Host::vector_unary_dual(
+                    let (v, t) = Host::vector_unary_dual(
                         &value.to_backend::<Host>(),
                         &tangent.to_backend::<Host>(),
                         f,
                     );
-                    (value.to_backend(), tangent.to_backend())
+                    (v.to_backend(), t.to_backend())
                 }
             }
         }
 
-        fn dot<const N: usize>(a: &Vector<f32, N, Self>, b: &Vector<f32, N, Self>) -> f32 {
+        fn dot(a: &Vector<f32, Self>, b: &Vector<f32, Self>) -> f32 {
             a.dot(b)
         }
 
-        fn vecmat<const N: usize, const C: usize>(
-            v: &Vector<f32, N, Self>,
-            m: &Matrix<f32, N, C, Self>,
-        ) -> Vector<f32, C, Self> {
+        fn vecmat(v: &Vector<f32, Self>, m: &Matrix<f32, Self>) -> Vector<f32, Self> {
             v.vecmat(m)
         }
 
-        fn matvec<const R: usize, const C: usize>(
-            m: &Matrix<f32, R, C, Self>,
-            v: &Vector<f32, C, Self>,
-        ) -> Vector<f32, R, Self> {
+        fn matvec(m: &Matrix<f32, Self>, v: &Vector<f32, Self>) -> Vector<f32, Self> {
             m.matvec(v)
         }
 
-        fn matvec_add<const R: usize, const C: usize>(
-            m: &Matrix<f32, R, C, Self>,
-            v: &Vector<f32, C, Self>,
-            addend: Vector<f32, R, Self>,
-        ) -> Vector<f32, R, Self> {
+        fn matvec_add(
+            m: &Matrix<f32, Self>,
+            v: &Vector<f32, Self>,
+            addend: Vector<f32, Self>,
+        ) -> Vector<f32, Self> {
             m.matvec_add(v, addend)
         }
 
-        fn matrix_elementwise<const R: usize, const C: usize>(
-            a: &Matrix<f32, R, C, Self>,
-            b: &Matrix<f32, R, C, Self>,
+        fn matrix_elementwise(
+            a: &Matrix<f32, Self>,
+            b: &Matrix<f32, Self>,
             op: BinaryOp,
-        ) -> Matrix<f32, R, C, Self> {
+        ) -> Matrix<f32, Self> {
             matrix_elementwise(a, b, op)
         }
 
-        fn matrix_broadcast<const R: usize, const C: usize>(
-            a: &Matrix<f32, R, C, Self>,
+        fn matrix_broadcast(
+            a: &Matrix<f32, Self>,
             scalar: f32,
             op: BinaryOp,
             scalar_left: bool,
-        ) -> Matrix<f32, R, C, Self> {
+        ) -> Matrix<f32, Self> {
             if scalar_left {
                 a.broadcast_left(scalar, op)
             } else {
@@ -844,76 +869,82 @@ mod gpu {
             }
         }
 
-        fn matrix_compare<const R: usize, const C: usize>(
-            a: &Matrix<f32, R, C, Self>,
-            b: &Matrix<f32, R, C, Self>,
+        fn matrix_compare(
+            a: &Matrix<f32, Self>,
+            b: &Matrix<f32, Self>,
             op: Compare,
-        ) -> Matrix<f32, R, C, Self> {
+        ) -> Matrix<f32, Self> {
             a.compare(b, op)
         }
 
-        fn matrix_compare_scalar<const R: usize, const C: usize>(
-            a: &Matrix<f32, R, C, Self>,
+        fn matrix_compare_scalar(
+            a: &Matrix<f32, Self>,
             scalar: f32,
             op: Compare,
             scalar_left: bool,
-        ) -> Matrix<f32, R, C, Self> {
+        ) -> Matrix<f32, Self> {
             a.compare_scalar(scalar, op, scalar_left)
         }
 
-        fn matrix_unary<const R: usize, const C: usize>(
-            a: &Matrix<f32, R, C, Self>,
-            f: Analytic,
-        ) -> Matrix<f32, R, C, Self> {
+        fn matrix_unary(a: &Matrix<f32, Self>, f: Analytic) -> Matrix<f32, Self> {
             a.analytic(f)
         }
 
-        fn matrix_unary_dual<const R: usize, const C: usize>(
-            value: &Matrix<f32, R, C, Self>,
-            tangent: &Matrix<f32, R, C, Self>,
+        fn matrix_unary_dual(
+            value: &Matrix<f32, Self>,
+            tangent: &Matrix<f32, Self>,
             f: Analytic,
-        ) -> (Matrix<f32, R, C, Self>, Matrix<f32, R, C, Self>) {
-            match value.data.unary_dual(&tangent.data, f) {
-                Some((value, tangent)) => (Matrix { data: value }, Matrix { data: tangent }),
+        ) -> (Matrix<f32, Self>, Matrix<f32, Self>) {
+            let (rows, cols) = value.shape();
+            match value.storage().unary_dual(tangent.storage(), f) {
+                Some((v, t)) => (
+                    Matrix::from_storage(rows, cols, v),
+                    Matrix::from_storage(rows, cols, t),
+                ),
                 None => {
-                    let (value, tangent) = Host::matrix_unary_dual(
+                    let (v, t) = Host::matrix_unary_dual(
                         &value.to_backend::<Host>(),
                         &tangent.to_backend::<Host>(),
                         f,
                     );
-                    (value.to_backend(), tangent.to_backend())
+                    (v.to_backend(), t.to_backend())
                 }
             }
         }
 
-        fn matmul<const R: usize, const K: usize, const C: usize>(
-            a: &Matrix<f32, R, K, Self>,
-            b: &Matrix<f32, K, C, Self>,
-        ) -> Matrix<f32, R, C, Self> {
+        fn matmul(a: &Matrix<f32, Self>, b: &Matrix<f32, Self>) -> Matrix<f32, Self> {
             a.matmul(b)
         }
 
-        fn matmul_add<const R: usize, const K: usize, const C: usize>(
-            a: &Matrix<f32, R, K, Self>,
-            b: &Matrix<f32, K, C, Self>,
-            addend: Matrix<f32, R, C, Self>,
-        ) -> Matrix<f32, R, C, Self> {
+        fn matmul_add(
+            a: &Matrix<f32, Self>,
+            b: &Matrix<f32, Self>,
+            addend: Matrix<f32, Self>,
+        ) -> Matrix<f32, Self> {
             a.matmul_add(b, addend)
         }
 
-        fn transpose<const R: usize, const C: usize>(
-            m: &Matrix<f32, R, C, Self>,
-        ) -> Matrix<f32, C, R, Self> {
+        fn transpose(m: &Matrix<f32, Self>) -> Matrix<f32, Self> {
             m.transpose()
         }
 
-        fn correlate<const R: usize, const C: usize, const KR: usize, const KC: usize>(
-            input: &Matrix<f32, R, C, Self>,
-            window: &Matrix<f32, KR, KC, Self>,
+        fn correlate(
+            input: &Matrix<f32, Self>,
+            window: &Matrix<f32, Self>,
             flip: bool,
-        ) -> Matrix<f32, { R - KR + 1 }, { C - KC + 1 }, Self> {
-            match input.data.correlate(&window.data, R, C, KR, KC, flip) {
-                Some(data) => Matrix { data },
+        ) -> Matrix<f32, Self> {
+            let (rows, cols) = input.shape();
+            let (window_rows, window_cols) = window.shape();
+            let (out_rows, out_cols) = correlation_shape(input.shape(), window.shape());
+            match input.storage().correlate(
+                window.storage(),
+                rows,
+                cols,
+                window_rows,
+                window_cols,
+                flip,
+            ) {
+                Some(data) => Matrix::from_storage(out_rows, out_cols, data),
                 None => Host::correlate(
                     &input.to_backend::<Host>(),
                     &window.to_backend::<Host>(),
@@ -923,56 +954,50 @@ mod gpu {
             }
         }
 
-        fn flip<const R: usize, const C: usize>(
-            input: &Matrix<f32, R, C, Self>,
-        ) -> Matrix<f32, R, C, Self> {
-            match input.data.flip(R, C) {
-                Some(data) => Matrix { data },
+        fn flip(input: &Matrix<f32, Self>) -> Matrix<f32, Self> {
+            let (rows, cols) = input.shape();
+            match input.storage().flip(rows, cols) {
+                Some(data) => Matrix::from_storage(rows, cols, data),
                 None => Host::flip(&input.to_backend::<Host>()).to_backend(),
             }
         }
 
-        fn correlate_window_gradient<
-            const R: usize,
-            const C: usize,
-            const KR: usize,
-            const KC: usize,
-        >(
-            input: &Matrix<f32, R, C, Self>,
-            adjoint: &Matrix<f32, { R - KR + 1 }, { C - KC + 1 }, Self>,
-        ) -> Matrix<f32, KR, KC, Self> {
+        fn correlate_window_gradient(
+            input: &Matrix<f32, Self>,
+            adjoint: &Matrix<f32, Self>,
+        ) -> Matrix<f32, Self> {
             // Correlating the input with the adjoint as the window leaves
-            // exactly `KR × KC`, and the storage layer takes those as numbers.
-            match input
-                .data
-                .correlate(&adjoint.data, R, C, R - KR + 1, C - KC + 1, false)
-            {
-                Some(data) => Matrix { data },
-                None => Host::correlate_window_gradient::<R, C, KR, KC>(
-                    &input.to_backend::<Host>(),
-                    &adjoint.to_backend::<Host>(),
-                )
-                .to_backend(),
-            }
+            // exactly the window's shape, and the storage layer takes the
+            // extents as numbers.
+            Self::correlate(input, adjoint, false)
         }
 
-        fn correlate_input_gradient<
-            const R: usize,
-            const C: usize,
-            const KR: usize,
-            const KC: usize,
-        >(
-            adjoint: &Matrix<f32, { R - KR + 1 }, { C - KC + 1 }, Self>,
-            window: &Matrix<f32, KR, KC, Self>,
+        fn correlate_input_gradient(
+            adjoint: &Matrix<f32, Self>,
+            window: &Matrix<f32, Self>,
             forward_flip: bool,
-        ) -> Matrix<f32, R, C, Self> {
-            let padded = adjoint.data.pad(R - KR + 1, C - KC + 1, KR - 1, KC - 1);
+        ) -> Matrix<f32, Self> {
+            let (out_rows, out_cols) = adjoint.shape();
+            let (window_rows, window_cols) = window.shape();
+            let (rows, cols) = (out_rows + window_rows - 1, out_cols + window_cols - 1);
+
+            let padded =
+                adjoint
+                    .storage()
+                    .pad(out_rows, out_cols, window_rows - 1, window_cols - 1);
             let full = padded.and_then(|padded| {
-                padded.correlate(&window.data, R + KR - 1, C + KC - 1, KR, KC, !forward_flip)
+                padded.correlate(
+                    window.storage(),
+                    rows + window_rows - 1,
+                    cols + window_cols - 1,
+                    window_rows,
+                    window_cols,
+                    !forward_flip,
+                )
             });
             match full {
-                Some(data) => Matrix { data },
-                None => Host::correlate_input_gradient::<R, C, KR, KC>(
+                Some(data) => Matrix::from_storage(rows, cols, data),
+                None => Host::correlate_input_gradient(
                     &adjoint.to_backend::<Host>(),
                     &window.to_backend::<Host>(),
                     forward_flip,
@@ -981,12 +1006,12 @@ mod gpu {
             }
         }
 
-        fn pad<const R: usize, const C: usize, const PR: usize, const PC: usize>(
-            input: &Matrix<f32, R, C, Self>,
-        ) -> Matrix<f32, { R + 2 * PR }, { C + 2 * PC }, Self> {
-            match input.data.pad(R, C, PR, PC) {
-                Some(data) => Matrix { data },
-                None => Host::pad::<R, C, PR, PC>(&input.to_backend::<Host>()).to_backend(),
+        fn pad(input: &Matrix<f32, Self>, pad_rows: usize, pad_cols: usize) -> Matrix<f32, Self> {
+            let (rows, cols) = input.shape();
+            let (padded_rows, padded_cols) = (rows + 2 * pad_rows, cols + 2 * pad_cols);
+            match input.storage().pad(rows, cols, pad_rows, pad_cols) {
+                Some(data) => Matrix::from_storage(padded_rows, padded_cols, data),
+                None => Host::pad(&input.to_backend::<Host>(), pad_rows, pad_cols).to_backend(),
             }
         }
     }

@@ -1,18 +1,21 @@
 //! Saving and loading tensors.
 //!
-//! [`Vector`] and [`Matrix`] carry their shapes as const generic parameters, so
-//! the shape of a tensor being loaded is fixed before the file is opened. That
-//! makes reading a checked operation rather than a parse: the stored shape has
-//! to agree with the one the target type names, and disagreement is an
-//! [`Error::Shape`] rather than a reinterpretation.
+//! [`Vector`] and [`Matrix`] carry their shapes as runtime fields, so the shape
+//! of a tensor being loaded comes *out of the file* rather than having to be
+//! known before it is opened. Reading is a parse: the header's extents become
+//! the tensor's extents, and a file written by one program can be read by
+//! another that has no idea how big it is.
 //!
-//! The element type needs the same protection and is the harder half. The
-//! numeric tower in [`numbers`](crate::numbers) has ten leaf types and lets
-//! [`Complex`] and [`Dual`] nest without limit, and it deliberately carries no
-//! runtime type tag. Nothing in `[f32; 4]` distinguishes it from `[i32; 4]` once
-//! it reaches a file, so the format records an element tag and loading checks
-//! it. Reading an `f32` file into a `Matrix<i32, R, C>` fails with
-//! [`Error::Format`] instead of silently handing back reinterpreted bits.
+//! The element type needs protection that a shape no longer does, and is the
+//! harder half. The numeric tower in [`numbers`](crate::numbers) has ten leaf
+//! types and lets [`Complex`] and [`Dual`] nest without limit, and it
+//! deliberately carries no runtime type tag. Nothing in four `f32` distinguishes
+//! them from four `i32` once they reach a file, so the format records an element
+//! tag and loading checks it. Reading an `f32` file into a `Matrix<i32>` fails
+//! with [`Error::Format`] instead of silently handing back reinterpreted bits.
+//!
+//! Loading a vector still checks one thing about the shape: the file has to hold
+//! a vector rather than a matrix, which is the `kind` byte, not the extents.
 //!
 //! The entry points are [`Vector::write_to`] / [`Vector::read_from`] over any
 //! [`Write`] / [`Read`], with [`Vector::save`] / [`Vector::load`] as filesystem
@@ -24,14 +27,17 @@
 //! ```
 //! use tensorcrate::tensors::Matrix;
 //!
-//! let m = Matrix::<f64, 2, 2>::from_rows([[1.0, 2.0], [3.0, 4.0]]);
+//! let m = Matrix::<f64>::from_rows([[1.0, 2.0], [3.0, 4.0]]);
 //! let mut bytes = Vec::new();
 //! m.write_to(&mut bytes)?;
 //!
-//! assert_eq!(Matrix::<f64, 2, 2>::read_from(&bytes[..])?, m);
+//! // The shape is read back from the file, not asserted beforehand.
+//! let loaded = Matrix::<f64>::read_from(&bytes[..])?;
+//! assert_eq!(loaded.shape(), (2, 2));
+//! assert_eq!(loaded, m);
 //!
-//! // The shape is part of the type, so a wrong one cannot slip through.
-//! assert!(Matrix::<f64, 4, 1>::read_from(&bytes[..]).is_err());
+//! // The element type is still checked, and still cannot slip through.
+//! assert!(Matrix::<i32>::read_from(&bytes[..]).is_err());
 //! # Ok::<(), tensorcrate::errors::Error>(())
 //! ```
 //!
@@ -62,7 +68,7 @@ use std::path::Path;
 
 use crate::errors::Error;
 use crate::numbers::{Coefficient, Complex, Dual};
-use crate::tensors::{Matrix, Vector};
+use crate::tensors::{Host, Matrix, Vector};
 
 const MAGIC: [u8; 4] = *b"TCR1";
 const VERSION: u8 = 1;
@@ -213,14 +219,9 @@ fn write_header<W: Write, T: Storable>(
     Ok(())
 }
 
-/// Reads and validates a header against the shape and element type the caller
-/// is loading into.
-fn read_header<Rd: Read, T: Storable>(
-    reader: &mut Rd,
-    kind: u8,
-    rows: usize,
-    cols: usize,
-) -> Result<(), Error> {
+/// Reads a header, validates everything that is not a shape, and returns the
+/// stored extents for the caller to build a tensor of.
+fn read_header<Rd: Read, T: Storable>(reader: &mut Rd, kind: u8) -> Result<(usize, usize), Error> {
     let mut magic = [0u8; 4];
     reader.read_exact(&mut magic)?;
     if magic != MAGIC {
@@ -263,13 +264,23 @@ fn read_header<Rd: Read, T: Storable>(
     reader.read_exact(&mut extents)?;
     let stored_rows = u64::from_le_bytes(extents[..8].try_into().expect("8 bytes"));
     let stored_cols = u64::from_le_bytes(extents[8..].try_into().expect("8 bytes"));
-    if stored_rows != rows as u64 || stored_cols != cols as u64 {
-        return Err(Error::shape(format!(
-            "stored tensor is {stored_rows}×{stored_cols}, but the target type is {rows}×{cols}"
-        )));
-    }
 
-    Ok(())
+    let (rows, cols) = (
+        usize::try_from(stored_rows).map_err(|_| too_large(stored_rows))?,
+        usize::try_from(stored_cols).map_err(|_| too_large(stored_cols))?,
+    );
+    rows.checked_mul(cols).ok_or_else(|| {
+        Error::format(format!(
+            "stored tensor is {rows}\u{d7}{cols}, which overflows this platform's address space"
+        ))
+    })?;
+    Ok((rows, cols))
+}
+
+fn too_large(extent: u64) -> Error {
+    Error::format(format!(
+        "stored extent {extent} does not fit in this platform's usize"
+    ))
 }
 
 fn name_of_kind(kind: u8) -> &'static str {
@@ -280,29 +291,29 @@ fn name_of_kind(kind: u8) -> &'static str {
     }
 }
 
-impl<T: Storable, const N: usize> Vector<T, N> {
+impl<T: Storable> Vector<T, Host> {
     /// Writes this vector to `writer`.
     ///
     /// Elements go out one at a time, so a `writer` that syscalls per write —
     /// a bare [`File`] — should be wrapped in a [`BufWriter`]. [`save`](Self::save)
     /// does that for you.
     pub fn write_to<W: Write>(&self, mut writer: W) -> Result<(), Error> {
-        write_header::<W, T>(&mut writer, KIND_VECTOR, N, 1)?;
+        write_header::<W, T>(&mut writer, KIND_VECTOR, self.len(), 1)?;
         for value in self.data() {
             value.write_value(&mut writer)?;
         }
         Ok(())
     }
 
-    /// Reads a vector of exactly this length and element type.
+    /// Reads a vector of this element type, taking its length from the file.
     ///
-    /// Fails with [`Error::Shape`] if the stored length is different, and
-    /// [`Error::Format`] if the element type is.
+    /// Fails with [`Error::Format`] if the stored element type differs, or if
+    /// the bytes are a matrix rather than a vector.
     pub fn read_from<Rd: Read>(mut reader: Rd) -> Result<Self, Error> {
-        read_header::<Rd, T>(&mut reader, KIND_VECTOR, N, 1)?;
-        let mut data = [T::zero(); N];
-        for slot in data.iter_mut() {
-            *slot = T::read_value(&mut reader)?;
+        let (len, _) = read_header::<Rd, T>(&mut reader, KIND_VECTOR)?;
+        let mut data = Vec::with_capacity(len);
+        for _ in 0..len {
+            data.push(T::read_value(&mut reader)?);
         }
         Ok(Vector::new(data))
     }
@@ -322,33 +333,30 @@ impl<T: Storable, const N: usize> Vector<T, N> {
     }
 }
 
-impl<T: Storable, const R: usize, const C: usize> Matrix<T, R, C> {
+impl<T: Storable> Matrix<T, Host> {
     /// Writes this matrix to `writer` in row-major order.
     ///
     /// As with [`Vector::write_to`], wrap an unbuffered sink.
     pub fn write_to<W: Write>(&self, mut writer: W) -> Result<(), Error> {
-        write_header::<W, T>(&mut writer, KIND_MATRIX, R, C)?;
-        for row in self.data() {
-            for value in row {
-                value.write_value(&mut writer)?;
-            }
+        let (rows, cols) = self.shape();
+        write_header::<W, T>(&mut writer, KIND_MATRIX, rows, cols)?;
+        for value in self.data() {
+            value.write_value(&mut writer)?;
         }
         Ok(())
     }
 
-    /// Reads a matrix of exactly this shape and element type.
+    /// Reads a matrix of this element type, taking its shape from the file.
     ///
-    /// Fails with [`Error::Shape`] if the stored shape is different, and
-    /// [`Error::Format`] if the element type is.
+    /// Fails with [`Error::Format`] if the stored element type differs, or if
+    /// the bytes are a vector rather than a matrix.
     pub fn read_from<Rd: Read>(mut reader: Rd) -> Result<Self, Error> {
-        read_header::<Rd, T>(&mut reader, KIND_MATRIX, R, C)?;
-        let mut data = [[T::zero(); C]; R];
-        for row in data.iter_mut() {
-            for slot in row.iter_mut() {
-                *slot = T::read_value(&mut reader)?;
-            }
+        let (rows, cols) = read_header::<Rd, T>(&mut reader, KIND_MATRIX)?;
+        let mut data = Vec::with_capacity(rows * cols);
+        for _ in 0..rows * cols {
+            data.push(T::read_value(&mut reader)?);
         }
-        Ok(Matrix::from_rows(data))
+        Ok(Matrix::from_flat(rows, cols, data))
     }
 
     /// Writes this matrix to a file, replacing it if it exists.
@@ -386,8 +394,14 @@ mod tag_tests {
     #[test]
     fn descriptions_round_trip_the_tag() {
         assert_eq!(describe(&tag_of::<i16>()), "i16");
-        assert_eq!(describe(&tag_of::<Complex<Dual<f64>>>()), "Complex<Dual<f64>>");
-        assert_eq!(describe(&tag_of::<Dual<Complex<f32>>>()), "Dual<Complex<f32>>");
+        assert_eq!(
+            describe(&tag_of::<Complex<Dual<f64>>>()),
+            "Complex<Dual<f64>>"
+        );
+        assert_eq!(
+            describe(&tag_of::<Dual<Complex<f32>>>()),
+            "Dual<Complex<f32>>"
+        );
     }
 
     #[test]

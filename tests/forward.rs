@@ -2,7 +2,7 @@
 //!
 //! Three independent checks run against every rule:
 //!
-//! 1. the existing scalar `Dual<f32>` path over `Vector<Dual<f32>, N>` — the
+//! 1. the existing scalar `Dual<f32>` path over `Vector<Dual<f32>>` — the
 //!    oracle, since it is derived from the algebra in `numbers.rs`;
 //! 2. central finite differences, which catch a rule that is self-consistently
 //!    wrong in both implementations;
@@ -40,23 +40,31 @@ fn value(index: usize) -> f32 {
     0.15 + (index % 5) as f32 * 0.17
 }
 
-fn vector<const N: usize>() -> Vector<f32, N> {
-    Vector::new(std::array::from_fn(value))
+fn vector(len: usize) -> Vector<f32> {
+    Vector::new((0..len).map(value).collect::<Vec<_>>())
 }
 
-fn direction<const N: usize>() -> Vector<f32, N> {
-    Vector::new(std::array::from_fn(|i| 0.5 - (i % 3) as f32 * 0.4))
+fn direction(len: usize) -> Vector<f32> {
+    Vector::new(
+        (0..len)
+            .map(|i| 0.5 - (i % 3) as f32 * 0.4)
+            .collect::<Vec<_>>(),
+    )
 }
 
-fn matrix<const R: usize, const C: usize>() -> Matrix<f32, R, C> {
-    Matrix::from_rows(std::array::from_fn(|row| {
-        std::array::from_fn(|col| value(row * C + col + row))
+fn matrix(rows: usize, cols: usize) -> Matrix<f32> {
+    Matrix::from_rows((0..rows).map(|row| {
+        (0..cols)
+            .map(|col| value(row * cols + col + row))
+            .collect::<Vec<_>>()
     }))
 }
 
-fn matrix_direction<const R: usize, const C: usize>() -> Matrix<f32, R, C> {
-    Matrix::from_rows(std::array::from_fn(|row| {
-        std::array::from_fn(|col| 0.3 - ((row + col) % 4) as f32 * 0.2)
+fn matrix_direction(rows: usize, cols: usize) -> Matrix<f32> {
+    Matrix::from_rows((0..rows).map(|row| {
+        (0..cols)
+            .map(|col| 0.3 - ((row + col) % 4) as f32 * 0.2)
+            .collect::<Vec<_>>()
     }))
 }
 
@@ -67,13 +75,13 @@ fn matrix_direction<const R: usize, const C: usize>() -> Matrix<f32, R, C> {
 #[allow(clippy::op_ref)]
 #[test]
 fn elementwise_rules_match_the_scalar_dual_path() {
-    let (a, b) = (vector::<12>(), direction::<12>().shift_up());
-    let (da, db) = (direction::<12>(), vector::<12>());
+    let (a, b) = (vector(12), direction(12).shift_up());
+    let (da, db) = (direction(12), vector(12));
 
-    let dual_a = DualVector::<12>::new(a, da);
-    let dual_b = DualVector::<12>::new(b, db);
+    let dual_a = DualVector::new(a, da);
+    let dual_b = DualVector::new(b, db);
 
-    // The oracle: the same inputs as a `Vector<Dual<f32>, N>`, where every
+    // The oracle: the same inputs as a `Vector<Dual<f32>>`, where every
     // operation is the scalar dual arithmetic from `numbers.rs`.
     let oracle_a = dual_a.to_dual_vector();
     let oracle_b = dual_b.to_dual_vector();
@@ -92,10 +100,10 @@ fn elementwise_rules_match_the_scalar_dual_path() {
             BinaryOp::Rem => unreachable!(),
         };
         let expected = match op {
-            BinaryOp::Add => oracle_a + oracle_b,
-            BinaryOp::Sub => oracle_a - oracle_b,
-            BinaryOp::Mul => oracle_a * oracle_b,
-            BinaryOp::Div => oracle_a / oracle_b,
+            BinaryOp::Add => oracle_a.clone() + oracle_b.clone(),
+            BinaryOp::Sub => oracle_a.clone() - oracle_b.clone(),
+            BinaryOp::Mul => oracle_a.clone() * oracle_b.clone(),
+            BinaryOp::Div => oracle_a.clone() / oracle_b.clone(),
             BinaryOp::Rem => unreachable!(),
         };
         for (index, dual) in expected.data().iter().enumerate() {
@@ -115,9 +123,9 @@ fn elementwise_rules_match_the_scalar_dual_path() {
 
 #[test]
 fn every_analytic_function_matches_the_scalar_dual_path() {
-    let a = vector::<8>();
-    let da = direction::<8>();
-    let dual = DualVector::<8>::new(a, da);
+    let a = vector(8);
+    let da = direction(8);
+    let dual = DualVector::new(a, da);
     let oracle = dual.to_dual_vector();
 
     use tensorcrate::numbers::{
@@ -125,7 +133,7 @@ fn every_analytic_function_matches_the_scalar_dual_path() {
     };
 
     // `arcsin`/`arccos` need |x| < 1, which `value()` satisfies.
-    let cases: [(&str, DualVector<8>, Vector<Dual<f32>, 8>); 13] = [
+    let cases: [(&str, DualVector, Vector<Dual<f32>>); 13] = [
         ("sin", dual.sin(), oracle.map(|&x| Sin::sin(x))),
         ("cos", dual.cos(), oracle.map(|&x| Cos::cos(x))),
         ("tan", dual.tan(), oracle.map(|&x| Tan::tan(x))),
@@ -159,17 +167,17 @@ fn every_analytic_function_matches_the_scalar_dual_path() {
 
 #[test]
 fn products_match_the_dual_coefficient_path() {
-    // `Matrix<Dual<f32>, R, C>` already supports matmul through `Coefficient`,
+    // `Matrix<Dual<f32>>` already supports matmul through `Coefficient`,
     // so the whole product rule can be checked against it at once.
-    let (a, da) = (matrix::<4, 5>(), matrix_direction::<4, 5>());
-    let (b, db) = (matrix::<5, 3>(), matrix_direction::<5, 3>());
+    let (a, da) = (matrix(4, 5), matrix_direction(4, 5));
+    let (b, db) = (matrix(5, 3), matrix_direction(5, 3));
 
-    let dual_a = DualMatrix::<4, 5>::new(a, da);
-    let dual_b = DualMatrix::<5, 3>::new(b, db);
+    let dual_a = DualMatrix::new(a, da.clone());
+    let dual_b = DualMatrix::new(b, db);
     let product = dual_a.matmul(&dual_b);
 
     let oracle = dual_a.to_dual_matrix().matmul(&dual_b.to_dual_matrix());
-    for (row, expected_row) in oracle.data().iter().enumerate() {
+    for (row, expected_row) in oracle.to_rows().iter().enumerate() {
         for (col, expected) in expected_row.iter().enumerate() {
             assert!(
                 close(product.value().to_rows()[row][col], expected.real),
@@ -185,8 +193,8 @@ fn products_match_the_dual_coefficient_path() {
     }
 
     // matvec and dot follow the same rule.
-    let (v, dv) = (vector::<5>(), direction::<5>());
-    let dual_v = DualVector::<5>::new(v, dv);
+    let (v, dv) = (vector(5), direction(5));
+    let dual_v = DualVector::new(v, dv);
     let mapped = dual_a.matvec(&dual_v);
     let oracle_mapped = dual_a.to_dual_matrix().matvec(&dual_v.to_dual_vector());
     for (index, expected) in oracle_mapped.data().iter().enumerate() {
@@ -200,7 +208,7 @@ fn products_match_the_dual_coefficient_path() {
     assert!(close(self_dot.dual, oracle_dot.dual));
 
     // vecmat, and transposition of both parts.
-    let row_vector = DualVector::<4>::new(vector::<4>(), direction::<4>());
+    let row_vector = DualVector::new(vector(4), direction(4));
     let through_matrix = row_vector.vecmat(&dual_a);
     let oracle_row = row_vector.to_dual_vector().vecmat(&dual_a.to_dual_matrix());
     for (index, expected) in oracle_row.data().iter().enumerate() {
@@ -223,26 +231,26 @@ fn products_match_the_dual_coefficient_path() {
 
 /// A test function exercising products, an analytic function and a reduction:
 /// `f(x) = Σ tanh(Ax) ⊙ (x ⊙ x)`.
-fn probe<const N: usize, B: Kernels>(a: &Matrix<f32, N, N, B>, x: &DualVector<N, B>) -> Dual<f32> {
+fn probe<B: Kernels>(a: &Matrix<f32, Host>, x: &DualVector<B>) -> Dual<f32> {
     let mapped = DualMatrix::constant(a.to_backend::<B>()).matvec(x).tanh();
     (&mapped * &(x * x)).sum()
 }
 
 #[test]
 fn gradients_match_central_finite_differences() {
-    let a = matrix::<4, 4>();
-    let at = vector::<4>();
+    let a = matrix(4, 4);
+    let at = vector(4);
 
     let analytic = gradient(&at, |x| probe(&a, x));
 
     let step = 1e-3f32;
     for input in 0..4 {
-        let mut forward = *at.data();
-        let mut backward = *at.data();
+        let mut forward = at.data().to_vec();
+        let mut backward = at.data().to_vec();
         forward[input] += step;
         backward[input] -= step;
-        let numeric = (probe(&a, &DualVector::constant(Vector::new(forward))).real
-            - probe(&a, &DualVector::constant(Vector::new(backward))).real)
+        let numeric = (probe(&a, &DualVector::constant(Vector::new(forward.clone()))).real
+            - probe(&a, &DualVector::constant(Vector::new(backward.clone()))).real)
             / (2.0 * step);
         assert!(
             (analytic.as_slice()[input] - numeric).abs() < 5e-3,
@@ -255,17 +263,17 @@ fn gradients_match_central_finite_differences() {
 #[test]
 fn jacobian_columns_are_the_seeded_tangents() {
     // f(x) = A·(x ⊙ x), so J = 2·A·diag(x).
-    let a = matrix::<3, 4>();
-    let at = vector::<4>();
-    let computed = jacobian::<4, 3, Host>(&at, |x| DualMatrix::constant(a).matvec(&(x * x)));
+    let a = matrix(3, 4);
+    let at = vector(4);
+    let computed = jacobian::<Host>(&at, |x| DualMatrix::constant(a.clone()).matvec(&(x * x)));
 
     for row in 0..3 {
         for col in 0..4 {
-            let expected = 2.0 * a.data()[row][col] * at.data()[col];
+            let expected = 2.0 * a[(row, col)] * at[col];
             assert!(
-                close(computed.data()[row][col], expected),
+                close(computed[(row, col)], expected),
                 "J[{row},{col}]: {} vs {expected}",
-                computed.data()[row][col]
+                computed[(row, col)]
             );
         }
     }
@@ -273,15 +281,17 @@ fn jacobian_columns_are_the_seeded_tangents() {
 
 #[test]
 fn fused_multiply_adds_propagate_every_tangent() {
-    let a = matrix::<3, 4>();
-    let da = matrix_direction::<3, 4>();
-    let x = vector::<4>();
-    let dx = direction::<4>();
-    let bias = vector::<3>();
-    let dbias = direction::<3>();
+    let a = matrix(3, 4);
+    let da = matrix_direction(3, 4);
+    let x = vector(4);
+    let dx = direction(4);
+    let bias = vector(3);
+    let dbias = direction(3);
 
-    let fused =
-        DualMatrix::new(a, da).matvec_add(&DualVector::new(x, dx), &DualVector::new(bias, dbias));
+    let fused = DualMatrix::new(a.clone(), da.clone()).matvec_add(
+        &DualVector::new(x.clone(), dx.clone()),
+        &DualVector::new(bias.clone(), dbias.clone()),
+    );
     assert_slice_close(
         fused.value().as_slice(),
         a.matvec_add(&x, bias).as_slice(),
@@ -293,12 +303,14 @@ fn fused_multiply_adds_propagate_every_tangent() {
         "fused matvec tangent",
     );
 
-    let b = matrix::<4, 2>();
-    let db = matrix_direction::<4, 2>();
-    let addend = matrix::<3, 2>();
-    let daddend = matrix_direction::<3, 2>();
-    let fused = DualMatrix::new(a, da)
-        .matmul_add(&DualMatrix::new(b, db), &DualMatrix::new(addend, daddend));
+    let b = matrix(4, 2);
+    let db = matrix_direction(4, 2);
+    let addend = matrix(3, 2);
+    let daddend = matrix_direction(3, 2);
+    let fused = DualMatrix::new(a.clone(), da.clone()).matmul_add(
+        &DualMatrix::new(b.clone(), db.clone()),
+        &DualMatrix::new(addend.clone(), daddend.clone()),
+    );
     assert_slice_close(
         fused.value().as_slice(),
         a.matmul_add(&b, addend).as_slice(),
@@ -313,19 +325,16 @@ fn fused_multiply_adds_propagate_every_tangent() {
 
 #[test]
 fn constants_have_no_tangent_and_seeds_are_one_hot() {
-    let constant = DualVector::<5>::constant(vector::<5>());
-    assert_eq!(constant.tangent().to_array(), [0.0; 5]);
-    assert_eq!(constant.sin().tangent().to_array(), [0.0; 5]);
+    let constant = DualVector::constant(vector(5));
+    assert_eq!(constant.tangent().to_vec(), [0.0; 5]);
+    assert_eq!(constant.sin().tangent().to_vec(), [0.0; 5]);
 
-    let seeded = DualVector::<5>::seed(vector::<5>(), 2);
-    assert_eq!(seeded.tangent().to_array(), [0.0, 0.0, 1.0, 0.0, 0.0]);
+    let seeded = DualVector::seed(vector(5), 2);
+    assert_eq!(seeded.tangent().to_vec(), [0.0, 0.0, 1.0, 0.0, 0.0]);
     // An out-of-range seed differentiates with respect to nothing.
-    assert_eq!(
-        DualVector::<5>::seed(vector::<5>(), 9).tangent().to_array(),
-        [0.0; 5]
-    );
+    assert_eq!(DualVector::seed(vector(5), 9).tangent().to_vec(), [0.0; 5]);
 
-    let matrix_seed = DualMatrix::<2, 3>::seed(matrix::<2, 3>(), 1, 2);
+    let matrix_seed = DualMatrix::seed(matrix(2, 3), 1, 2);
     assert_eq!(
         matrix_seed.tangent().to_rows(),
         [[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
@@ -334,13 +343,13 @@ fn constants_have_no_tangent_and_seeds_are_one_hot() {
 
 #[test]
 fn scalar_helpers_follow_the_product_and_quotient_rules() {
-    let x = DualVector::<4>::new(vector::<4>(), direction::<4>());
+    let x = DualVector::new(vector(4), direction(4));
 
     // A constant shift leaves the tangent alone; a constant scale multiplies it.
-    assert_eq!(x.shift(2.5).tangent().to_array(), x.tangent().to_array());
+    assert_eq!(x.shift(2.5).tangent().to_vec(), x.tangent().to_vec());
     assert_slice_close(
         x.scale(3.0).tangent().as_slice(),
-        &x.tangent().scale(3.0).to_array(),
+        &x.tangent().scale(3.0).to_vec(),
         "scale",
     );
 
@@ -382,17 +391,17 @@ fn scalar_helpers_follow_the_product_and_quotient_rules() {
 #[allow(clippy::op_ref)]
 #[test]
 fn the_metal_backend_agrees_with_the_host_backend() {
-    let (a, da) = (matrix::<8, 8>(), matrix_direction::<8, 8>());
-    let (b, db) = (matrix::<8, 8>(), matrix_direction::<8, 8>());
-    let (v, dv) = (vector::<8>(), direction::<8>());
+    let (a, da) = (matrix(8, 8), matrix_direction(8, 8));
+    let (b, db) = (matrix(8, 8), matrix_direction(8, 8));
+    let (v, dv) = (vector(8), direction(8));
 
-    let host_a = DualMatrix::<8, 8, Host>::new(a, da);
-    let host_b = DualMatrix::<8, 8, Host>::new(b, db);
-    let host_v = DualVector::<8, Host>::new(v, dv);
+    let host_a = DualMatrix::<Host>::new(a.clone(), da.clone());
+    let host_b = DualMatrix::<Host>::new(b.clone(), db.clone());
+    let host_v = DualVector::<Host>::new(v.clone(), dv.clone());
 
-    let gpu_a = DualMatrix::<8, 8, Metal>::new(a.to_backend(), da.to_backend());
-    let gpu_b = DualMatrix::<8, 8, Metal>::new(b.to_backend(), db.to_backend());
-    let gpu_v = DualVector::<8, Metal>::new(v.to_backend(), dv.to_backend());
+    let gpu_a = DualMatrix::<Metal>::new(a.to_backend(), da.to_backend());
+    let gpu_b = DualMatrix::<Metal>::new(b.to_backend(), db.to_backend());
+    let gpu_v = DualVector::<Metal>::new(v.to_backend(), dv.to_backend());
 
     // A chain with a product, an elementwise product, an analytic function and a
     // scalar — every kind of rule at once.
@@ -439,7 +448,7 @@ fn the_metal_backend_agrees_with_the_host_backend() {
     // And the primal-only analytic path the `unary` kernel serves.
     assert_slice_close(
         v.to_backend::<Metal>().analytic(Analytic::Tanh).as_slice(),
-        &v.map(|&x| x.tanh()).to_array(),
+        &v.map(|&x| x.tanh()).to_vec(),
         "primal tanh",
     );
 }
@@ -450,9 +459,9 @@ fn the_metal_backend_agrees_with_the_host_backend() {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn every_analytic_variant_agrees_between_the_shader_and_the_cpu_table() {
-    let (v, dv) = (vector::<16>(), direction::<16>());
-    let host = DualVector::<16, Host>::new(v, dv);
-    let gpu = DualVector::<16, Metal>::new(v.to_backend(), dv.to_backend());
+    let (v, dv) = (vector(16), direction(16));
+    let host = DualVector::<Host>::new(v.clone(), dv.clone());
+    let gpu = DualVector::<Metal>::new(v.to_backend(), dv.to_backend());
 
     let gpu_v = v.to_backend::<Metal>();
     for f in Analytic::ALL {
@@ -485,7 +494,7 @@ trait AnalyticOnHost {
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
-impl<const N: usize> AnalyticOnHost for Vector<f32, N, Host> {
+impl AnalyticOnHost for Vector<f32, Host> {
     fn analytic_on_host(&self, f: Analytic) -> Self {
         Host::vector_unary(self, f)
     }
@@ -497,7 +506,7 @@ trait ShiftUp {
     fn shift_up(self) -> Self;
 }
 
-impl<const N: usize> ShiftUp for Vector<f32, N> {
+impl ShiftUp for Vector<f32> {
     fn shift_up(self) -> Self {
         self.broadcast_right(2.0, BinaryOp::Add)
     }
@@ -507,43 +516,36 @@ impl<const N: usize> ShiftUp for Vector<f32, N> {
 
 #[test]
 fn flattening_round_trips_and_reshapes_preserve_row_major_order() {
-    let (m, dm) = (matrix::<2, 3>(), matrix_direction::<2, 3>());
-    let dual = DualMatrix::<2, 3>::new(m, dm);
+    let (m, dm) = (matrix(2, 3), matrix_direction(2, 3));
+    let dual = DualMatrix::new(m.clone(), dm.clone());
 
     let flat = dual.flattened();
     assert_eq!(flat.value().as_slice(), m.as_slice());
     assert_eq!(flat.tangent().as_slice(), dm.as_slice());
 
-    let restored = DualMatrix::<2, 3>::from_flattened(flat);
+    let restored = DualMatrix::from_flattened(2, 3, flat);
     assert_eq!(restored.value().to_rows(), m.to_rows());
     assert_eq!(restored.tangent().to_rows(), dm.to_rows());
 
     // A vector viewed as a one-row or one-column matrix keeps its elements.
-    let v = DualVector::<4>::new(vector::<4>(), direction::<4>());
-    let row = v.into_row();
-    assert_eq!(row.value().to_rows()[0], vector::<4>().to_array());
+    let v = DualVector::new(vector(4), direction(4));
+    let row = v.clone().into_row();
+    assert_eq!(row.value().to_rows()[0], vector(4).to_vec());
     let column = v.into_column();
-    assert_eq!(column.value().to_rows()[2][0], vector::<4>().to_array()[2]);
+    assert_eq!(column.value().to_rows()[2][0], vector(4).to_vec()[2]);
     assert_eq!(column.value().shape(), (4, 1));
 }
 
 /// `f(A) = ‖A·x‖²`, whose gradient with respect to `A` is `2(Ax)xᵀ`.
-fn projection_energy<const R: usize, const C: usize, B: Kernels>(
-    x: &Vector<f32, C, B>,
-    a: &DualMatrix<R, C, B>,
-) -> Dual<f32> {
-    let mapped = a.matvec(&DualVector::constant(duplicate(x)));
+fn projection_energy<B: Kernels>(x: &Vector<f32, Host>, a: &DualMatrix<B>) -> Dual<f32> {
+    let mapped = a.matvec(&DualVector::constant(x.to_backend::<B>()));
     mapped.dot(&mapped)
-}
-
-fn duplicate<const N: usize, B: Kernels>(v: &Vector<f32, N, B>) -> Vector<f32, N, B> {
-    v.to_backend::<B>()
 }
 
 #[test]
 fn gradient_wrt_matrix_matches_the_closed_form_and_finite_differences() {
-    let a = matrix::<3, 4>();
-    let x = vector::<4>();
+    let a = matrix(3, 4);
+    let x = vector(4);
 
     let computed = gradient_wrt_matrix(&a, |m| projection_energy(&x, m));
 
@@ -551,11 +553,11 @@ fn gradient_wrt_matrix_matches_the_closed_form_and_finite_differences() {
     let projected = a.matvec(&x);
     for row in 0..3 {
         for col in 0..4 {
-            let expected = 2.0 * projected.data()[row] * x.data()[col];
+            let expected = 2.0 * projected[row] * x[col];
             assert!(
-                close(computed.data()[row][col], expected),
+                close(computed[(row, col)], expected),
                 "∂f/∂A[{row},{col}]: {} vs {expected}",
-                computed.data()[row][col]
+                computed[(row, col)]
             );
         }
     }
@@ -564,19 +566,25 @@ fn gradient_wrt_matrix_matches_the_closed_form_and_finite_differences() {
     let step = 1e-3f32;
     for row in 0..3 {
         for col in 0..4 {
-            let mut forward = *a.data();
-            let mut backward = *a.data();
+            let mut forward = a.to_rows();
+            let mut backward = a.to_rows();
             forward[row][col] += step;
             backward[row][col] -= step;
-            let numeric =
-                (projection_energy(&x, &DualMatrix::constant(Matrix::from_rows(forward))).real
-                    - projection_energy(&x, &DualMatrix::constant(Matrix::from_rows(backward)))
-                        .real)
-                    / (2.0 * step);
+            let numeric = (projection_energy(
+                &x,
+                &DualMatrix::constant(Matrix::from_rows(forward.clone())),
+            )
+            .real
+                - projection_energy(
+                    &x,
+                    &DualMatrix::constant(Matrix::from_rows(backward.clone())),
+                )
+                .real)
+                / (2.0 * step);
             assert!(
-                (computed.data()[row][col] - numeric).abs() < 5e-3,
+                (computed[(row, col)] - numeric).abs() < 5e-3,
                 "∂f/∂A[{row},{col}]: forward mode {} vs finite difference {numeric}",
-                computed.data()[row][col]
+                computed[(row, col)]
             );
         }
     }
@@ -585,18 +593,18 @@ fn gradient_wrt_matrix_matches_the_closed_form_and_finite_differences() {
 #[test]
 fn jacobian_wrt_matrix_has_one_column_per_input_element() {
     // f(A) = A·x, so ∂(Ax)ᵢ/∂Aⱼₖ = δᵢⱼ·xₖ.
-    let a = matrix::<3, 4>();
-    let x = vector::<4>();
-    let computed = jacobian_wrt_matrix(&a, |m| m.matvec(&DualVector::constant(x)));
+    let a = matrix(3, 4);
+    let x = vector(4);
+    let computed = jacobian_wrt_matrix(&a, |m| m.matvec(&DualVector::constant(x.clone())));
 
     for output in 0..3 {
         for row in 0..3 {
             for col in 0..4 {
-                let expected = if output == row { x.data()[col] } else { 0.0 };
+                let expected = if output == row { x[col] } else { 0.0 };
                 assert!(
-                    close(computed.data()[output][row * 4 + col], expected),
+                    close(computed[(output, row * 4 + col)], expected),
                     "J[{output}, ({row},{col})]: {} vs {expected}",
-                    computed.data()[output][row * 4 + col]
+                    computed[(output, row * 4 + col)]
                 );
             }
         }
@@ -606,16 +614,18 @@ fn jacobian_wrt_matrix_has_one_column_per_input_element() {
 #[test]
 fn a_matrix_valued_function_flattens_into_a_square_jacobian() {
     // f(A) = A·B, so ∂(AB)ᵢⱼ/∂Aₖₗ = δᵢₖ·Bₗⱼ.
-    let a = matrix::<2, 2>();
-    let b = matrix_direction::<2, 2>();
-    let computed = jacobian_wrt_matrix(&a, |m| m.matmul(&DualMatrix::constant(b)).into_flattened());
+    let a = matrix(2, 2);
+    let b = matrix_direction(2, 2);
+    let computed = jacobian_wrt_matrix(&a, |m| {
+        m.matmul(&DualMatrix::constant(b.clone())).into_flattened()
+    });
 
     for i in 0..2 {
         for j in 0..2 {
             for k in 0..2 {
                 for l in 0..2 {
-                    let expected = if i == k { b.data()[l][j] } else { 0.0 };
-                    let actual = computed.data()[i * 2 + j][k * 2 + l];
+                    let expected = if i == k { b[(l, j)] } else { 0.0 };
+                    let actual = computed[(i * 2 + j, k * 2 + l)];
                     assert!(
                         close(actual, expected),
                         "J[({i},{j}),({k},{l})]: {actual} vs {expected}"
@@ -629,13 +639,11 @@ fn a_matrix_valued_function_flattens_into_a_square_jacobian() {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn matrix_derivatives_agree_between_the_backends() {
-    let a = matrix::<4, 5>();
-    let x = vector::<5>();
+    let a = matrix(4, 5);
+    let x = vector(5);
 
     let host = gradient_wrt_matrix(&a, |m| projection_energy(&x, m));
-    let resident = gradient_wrt_matrix(&a.to_backend::<Metal>(), |m| {
-        projection_energy(&x.to_backend::<Metal>(), m)
-    });
+    let resident = gradient_wrt_matrix(&a.to_backend::<Metal>(), |m| projection_energy(&x, m));
     assert_slice_close(
         resident.as_slice(),
         host.as_slice(),
@@ -645,7 +653,7 @@ fn matrix_derivatives_agree_between_the_backends() {
         assert!(resident.is_device_resident(), "the gradient stays resident");
     }
 
-    let host = jacobian_wrt_matrix(&a, |m| m.matvec(&DualVector::constant(x)));
+    let host = jacobian_wrt_matrix(&a, |m| m.matvec(&DualVector::constant(x.clone())));
     let resident = jacobian_wrt_matrix(&a.to_backend::<Metal>(), |m| {
         m.matvec(&DualVector::constant(x.to_backend::<Metal>()))
     });
@@ -656,7 +664,7 @@ fn matrix_derivatives_agree_between_the_backends() {
     );
 
     // Flattening is a move on this backend, so it must not disturb the values.
-    let dual = DualMatrix::<4, 5, Metal>::new(a.to_backend(), a.to_backend());
+    let dual = DualMatrix::<Metal>::new(a.to_backend(), a.to_backend());
     assert_slice_close(
         dual.flattened().value().as_slice(),
         a.as_slice(),
@@ -677,30 +685,27 @@ fn comparisons_carry_the_tangent_of_whichever_operand_won() {
         Vector::new([10.0f32, 20.0, 30.0]),
     );
 
-    let dual_a = DualVector::<3>::new(a, da);
-    let dual_b = DualVector::<3>::new(b, db);
+    let dual_a = DualVector::new(a, da);
+    let dual_b = DualVector::new(b, db);
 
     let largest = dual_a.maximum(&dual_b);
-    assert_eq!(largest.value().to_array(), [1.5, -1.0, 2.0]);
+    assert_eq!(largest.value().to_vec(), [1.5, -1.0, 2.0]);
     // b wins, a wins, then a tie splits the two tangents evenly.
-    assert_eq!(largest.tangent().to_array(), [10.0, 2.0, 16.5]);
+    assert_eq!(largest.tangent().to_vec(), [10.0, 2.0, 16.5]);
 
     let smallest = dual_a.minimum(&dual_b);
-    assert_eq!(smallest.value().to_array(), [0.5, -2.0, 2.0]);
-    assert_eq!(smallest.tangent().to_array(), [1.0, 20.0, 16.5]);
+    assert_eq!(smallest.value().to_vec(), [0.5, -2.0, 2.0]);
+    assert_eq!(smallest.tangent().to_vec(), [1.0, 20.0, 16.5]);
 
     // |x| and relu, with the conventions the tie implies.
-    let point = DualVector::<5>::new(
+    let point = DualVector::new(
         Vector::new([-2.0f32, -0.5, 0.0, 0.5, 2.0]),
-        Vector::filled(1.0),
+        Vector::filled(5, 1.0),
     );
+    assert_eq!(point.abs().tangent().to_vec(), [-1.0, -1.0, 0.0, 1.0, 1.0]);
+    assert_eq!(point.relu().tangent().to_vec(), [0.0, 0.0, 0.5, 1.0, 1.0]);
     assert_eq!(
-        point.abs().tangent().to_array(),
-        [-1.0, -1.0, 0.0, 1.0, 1.0]
-    );
-    assert_eq!(point.relu().tangent().to_array(), [0.0, 0.0, 0.5, 1.0, 1.0]);
-    assert_eq!(
-        point.clamp(-1.0, 1.0).value().to_array(),
+        point.clamp(-1.0, 1.0).value().to_vec(),
         [-1.0, -0.5, 0.0, 0.5, 1.0]
     );
 
@@ -711,19 +716,19 @@ fn comparisons_carry_the_tangent_of_whichever_operand_won() {
 
 #[test]
 fn axis_reductions_are_linear_in_the_tangent() {
-    let (m, dm) = (matrix::<3, 4>(), matrix_direction::<3, 4>());
-    let dual = DualMatrix::<3, 4>::new(m, dm);
+    let (m, dm) = (matrix(3, 4), matrix_direction(3, 4));
+    let dual = DualMatrix::new(m.clone(), dm.clone());
 
     let rows = dual.row_sums();
     let columns = dual.column_sums();
     for row in 0..3 {
-        let value: f32 = (0..4).map(|col| m.data()[row][col]).sum();
-        let tangent: f32 = (0..4).map(|col| dm.data()[row][col]).sum();
+        let value: f32 = (0..4).map(|col| m[(row, col)]).sum();
+        let tangent: f32 = (0..4).map(|col| dm[(row, col)]).sum();
         assert!(close(rows.value().as_slice()[row], value));
         assert!(close(rows.tangent().as_slice()[row], tangent));
     }
     for col in 0..4 {
-        let value: f32 = (0..3).map(|row| m.data()[row][col]).sum();
+        let value: f32 = (0..3).map(|row| m[(row, col)]).sum();
         assert!(close(columns.value().as_slice()[col], value));
     }
 }

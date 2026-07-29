@@ -220,30 +220,30 @@ use tensorcrate::tensors::{Matrix, Vector};
 
 #[test]
 fn vector_and_matrix_literals() {
-    let v: Vector<f64, 3> = math! { [1, 2, 3] };
+    let v: Vector<f64> = math! { [1, 2, 3] };
     assert_eq!(v.data(), &[1.0, 2.0, 3.0]);
 
-    let m: Matrix<f64, 2, 2> = math! { [[1, 2], [3, 4]] };
-    assert_eq!(m.data(), &[[1.0, 2.0], [3.0, 4.0]]);
+    let m: Matrix<f64> = math! { [[1, 2], [3, 4]] };
+    assert_eq!(m.to_rows(), [[1.0, 2.0], [3.0, 4.0]]);
 }
 
 #[test]
 fn elementwise_and_broadcast() {
     // Elementwise addition of two vectors.
-    let v: Vector<f64, 3> = math! { [1, 2, 3] + [10, 20, 30] };
+    let v: Vector<f64> = math! { [1, 2, 3] + [10, 20, 30] };
     assert_eq!(v.data(), &[11.0, 22.0, 33.0]);
 
     // A scalar broadcasts over a tensor, either side.
-    let v: Vector<f64, 3> = math! { 2 * [1, 2, 3] };
+    let v: Vector<f64> = math! { 2 * [1, 2, 3] };
     assert_eq!(v.data(), &[2.0, 4.0, 6.0]);
-    let v: Vector<f64, 3> = math! { [1, 2, 3] + 100 };
+    let v: Vector<f64> = math! { [1, 2, 3] + 100 };
     assert_eq!(v.data(), &[101.0, 102.0, 103.0]);
 }
 
 #[test]
 fn matmul_dot_and_det() {
-    let product: Matrix<f64, 2, 2> = math! { matmul([[1, 2], [3, 4]], [[5, 6], [7, 8]]) };
-    assert_eq!(product.data(), &[[19.0, 22.0], [43.0, 50.0]]);
+    let product: Matrix<f64> = math! { matmul([[1, 2], [3, 4]], [[5, 6], [7, 8]]) };
+    assert_eq!(product.to_rows(), [[19.0, 22.0], [43.0, 50.0]]);
 
     // dot collapses two vectors to a scalar — the whole block is still fallible.
     let d: f64 = math! { dot([1, 2, 3], [4, 5, 6]) };
@@ -255,7 +255,7 @@ fn matmul_dot_and_det() {
 
 #[test]
 fn symbolic_products_are_deduced_from_operand_shapes() {
-    let matrix_product: Matrix<f64, 2, 2> = math! {
+    let matrix_product: Matrix<f64> = math! {
         let a = [[1, 2, 3], [4, 5, 6]];
         let b = [[7, 8], [9, 10], [11, 12]];
         a @ b
@@ -270,16 +270,16 @@ fn symbolic_products_are_deduced_from_operand_shapes() {
         cos(a)
     };
 
-    assert_eq!(matrix_product.data(), &[[58.0, 64.0], [139.0, 154.0]]);
+    assert_eq!(matrix_product.to_rows(), [[58.0, 64.0], [139.0, 154.0]]);
 
-    let matrix_vector: Vector<f64, 2> = math! {
+    let matrix_vector: Vector<f64> = math! {
         let a = [[1, 2, 3], [4, 5, 6]];
         let v = [1, 2, 3];
         a @ v
     };
     assert_eq!(matrix_vector.data(), &[14.0, 32.0]);
 
-    let row_matrix: Vector<f64, 3> = math! {
+    let row_matrix: Vector<f64> = math! {
         let v = [1, 2];
         let b = [[1, 2, 3], [4, 5, 6]];
         v @ b
@@ -290,31 +290,31 @@ fn symbolic_products_are_deduced_from_operand_shapes() {
     assert_eq!(dot, 32.0);
 
     // `@` has multiplicative precedence and chains left-to-right.
-    let chained: Matrix<f64, 2, 2> = math! {
+    let chained: Matrix<f64> = math! {
         let a = [[1, 2], [3, 4]];
         let b = [[2, 0], [0, 2]];
         let c = [[1, 1], [0, 1]];
         a @ b @ c + [[1, 0], [0, 1]]
     };
-    assert_eq!(chained.data(), &[[3.0, 6.0], [6.0, 15.0]]);
+    assert_eq!(chained.to_rows(), [[3.0, 6.0], [6.0, 15.0]]);
 }
 
 #[test]
 fn matrix_vector_products_and_tensor_power() {
-    let mv: Vector<f64, 2> = math! { matmul([[1, 2, 3], [4, 5, 6]], [1, 2, 3]) };
+    let mv: Vector<f64> = math! { matmul([[1, 2, 3], [4, 5, 6]], [1, 2, 3]) };
     assert_eq!(mv.data(), &[14.0, 32.0]);
 
-    let vm: Vector<f64, 3> = math! { matmul([1, 2], [[1, 2, 3], [4, 5, 6]]) };
+    let vm: Vector<f64> = math! { matmul([1, 2], [[1, 2, 3], [4, 5, 6]]) };
     assert_eq!(vm.data(), &[9.0, 12.0, 15.0]);
 
-    let squares: Vector<f64, 3> = math! { pow([1, 2, 3], 2) };
+    let squares: Vector<f64> = math! { pow([1, 2, 3], 2) };
     assert_eq!(squares.data(), &[1.0, 4.0, 9.0]);
 }
 
 #[test]
 fn a_full_linear_algebra_block() {
     // A · A⁻¹ = I, written as mathematics.
-    let identity: Matrix<f64, 2, 2> = math! {
+    let identity: Matrix<f64> = math! {
         let a = [[4, 7], [2, 6]];
         matmul(a, inv(a))
     }
@@ -326,26 +326,26 @@ fn a_full_linear_algebra_block() {
 
 #[test]
 fn transpose_and_scaling() {
-    let t: Matrix<f64, 3, 2> = math! { transpose([[1, 2, 3], [4, 5, 6]]) };
-    assert_eq!(t.data(), &[[1.0, 4.0], [2.0, 5.0], [3.0, 6.0]]);
+    let t: Matrix<f64> = math! { transpose([[1, 2, 3], [4, 5, 6]]) };
+    assert_eq!(t.to_rows(), [[1.0, 4.0], [2.0, 5.0], [3.0, 6.0]]);
 }
 
 #[test]
 fn tensors_of_complex_numbers() {
     // The element type is inferred from the literals inside.
-    let v: Vector<Complex<f64>, 2> = math! { [1 + 1i, 2 - 1i] };
+    let v: Vector<Complex<f64>> = math! { [1 + 1i, 2 - 1i] };
     assert_eq!(v.get(0), Some(&Complex::new(1.0, 1.0)));
     assert_eq!(v.get(1), Some(&Complex::new(2.0, -1.0)));
 
     // Scalars widen to the complex element type.
-    let v: Vector<Complex<f64>, 2> = math! { [1, 2] + [0 + 1i, 0 - 1i] };
+    let v: Vector<Complex<f64>> = math! { [1, 2] + [0 + 1i, 0 - 1i] };
     assert_eq!(v.get(0), Some(&Complex::new(1.0, 1.0)));
 }
 
 #[test]
 fn tensors_differentiate_through_matmul() {
     // Seed a matrix entry with ε and read the derivative out of the product.
-    let squared: Matrix<Dual<f64>, 2, 2> = math! {
+    let squared: Matrix<Dual<f64>> = math! {
         let x = 2 + 1d;
         let a = [[x, 1], [0, 1]];
         matmul(a, a)
@@ -357,7 +357,7 @@ fn tensors_differentiate_through_matmul() {
 
 #[test]
 fn tensors_unify_real_complex_and_dual_elements() {
-    let literal: Vector<Dual<Complex<f64>>, 3> = math! { [1, 2 + 3i, 4 + 5d] };
+    let literal: Vector<Dual<Complex<f64>>> = math! { [1, 2 + 3i, 4 + 5d] };
     assert_eq!(
         literal.get(0),
         Some(&Dual::constant(Complex::new(1.0, 0.0)))
@@ -372,19 +372,19 @@ fn tensors_unify_real_complex_and_dual_elements() {
     );
 
     // Tensor/tensor and scalar/tensor widening both lift every coefficient.
-    let sum: Vector<Dual<Complex<f64>>, 2> = math! { [1 + 1i, 2] + [3 + 4d, 5 + 6d] };
+    let sum: Vector<Dual<Complex<f64>>> = math! { [1 + 1i, 2] + [3 + 4d, 5 + 6d] };
     assert_eq!(
         sum.get(0),
         Some(&Dual::new(Complex::new(4.0, 1.0), Complex::new(4.0, 0.0)))
     );
 
-    let broadcast: Vector<Dual<Complex<f64>>, 2> = math! { (1 + 2i) * [3 + 1d, 4 + 2d] };
+    let broadcast: Vector<Dual<Complex<f64>>> = math! { (1 + 2i) * [3 + 1d, 4 + 2d] };
     assert_eq!(
         broadcast.get(0),
         Some(&Dual::new(Complex::new(3.0, 6.0), Complex::new(1.0, 2.0)))
     );
 
-    let conjugated: Vector<Dual<Complex<f64>>, 1> = math! { conj([1 + 2i + 3d * (1 + 1i)]) };
+    let conjugated: Vector<Dual<Complex<f64>>> = math! { conj([1 + 2i + 3d * (1 + 1i)]) };
     assert_eq!(
         conjugated.get(0),
         Some(&Dual::new(Complex::new(1.0, -2.0), Complex::new(3.0, -3.0)))
@@ -397,7 +397,7 @@ fn linear_algebra_infers_complex_dual_results() {
     assert_eq!(dot_product.real, Complex::new(11.0, 3.0));
     assert_eq!(dot_product.dual, Complex::new(5.0, 1.0));
 
-    let product: Matrix<Dual<Complex<f64>>, 2, 2> = math! {
+    let product: Matrix<Dual<Complex<f64>>> = math! {
         matmul(
             [[1 + 1i, 0], [0, 1]],
             [[2 + 1d, 0], [0, 3 + 2d]]
@@ -415,12 +415,12 @@ fn linear_algebra_infers_complex_dual_results() {
 
 #[test]
 fn elementwise_functions_map_over_tensors() {
-    let v: Vector<f64, 3> = math! { exp([0, 0, 0]) };
+    let v: Vector<f64> = math! { exp([0, 0, 0]) };
     assert_eq!(v.data(), &[1.0, 1.0, 1.0]);
 
-    let sine: Matrix<f64, 2, 2> = math! { sin([[0, 0], [0, 0]]) };
-    assert_eq!(sine.data(), &[[0.0, 0.0], [0.0, 0.0]]);
+    let sine: Matrix<f64> = math! { sin([[0, 0], [0, 0]]) };
+    assert_eq!(sine.to_rows(), [[0.0, 0.0], [0.0, 0.0]]);
 
-    let cosine: Vector<f64, 3> = math! { cos([0, 0, 0]) };
+    let cosine: Vector<f64> = math! { cos([0, 0, 0]) };
     assert_eq!(cosine.data(), &[1.0, 1.0, 1.0]);
 }

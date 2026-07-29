@@ -1,9 +1,9 @@
 //! Where a tensor's elements live.
 //!
 //! [`Vector`](super::Vector) and [`Matrix`](super::Matrix) carry a backend type
-//! parameter that selects their storage. It defaults to [`Host`] — the plain
-//! fixed-size array they have always used — so `Vector<f64, 3>` and
-//! `Matrix<i64, 2, 2>` keep meaning exactly what they meant before.
+//! parameter that selects their storage. It defaults to [`Host`] — the flat
+//! row-major `Vec` they normally use — so `Vector<f64>` and `Matrix<i64>` keep
+//! meaning exactly what they meant before.
 //!
 //! The [`Metal`] backend (macOS, `metal` feature) instead keeps `f32` elements
 //! in `MTLStorageModeShared` memory, which the GPU kernels read and write in
@@ -22,7 +22,7 @@
 //! # #[cfg(all(feature = "metal", target_os = "macos"))] {
 //! use tensorcrate::tensors::{Host, Matrix, Metal};
 //!
-//! let m: Matrix<f32, 2, 2> = Matrix::from_rows([[1.0, 2.0], [3.0, 4.0]]);
+//! let m: Matrix<f32> = Matrix::from_rows([[1.0, 2.0], [3.0, 4.0]]);
 //! let resident = m.to_backend::<Metal>(); // one upload
 //! let cubed = resident.matmul(&resident).matmul(&resident); // no copies
 //! assert_eq!(cubed.to_backend::<Host>(), m.matmul(&m).matmul(&m));
@@ -33,192 +33,195 @@
 //! are 32-bit, and `f32` is the only element type they understand. The backend
 //! never changes an answer — it only decides which memory the answer is
 //! computed in.
+//!
+//! # Shapes
+//!
+//! Storage here is shapeless: it is a run of `f32`, and the extents live in the
+//! [`Vector`](super::Vector) and [`Matrix`](super::Matrix) wrappers. That is why
+//! the reshaping operations below take no arguments — a row vector, a column
+//! vector and their flattening are all the same run of elements, so on either
+//! backend the conversion is a move rather than a copy. Operations that really
+//! do depend on the extents, like [`concat`](Backend::concat), take them as
+//! ordinary parameters.
 
 /// A tensor storage backend.
 ///
 /// The trait is sealed: [`Host`] and [`Metal`] are the only implementations,
 /// since the kernels behind them are part of this crate.
 pub trait Backend: sealed::Sealed + Sized + 'static {
-    /// Storage for a length-`N` vector of `T`.
-    type Vector<T, const N: usize>;
+    /// Storage for a vector of `T`.
+    type Vector<T>;
 
-    /// Storage for an `R × C` matrix of `T`, in row-major order.
-    type Matrix<T, const R: usize, const C: usize>;
+    /// Storage for a matrix of `T`, in row-major order.
+    type Matrix<T>;
 
-    /// Build vector storage from `N` `f32` values.
-    fn store_vector<const N: usize>(values: &[f32]) -> Self::Vector<f32, N>;
+    /// Build vector storage from `f32` values.
+    fn store_vector(values: &[f32]) -> Self::Vector<f32>;
 
-    /// Reinterpret a vector as a `1 × N` row matrix.
-    fn vector_into_row<const N: usize>(vector: Self::Vector<f32, N>) -> Self::Matrix<f32, 1, N>;
+    /// Build matrix storage from row-major `f32` values.
+    fn store_matrix(values: &[f32]) -> Self::Matrix<f32>;
 
-    /// Reinterpret a vector as an `N × 1` column matrix.
-    fn vector_into_column<const N: usize>(vector: Self::Vector<f32, N>) -> Self::Matrix<f32, N, 1>;
-
-    /// Reinterpret a matrix as its row-major flattening.
-    ///
-    /// This and [`vector_into_matrix`](Self::vector_into_matrix) are what let a
-    /// matrix input be differentiated by the vector machinery. Both are free on
-    /// the [`Metal`] backend, where a vector and a matrix are the same
-    /// allocation — which is why they take ownership rather than borrowing.
-    fn matrix_into_flattened<const R: usize, const C: usize>(
-        matrix: Self::Matrix<f32, R, C>,
-    ) -> Self::Vector<f32, { R * C }>;
-
-    /// Reinterpret a vector as an `R × C` matrix, filling rows in order.
-    fn vector_into_matrix<const R: usize, const C: usize>(
-        vector: Self::Vector<f32, { R * C }>,
-    ) -> Self::Matrix<f32, R, C>;
-
-    /// Build a matrix from a collection of vectors stacked along the
-    /// vertical axis (vectors are row vectors).
-    fn vstack<const M: usize, const N: usize>(
-        vectors: [Self::Vector<f32, N>; M],
-    ) -> Self::Matrix<f32, M, N>;
-
-    /// Build a matrix from a collection of vectors stacked along the
-    /// horizontal axis (vectors are column vectors).
-    fn hstack<const M: usize, const N: usize>(
-        vectors: [Self::Vector<f32, M>; N],
-    ) -> Self::Matrix<f32, M, N>;
-
-    /// Builds a matrix by stacking two matrices horizontally.
-    fn concat<const M: usize, const N1: usize, const N2: usize>(
-        a: Self::Matrix<f32, M, N1>,
-        b: Self::Matrix<f32, M, N2>,
-    ) -> Self::Matrix<f32, M, { N1 + N2 }>;
-
-    /// Builds a matrix by stacking two matrices vertically.
-    fn stack<const M1: usize, const M2: usize, const N: usize>(
-        a: Self::Matrix<f32, M1, N>,
-        b: Self::Matrix<f32, M2, N>,
-    ) -> Self::Matrix<f32, { M1 + M2 }, N>;
-
-    /// Builds a matrix by concating a collection of matrices with
-    /// the same number of columns along the horizontal axis.
-    fn hmerge<const M: usize, const N: usize, const K: usize>(
-        matrices: [Self::Matrix<f32, M, N>; K],
-    ) -> Self::Matrix<f32, M, { K * N }>;
-
-    /// Builds a matrix by concating a collection of matrices with
-    /// the same number of columns along the vertical axis.
-    fn vmerge<const M: usize, const N: usize, const K: usize>(
-        matrices: [Self::Matrix<f32, M, N>; K],
-    ) -> Self::Matrix<f32, { K * M }, N>;
-
-    /// Borrow this vector storage as a flat `f32` slice of length `N`.
+    /// Borrow this vector storage as a flat `f32` slice.
     ///
     /// Nothing is copied: for the [`Metal`] backend this borrows the shared
     /// allocation itself, which the CPU can read directly.
-    fn vector_slice<const N: usize>(storage: &Self::Vector<f32, N>) -> &[f32];
+    fn vector_slice(storage: &Self::Vector<f32>) -> &[f32];
 
-    /// Build matrix storage from `R * C` row-major `f32` values.
-    fn store_matrix<const R: usize, const C: usize>(values: &[f32]) -> Self::Matrix<f32, R, C>;
+    /// Borrow this matrix storage as a flat row-major `f32` slice, again without
+    /// copying.
+    fn matrix_slice(storage: &Self::Matrix<f32>) -> &[f32];
 
-    /// Borrow this matrix storage as a flat row-major `f32` slice of length
-    /// `R * C`, again without copying.
-    fn matrix_slice<const R: usize, const C: usize>(storage: &Self::Matrix<f32, R, C>) -> &[f32];
+    /// Reinterpret a vector as a matrix, filling rows in order.
+    ///
+    /// This and [`matrix_into_flattened`](Self::matrix_into_flattened) are what
+    /// let a matrix input be differentiated by the vector machinery. Both are
+    /// free on either backend — the elements are already in the right order —
+    /// which is why they take ownership rather than borrowing.
+    fn vector_into_matrix(vector: Self::Vector<f32>) -> Self::Matrix<f32>;
+
+    /// Reinterpret a matrix as its row-major flattening.
+    fn matrix_into_flattened(matrix: Self::Matrix<f32>) -> Self::Vector<f32>;
+
+    /// Build a matrix from vectors stacked along the vertical axis (the vectors
+    /// are rows), each of length `len`.
+    fn vstack(vectors: &[Self::Vector<f32>], len: usize) -> Self::Matrix<f32>;
+
+    /// Build a matrix from vectors stacked along the horizontal axis (the
+    /// vectors are columns), each of length `len`.
+    fn hstack(vectors: &[Self::Vector<f32>], len: usize) -> Self::Matrix<f32>;
+
+    /// Build a matrix by placing two `rows`-tall matrices side by side.
+    fn concat(
+        a: &Self::Matrix<f32>,
+        b: &Self::Matrix<f32>,
+        rows: usize,
+        left_cols: usize,
+        right_cols: usize,
+    ) -> Self::Matrix<f32>;
+
+    /// Build a matrix by placing two `cols`-wide matrices one above the other.
+    fn stack(
+        a: &Self::Matrix<f32>,
+        b: &Self::Matrix<f32>,
+        top_rows: usize,
+        bottom_rows: usize,
+        cols: usize,
+    ) -> Self::Matrix<f32>;
+
+    /// Build a matrix by placing several `rows × cols` matrices side by side.
+    fn hmerge(matrices: &[Self::Matrix<f32>], rows: usize, cols: usize) -> Self::Matrix<f32>;
+
+    /// Build a matrix by stacking several `rows × cols` matrices vertically.
+    fn vmerge(matrices: &[Self::Matrix<f32>], rows: usize, cols: usize) -> Self::Matrix<f32>;
 }
 
 mod sealed {
     pub trait Sealed {}
 }
 
-/// The default backend: elements live in a fixed-size array, on the stack.
+/// The default backend: elements live in a flat row-major [`Vec`].
 ///
-/// Every element type is supported, and the tensors are `Copy` whenever the
-/// element type is.
+/// Every element type is supported.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct Host;
 
 impl sealed::Sealed for Host {}
 
 impl Backend for Host {
-    type Vector<T, const N: usize> = [T; N];
-    type Matrix<T, const R: usize, const C: usize> = [[T; C]; R];
+    type Vector<T> = Vec<T>;
+    type Matrix<T> = Vec<T>;
 
-    fn store_vector<const N: usize>(values: &[f32]) -> [f32; N] {
-        debug_assert_eq!(values.len(), N);
-        std::array::from_fn(|index| values[index])
+    fn store_vector(values: &[f32]) -> Vec<f32> {
+        values.to_vec()
     }
 
-    fn vector_into_row<const N: usize>(vector: [f32; N]) -> [[f32; N]; 1] {
-        [vector]
+    fn store_matrix(values: &[f32]) -> Vec<f32> {
+        values.to_vec()
     }
 
-    fn vector_into_column<const N: usize>(vector: [f32; N]) -> [[f32; 1]; N] {
-        vector.map(|value| [value])
-    }
-
-    fn matrix_into_flattened<const R: usize, const C: usize>(
-        matrix: [[f32; C]; R],
-    ) -> [f32; R * C] {
-        let flat = matrix.as_flattened();
-        std::array::from_fn(|index| flat[index])
-    }
-
-    fn vector_into_matrix<const R: usize, const C: usize>(vector: [f32; R * C]) -> [[f32; C]; R] {
-        std::array::from_fn(|row| std::array::from_fn(|col| vector[row * C + col]))
-    }
-
-    fn vector_slice<const N: usize>(storage: &[f32; N]) -> &[f32] {
+    fn vector_slice(storage: &Vec<f32>) -> &[f32] {
         storage
     }
 
-    fn store_matrix<const R: usize, const C: usize>(values: &[f32]) -> [[f32; C]; R] {
-        debug_assert_eq!(values.len(), R * C);
-        std::array::from_fn(|row| std::array::from_fn(|col| values[row * C + col]))
+    fn matrix_slice(storage: &Vec<f32>) -> &[f32] {
+        storage
     }
 
-    fn matrix_slice<const R: usize, const C: usize>(storage: &[[f32; C]; R]) -> &[f32] {
-        // SAFETY: nested arrays are contiguous, so the rows are exactly R*C
-        // adjacent `f32` with no padding.
-        unsafe { std::slice::from_raw_parts(storage.as_ptr().cast::<f32>(), R * C) }
+    // A vector and a matrix are the same run of elements in the same order, so
+    // both reshapes are the identity.
+    fn vector_into_matrix(vector: Vec<f32>) -> Vec<f32> {
+        vector
     }
 
-    fn vstack<const M: usize, const N: usize>(
-        vectors: [Self::Vector<f32, N>; M],
-    ) -> Self::Matrix<f32, M, N> {
-        std::array::from_fn(|row| vectors[row])
+    fn matrix_into_flattened(matrix: Vec<f32>) -> Vec<f32> {
+        matrix
     }
 
-    fn hstack<const M: usize, const N: usize>(
-        vectors: [Self::Vector<f32, M>; N],
-    ) -> Self::Matrix<f32, M, N> {
-        std::array::from_fn(|row| std::array::from_fn(|col| vectors[col][row]))
+    fn vstack(vectors: &[Vec<f32>], len: usize) -> Vec<f32> {
+        let mut values = Vec::with_capacity(vectors.len() * len);
+        for vector in vectors {
+            debug_assert_eq!(vector.len(), len);
+            values.extend_from_slice(vector);
+        }
+        values
     }
 
-    fn concat<const M: usize, const N1: usize, const N2: usize>(
-        a: Self::Matrix<f32, M, N1>,
-        b: Self::Matrix<f32, M, N2>,
-    ) -> Self::Matrix<f32, M, { N1 + N2 }> {
-        std::array::from_fn(|row| {
-            std::array::from_fn(|col| {
-                if col < N1 {
-                    a[row][col]
-                } else {
-                    b[row][col - N1]
-                }
-            })
-        })
+    fn hstack(vectors: &[Vec<f32>], len: usize) -> Vec<f32> {
+        let cols = vectors.len();
+        let mut values = vec![0.0; len * cols];
+        for (col, vector) in vectors.iter().enumerate() {
+            debug_assert_eq!(vector.len(), len);
+            for (row, value) in vector.iter().enumerate() {
+                values[row * cols + col] = *value;
+            }
+        }
+        values
     }
 
-    fn stack<const M1: usize, const M2: usize, const N: usize>(
-        a: Self::Matrix<f32, M1, N>,
-        b: Self::Matrix<f32, M2, N>,
-    ) -> Self::Matrix<f32, { M1 + M2 }, N> {
-        std::array::from_fn(|row| if row < M1 { a[row] } else { b[row - M1] })
+    fn concat(
+        a: &Vec<f32>,
+        b: &Vec<f32>,
+        rows: usize,
+        left_cols: usize,
+        right_cols: usize,
+    ) -> Vec<f32> {
+        let mut values = Vec::with_capacity(rows * (left_cols + right_cols));
+        for row in 0..rows {
+            values.extend_from_slice(&a[row * left_cols..(row + 1) * left_cols]);
+            values.extend_from_slice(&b[row * right_cols..(row + 1) * right_cols]);
+        }
+        values
     }
 
-    fn hmerge<const M: usize, const N: usize, const K: usize>(
-        matrices: [Self::Matrix<f32, M, N>; K],
-    ) -> Self::Matrix<f32, M, { K * N }> {
-        std::array::from_fn(|row| std::array::from_fn(|col| matrices[col / N][row][col % N]))
+    fn stack(
+        a: &Vec<f32>,
+        b: &Vec<f32>,
+        top_rows: usize,
+        bottom_rows: usize,
+        cols: usize,
+    ) -> Vec<f32> {
+        let mut values = Vec::with_capacity((top_rows + bottom_rows) * cols);
+        values.extend_from_slice(a);
+        values.extend_from_slice(b);
+        values
     }
 
-    fn vmerge<const M: usize, const N: usize, const K: usize>(
-        matrices: [Self::Matrix<f32, M, N>; K],
-    ) -> Self::Matrix<f32, { K * M }, N> {
-        std::array::from_fn(|row| matrices[row / M][row % M])
+    fn hmerge(matrices: &[Vec<f32>], rows: usize, cols: usize) -> Vec<f32> {
+        let mut values = Vec::with_capacity(rows * cols * matrices.len());
+        for row in 0..rows {
+            for matrix in matrices {
+                values.extend_from_slice(&matrix[row * cols..(row + 1) * cols]);
+            }
+        }
+        values
+    }
+
+    fn vmerge(matrices: &[Vec<f32>], rows: usize, cols: usize) -> Vec<f32> {
+        let mut values = Vec::with_capacity(rows * cols * matrices.len());
+        for matrix in matrices {
+            values.extend_from_slice(matrix);
+        }
+        values
     }
 }
 
@@ -237,147 +240,127 @@ mod gpu {
     /// A backend that keeps `f32` elements in GPU-shared memory, so the Metal
     /// kernels read and write them in place.
     ///
-    /// Only `f32` tensors can be built here: `Vector<f32, N, Metal>` and
-    /// `Matrix<f32, R, C, Metal>` have constructors, any other element type
-    /// names a type with none.
+    /// Only `f32` tensors can be built here: `Vector<f32, Metal>` and
+    /// `Matrix<f32, Metal>` have constructors, any other element type names a
+    /// type with none.
     ///
-    /// Metal objects are thread-affine, so these tensors are not `Send`, and —
-    /// a shared allocation not being a fixed-size array — not `Copy` either.
-    /// They do clone (into a fresh allocation with the same values) and compare
-    /// by value.
+    /// Metal objects are thread-affine, so these tensors are not `Send`. They do
+    /// clone (into a fresh allocation with the same values) and compare by
+    /// value.
     #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
     pub struct Metal;
 
     impl sealed::Sealed for Metal {}
 
     impl Backend for Metal {
-        type Vector<T, const N: usize> = MetalStorage;
-        type Matrix<T, const R: usize, const C: usize> = MetalStorage;
+        type Vector<T> = MetalStorage;
+        type Matrix<T> = MetalStorage;
 
-        fn store_vector<const N: usize>(values: &[f32]) -> MetalStorage {
-            debug_assert_eq!(values.len(), N);
+        fn store_vector(values: &[f32]) -> MetalStorage {
             MetalStorage::from_slice(values)
         }
 
-        fn vector_into_row<const N: usize>(vector: MetalStorage) -> MetalStorage {
-            vector
+        fn store_matrix(values: &[f32]) -> MetalStorage {
+            MetalStorage::from_slice(values)
         }
 
-        fn vector_into_column<const N: usize>(vector: MetalStorage) -> MetalStorage {
-            vector
+        fn vector_slice(storage: &MetalStorage) -> &[f32] {
+            storage.as_slice()
+        }
+
+        fn matrix_slice(storage: &MetalStorage) -> &[f32] {
+            storage.as_slice()
         }
 
         // A vector and a matrix are the same shared allocation, and row-major
         // flattening is the identity on it: these move, they do not copy.
-        fn matrix_into_flattened<const R: usize, const C: usize>(
-            matrix: MetalStorage,
-        ) -> MetalStorage {
-            matrix
-        }
-
-        fn vector_into_matrix<const R: usize, const C: usize>(
-            vector: MetalStorage,
-        ) -> MetalStorage {
+        fn vector_into_matrix(vector: MetalStorage) -> MetalStorage {
             vector
         }
 
-        fn vector_slice<const N: usize>(storage: &MetalStorage) -> &[f32] {
-            storage.as_slice()
+        fn matrix_into_flattened(matrix: MetalStorage) -> MetalStorage {
+            matrix
         }
 
-        fn store_matrix<const R: usize, const C: usize>(values: &[f32]) -> MetalStorage {
-            debug_assert_eq!(values.len(), R * C);
-            MetalStorage::from_slice(values)
-        }
-
-        fn matrix_slice<const R: usize, const C: usize>(storage: &MetalStorage) -> &[f32] {
-            storage.as_slice()
-        }
-
-        fn vstack<const M: usize, const N: usize>(
-            vectors: [Self::Vector<f32, N>; M],
-        ) -> Self::Matrix<f32, M, N> {
-            if let Some(storage) = MetalStorage::vstack(&vectors, N) {
+        fn vstack(vectors: &[MetalStorage], len: usize) -> MetalStorage {
+            if let Some(storage) = MetalStorage::vstack(vectors, len) {
                 return storage;
             }
-            let mut values = Vec::with_capacity(M * N);
-            for vector in &vectors {
+            let mut values = Vec::with_capacity(vectors.len() * len);
+            for vector in vectors {
                 values.extend_from_slice(vector.as_slice());
             }
             MetalStorage::from_slice(&values)
         }
 
-        fn hstack<const M: usize, const N: usize>(
-            vectors: [Self::Vector<f32, M>; N],
-        ) -> Self::Matrix<f32, M, N> {
-            if let Some(storage) = MetalStorage::hstack(&vectors, M) {
+        fn hstack(vectors: &[MetalStorage], len: usize) -> MetalStorage {
+            if let Some(storage) = MetalStorage::hstack(vectors, len) {
                 return storage;
             }
-            let mut values = vec![0.0; M * N];
+            let cols = vectors.len();
+            let mut values = vec![0.0; len * cols];
             for (col, vector) in vectors.iter().enumerate() {
                 for (row, value) in vector.as_slice().iter().enumerate() {
-                    values[row * N + col] = *value;
+                    values[row * cols + col] = *value;
                 }
             }
             MetalStorage::from_slice(&values)
         }
 
-        fn concat<const M: usize, const N1: usize, const N2: usize>(
-            a: Self::Matrix<f32, M, N1>,
-            b: Self::Matrix<f32, M, N2>,
-        ) -> Self::Matrix<f32, M, { N1 + N2 }> {
-            if let Some(storage) = a.concat(&b, M, N1, N2) {
+        fn concat(
+            a: &MetalStorage,
+            b: &MetalStorage,
+            rows: usize,
+            left_cols: usize,
+            right_cols: usize,
+        ) -> MetalStorage {
+            if let Some(storage) = a.concat(b, rows, left_cols, right_cols) {
                 return storage;
             }
             let (left, right) = (a.as_slice(), b.as_slice());
-            let mut values = Vec::with_capacity(M * (N1 + N2));
-            for row in 0..M {
-                values.extend_from_slice(&left[row * N1..(row + 1) * N1]);
-                values.extend_from_slice(&right[row * N2..(row + 1) * N2]);
+            let mut values = Vec::with_capacity(rows * (left_cols + right_cols));
+            for row in 0..rows {
+                values.extend_from_slice(&left[row * left_cols..(row + 1) * left_cols]);
+                values.extend_from_slice(&right[row * right_cols..(row + 1) * right_cols]);
             }
             MetalStorage::from_slice(&values)
         }
 
-        fn stack<const M1: usize, const M2: usize, const N: usize>(
-            a: Self::Matrix<f32, M1, N>,
-            b: Self::Matrix<f32, M2, N>,
-        ) -> Self::Matrix<f32, { M1 + M2 }, N> {
-            if let Some(storage) = a.stack(&b, M1, M2, N) {
+        fn stack(
+            a: &MetalStorage,
+            b: &MetalStorage,
+            top_rows: usize,
+            bottom_rows: usize,
+            cols: usize,
+        ) -> MetalStorage {
+            if let Some(storage) = a.stack(b, top_rows, bottom_rows, cols) {
                 return storage;
             }
-            let mut values = Vec::with_capacity((M1 + M2) * N);
+            let mut values = Vec::with_capacity((top_rows + bottom_rows) * cols);
             values.extend_from_slice(a.as_slice());
             values.extend_from_slice(b.as_slice());
             MetalStorage::from_slice(&values)
         }
 
-        fn hmerge<const M: usize, const N: usize, const K: usize>(
-            matrices: [Self::Matrix<f32, M, N>; K],
-        ) -> Self::Matrix<f32, M, { K * N }> {
-            if let Some(storage) = MetalStorage::hmerge(&matrices, M, N) {
+        fn hmerge(matrices: &[MetalStorage], rows: usize, cols: usize) -> MetalStorage {
+            if let Some(storage) = MetalStorage::hmerge(matrices, rows, cols) {
                 return storage;
             }
-            let slices = matrices
-                .iter()
-                .map(Self::matrix_slice::<M, N>)
-                .collect::<Vec<_>>();
-            let mut values = Vec::with_capacity(M * K * N);
-            for row in 0..M {
-                for matrix in &slices {
-                    values.extend_from_slice(&matrix[row * N..(row + 1) * N]);
+            let mut values = Vec::with_capacity(rows * cols * matrices.len());
+            for row in 0..rows {
+                for matrix in matrices {
+                    values.extend_from_slice(&matrix.as_slice()[row * cols..(row + 1) * cols]);
                 }
             }
             MetalStorage::from_slice(&values)
         }
 
-        fn vmerge<const M: usize, const N: usize, const K: usize>(
-            matrices: [Self::Matrix<f32, M, N>; K],
-        ) -> Self::Matrix<f32, { K * M }, N> {
-            if let Some(storage) = MetalStorage::vmerge(&matrices, M, N) {
+        fn vmerge(matrices: &[MetalStorage], rows: usize, cols: usize) -> MetalStorage {
+            if let Some(storage) = MetalStorage::vmerge(matrices, rows, cols) {
                 return storage;
             }
-            let mut values = Vec::with_capacity(K * M * N);
-            for matrix in &matrices {
+            let mut values = Vec::with_capacity(rows * cols * matrices.len());
+            for matrix in matrices {
                 values.extend_from_slice(matrix.as_slice());
             }
             MetalStorage::from_slice(&values)

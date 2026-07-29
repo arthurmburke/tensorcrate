@@ -22,19 +22,17 @@ use tensorcrate::tensors::{Matrix, Tape, Vector};
 const SAMPLES: usize = 24;
 const FEATURES: usize = 2;
 
-type Design = Matrix<f32, SAMPLES, FEATURES>;
-type Parameters = Vector<f32, FEATURES>;
+type Design = Matrix<f32>;
+type Parameters = Vector<f32>;
 
 fn main() {
     // A clean line, y = 0.8 + 1.5t, sampled on a grid.
-    let design = Design::from_rows(std::array::from_fn(|row| {
-        [1.0, row as f32 / SAMPLES as f32]
-    }));
+    let design = Design::from_rows((0..SAMPLES).map(|row| vec![1.0, row as f32 / SAMPLES as f32]));
     let truth = Vector::new([0.8f32, 1.5]);
     let clean = design.matvec(&truth);
 
     // One sample is badly wrong — a sensor glitch, a transcription error.
-    let mut corrupted = *clean.data();
+    let mut corrupted = clean.data().to_vec();
     corrupted[SAMPLES / 2] += 9.0;
     let corrupted = Vector::new(corrupted);
 
@@ -59,7 +57,7 @@ fn main() {
 
     let error = |fitted: &Parameters| {
         (0..FEATURES)
-            .map(|i| (fitted.data()[i] - truth.data()[i]).abs())
+            .map(|i| (fitted[i] - truth[i]).abs())
             .fold(0.0f32, f32::max)
     };
     println!();
@@ -92,13 +90,13 @@ enum Objective {
 
 /// Plain gradient descent to convergence, differing only in the scalar it
 /// minimizes.
-fn fit(design: &Design, targets: &Vector<f32, SAMPLES>, objective: Objective) -> Parameters {
+fn fit(design: &Design, targets: &Vector<f32>, objective: Objective) -> Parameters {
     // Trust every sample equally, except the one known to be unreliable.
     let mut precision = [1.0f32; SAMPLES];
     precision[SAMPLES / 2] = 0.01;
     let precision = Vector::new(precision);
 
-    let mut parameters = Parameters::zeros();
+    let mut parameters = Parameters::zeros(FEATURES);
 
     for step in 0..20_000 {
         // A nonsmooth objective needs a shrinking step. `|r|` keeps the full
@@ -110,14 +108,15 @@ fn fit(design: &Design, targets: &Vector<f32, SAMPLES>, objective: Objective) ->
             _ => 0.4,
         };
         let tape = Tape::new();
-        let recorded = tape.vector(parameters);
-        let residual = &tape.matrix(*design).matvec(&recorded) - &tape.vector(*targets);
+        let recorded = tape.vector(parameters.clone());
+        let residual =
+            &tape.matrix(design.clone()).matvec(&recorded) - &tape.vector(targets.clone());
 
         let loss = match objective {
             Objective::SumOfSquares => residual.dot(&residual),
             Objective::LogCosh => residual.cosh().ln().sum(),
             Objective::AbsoluteError => residual.abs().sum(),
-            Objective::Weighted => residual.dot(&(&residual * &tape.vector(precision))),
+            Objective::Weighted => residual.dot(&(&residual * &tape.vector(precision.clone()))),
         }
         .scale(1.0 / SAMPLES as f32);
 

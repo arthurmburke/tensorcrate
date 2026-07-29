@@ -18,19 +18,19 @@
 //! use tensorcrate::tensors::{Matrix, Vector};
 //!
 //! // Fit x to A·x = y by minimizing the residual, whatever the rule.
-//! let a = Matrix::<f32, 4, 2>::from_rows([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, -1.0]]);
+//! let a = Matrix::<f32>::from_rows([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, -1.0]]);
 //! let targets = a.matvec(&Vector::new([0.5f32, -0.25]));
 //!
-//! let mut parameters = Vector::<f32, 2>::zeros();
+//! let mut parameters = Vector::<f32>::zeros(2);
 //! let mut rule = Adam::new(0.1);
 //! minimize(&mut parameters, &mut rule, 400, |x, _step| {
 //!     let tape = x.tape();
-//!     let residual = &tape.matrix(a).matvec(x) - &tape.vector(targets);
+//!     let residual = &tape.matrix(a.clone()).matvec(x) - &tape.vector(targets.clone());
 //!     residual.dot(&residual)
 //! });
 //!
-//! assert!((parameters.data()[0] - 0.5).abs() < 1e-3);
-//! assert!((parameters.data()[1] + 0.25).abs() < 1e-3);
+//! assert!((parameters[0] - 0.5).abs() < 1e-3);
+//! assert!((parameters[1] + 0.25).abs() < 1e-3);
 //! ```
 //!
 //! # Stochastic descent
@@ -59,9 +59,10 @@ pub trait Parameter: Sized + 'static {
     /// Where this parameter's elements live.
     type Backend: Kernels;
 
-    /// A tensor of this shape, all zeros — the starting point for the moment
-    /// buffers the adaptive rules keep.
-    fn zeros() -> Self;
+    /// A tensor of *this* parameter's shape, all zeros — the starting point for
+    /// the moment buffers the adaptive rules keep. With runtime dimensions the
+    /// shape comes from an existing tensor rather than from the type.
+    fn zeros_like(&self) -> Self;
 
     /// A second copy on the same backend.
     fn duplicate(&self) -> Self;
@@ -93,7 +94,7 @@ pub trait Parameter: Sized + 'static {
 impl Parameter for f32 {
     type Backend = Host;
 
-    fn zeros() -> Self {
+    fn zeros_like(&self) -> Self {
         0.0
     }
 
@@ -134,11 +135,11 @@ impl Parameter for f32 {
     }
 }
 
-impl<const N: usize, B: Kernels> Parameter for Vector<f32, N, B> {
+impl<B: Kernels> Parameter for Vector<f32, B> {
     type Backend = B;
 
-    fn zeros() -> Self {
-        Vector::filled(0.0)
+    fn zeros_like(&self) -> Self {
+        Vector::filled(self.len(), 0.0)
     }
 
     fn duplicate(&self) -> Self {
@@ -178,11 +179,12 @@ impl<const N: usize, B: Kernels> Parameter for Vector<f32, N, B> {
     }
 }
 
-impl<const R: usize, const C: usize, B: Kernels> Parameter for Matrix<f32, R, C, B> {
+impl<B: Kernels> Parameter for Matrix<f32, B> {
     type Backend = B;
 
-    fn zeros() -> Self {
-        Matrix::filled(0.0)
+    fn zeros_like(&self) -> Self {
+        let (rows, cols) = self.shape();
+        Matrix::filled(rows, cols, 0.0)
     }
 
     fn duplicate(&self) -> Self {

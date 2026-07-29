@@ -21,10 +21,10 @@ use tensorcrate::tensors::{Matrix, Tape, Vector};
 const SAMPLES: usize = 12;
 const FEATURES: usize = 3;
 
-fn design() -> Matrix<f32, SAMPLES, FEATURES> {
-    Matrix::from_rows(std::array::from_fn(|row| {
+fn design() -> Matrix<f32> {
+    Matrix::from_rows((0..SAMPLES).map(|row| {
         let t = row as f32 / SAMPLES as f32;
-        [1.0, t, (t * 2.4).sin()]
+        vec![1.0, t, (t * 2.4).sin()]
     }))
 }
 
@@ -40,7 +40,7 @@ fn main() {
     // keeps a step size of this order stable — the raw sum has n times the
     // curvature, and gradient descent diverges above 2/λmax.
     println!("least squares: fitting {FEATURES} parameters to {SAMPLES} samples");
-    let mut x = Vector::<f32, FEATURES>::zeros();
+    let mut x = Vector::<f32>::zeros(FEATURES);
     // Descent is stable below 2/λmax of the loss curvature, which is 0.567 for
     // this averaged least-squares problem; 0.6 diverges to NaN, 0.4 does not.
     let rate = 0.4;
@@ -49,9 +49,9 @@ fn main() {
         let tape = Tape::new();
 
         // The parameters are the leaves whose gradient we want.
-        let parameters = tape.vector(x);
+        let parameters = tape.vector(x.clone());
         // Everything else is recorded too; we simply never read its gradient.
-        let residual = &tape.matrix(a).matvec(&parameters) - &tape.vector(targets);
+        let residual = &tape.matrix(a.clone()).matvec(&parameters) - &tape.vector(targets.clone());
         let loss = residual.dot(&residual).scale(1.0 / SAMPLES as f32);
 
         loss.backward();
@@ -79,7 +79,7 @@ fn main() {
     println!("  exact  {exact}");
     println!("  truth  {truth}");
     let worst = (0..FEATURES)
-        .map(|i| (x.data()[i] - exact.data()[i]).abs())
+        .map(|i| (x[i] - exact[i]).abs())
         .fold(0.0f32, f32::max);
     println!("  largest deviation from the exact solution: {worst:.2e}\n");
 
@@ -89,26 +89,22 @@ fn main() {
     // backward pass gives all nine partials; forward mode would need nine
     // passes, one per entry of W.
     println!("nonlinear fit: a 3×3 weight matrix behind a tanh");
-    let inputs = Matrix::<f32, FEATURES, 4>::from_rows([
+    let inputs = Matrix::<f32>::from_rows([
         [0.9, -0.4, 0.2, 0.7],
         [0.1, 0.8, -0.6, 0.3],
         [-0.5, 0.2, 0.7, -0.9],
     ]);
-    let hidden = Matrix::<f32, FEATURES, FEATURES>::from_rows([
-        [0.6, -0.2, 0.3],
-        [0.1, 0.5, -0.4],
-        [-0.3, 0.2, 0.7],
-    ]);
+    let hidden = Matrix::<f32>::from_rows([[0.6, -0.2, 0.3], [0.1, 0.5, -0.4], [-0.3, 0.2, 0.7]]);
     let wanted = hidden.matmul(&inputs).map(|value| value.tanh());
 
-    let mut weights = Matrix::<f32, FEATURES, FEATURES>::identity().scale(0.1);
+    let mut weights = Matrix::<f32>::identity(FEATURES).scale(0.1);
     let rate = 0.4;
 
     for step in 0..=20_000 {
         let tape = Tape::new();
-        let parameters = tape.matrix(weights);
-        let predicted = parameters.matmul(&tape.matrix(inputs)).tanh();
-        let residual = &predicted - &tape.matrix(wanted);
+        let parameters = tape.matrix(weights.clone());
+        let predicted = parameters.matmul(&tape.matrix(inputs.clone())).tanh();
+        let residual = &predicted - &tape.matrix(wanted.clone());
         let loss = residual
             .frobenius_dot(&residual)
             .scale(1.0 / (FEATURES * 4) as f32);
@@ -125,7 +121,7 @@ fn main() {
     let recovered = weights.matmul(&inputs).map(|value| value.tanh());
     let error = (0..FEATURES)
         .flat_map(|row| (0..4).map(move |col| (row, col)))
-        .map(|(row, col)| (recovered.data()[row][col] - wanted.data()[row][col]).abs())
+        .map(|(row, col)| (recovered[(row, col)] - wanted[(row, col)]).abs())
         .fold(0.0f32, f32::max);
     println!("  largest residual on the fitted outputs: {error:.2e}");
     println!("  recovered weights:\n{weights}");
@@ -156,37 +152,36 @@ fn multi_output_regression() {
         state ^= state << 17;
         (state >> 40) as f32 / 8_388_608.0 - 1.0 // in [-1, 1)
     };
-    let inputs = Matrix::<f32, IN, BATCH>::from_rows(std::array::from_fn(|_| {
-        std::array::from_fn(|_| next())
-    }));
-    let true_weights = Matrix::<f32, OUT, IN>::from_rows([
+    let inputs =
+        Matrix::<f32>::from_rows((0..IN).map(|_| (0..BATCH).map(|_| next()).collect::<Vec<_>>()));
+    let true_weights = Matrix::<f32>::from_rows([
         [0.8, -0.5, 0.3, 1.1],
         [-0.2, 0.9, -0.7, 0.4],
         [0.5, 0.1, 1.2, -0.6],
     ]);
     let true_bias = Vector::new([0.25f32, -0.4, 0.7]);
-    let ones = Vector::<f32, BATCH>::filled(1.0);
+    let ones = Vector::<f32>::filled(BATCH, 1.0);
     let targets = true_weights.matmul(&inputs) + outer(&true_bias, &ones);
 
     println!("multi-output regression: learning a {OUT}×{IN} matrix and a {OUT}-vector bias");
 
-    let mut weights = Matrix::<f32, OUT, IN>::zeros();
-    let mut bias = Vector::<f32, OUT>::zeros();
+    let mut weights = Matrix::<f32>::zeros(OUT, IN);
+    let mut bias = Vector::<f32>::zeros(OUT);
     let rate = 0.8;
 
     for step in 0..=6000 {
         let tape = Tape::new();
 
         // Two parameter tensors of different shapes, on one tape.
-        let weight_var = tape.matrix(weights);
-        let bias_var = tape.vector(bias);
+        let weight_var = tape.matrix(weights.clone());
+        let bias_var = tape.vector(bias.clone());
 
         // The bias is broadcast across the batch as an outer product with ones,
         // which is differentiable like anything else: its adjoint contracts back
         // into a per-output sum over the batch.
-        let predicted =
-            &weight_var.matmul(&tape.matrix(inputs)) + &bias_var.outer(&tape.vector(ones));
-        let residual = &predicted - &tape.matrix(targets);
+        let predicted = &weight_var.matmul(&tape.matrix(inputs.clone()))
+            + &bias_var.outer(&tape.vector(ones.clone()));
+        let residual = &predicted - &tape.matrix(targets.clone());
         let loss = residual
             .frobenius_dot(&residual)
             .scale(1.0 / (OUT * BATCH) as f32);
@@ -197,7 +192,7 @@ fn multi_output_regression() {
         if step == 0 {
             // ∂L/∂W = (2/n)(W·X − Y)·Xᵀ, checked once against the closed form.
             let discrepancy = (weight_var.grad()
-                - (predicted.value().to_owned() - targets)
+                - (predicted.value().to_owned() - targets.clone())
                     .matmul(&inputs.transpose())
                     .scale(2.0 / (OUT * BATCH) as f32))
             .as_slice()
@@ -213,11 +208,11 @@ fn multi_output_regression() {
         bias = bias - bias_var.grad().scale(rate);
     }
 
-    let weight_error = (weights - true_weights)
+    let weight_error = (weights.clone() - true_weights)
         .as_slice()
         .iter()
         .fold(0.0f32, |worst, value| worst.max(value.abs()));
-    let bias_error = (bias - true_bias)
+    let bias_error = (bias.clone() - true_bias)
         .as_slice()
         .iter()
         .fold(0.0f32, |worst, value| worst.max(value.abs()));
@@ -227,11 +222,8 @@ fn multi_output_regression() {
 }
 
 /// `u ⊗ v` on plain tensors, for building the reference data.
-fn outer<const R: usize, const C: usize>(
-    u: &Vector<f32, R>,
-    v: &Vector<f32, C>,
-) -> Matrix<f32, R, C> {
-    Matrix::from_rows(std::array::from_fn(|row| {
-        std::array::from_fn(|col| u.data()[row] * v.data()[col])
-    }))
+fn outer(u: &Vector<f32>, v: &Vector<f32>) -> Matrix<f32> {
+    Matrix::from_rows(
+        (0..u.len()).map(|row| (0..v.len()).map(|col| u[row] * v[col]).collect::<Vec<_>>()),
+    )
 }

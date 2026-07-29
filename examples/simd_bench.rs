@@ -104,7 +104,10 @@ fn main() {
     // argument; `const` will call the specialized entry point once it exists.
 
     println!("dot: opaque length vs compile-time length");
-    println!("  {:>8}  {:>12}  {:>12}  {:>9}", "N", "opaque ns", "const ns", "speedup");
+    println!(
+        "  {:>8}  {:>12}  {:>12}  {:>9}",
+        "N", "opaque ns", "const ns", "speedup"
+    );
 
     macro_rules! dot_sweep {
         ($($n:expr => $iters:expr),* $(,)?) => {$({
@@ -162,9 +165,10 @@ fn main() {
                 // dot product and report a physically impossible time.
                 black_box(&mut c);
             });
-            // Literal dims through the same kernel — what every const-generic
-            // call site in the crate already gets for free, because `matmul` is
-            // `#[inline]` and the extents fold on inlining.
+            // Literal dims through the same kernel, which is what a call site
+            // with a size the optimizer can see gets: `matmul` is `#[inline]`,
+            // so a constant extent still folds even though the tensor types
+            // carry theirs at runtime.
             let constant = bench_ns($iters, || {
                 f32k::matmul(
                     black_box(a.as_flattened()),
@@ -207,8 +211,8 @@ fn main() {
         ($($n:expr => $iters:expr),* $(,)?) => {$({
             const N: usize = $n;
             let rows = square::<N>();
-            let a = Matrix::<f32, N, N>::from_rows(rows);
-            let b = Matrix::<f32, N, N>::from_rows(rows);
+            let a = Matrix::<f32>::from_rows(rows);
+            let b = Matrix::<f32>::from_rows(rows);
             // Kernel and end-to-end are timed in the same run so the difference
             // between them is real rather than an artifact of run-to-run drift.
             let mut scratch = [[0.0f32; N]; N];
@@ -269,12 +273,15 @@ fn main() {
     // exceeds 15 to the quadratic direct DFT.
 
     println!("Vector::fft end-to-end");
-    println!("  {:>8}  {:>12}  {:>16}  {:>12}", "N", "ns", "path", "ns/element");
+    println!(
+        "  {:>8}  {:>12}  {:>16}  {:>12}",
+        "N", "ns", "path", "ns/element"
+    );
 
     macro_rules! fft_sweep {
         ($($n:expr => ($iters:expr, $path:expr)),* $(,)?) => {$({
             const N: usize = $n;
-            let v = Vector::<f32, N>::new(ramp::<N>(0.25));
+            let v = Vector::<f32>::new(ramp::<N>(0.25));
             let elapsed = bench_ns($iters, || {
                 let out = black_box(&v).fft();
                 black_box(&out);

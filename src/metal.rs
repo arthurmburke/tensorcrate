@@ -16,14 +16,14 @@
 //! The tensor API on its default `Host` backend offloads above fixed size
 //! thresholds: 32,768 multiply-accumulates for products, 4,096 values for
 //! elementwise and broadcast work, and 1,024 values for radix-2 FFTs. Because
-//! those tensors live in stack arrays, each such call has to upload its operands
+//! those tensors live in host memory, each such call has to upload its operands
 //! and download its result.
 //!
 //! To keep a *sequence* of operations on the GPU, put the tensors on the
 //! [`Metal`](crate::tensors::Metal) backend, which stores their elements in
 //! `MTLStorageModeShared` memory and passes the allocations from kernel to
 //! kernel. [`MetalBuffer`] is that storage, usable directly when the
-//! statically-shaped tensor types do not fit.
+//! `Vector`/`Matrix` types do not fit.
 
 use std::cell::{OnceCell, RefCell};
 use std::mem::{ManuallyDrop, size_of};
@@ -615,7 +615,7 @@ fn download(buffer: &ProtocolObject<dyn MTLBuffer>, len: usize) -> Vec<f32> {
 /// FFT operations chain without ever leaving it.
 ///
 /// This is the storage behind the [`Metal`](crate::tensors::Metal) tensor
-/// backend, which wraps it in the statically-shaped `Vector`/`Matrix` API.
+/// backend, which pairs it with the extents to make a `Vector` or `Matrix`.
 ///
 /// Metal objects are thread-affine, so this type intentionally is not `Send`.
 /// Dropping one returns its allocation to the thread's buffer pool.
