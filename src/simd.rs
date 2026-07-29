@@ -307,6 +307,11 @@ pub mod fft_f32 {
         }
 
         let tau = std::f32::consts::TAU;
+        // Twiddle scratch for the widest stage, allocated once. Each stage uses
+        // the leading `half` entries. Allocating per stage instead costs one
+        // pair of allocations per stage — twenty for a 1024-point transform.
+        let mut tw_re_buf = vec![0.0f32; n / 2];
+        let mut tw_im_buf = vec![0.0f32; n / 2];
         let mut len = 2usize;
         while len <= n {
             let half = len / 2;
@@ -314,8 +319,8 @@ pub mod fft_f32 {
             let step = (angle.cos(), angle.sin());
 
             // Precompute this stage's twiddles: tw[o] = exp(i·angle·o).
-            let mut tw_re = vec![0.0f32; half];
-            let mut tw_im = vec![0.0f32; half];
+            let tw_re = &mut tw_re_buf[..half];
+            let tw_im = &mut tw_im_buf[..half];
             let (mut wr, mut wi) = (1.0f32, 0.0f32);
             for o in 0..half {
                 tw_re[o] = wr;

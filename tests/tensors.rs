@@ -97,6 +97,37 @@ fn fft_uses_mixed_radices_for_composite_lengths() {
     ]);
 }
 
+/// Deterministic non-degenerate samples, so a length can be exercised without
+/// spelling out an array literal of that size.
+fn ramp<const N: usize>() -> [f64; N] {
+    std::array::from_fn(|i| ((i as f64) * 0.7).sin() * 3.0 + (i as f64) * 0.01)
+}
+
+#[test]
+fn fft_matches_dft_at_deep_recursion_depths() {
+    // The mixed-radix decomposition shares one root table across the whole
+    // recursion, indexed by a stride that grows with each split. These lengths
+    // exercise several distinct descent shapes: a three-distinct-factor chain,
+    // a repeated-factor chain four deep, a squared prime, and a length whose
+    // smallest factor exceeds the radix cutoff so it hits the direct path both
+    // at the root and beneath a split.
+    assert_fft_matches_dft(ramp::<105>()); // 3·5·7
+    assert_fft_matches_dft(ramp::<240>()); // 2⁴·3·5
+    assert_fft_matches_dft(ramp::<121>()); // 11²
+    assert_fft_matches_dft(ramp::<17>()); // prime > 15, direct at the root
+    assert_fft_matches_dft(ramp::<34>()); // 2·17, direct beneath a split
+    assert_fft_matches_dft(ramp::<98>()); // 2·7²
+}
+
+#[test]
+fn fft_ifft_round_trips_at_deep_recursion_depths() {
+    assert_fft_ifft_round_trip(ramp::<105>());
+    assert_fft_ifft_round_trip(ramp::<240>());
+    assert_fft_ifft_round_trip(ramp::<121>());
+    assert_fft_ifft_round_trip(ramp::<34>());
+    assert_fft_ifft_round_trip(ramp::<1000>()); // 2³·5³, the deepest chain here
+}
+
 fn assert_fft_ifft_round_trip<const N: usize>(input: [f64; N]) {
     let reconstructed = Vector::new(input).fft().ifft();
     for (actual, expected) in reconstructed.data().iter().zip(input) {

@@ -606,8 +606,7 @@ impl<T: Coefficient, const N: usize> Vector<T, N> {
         }
 
         if !N.is_power_of_two() {
-            let transformed = mixed_radix_fft(&output, false);
-            output.copy_from_slice(&transformed);
+            mixed_radix_fft(&mut output, false);
             return Vector::new(output);
         }
 
@@ -646,8 +645,7 @@ impl<T: Float + Coefficient, const N: usize> Vector<Complex<T>, N> {
                 radix2_fft(&mut output, true);
             }
         } else {
-            let transformed = mixed_radix_fft(&output, true);
-            output.copy_from_slice(&transformed);
+            mixed_radix_fft(&mut output, true);
         }
 
         let normalization = cast::<T>(N);
@@ -712,73 +710,118 @@ fn radix2_fft<T: Float + Coefficient>(output: &mut [Complex<T>], inverse: bool) 
 /// the smallest supported factor uses radices up to 15. If no supported factor
 /// divides the length, the transform uses the quadratic DFT rather than a
 /// high-radix stage.
-fn mixed_radix_fft<T: Float + Coefficient>(input: &[Complex<T>], inverse: bool) -> Vec<Complex<T>> {
-    let n = input.len();
+fn mixed_radix_fft<T: Float + Coefficient>(data: &mut [Complex<T>], inverse: bool) {
+    let n = data.len();
     if n <= 1 {
-        return input.to_vec();
+        return;
     }
 
-    let Some(radix) = smallest_mixed_radix(n) else {
-        return direct_dft(input, inverse);
+    let direction = if inverse {
+        <T as num_traits::One>::one()
+    } else {
+        -<T as num_traits::One>::one()
     };
-
-    let quotient = n / radix;
-    let mut sub_transforms = Vec::with_capacity(radix);
-    for residue in 0..radix {
-        let subsequence = (0..quotient)
-            .map(|index| input[residue + radix * index])
-            .collect::<Vec<_>>();
-        sub_transforms.push(mixed_radix_fft(&subsequence, inverse));
-    }
-
     let zero = Complex::new(
         <T as num_traits::Zero>::zero(),
         <T as num_traits::Zero>::zero(),
     );
-    let tau = cast::<T>(std::f64::consts::TAU);
-    let direction = if inverse {
-        <T as num_traits::One>::one()
-    } else {
-        -<T as num_traits::One>::one()
-    };
-    let mut output = vec![zero; n];
-    for (high_frequency, frequency_band) in output.chunks_exact_mut(quotient).enumerate() {
-        for (low_frequency, target) in frequency_band.iter_mut().enumerate() {
-            let frequency = low_frequency + quotient * high_frequency;
-            let mut sum = zero;
-            for (residue, sub_transform) in sub_transforms.iter().enumerate() {
-                let angle =
-                    direction * tau * cast::<T>(residue) * cast::<T>(frequency) / cast::<T>(n);
-                let twiddle = Complex::new(angle.cos(), angle.sin());
-                sum = sum + sub_transform[low_frequency] * twiddle;
-            }
-            *target = sum;
-        }
-    }
-    output
+
+    // Two allocations for the whole transform: one workspace and the root
+    // table. The recursion below borrows slices of these rather than allocating
+    // per node — the earlier shape allocated a subsequence per residue plus an
+    // output at every node of the tree, which for `n = 1000` (2³·5³, roughly
+    // 1250 nodes) meant thousands of allocations per call.
+    let unit = roots_of_unity(n, direction);
+    let mut workspace = vec![zero; n];
+    transform(data, &mut workspace, &unit, 1);
 }
 
-fn direct_dft<T: Float + Coefficient>(input: &[Complex<T>], inverse: bool) -> Vec<Complex<T>> {
-    let n = input.len();
-    let tau = cast::<T>(std::f64::consts::TAU);
-    let direction = if inverse {
-        <T as num_traits::One>::one()
-    } else {
-        -<T as num_traits::One>::one()
-    };
-    (0..n)
-        .map(|frequency| {
-            let mut sum = Complex::new(
-                <T as num_traits::Zero>::zero(),
-                <T as num_traits::Zero>::zero(),
-            );
-            for (index, &value) in input.iter().enumerate() {
-                let angle =
-                    direction * tau * cast::<T>(frequency) * cast::<T>(index) / cast::<T>(n);
-                let twiddle = Complex::new(angle.cos(), angle.sin());
-                sum = sum + value * twiddle;
+/// Transforms `data` in place, using `workspace` (same length) as scratch.
+///
+/// `unit` is the root table for the *top-level* length, shared by every node.
+/// A node of length `m` needs the `m`-th roots, which are a stride-`stride`
+/// subsequence of it: `exp(2πik/m) == unit[k · stride]` exactly when
+/// `m · stride` equals the top-level length. Each descent multiplies `stride`
+/// by the radix it split off, so no node ever needs a table of its own.
+fn transform<T: Float + Coefficient>(
+    data: &mut [Complex<T>],
+    workspace: &mut [Complex<T>],
+    unit: &[Complex<T>],
+    stride: usize,
+) {
+    let m = data.len();
+    if m <= 1 {
+        return;
+    }
+    let zero = Complex::new(
+        <T as num_traits::Zero>::zero(),
+        <T as num_traits::Zero>::zero(),
+    );
+
+    let Some(radix) = smallest_mixed_radix(m) else {
+        // No supported factor: evaluate the definition directly.
+        for frequency in 0..m {
+            let mut sum = zero;
+            for (index, &value) in data.iter().enumerate() {
+                sum = sum + value * unit[frequency * index % m * stride];
             }
-            sum
+            workspace[frequency] = sum;
+        }
+        data.copy_from_slice(&workspace[..m]);
+        return;
+    };
+
+    let quotient = m / radix;
+
+    // Gather each residue class into its own contiguous block of `workspace`.
+    for residue in 0..radix {
+        for index in 0..quotient {
+            workspace[residue * quotient + index] = data[residue + radix * index];
+        }
+    }
+
+    // Transform each block. `data` has been fully consumed by the gather, so
+    // the matching block of it is free to serve as that sub-call's workspace.
+    for residue in 0..radix {
+        let (start, end) = (residue * quotient, (residue + 1) * quotient);
+        transform(
+            &mut workspace[start..end],
+            &mut data[start..end],
+            unit,
+            stride * radix,
+        );
+    }
+
+    // Combine: output frequency `low + quotient·high` sums one sample from each
+    // residue class, phase-shifted by the corresponding root.
+    for high in 0..radix {
+        for low in 0..quotient {
+            let frequency = low + quotient * high;
+            let mut sum = zero;
+            for residue in 0..radix {
+                sum = sum
+                    + workspace[residue * quotient + low]
+                        * unit[residue * frequency % m * stride];
+            }
+            data[frequency] = sum;
+        }
+    }
+}
+
+/// `exp(direction · 2πk/n)` for every `k` in `0..n`.
+///
+/// The transform only ever needs these `n` angles, because the exponent is
+/// periodic modulo `n`. Computing them once and indexing by the reduced
+/// exponent replaces the quadratic number of `cos`/`sin` calls the direct and
+/// mixed-radix paths used to make — and is more accurate besides, since the
+/// angle handed to `cos` stays inside one period instead of growing to
+/// `2π·(n−1)²/n` and losing precision to argument reduction.
+fn roots_of_unity<T: Float + Coefficient>(n: usize, direction: T) -> Vec<Complex<T>> {
+    let tau = cast::<T>(std::f64::consts::TAU);
+    (0..n)
+        .map(|k| {
+            let angle = direction * tau * cast::<T>(k) / cast::<T>(n);
+            Complex::new(angle.cos(), angle.sin())
         })
         .collect()
 }

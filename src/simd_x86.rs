@@ -462,12 +462,15 @@ pub mod fft_f32 {
         }
 
         let use_avx = is_x86_feature_detected!("avx");
+        // Twiddle scratch for the widest stage, allocated once rather than once
+        // per stage; see the aarch64 path for the same change.
+        let mut twiddle_buf = vec![0.0f32; n];
         let mut len = 2usize;
         while len <= n {
             let half = len / 2;
             let angle = direction * std::f32::consts::TAU / len as f32;
             let step = (angle.cos(), angle.sin());
-            let mut twiddles = vec![0.0f32; 2 * half];
+            let twiddles = &mut twiddle_buf[..2 * half];
             let (mut real, mut imaginary) = (1.0f32, 0.0f32);
             for offset in 0..half {
                 twiddles[2 * offset] = real;

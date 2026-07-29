@@ -19,8 +19,8 @@
 fn main() {
     use std::hint::black_box;
     use std::time::Instant;
-    use tensorcrate::simd::f32k;
-    use tensorcrate::tensors::Matrix;
+    use tensorcrate::simd::{f32k, fft_f32};
+    use tensorcrate::tensors::{Matrix, Vector};
 
     /// Times `f`, reporting the per-iteration average. `iters` is scaled by the
     /// caller so that short kernels still run long enough to measure.
@@ -103,18 +103,27 @@ fn main() {
     // crate actually instantiates. `runtime` passes the length as a `usize`
     // argument; `const` will call the specialized entry point once it exists.
 
-    println!("dot sweep (runtime length)");
-    println!("  {:>8}  {:>12}", "N", "runtime ns");
+    println!("dot: opaque length vs compile-time length");
+    println!("  {:>8}  {:>12}  {:>12}  {:>9}", "N", "opaque ns", "const ns", "speedup");
 
     macro_rules! dot_sweep {
         ($($n:expr => $iters:expr),* $(,)?) => {$({
             const N: usize = $n;
             let a = ramp::<N>(0.0);
             let b = ramp::<N>(1.5);
-            let runtime = bench_ns($iters, || {
+            // `black_box(&a[..])` hides the length behind slice metadata;
+            // `black_box(&a)` keeps it in the array type, where the optimizer
+            // still sees it and specializes the `#[inline]` kernel.
+            let opaque = bench_ns($iters, || {
+                sink += f32k::dot(black_box(&a[..]), black_box(&b[..]));
+            });
+            let constant = bench_ns($iters, || {
                 sink += f32k::dot(black_box(&a), black_box(&b));
             });
-            println!("  {:>8}  {:>12.2}", N, runtime);
+            println!(
+                "  {:>8}  {:>12.2}  {:>12.2}  {:>8.2}×",
+                N, opaque, constant, opaque / constant
+            );
         })*};
     }
     dot_sweep!(
@@ -127,8 +136,11 @@ fn main() {
     );
     println!();
 
-    println!("matmul sweep (runtime dims, square N×N×N)");
-    println!("  {:>8}  {:>12}", "N", "runtime ns");
+    println!("matmul: opaque dims vs compile-time dims (square N×N×N)");
+    println!(
+        "  {:>8}  {:>12}  {:>12}  {:>9}",
+        "N", "opaque ns", "const ns", "speedup"
+    );
 
     macro_rules! matmul_sweep {
         ($($n:expr => $iters:expr),* $(,)?) => {$({
@@ -136,11 +148,13 @@ fn main() {
             let a = square::<N>();
             let b = square::<N>();
             let mut c = [[0.0f32; N]; N];
-            let runtime = bench_ns($iters, || {
+            // Genuinely runtime dims: `black_box` hides the extents from the
+            // optimizer, which is the only way to see the unspecialized kernel.
+            let opaque = bench_ns($iters, || {
                 f32k::matmul(
                     black_box(a.as_flattened()),
                     black_box(b.as_flattened()),
-                    N, N, N,
+                    black_box(N), black_box(N), black_box(N),
                     c.as_flattened_mut(),
                 );
                 // The whole output must be observed, not just one element:
@@ -148,7 +162,22 @@ fn main() {
                 // dot product and report a physically impossible time.
                 black_box(&mut c);
             });
-            println!("  {:>8}  {:>12.2}", N, runtime);
+            // Literal dims through the same kernel — what every const-generic
+            // call site in the crate already gets for free, because `matmul` is
+            // `#[inline]` and the extents fold on inlining.
+            let constant = bench_ns($iters, || {
+                f32k::matmul(
+                    black_box(a.as_flattened()),
+                    black_box(b.as_flattened()),
+                    N, N, N,
+                    c.as_flattened_mut(),
+                );
+                black_box(&mut c);
+            });
+            println!(
+                "  {:>8}  {:>12.2}  {:>12.2}  {:>8.2}×",
+                N, opaque, constant, opaque / constant
+            );
         })*};
     }
     matmul_sweep!(
@@ -169,30 +198,102 @@ fn main() {
     // kernel sweep above does not see.
 
     println!("Matrix::matmul end-to-end (N×N×N)");
-    println!("  {:>8}  {:>12}  {:>12}", "N", "total ns", "kernel ns");
+    println!(
+        "  {:>8}  {:>12}  {:>12}  {:>12}",
+        "N", "total ns", "kernel ns", "overhead ns"
+    );
 
     macro_rules! api_sweep {
-        ($($n:expr => ($iters:expr, $kernel_ns:expr)),* $(,)?) => {$({
+        ($($n:expr => $iters:expr),* $(,)?) => {$({
             const N: usize = $n;
-            let a = Matrix::<f32, N, N>::from_rows(square::<N>());
-            let b = Matrix::<f32, N, N>::from_rows(square::<N>());
+            let rows = square::<N>();
+            let a = Matrix::<f32, N, N>::from_rows(rows);
+            let b = Matrix::<f32, N, N>::from_rows(rows);
+            // Kernel and end-to-end are timed in the same run so the difference
+            // between them is real rather than an artifact of run-to-run drift.
+            let mut scratch = [[0.0f32; N]; N];
+            let kernel = bench_ns($iters, || {
+                f32k::matmul(
+                    black_box(rows.as_flattened()),
+                    black_box(rows.as_flattened()),
+                    N, N, N,
+                    scratch.as_flattened_mut(),
+                );
+                black_box(&mut scratch);
+            });
             let total = bench_ns($iters, || {
                 let c = black_box(&a).matmul(black_box(&b));
                 black_box(&c);
             });
             println!(
-                "  {:>8}  {:>12.2}  {:>12.2}   overhead {:>7.1}%",
-                N, total, $kernel_ns as f64,
-                (total - $kernel_ns as f64) / total * 100.0
+                "  {:>8}  {:>12.2}  {:>12.2}  {:>12.2}",
+                N, total, kernel, total - kernel
             );
         })*};
     }
     api_sweep!(
-        8 => (200_000, 10.54),
-        16 => (100_000, 108.86),
-        32 => (20_000, 816.19),
-        64 => (5_000, 5950.44),
-        128 => (1_000, 76535.96),
+        8 => 200_000,
+        16 => 100_000,
+        32 => 20_000,
+        64 => 5_000,
+        128 => 1_000,
+    );
+
+    println!();
+
+    // ---- FFT ---------------------------------------------------------------
+    //
+    // Radix-2 over an interleaved [re, im, …] buffer. The stage loop runs
+    // log2(N) times, so any per-stage allocation is paid log2(N) times per
+    // transform.
+
+    println!("fft radix-2 (interleaved complex)");
+    println!("  {:>8}  {:>12}  {:>10}", "N", "ns", "stages");
+    for &n in &[64usize, 256, 1024, 4096] {
+        let mut buf: Vec<f32> = (0..2 * n).map(|i| (i as f32 * 0.031).sin()).collect();
+        let iters = (2_000_000 / n) as u32;
+        let elapsed = bench_ns(iters, || {
+            fft_f32::radix2(black_box(&mut buf), n, -1.0);
+            black_box(&mut buf);
+        });
+        println!("  {:>8}  {:>12.2}  {:>10}", n, elapsed, n.trailing_zeros());
+    }
+
+    println!();
+
+    // ---- Vector::fft end-to-end --------------------------------------------
+    //
+    // Three different code paths depending on the length: power-of-two goes to
+    // the vectorized radix-2 kernel, composite lengths to the recursive
+    // mixed-radix decomposition, and lengths whose smallest prime factor
+    // exceeds 15 to the quadratic direct DFT.
+
+    println!("Vector::fft end-to-end");
+    println!("  {:>8}  {:>12}  {:>16}  {:>12}", "N", "ns", "path", "ns/element");
+
+    macro_rules! fft_sweep {
+        ($($n:expr => ($iters:expr, $path:expr)),* $(,)?) => {$({
+            const N: usize = $n;
+            let v = Vector::<f32, N>::new(ramp::<N>(0.25));
+            let elapsed = bench_ns($iters, || {
+                let out = black_box(&v).fft();
+                black_box(&out);
+            });
+            println!(
+                "  {:>8}  {:>12.2}  {:>16}  {:>12.2}",
+                N, elapsed, $path, elapsed / N as f64
+            );
+        })*};
+    }
+    fft_sweep!(
+        64 => (100_000, "radix-2 simd"),
+        256 => (50_000, "radix-2 simd"),
+        1024 => (20_000, "radix-2 simd"),
+        105 => (20_000, "mixed 3·5·7"),
+        240 => (20_000, "mixed 2^4·3·5"),
+        1000 => (5_000, "mixed 2^3·5^3"),
+        17 => (100_000, "direct dft"),
+        101 => (20_000, "direct dft"),
     );
 
     black_box(sink);
