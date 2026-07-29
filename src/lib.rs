@@ -30,6 +30,7 @@ pub mod errors;
 pub mod metal;
 pub mod numbers;
 pub mod optim;
+pub mod persist;
 #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub mod simd;
 pub mod tensors;
