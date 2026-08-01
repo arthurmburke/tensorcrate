@@ -54,7 +54,7 @@ pub use dual::{
     DualMatrix, DualVector, gradient, gradient_wrt_matrix, jacobian, jacobian_wrt_matrix,
     matrix_gradient,
 };
-pub use kernels::{Analytic, BinaryOp, Compare, Kernels, Reduce, SortOrder};
+pub use kernels::{Analytic, BinaryOp, Compare, Kernels, Ordered, Reduce, SortOrder};
 pub use tape::{MatrixVar, ScalarVar, Tape, Var, VectorVar};
 
 // ---- shape checking ---------------------------------------------------------

@@ -22,7 +22,7 @@
 //! loops over elements: the shapes are runtime values, and a per-element loop
 //! would be a scalar CPU loop even when the vector lives in GPU memory.
 
-use crate::tensors::{BinaryOp, Compare, Kernels, Reduce, SortOrder, Vector};
+use crate::tensors::{BinaryOp, Compare, Kernels, Ordered, Reduce, SortOrder, Vector};
 
 /// The Euclidean projection of `values` onto `{r : r ≥ 0, Σr ≤ cap}` — the
 /// probability simplex when `cap` is one, scaled by `cap` otherwise.
@@ -66,14 +66,14 @@ pub fn project_onto_capped_simplex<B: Kernels>(
 ) -> Vector<f32, B> {
     let len = values.len();
     // Clipping alone is the projection when the budget is not binding.
-    let clamped = B::vector_compare_scalar(values, 0.0, Compare::Max, false);
-    if len == 0 || B::vector_reduce(&clamped, Reduce::Sum) <= cap {
+    let clamped = values.max_scalar(0.0);
+    if len == 0 || clamped.sum() <= cap {
         return clamped;
     }
 
     // Descending, so a prefix of the order is the set of entries that survive.
-    let sorted = B::vector_sort(values, SortOrder::Descending);
-    let running = B::vector_prefix_sum(&sorted);
+    let sorted = values.sorted(SortOrder::Descending);
+    let running = sorted.prefix_sum();
 
     // candidate[i] = (running[i] − cap) / (i + 1): the offset that would make
     // the first i + 1 entries sum to exactly `cap`.
@@ -86,11 +86,11 @@ pub fn project_onto_capped_simplex<B: Kernels>(
     // *admissible* index with `len` (past the end) leaves the inadmissible ones
     // carrying their own index, so the smallest mark is the first offending
     // index, and `len` means there was none.
-    let offending = B::vector_compare(&candidates, &sorted, Compare::Greater);
+    let offending = candidates.compare(&sorted, Compare::Greater);
     let admissible = B::vector_broadcast(&offending, 1.0, BinaryOp::Sub, true);
     let bias = B::vector_broadcast(&admissible, len as f32, BinaryOp::Mul, false);
     let marks = B::vector_elementwise(&Vector::<f32, B>::ramp(len, 0.0, 1.0), &bias, BinaryOp::Add);
-    let first_offending = B::vector_reduce(&marks, Reduce::Min) as usize;
+    let first_offending = marks.reduce(Reduce::Min) as usize;
 
     // The offset is the last admissible candidate; if even the first entry
     // offends, no entry is dropped and nothing is subtracted.
@@ -100,8 +100,7 @@ pub fn project_onto_capped_simplex<B: Kernels>(
         candidates.as_slice()[first_offending.min(len) - 1]
     };
 
-    let shifted = B::vector_broadcast(values, offset, BinaryOp::Sub, false);
-    B::vector_compare_scalar(&shifted, 0.0, Compare::Max, false)
+    B::vector_broadcast(values, offset, BinaryOp::Sub, false).max_scalar(0.0)
 }
 
 /// The Euclidean projection onto the box `[low, high]` — clipping, which is what
@@ -134,8 +133,9 @@ pub fn project_onto_box<B: Kernels>(
 #[track_caller]
 pub fn project_onto_ball<B: Kernels>(values: &Vector<f32, B>, radius: f32) -> Vector<f32, B> {
     assert!(radius >= 0.0, "project_onto_ball: the radius is negative");
-    let squares = B::vector_elementwise(values, values, BinaryOp::Mul);
-    let norm = B::vector_reduce(&squares, Reduce::Sum).sqrt();
+    let norm = B::vector_elementwise(values, values, BinaryOp::Mul)
+        .sum()
+        .sqrt();
     if norm <= radius {
         return values.to_backend::<B>();
     }

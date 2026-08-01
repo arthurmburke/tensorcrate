@@ -8,7 +8,7 @@
 //! padding all run.
 
 use tensorcrate::projections::{project_onto_ball, project_onto_box, project_onto_capped_simplex};
-use tensorcrate::tensors::{Compare, Host, Reduce, SortOrder, Vector};
+use tensorcrate::tensors::{Compare, Host, Kernels, Ordered, Reduce, SortOrder, Vector};
 
 /// A deterministic spread of signs and magnitudes.
 fn values(len: usize) -> Vec<f32> {
@@ -147,6 +147,59 @@ fn sort_by_takes_an_arbitrary_comparator() {
         words.sorted_by(|a, b| a.len().cmp(&b.len())).data(),
         ["fig", "pear", "banana"]
     );
+}
+
+// ---- reaching the operations from generic code ------------------------------
+
+/// The shape of caller this exists for: the backend is a type parameter, so no
+/// inherent method applies and every one of these resolves through [`Ordered`].
+fn squash<B: Kernels>(v: &Vector<f32, B>, cap: f32) -> Vector<f32, B> {
+    let capped = v.max_scalar(0.0).min_scalar(cap);
+    let bound = capped.maximum().unwrap_or(1.0).max(1e-6);
+    capped.clamp(0.0, bound)
+}
+
+#[test]
+fn the_operations_are_reachable_when_the_backend_is_a_parameter() {
+    let v = vector(20);
+    let squashed = squash(&v, 2.0);
+    for i in 0..20 {
+        // No NaNs in this input, so `f32::clamp` is the same expectation here.
+        assert_eq!(squashed[i], values(20)[i].clamp(0.0, 2.0));
+    }
+
+    // Elementwise `min`/`max` and the reductions, generically.
+    fn spread<B: Kernels>(a: &Vector<f32, B>, b: &Vector<f32, B>) -> f32 {
+        a.max(b).sum() - a.min(b).sum()
+    }
+    let other = Vector::new(values(20).into_iter().rev().collect::<Vec<_>>());
+    let want: f32 = values(20)
+        .iter()
+        .zip(values(20).iter().rev())
+        .map(|(x, y)| x.max(*y) - x.min(*y))
+        .sum();
+    assert!((spread(&v, &other) - want).abs() <= 1e-4 * (1.0 + want.abs()));
+}
+
+#[test]
+fn the_inherent_methods_still_win_on_a_concrete_backend() {
+    // `Ordered` is in scope for this whole file, so if importing it made the
+    // concrete-backend calls ambiguous, nothing here would compile. The
+    // inherent method takes priority and computes the same thing.
+    let v = vector(20);
+    let other = Vector::new(values(20).into_iter().rev().collect::<Vec<_>>());
+    assert_eq!(v.max(&other).data(), Ordered::max(&v, &other).data());
+    assert_eq!(
+        v.clamp(0.0, 1.0).data(),
+        Ordered::clamp(&v, 0.0, 1.0).data()
+    );
+    assert_eq!(v.sum(), Ordered::sum(&v));
+
+    // The inherent surface also covers element types the trait cannot: the
+    // backend-generic one is `f32`, since that is what the shaders are.
+    let wide = Vector::<f64, Host>::new(vec![1.5f64, -2.5, 0.25]);
+    assert_eq!(wide.clamp(-1.0, 1.0).data(), [1.0, -1.0, 0.25]);
+    assert_eq!(wide.maximum(), Some(1.5));
 }
 
 // ---- the projection ---------------------------------------------------------

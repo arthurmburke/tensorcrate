@@ -408,12 +408,175 @@ mod operation_tests {
     }
 }
 
+/// The order-dependent vector operations, spelled as methods, on whatever
+/// backend the vector is on.
+///
+/// [`Vector<f32, Host>`] and [`Vector<f32, Metal>`] both have `min`, `max`,
+/// `clamp` and the rest as inherent methods already. Neither of those is
+/// reachable when the backend is a *type parameter*, though — an inherent impl
+/// has to name a concrete type, and `Vector<T, Host>` cannot be one impl with
+/// `Vector<f32, B>` because the two overlap at `Vector<f32, Host>`. So generic
+/// code goes through here:
+///
+/// ```
+/// use tensorcrate::tensors::{Kernels, Ordered, Vector};
+///
+/// // Note the `Kernels` bound: `Backend` says where elements live, `Kernels`
+/// // says what can be computed on them.
+/// fn relu_then_cap<B: Kernels>(v: &Vector<f32, B>, cap: f32) -> Vector<f32, B> {
+///     v.max_scalar(0.0).min_scalar(cap)
+/// }
+///
+/// let v = Vector::new([-1.0f32, 0.5, 9.0]);
+/// assert_eq!(relu_then_cap(&v, 2.0).data(), [0.0, 0.5, 2.0]);
+/// ```
+///
+/// On a concrete backend the inherent method wins method resolution and this
+/// trait is never consulted; both run the same kernel and give the same answer,
+/// so which one resolved is not observable. The inherent versions also cover
+/// element types this trait cannot — `Vector<f64, Host>::max` is real, while the
+/// 32-bit shaders mean the backend-generic surface is `f32` only.
+///
+/// [`Vector<f32, Host>`]: Vector
+/// [`Vector<f32, Metal>`]: Vector
+pub trait Ordered: Sized {
+    /// Elementwise minimum.
+    ///
+    /// # Panics
+    ///
+    /// If the two lengths differ.
+    fn min(&self, other: &Self) -> Self;
+
+    /// Elementwise maximum.
+    ///
+    /// # Panics
+    ///
+    /// If the two lengths differ.
+    fn max(&self, other: &Self) -> Self;
+
+    /// The lesser of each element and `scalar`.
+    fn min_scalar(&self, scalar: f32) -> Self;
+
+    /// The greater of each element and `scalar` — `max_scalar(0.0)` is a relu.
+    fn max_scalar(&self, scalar: f32) -> Self;
+
+    /// Confine every element to `[low, high]`, in one pass.
+    ///
+    /// # Panics
+    ///
+    /// If `low > high`.
+    fn clamp(&self, low: f32, high: f32) -> Self;
+
+    /// Elementwise comparison, including the [`Compare`] predicates.
+    ///
+    /// # Panics
+    ///
+    /// If the two lengths differ.
+    fn compare(&self, other: &Self, op: Compare) -> Self;
+
+    /// Elementwise comparison against a scalar; `scalar_left` puts the scalar on
+    /// the left, which matters for every op but `Min` and `Max`.
+    fn compare_scalar(&self, scalar: f32, op: Compare, scalar_left: bool) -> Self;
+
+    /// Fold the whole vector to one value; an empty vector gives
+    /// [`op.identity()`](Reduce::identity).
+    fn reduce(&self, op: Reduce) -> f32;
+
+    /// The sum of every element.
+    fn sum(&self) -> f32 {
+        self.reduce(Reduce::Sum)
+    }
+
+    /// The smallest element, or `None` when there are none.
+    fn minimum(&self) -> Option<f32>;
+
+    /// The largest element, or `None` when there are none.
+    fn maximum(&self) -> Option<f32>;
+
+    /// Inclusive prefix sum: `out[i] = Σ_{j ≤ i} self[j]`.
+    fn prefix_sum(&self) -> Self;
+
+    /// The elements in [`SortOrder`]'s total order.
+    fn sorted(&self, order: SortOrder) -> Self;
+
+    /// The elements under an arbitrary comparator.
+    ///
+    /// A closure cannot cross to the GPU, so on a device-resident vector this
+    /// one sorts on the CPU and stores the result back; [`sorted`](Self::sorted)
+    /// is the version that stays put.
+    fn sorted_by(&self, compare: impl FnMut(&f32, &f32) -> Ordering) -> Self;
+}
+
+impl<B: Kernels> Ordered for Vector<f32, B> {
+    #[track_caller]
+    fn min(&self, other: &Self) -> Self {
+        B::vector_compare(self, other, Compare::Min)
+    }
+
+    #[track_caller]
+    fn max(&self, other: &Self) -> Self {
+        B::vector_compare(self, other, Compare::Max)
+    }
+
+    fn min_scalar(&self, scalar: f32) -> Self {
+        B::vector_compare_scalar(self, scalar, Compare::Min, false)
+    }
+
+    fn max_scalar(&self, scalar: f32) -> Self {
+        B::vector_compare_scalar(self, scalar, Compare::Max, false)
+    }
+
+    #[track_caller]
+    fn clamp(&self, low: f32, high: f32) -> Self {
+        B::vector_clamp(self, low, high)
+    }
+
+    #[track_caller]
+    fn compare(&self, other: &Self, op: Compare) -> Self {
+        B::vector_compare(self, other, op)
+    }
+
+    fn compare_scalar(&self, scalar: f32, op: Compare, scalar_left: bool) -> Self {
+        B::vector_compare_scalar(self, scalar, op, scalar_left)
+    }
+
+    fn reduce(&self, op: Reduce) -> f32 {
+        B::vector_reduce(self, op)
+    }
+
+    fn minimum(&self) -> Option<f32> {
+        (!self.is_empty()).then(|| self.reduce(Reduce::Min))
+    }
+
+    fn maximum(&self) -> Option<f32> {
+        (!self.is_empty()).then(|| self.reduce(Reduce::Max))
+    }
+
+    fn prefix_sum(&self) -> Self {
+        B::vector_prefix_sum(self)
+    }
+
+    fn sorted(&self, order: SortOrder) -> Self {
+        B::vector_sort(self, order)
+    }
+
+    fn sorted_by(&self, compare: impl FnMut(&f32, &f32) -> Ordering) -> Self {
+        let mut values = self.as_slice().to_vec();
+        values.sort_by(compare);
+        Vector::<f32, Host>::new(values).to_backend()
+    }
+}
+
 /// The `f32` tensor operations a [`Backend`] provides.
 ///
 /// Every method reads the shapes it needs from its operands, so the trait names
 /// the operations without naming any dimension. The shape *rules* still hold —
 /// a mismatch panics, exactly as it does on the inherent methods these forward
 /// to — they are simply checked when the call happens.
+///
+/// This is the operation-enum-shaped surface: `B::vector_compare(&a, &b,
+/// Compare::Max)`. [`Ordered`] is the same operations spelled as methods —
+/// `a.max(&b)` — for the cases where that reads better.
 pub trait Kernels: Backend {
     // ---- vectors ----
 
