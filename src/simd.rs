@@ -25,10 +25,12 @@ macro_rules! neon_kernels {
         mod $modname:ident, ty = $t:ty, vec = $v:ty, lanes = $lanes:expr,
         load = $load:ident, store = $store:ident, dup = $dup:ident,
         add = $add:ident, sub = $sub:ident, mul = $mul:ident, div = $div:ident,
-        fma = $fma:ident, addv = $addv:ident
+        fma = $fma:ident, addv = $addv:ident,
+        min = $min:ident, max = $max:ident, bsl = $bsl:ident,
+        cgt = $cgt:ident, clt = $clt:ident, cge = $cge:ident, cle = $cle:ident
     ) => {
         pub mod $modname {
-            use crate::tensors::BinaryOp;
+            use crate::tensors::{BinaryOp, Compare, Reduce};
             use core::arch::aarch64::*;
 
             /// Lanes per NEON register for this element type.
@@ -172,6 +174,224 @@ macro_rules! neon_kernels {
                 }
             }
 
+            /// The scalar definition of every comparison, for the ragged tail —
+            /// and the oracle the vector arms below have to agree with.
+            ///
+            /// `Min`/`Max` are `fminnm`/`fmaxnm`, the IEEE `minNum`/`maxNum`
+            /// that let a number beat a NaN, which is exactly what the
+            /// `f32::min` in the scalar path does. Plain `fmin`/`fmax` (the
+            /// `vminq`/`vmaxq` intrinsics) propagate the NaN instead, so they
+            /// would disagree with it.
+            #[inline]
+            fn compare_values(op: Compare, a: $t, b: $t) -> $t {
+                match op {
+                    Compare::Min => a.min(b),
+                    Compare::Max => a.max(b),
+                    Compare::MaxShare => match a.partial_cmp(&b) {
+                        Some(core::cmp::Ordering::Greater) => 1.0,
+                        Some(core::cmp::Ordering::Less) => 0.0,
+                        _ => 0.5,
+                    },
+                    Compare::Less => {
+                        if a < b {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    Compare::LessEqual => {
+                        if a <= b {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    Compare::Greater => {
+                        if a > b {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    Compare::GreaterEqual => {
+                        if a >= b {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                }
+            }
+
+            /// One vector-wide comparison. The predicates turn a lane mask into
+            /// `1.0`/`0.0` with a bitwise select, which is branchless and needs
+            /// no conversion instruction.
+            #[inline]
+            unsafe fn compare_vectors(op: Compare, a: $v, b: $v) -> $v {
+                unsafe {
+                    let one = $dup(1.0);
+                    let zero = $dup(0.0);
+                    match op {
+                        Compare::Min => $min(a, b),
+                        Compare::Max => $max(a, b),
+                        // Ordered greater / ordered less, so an unordered pair
+                        // (either operand NaN) falls through to the tie value.
+                        Compare::MaxShare => {
+                            let tie = $bsl($clt(a, b), zero, $dup(0.5));
+                            $bsl($cgt(a, b), one, tie)
+                        }
+                        Compare::Less => $bsl($clt(a, b), one, zero),
+                        Compare::LessEqual => $bsl($cle(a, b), one, zero),
+                        Compare::Greater => $bsl($cgt(a, b), one, zero),
+                        Compare::GreaterEqual => $bsl($cge(a, b), one, zero),
+                    }
+                }
+            }
+
+            /// Elementwise comparison of two slices.
+            #[inline]
+            pub fn compare(a: &[$t], b: &[$t], op: Compare, out: &mut [$t]) {
+                let n = a.len();
+                debug_assert!(b.len() == n && out.len() == n);
+                let mut i = 0;
+                unsafe {
+                    while i + LANES <= n {
+                        let va = $load(a.as_ptr().add(i));
+                        let vb = $load(b.as_ptr().add(i));
+                        $store(out.as_mut_ptr().add(i), compare_vectors(op, va, vb));
+                        i += LANES;
+                    }
+                }
+                while i < n {
+                    out[i] = compare_values(op, a[i], b[i]);
+                    i += 1;
+                }
+            }
+
+            /// Comparison against a splatted scalar. `scalar_left` selects the
+            /// operand order, which matters for every op but `Min` and `Max`.
+            #[inline]
+            pub fn compare_scalar(
+                values: &[$t],
+                scalar: $t,
+                op: Compare,
+                scalar_left: bool,
+                out: &mut [$t],
+            ) {
+                let n = values.len();
+                debug_assert_eq!(out.len(), n);
+                let mut i = 0;
+                unsafe {
+                    let vs = $dup(scalar);
+                    while i + LANES <= n {
+                        let vx = $load(values.as_ptr().add(i));
+                        let (lhs, rhs) = if scalar_left { (vs, vx) } else { (vx, vs) };
+                        $store(out.as_mut_ptr().add(i), compare_vectors(op, lhs, rhs));
+                        i += LANES;
+                    }
+                }
+                while i < n {
+                    let (lhs, rhs) = if scalar_left {
+                        (scalar, values[i])
+                    } else {
+                        (values[i], scalar)
+                    };
+                    out[i] = compare_values(op, lhs, rhs);
+                    i += 1;
+                }
+            }
+
+            /// Confine every element to `[low, high]`, in one pass.
+            ///
+            /// Two `compare_scalar` calls would stream the data twice; the pair
+            /// of instructions here has no reason to.
+            #[inline]
+            pub fn clamp(values: &[$t], low: $t, high: $t, out: &mut [$t]) {
+                let n = values.len();
+                debug_assert_eq!(out.len(), n);
+                let mut i = 0;
+                unsafe {
+                    let (vlow, vhigh) = ($dup(low), $dup(high));
+                    while i + LANES <= n {
+                        let vx = $load(values.as_ptr().add(i));
+                        $store(out.as_mut_ptr().add(i), $min($max(vx, vlow), vhigh));
+                        i += LANES;
+                    }
+                }
+                while i < n {
+                    out[i] = values[i].max(low).min(high);
+                    i += 1;
+                }
+            }
+
+            #[inline]
+            fn reduce_values(op: Reduce, a: $t, b: $t) -> $t {
+                match op {
+                    Reduce::Sum => a + b,
+                    Reduce::Min => a.min(b),
+                    Reduce::Max => a.max(b),
+                }
+            }
+
+            fn identity(op: Reduce) -> $t {
+                match op {
+                    Reduce::Sum => 0.0,
+                    Reduce::Min => <$t>::INFINITY,
+                    Reduce::Max => <$t>::NEG_INFINITY,
+                }
+            }
+
+            /// Fold a whole slice to one value.
+            ///
+            /// Four accumulators again, for the same reason [`dot`] keeps them:
+            /// a single running total serializes the fold on the latency of one
+            /// add. The lanes are combined at the end, so `Sum` associates
+            /// differently from the scalar loop and may land a rounding step
+            /// away from it — `Min` and `Max` are exact.
+            #[inline]
+            pub fn reduce(values: &[$t], op: Reduce) -> $t {
+                let n = values.len();
+                let mut i = 0;
+                let mut total = identity(op);
+                unsafe {
+                    let mut acc = [$dup(identity(op)); 4];
+                    while i + 4 * LANES <= n {
+                        let mut k = 0;
+                        while k < 4 {
+                            let v = $load(values.as_ptr().add(i + k * LANES));
+                            acc[k] = match op {
+                                Reduce::Sum => $add(acc[k], v),
+                                Reduce::Min => $min(acc[k], v),
+                                Reduce::Max => $max(acc[k], v),
+                            };
+                            k += 1;
+                        }
+                        i += 4 * LANES;
+                    }
+                    while i + LANES <= n {
+                        let v = $load(values.as_ptr().add(i));
+                        acc[0] = match op {
+                            Reduce::Sum => $add(acc[0], v),
+                            Reduce::Min => $min(acc[0], v),
+                            Reduce::Max => $max(acc[0], v),
+                        };
+                        i += LANES;
+                    }
+                    let mut lanes = [0 as $t; LANES];
+                    for a in acc {
+                        $store(lanes.as_mut_ptr(), a);
+                        for lane in lanes {
+                            total = reduce_values(op, total, lane);
+                        }
+                    }
+                }
+                while i < n {
+                    total = reduce_values(op, total, values[i]);
+                    i += 1;
+                }
+                total
+            }
+
             /// Row-major matrix multiply: `a` is `m×k`, `b` is `k×n`, `out` is
             /// `m×n` (must be pre-sized; it is overwritten).
             ///
@@ -257,7 +477,9 @@ neon_kernels! {
     mod f32k, ty = f32, vec = float32x4_t, lanes = 4,
     load = vld1q_f32, store = vst1q_f32, dup = vdupq_n_f32,
     add = vaddq_f32, sub = vsubq_f32, mul = vmulq_f32, div = vdivq_f32,
-    fma = vfmaq_f32, addv = vaddvq_f32
+    fma = vfmaq_f32, addv = vaddvq_f32,
+    min = vminnmq_f32, max = vmaxnmq_f32, bsl = vbslq_f32,
+    cgt = vcgtq_f32, clt = vcltq_f32, cge = vcgeq_f32, cle = vcleq_f32
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -265,7 +487,9 @@ neon_kernels! {
     mod f64k, ty = f64, vec = float64x2_t, lanes = 2,
     load = vld1q_f64, store = vst1q_f64, dup = vdupq_n_f64,
     add = vaddq_f64, sub = vsubq_f64, mul = vmulq_f64, div = vdivq_f64,
-    fma = vfmaq_f64, addv = vaddvq_f64
+    fma = vfmaq_f64, addv = vaddvq_f64,
+    min = vminnmq_f64, max = vmaxnmq_f64, bsl = vbslq_f64,
+    cgt = vcgtq_f64, clt = vcltq_f64, cge = vcgeq_f64, cle = vcleq_f64
 }
 
 /// Radix-2 Cooley–Tukey FFT over an interleaved `[re, im, re, im, …]` buffer of

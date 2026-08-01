@@ -234,8 +234,7 @@ mod gpu {
 
     use super::{Backend, sealed};
     use crate::metal::MetalBuffer;
-    use crate::tensors::Compare;
-    use crate::tensors::{Analytic, BinaryOp};
+    use crate::tensors::{Analytic, BinaryOp, Compare, Reduce, SortOrder};
 
     /// A backend that keeps `f32` elements in GPU-shared memory, so the Metal
     /// kernels read and write them in place.
@@ -615,6 +614,27 @@ mod gpu {
         ) -> Option<Self> {
             let output = self.device()?.compare_scalar(scalar, op, scalar_left)?;
             Some(Self(Residency::Device(output)))
+        }
+
+        /// Elementwise clamp to `[low, high]`.
+        pub(crate) fn clamp(&self, low: f32, high: f32) -> Option<Self> {
+            Some(Self(Residency::Device(self.device()?.clamp(low, high)?)))
+        }
+
+        /// Whole-buffer fold. The result is a number rather than an allocation,
+        /// so unlike its neighbours this one ends on the CPU by construction.
+        pub(crate) fn reduce(&self, op: Reduce) -> Option<f32> {
+            self.device()?.reduce(op)
+        }
+
+        /// Inclusive prefix sum, staying in shared memory.
+        pub(crate) fn prefix_sum(&self) -> Option<Self> {
+            Some(Self(Residency::Device(self.device()?.prefix_sum()?)))
+        }
+
+        /// Sort in IEEE total order, staying in shared memory.
+        pub(crate) fn sort(&self, order: SortOrder) -> Option<Self> {
+            Some(Self(Residency::Device(self.device()?.sort(order)?)))
         }
 
         /// Analytic function applied elementwise; `op` is an

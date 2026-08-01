@@ -14,6 +14,8 @@
 //!
 //! The trait is sealed, since [`Backend`] is.
 
+use std::cmp::Ordering;
+
 use super::{Backend, Host, Matrix, Vector};
 
 /// An elementwise binary operation.
@@ -76,6 +78,24 @@ impl TryFrom<u16> for BinaryOp {
 /// worth knowing: `|x|` differentiates to `sign(x)` with `sign(0) = 0`, and
 /// `relu` has slope `½` exactly at the kink rather than the `0` some frameworks
 /// pick.
+///
+/// The last four are *predicates*: they answer with `1.0` or `0.0` rather than
+/// with a value, which is how a tensor algebra with no boolean element type
+/// writes a mask. A mask multiplies (to zero out entries) or adds (to bias an
+/// index), so `select`, `count` and `first index where …` are all ordinary
+/// arithmetic over one. They are locally constant, so their derivative is zero
+/// wherever it exists and they are not meant to appear inside a differentiated
+/// expression.
+///
+/// A predicate is `false` whenever either operand is NaN, since an unordered
+/// comparison holds no way round — including `NaN ≤ NaN`.
+///
+/// `Min` and `Max` are IEEE `minNum`/`maxNum`, matching [`f32::min`] and
+/// [`f32::max`]: a number beats a NaN, so a stray NaN operand does not
+/// propagate. The one thing they do not pin down is the *sign* of a zero when
+/// `−0.0` and `+0.0` tie — `fminnm` answers `−0.0` where `minps` answers `+0.0`,
+/// and IEEE 754 permits both. The two zeros compare equal, so this is visible
+/// only to a bit-level comparison.
 #[repr(u16)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Compare {
@@ -86,11 +106,27 @@ pub enum Compare {
     /// `∂max(a, b)/∂a`: one where `a` is larger, zero where it is smaller, and a
     /// half where they tie. The rule for `Min` is its complement, `1 − share`.
     MaxShare = 2,
+    /// `1.0` where `a < b`.
+    Less = 3,
+    /// `1.0` where `a ≤ b`.
+    LessEqual = 4,
+    /// `1.0` where `a > b`.
+    Greater = 5,
+    /// `1.0` where `a ≥ b`.
+    GreaterEqual = 6,
 }
 
 impl Compare {
     /// Every comparison, in discriminant order.
-    pub const ALL: [Compare; 3] = [Compare::Min, Compare::Max, Compare::MaxShare];
+    pub const ALL: [Compare; 7] = [
+        Compare::Min,
+        Compare::Max,
+        Compare::MaxShare,
+        Compare::Less,
+        Compare::LessEqual,
+        Compare::Greater,
+        Compare::GreaterEqual,
+    ];
 
     /// Apply the comparison to a pair of values — the CPU counterpart of the
     /// `compare` shader, and the definition the GPU is tested against.
@@ -99,10 +135,14 @@ impl Compare {
             Compare::Min => a.min(b),
             Compare::Max => a.max(b),
             Compare::MaxShare => match a.partial_cmp(&b) {
-                Some(std::cmp::Ordering::Greater) => 1.0,
-                Some(std::cmp::Ordering::Less) => 0.0,
+                Some(Ordering::Greater) => 1.0,
+                Some(Ordering::Less) => 0.0,
                 _ => 0.5,
             },
+            Compare::Less => f32::from(a < b),
+            Compare::LessEqual => f32::from(a <= b),
+            Compare::Greater => f32::from(a > b),
+            Compare::GreaterEqual => f32::from(a >= b),
         }
     }
 }
@@ -114,6 +154,114 @@ impl From<Compare> for u16 {
 }
 
 impl TryFrom<u16> for Compare {
+    type Error = u16;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        Self::ALL.get(value as usize).copied().ok_or(value)
+    }
+}
+
+/// A whole-tensor reduction: many values in, one out.
+///
+/// Like the other operation enums the representation is part of the Metal shader
+/// ABI, so keep the discriminants stable and only append.
+///
+/// Each variant is an associative fold, which is what lets the GPU evaluate it
+/// as a tree and the CPU keep several accumulators in flight. Floating-point
+/// addition is *not* associative, so [`Sum`](Reduce::Sum) is order-dependent by
+/// a rounding error or two: the backends agree to within tolerance, not to the
+/// last bit. [`Min`](Reduce::Min) and [`Max`](Reduce::Max) are exact on every
+/// path.
+#[repr(u16)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Reduce {
+    Sum = 0,
+    Min = 1,
+    Max = 2,
+}
+
+impl Reduce {
+    /// Every reduction, in discriminant order.
+    pub const ALL: [Reduce; 3] = [Reduce::Sum, Reduce::Min, Reduce::Max];
+
+    /// The value that leaves the fold unchanged, and therefore the answer for an
+    /// empty tensor.
+    pub fn identity(self) -> f32 {
+        match self {
+            Reduce::Sum => 0.0,
+            Reduce::Min => f32::INFINITY,
+            Reduce::Max => f32::NEG_INFINITY,
+        }
+    }
+
+    /// Combine two partial results. `Min`/`Max` follow [`f32::min`]/[`f32::max`],
+    /// so a NaN operand loses to a number rather than poisoning the fold.
+    pub fn combine(self, a: f32, b: f32) -> f32 {
+        match self {
+            Reduce::Sum => a + b,
+            Reduce::Min => a.min(b),
+            Reduce::Max => a.max(b),
+        }
+    }
+
+    /// Fold a slice left to right — the scalar definition the vector and GPU
+    /// paths are tested against.
+    pub fn fold(self, values: &[f32]) -> f32 {
+        values
+            .iter()
+            .fold(self.identity(), |total, &value| self.combine(total, value))
+    }
+}
+
+impl From<Reduce> for u16 {
+    fn from(op: Reduce) -> Self {
+        op as u16
+    }
+}
+
+impl TryFrom<u16> for Reduce {
+    type Error = u16;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        Self::ALL.get(value as usize).copied().ok_or(value)
+    }
+}
+
+/// Which way a sort runs.
+///
+/// Both directions order by [`f32::total_cmp`] — the IEEE total order, under
+/// which `−0.0` precedes `+0.0` and NaNs sit at the ends by sign rather than
+/// comparing unordered. That is a stronger promise than the `<` of a comparison
+/// kernel, and it is what lets the GPU sort agree with the CPU one on every
+/// input rather than only on NaN-free ones.
+#[repr(u16)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum SortOrder {
+    Ascending = 0,
+    Descending = 1,
+}
+
+impl SortOrder {
+    /// Every direction, in discriminant order.
+    pub const ALL: [SortOrder; 2] = [SortOrder::Ascending, SortOrder::Descending];
+
+    /// The comparator this order sorts by, for handing to [`slice::sort_by`] —
+    /// or to [`Vector::sort_by`](crate::tensors::Vector::sort_by).
+    pub fn comparator(self) -> impl Fn(&f32, &f32) -> Ordering + Copy {
+        move |left: &f32, right: &f32| match self {
+            SortOrder::Ascending => left.total_cmp(right),
+            SortOrder::Descending => right.total_cmp(left),
+        }
+    }
+}
+
+impl From<SortOrder> for u16 {
+    fn from(op: SortOrder) -> Self {
+        op as u16
+    }
+}
+
+impl TryFrom<u16> for SortOrder {
     type Error = u16;
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
@@ -297,6 +445,25 @@ pub trait Kernels: Backend {
         scalar_left: bool,
     ) -> Vector<f32, Self>;
 
+    /// Confine every element to `[low, high]`.
+    ///
+    /// The pair of comparisons fused into one pass: two `compare_scalar` calls
+    /// would read and write the whole tensor twice, and on the GPU would be two
+    /// dispatches.
+    ///
+    /// Panics unless `low ≤ high`.
+    fn vector_clamp(a: &Vector<f32, Self>, low: f32, high: f32) -> Vector<f32, Self>;
+
+    /// Fold the whole vector to one value; an empty vector gives
+    /// [`op.identity()`](Reduce::identity).
+    fn vector_reduce(a: &Vector<f32, Self>, op: Reduce) -> f32;
+
+    /// Inclusive prefix sum: `out[i] = Σ_{j ≤ i} a[j]`.
+    fn vector_prefix_sum(a: &Vector<f32, Self>) -> Vector<f32, Self>;
+
+    /// The elements in [`SortOrder`]'s total order.
+    fn vector_sort(a: &Vector<f32, Self>, order: SortOrder) -> Vector<f32, Self>;
+
     /// `f(a)`, elementwise.
     fn vector_unary(a: &Vector<f32, Self>, f: Analytic) -> Vector<f32, Self>;
 
@@ -349,6 +516,10 @@ pub trait Kernels: Backend {
         op: Compare,
         scalar_left: bool,
     ) -> Matrix<f32, Self>;
+
+    /// Confine every element to `[low, high]`; see
+    /// [`vector_clamp`](Kernels::vector_clamp).
+    fn matrix_clamp(a: &Matrix<f32, Self>, low: f32, high: f32) -> Matrix<f32, Self>;
 
     /// `f(a)`, elementwise.
     fn matrix_unary(a: &Matrix<f32, Self>, f: Analytic) -> Matrix<f32, Self>;
@@ -456,14 +627,7 @@ impl Kernels for Host {
         b: &Vector<f32, Self>,
         op: Compare,
     ) -> Vector<f32, Self> {
-        assert_eq!(a.len(), b.len(), "compare: vector lengths differ");
-        let (left, right) = (a.data(), b.data());
-        Vector::new(
-            left.iter()
-                .zip(right)
-                .map(|(&x, &y)| op.value(x, y))
-                .collect::<Vec<_>>(),
-        )
+        a.compare(b, op)
     }
 
     fn vector_compare_scalar(
@@ -472,13 +636,23 @@ impl Kernels for Host {
         op: Compare,
         scalar_left: bool,
     ) -> Vector<f32, Self> {
-        a.map(|&x| {
-            if scalar_left {
-                op.value(scalar, x)
-            } else {
-                op.value(x, scalar)
-            }
-        })
+        a.compare_scalar(scalar, op, scalar_left)
+    }
+
+    fn vector_clamp(a: &Vector<f32, Self>, low: f32, high: f32) -> Vector<f32, Self> {
+        a.clamp(low, high)
+    }
+
+    fn vector_reduce(a: &Vector<f32, Self>, op: Reduce) -> f32 {
+        a.reduce(op)
+    }
+
+    fn vector_prefix_sum(a: &Vector<f32, Self>) -> Vector<f32, Self> {
+        a.prefix_sum()
+    }
+
+    fn vector_sort(a: &Vector<f32, Self>, order: SortOrder) -> Vector<f32, Self> {
+        a.sorted(order)
     }
 
     fn vector_unary(a: &Vector<f32, Self>, f: Analytic) -> Vector<f32, Self> {
@@ -556,15 +730,7 @@ impl Kernels for Host {
         b: &Matrix<f32, Self>,
         op: Compare,
     ) -> Matrix<f32, Self> {
-        assert_eq!(a.shape(), b.shape(), "compare: matrix shapes differ");
-        let (rows, cols) = a.shape();
-        let values = a
-            .data()
-            .iter()
-            .zip(b.data())
-            .map(|(&x, &y)| op.value(x, y))
-            .collect::<Vec<_>>();
-        Matrix::from_flat(rows, cols, values)
+        a.compare(b, op)
     }
 
     fn matrix_compare_scalar(
@@ -573,13 +739,11 @@ impl Kernels for Host {
         op: Compare,
         scalar_left: bool,
     ) -> Matrix<f32, Self> {
-        a.map(|&x| {
-            if scalar_left {
-                op.value(scalar, x)
-            } else {
-                op.value(x, scalar)
-            }
-        })
+        a.compare_scalar(scalar, op, scalar_left)
+    }
+
+    fn matrix_clamp(a: &Matrix<f32, Self>, low: f32, high: f32) -> Matrix<f32, Self> {
+        a.clamp(low, high)
     }
 
     fn matrix_unary(a: &Matrix<f32, Self>, f: Analytic) -> Matrix<f32, Self> {
@@ -758,7 +922,9 @@ pub(crate) fn correlation_shape(input: (usize, usize), window: (usize, usize)) -
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod gpu {
-    use super::{Analytic, BinaryOp, Compare, Kernels, Matrix, Vector, correlation_shape};
+    use super::{
+        Analytic, BinaryOp, Compare, Kernels, Matrix, Reduce, SortOrder, Vector, correlation_shape,
+    };
     use crate::tensors::metal_backend::{matrix_elementwise, vector_elementwise};
     use crate::tensors::{Host, Metal};
 
@@ -801,6 +967,22 @@ mod gpu {
             scalar_left: bool,
         ) -> Vector<f32, Self> {
             a.compare_scalar(scalar, op, scalar_left)
+        }
+
+        fn vector_clamp(a: &Vector<f32, Self>, low: f32, high: f32) -> Vector<f32, Self> {
+            a.clamp(low, high)
+        }
+
+        fn vector_reduce(a: &Vector<f32, Self>, op: Reduce) -> f32 {
+            a.reduce(op)
+        }
+
+        fn vector_prefix_sum(a: &Vector<f32, Self>) -> Vector<f32, Self> {
+            a.prefix_sum()
+        }
+
+        fn vector_sort(a: &Vector<f32, Self>, order: SortOrder) -> Vector<f32, Self> {
+            a.sorted(order)
         }
 
         fn vector_unary(a: &Vector<f32, Self>, f: Analytic) -> Vector<f32, Self> {
@@ -884,6 +1066,10 @@ mod gpu {
             scalar_left: bool,
         ) -> Matrix<f32, Self> {
             a.compare_scalar(scalar, op, scalar_left)
+        }
+
+        fn matrix_clamp(a: &Matrix<f32, Self>, low: f32, high: f32) -> Matrix<f32, Self> {
+            a.clamp(low, high)
         }
 
         fn matrix_unary(a: &Matrix<f32, Self>, f: Analytic) -> Matrix<f32, Self> {

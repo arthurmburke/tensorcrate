@@ -29,12 +29,13 @@
 //! [`Matrix::determinant`]: super::Matrix::determinant
 //! [`Matrix::inverse`]: super::Matrix::inverse
 
+use std::cmp::Ordering;
 use std::fmt::{self, Display};
 use std::ops::{Add, Div, Mul, Neg, Rem, Sub};
 
 use super::{
-    Analytic, BinaryOp, Compare, Host, Kernels, Matrix, Metal, Vector, assert_inner,
-    assert_same_len, assert_same_shape,
+    Analytic, BinaryOp, Compare, Host, Kernels, Matrix, Metal, Reduce, SortOrder, Vector,
+    assert_inner, assert_ordered_bounds, assert_same_len, assert_same_shape,
 };
 
 impl Vector<f32, Metal> {
@@ -115,6 +116,114 @@ impl Vector<f32, Metal> {
                     .to_backend()
             }
         }
+    }
+
+    /// Elementwise minimum with another resident vector, on the GPU.
+    ///
+    /// # Panics
+    ///
+    /// If the two lengths differ.
+    #[track_caller]
+    pub fn min(&self, other: &Self) -> Self {
+        self.compare(other, Compare::Min)
+    }
+
+    /// Elementwise maximum with another resident vector, on the GPU.
+    ///
+    /// # Panics
+    ///
+    /// If the two lengths differ.
+    #[track_caller]
+    pub fn max(&self, other: &Self) -> Self {
+        self.compare(other, Compare::Max)
+    }
+
+    /// The lesser of each element and `scalar`, on the GPU.
+    pub fn min_scalar(&self, scalar: f32) -> Self {
+        self.compare_scalar(scalar, Compare::Min, false)
+    }
+
+    /// The greater of each element and `scalar`, on the GPU — `max_scalar(0.0)`
+    /// is a relu.
+    pub fn max_scalar(&self, scalar: f32) -> Self {
+        self.compare_scalar(scalar, Compare::Max, false)
+    }
+
+    /// Confine every element to `[low, high]`, in one dispatch.
+    ///
+    /// # Panics
+    ///
+    /// If `low > high`.
+    #[track_caller]
+    pub fn clamp(&self, low: f32, high: f32) -> Self {
+        assert_ordered_bounds(&low, &high);
+        match self.storage().clamp(low, high) {
+            Some(data) => Vector::from_storage(self.len(), data),
+            None => Host::vector_clamp(&self.to_backend::<Host>(), low, high).to_backend(),
+        }
+    }
+
+    /// Fold the whole vector to one value with a GPU tree reduction. An empty
+    /// vector gives [`op.identity()`](Reduce::identity).
+    ///
+    /// The answer is a number rather than a tensor, so this necessarily comes
+    /// back to the CPU: it is a synchronization point, unlike the operations
+    /// that leave their result resident.
+    pub fn reduce(&self, op: Reduce) -> f32 {
+        match self.storage().reduce(op) {
+            Some(value) => value,
+            None => Host::vector_reduce(&self.to_backend::<Host>(), op),
+        }
+    }
+
+    /// The sum of every element.
+    pub fn sum(&self) -> f32 {
+        self.reduce(Reduce::Sum)
+    }
+
+    /// The smallest element, or `None` when there are none.
+    pub fn minimum(&self) -> Option<f32> {
+        (!self.is_empty()).then(|| self.reduce(Reduce::Min))
+    }
+
+    /// The largest element, or `None` when there are none.
+    pub fn maximum(&self) -> Option<f32> {
+        (!self.is_empty()).then(|| self.reduce(Reduce::Max))
+    }
+
+    /// Inclusive prefix sum, staying resident.
+    ///
+    /// `log2(len)` dispatches of a Hillis–Steele scan. Its additions associate
+    /// differently from the host's running total, so the two agree to a
+    /// rounding error rather than bit for bit.
+    pub fn prefix_sum(&self) -> Self {
+        match self.storage().prefix_sum() {
+            Some(data) => Vector::from_storage(self.len(), data),
+            None => Host::vector_prefix_sum(&self.to_backend::<Host>()).to_backend(),
+        }
+    }
+
+    /// Sort in [`SortOrder`]'s total order, staying resident.
+    ///
+    /// A bitonic sort over integer sort keys, so the result matches a host
+    /// [`f32::total_cmp`] sort exactly, NaNs included.
+    pub fn sorted(&self, order: SortOrder) -> Self {
+        match self.storage().sort(order) {
+            Some(data) => Vector::from_storage(self.len(), data),
+            None => Host::vector_sort(&self.to_backend::<Host>(), order).to_backend(),
+        }
+    }
+
+    /// Sort under an arbitrary comparator.
+    ///
+    /// A closure cannot cross to the GPU, so this is the one operation here that
+    /// leaves the device: the elements are read out of shared memory, sorted on
+    /// the CPU, and stored back. [`sorted`](Self::sorted) is the resident
+    /// version, and covers everything a total order can express.
+    pub fn sorted_by(&self, compare: impl FnMut(&f32, &f32) -> Ordering) -> Self {
+        let mut values = self.to_vec();
+        values.sort_by(compare);
+        Vector::new(values).to_backend()
     }
 
     /// Multiply every element by `scalar`, on the GPU.
@@ -295,6 +404,21 @@ impl Matrix<f32, Metal> {
                 Host::matrix_compare_scalar(&self.to_backend::<Host>(), scalar, op, scalar_left)
                     .to_backend()
             }
+        }
+    }
+
+    /// Confine every element to `[low, high]`, in one dispatch.
+    ///
+    /// # Panics
+    ///
+    /// If `low > high`.
+    #[track_caller]
+    pub fn clamp(&self, low: f32, high: f32) -> Self {
+        assert_ordered_bounds(&low, &high);
+        let (rows, cols) = self.shape();
+        match self.storage().clamp(low, high) {
+            Some(data) => Matrix::from_storage(rows, cols, data),
+            None => Host::matrix_clamp(&self.to_backend::<Host>(), low, high).to_backend(),
         }
     }
 

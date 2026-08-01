@@ -7,7 +7,7 @@
 #![cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
 
 use tensorcrate::simd::{f32k, f64k, fft_f32};
-use tensorcrate::tensors::{BinaryOp, Matrix, Vector};
+use tensorcrate::tensors::{BinaryOp, Compare, Matrix, Reduce, Vector};
 
 fn approx(a: f32, b: f32, tol: f32) -> bool {
     (a - b).abs() <= tol * (1.0 + a.abs().max(b.abs()))
@@ -202,4 +202,183 @@ fn radix2_matches_the_dft_and_round_trips() {
             );
         }
     }
+}
+
+// ---- comparisons, clamp and reductions --------------------------------------
+
+/// The scalar definition of a comparison, written for both float widths so the
+/// `f64` kernel is held to the same standard as the `f32` one.
+macro_rules! scalar_compare {
+    ($name:ident, $t:ty) => {
+        fn $name(op: Compare, a: $t, b: $t) -> $t {
+            match op {
+                Compare::Min => a.min(b),
+                Compare::Max => a.max(b),
+                Compare::MaxShare => match a.partial_cmp(&b) {
+                    Some(std::cmp::Ordering::Greater) => 1.0,
+                    Some(std::cmp::Ordering::Less) => 0.0,
+                    _ => 0.5,
+                },
+                Compare::Less => (a < b) as u8 as $t,
+                Compare::LessEqual => (a <= b) as u8 as $t,
+                Compare::Greater => (a > b) as u8 as $t,
+                Compare::GreaterEqual => (a >= b) as u8 as $t,
+            }
+        }
+    };
+}
+
+scalar_compare!(compare32, f32);
+scalar_compare!(compare64, f64);
+
+/// Bit equality, with the two licensed exceptions: NaN payloads are not
+/// specified, and neither is the sign of a zero returned by `min`/`max` when
+/// `-0.0` and `+0.0` tie — `fminnm` keeps the negative sign, `minps` keeps
+/// whichever operand came second.
+fn same_answer(got: f32, want: f32) -> bool {
+    got.to_bits() == want.to_bits()
+        || (got.is_nan() && want.is_nan())
+        || (got == 0.0 && want == 0.0)
+}
+
+fn same_answer64(got: f64, want: f64) -> bool {
+    got.to_bits() == want.to_bits()
+        || (got.is_nan() && want.is_nan())
+        || (got == 0.0 && want == 0.0)
+}
+
+/// Values with ties, both zeros and a NaN, since those are where a vector
+/// comparison is free to disagree with the scalar one.
+fn awkward_f32(n: usize) -> Vec<f32> {
+    (0..n)
+        .map(|i| match i % 11 {
+            0 => 0.0,
+            1 => -0.0,
+            2 => f32::NAN,
+            3 => f32::INFINITY,
+            4 => f32::NEG_INFINITY,
+            other => (other as f32) * 0.75 - 3.0,
+        })
+        .collect()
+}
+
+#[test]
+fn compare_matches_scalar_including_ties_and_nans() {
+    for n in [1usize, 3, 4, 15, 16, 17, 37, 129] {
+        let a = awkward_f32(n);
+        let b: Vec<f32> = awkward_f32(n).into_iter().rev().collect();
+        for op in Compare::ALL {
+            let mut got = vec![0.0f32; n];
+            f32k::compare(&a, &b, op, &mut got);
+            for i in 0..n {
+                let want = compare32(op, a[i], b[i]);
+                assert!(
+                    same_answer(got[i], want),
+                    "f32 {op:?} n={n} i={i}: {} vs {want}",
+                    got[i]
+                );
+            }
+
+            let a64: Vec<f64> = a.iter().map(|&x| x as f64).collect();
+            let b64: Vec<f64> = b.iter().map(|&x| x as f64).collect();
+            let mut got64 = vec![0.0f64; n];
+            f64k::compare(&a64, &b64, op, &mut got64);
+            for i in 0..n {
+                let want = compare64(op, a64[i], b64[i]);
+                assert!(same_answer64(got64[i], want), "f64 {op:?} n={n} i={i}");
+            }
+        }
+    }
+}
+
+#[test]
+fn compare_scalar_respects_operand_order() {
+    let n = 37;
+    let values = awkward_f32(n);
+    for scalar in [0.0f32, -1.5, 2.0] {
+        for left in [false, true] {
+            for op in Compare::ALL {
+                let mut got = vec![0.0f32; n];
+                f32k::compare_scalar(&values, scalar, op, left, &mut got);
+                for i in 0..n {
+                    let (lhs, rhs) = if left {
+                        (scalar, values[i])
+                    } else {
+                        (values[i], scalar)
+                    };
+                    let want = compare32(op, lhs, rhs);
+                    assert!(
+                        same_answer(got[i], want),
+                        "{op:?} left={left} i={i}: {} vs {want}",
+                        got[i]
+                    );
+                }
+            }
+        }
+    }
+}
+
+// `max` then `min` rather than `f32::clamp`, which is a different function: it
+// panics on a NaN bound and propagates a NaN input, where the kernels are
+// specified as the pair of IEEE `minNum`/`maxNum` operations.
+#[allow(clippy::manual_clamp)]
+#[test]
+fn clamp_matches_the_scalar_pair_of_bounds() {
+    for n in [1usize, 5, 16, 33, 64] {
+        let values = awkward_f32(n);
+        let mut got = vec![0.0f32; n];
+        f32k::clamp(&values, -1.0, 2.0, &mut got);
+        for i in 0..n {
+            let want = values[i].max(-1.0).min(2.0);
+            assert!(
+                same_answer(got[i], want),
+                "n={n} i={i}: {} vs {want}",
+                got[i]
+            );
+        }
+
+        let values64: Vec<f64> = values.iter().map(|&x| x as f64).collect();
+        let mut got64 = vec![0.0f64; n];
+        f64k::clamp(&values64, -1.0, 2.0, &mut got64);
+        for i in 0..n {
+            assert!(same_answer64(got64[i], values64[i].max(-1.0).min(2.0)));
+        }
+    }
+}
+
+#[test]
+fn reduce_matches_the_scalar_fold() {
+    for n in [0usize, 1, 7, 16, 17, 64, 130] {
+        // Integral values, so the vector fold's different association is exact
+        // and `Sum` can be compared without a tolerance.
+        let values: Vec<f32> = (0..n).map(|i| ((i % 13) as f32) - 6.0).collect();
+        for op in Reduce::ALL {
+            assert_eq!(f32k::reduce(&values, op), op.fold(&values), "{op:?} n={n}");
+        }
+
+        let values64: Vec<f64> = values.iter().map(|&x| x as f64).collect();
+        let sum64: f64 = values64.iter().sum();
+        assert!((f64k::reduce(&values64, Reduce::Sum) - sum64).abs() <= 1e-12);
+        assert_eq!(
+            f64k::reduce(&values64, Reduce::Min),
+            values64.iter().copied().fold(f64::INFINITY, f64::min)
+        );
+        assert_eq!(
+            f64k::reduce(&values64, Reduce::Max),
+            values64.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+        );
+    }
+}
+
+#[test]
+fn reduce_lets_numbers_beat_nans() {
+    // `f32::min`/`f32::max` return the non-NaN operand, so a NaN anywhere in the
+    // input must not poison the fold — including when it lands in a different
+    // accumulator from the extreme value.
+    let mut values: Vec<f32> = (0..64).map(|i| (i as f32) - 32.0).collect();
+    values[5] = f32::NAN;
+    values[40] = f32::NAN;
+    assert_eq!(f32k::reduce(&values, Reduce::Min), -32.0);
+    assert_eq!(f32k::reduce(&values, Reduce::Max), 31.0);
+    assert!(f32k::reduce(&values, Reduce::Sum).is_nan());
 }

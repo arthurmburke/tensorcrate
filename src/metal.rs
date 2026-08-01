@@ -38,10 +38,14 @@ use objc2_metal::{
     MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
 };
 
-use crate::tensors::{Analytic, BinaryOp, Compare};
+use crate::tensors::{Analytic, BinaryOp, Compare, Reduce, SortOrder};
 
 /// Threadgroup tile edge; must match `TILE` in the shader. 16×16 = 256 threads.
 const TILE: usize = 16;
+
+/// Threads per group in the tree reduction; must match `REDUCE_GROUP` in the
+/// shader, which sizes its threadgroup scratch array with it.
+const REDUCE_GROUP: usize = 256;
 
 /// The compute kernels.
 ///
@@ -53,6 +57,7 @@ const KERNELS: &str = r#"
 using namespace metal;
 
 #define TILE 16
+#define REDUCE_GROUP 256
 
 enum class BinaryOp : ushort {
     Add = 0,
@@ -66,10 +71,23 @@ enum class BinaryOp : ushort {
 // `Max` with respect to its left operand: one where the left is larger, zero
 // where it is smaller, and a half where they tie, so a tied maximum splits its
 // gradient evenly between the two.
+// The last four are predicates, answering 1.0 or 0.0 — the mask a tensor
+// algebra with no boolean element type uses. They are the *ordered* comparisons,
+// so a NaN operand answers 0.0, which is what `a < b` does on the CPU side.
 enum class CompareOp : ushort {
     Min = 0,
     Max = 1,
-    MaxShare = 2
+    MaxShare = 2,
+    Less = 3,
+    LessEqual = 4,
+    Greater = 5,
+    GreaterEqual = 6
+};
+
+enum class ReduceOp : ushort {
+    Sum = 0,
+    Min = 1,
+    Max = 2
 };
 
 enum class AnalyticOp : ushort {
@@ -168,7 +186,11 @@ inline float compare_values(CompareOp op, float a, float b) {
     switch (op) {
         case CompareOp::Min: return fmin(a, b);
         case CompareOp::Max: return fmax(a, b);
-        default: return a > b ? 1.0f : (a < b ? 0.0f : 0.5f);
+        case CompareOp::MaxShare: return a > b ? 1.0f : (a < b ? 0.0f : 0.5f);
+        case CompareOp::Less: return a < b ? 1.0f : 0.0f;
+        case CompareOp::LessEqual: return a <= b ? 1.0f : 0.0f;
+        case CompareOp::Greater: return a > b ? 1.0f : 0.0f;
+        default: return a >= b ? 1.0f : 0.0f;
     }
 }
 
@@ -193,6 +215,128 @@ kernel void compare_scalar(
     float a = scalar_left ? scalar : A[i];
     float b = scalar_left ? A[i] : scalar;
     C[i] = compare_values(op, a, b);
+}
+
+// `fmin`/`fmax` rather than the `clamp` builtin, whose behaviour on a NaN input
+// is unspecified: this pair is `x.max(low).min(high)`, the CPU definition.
+kernel void clamp_values(
+    device const float* A  [[buffer(0)]],
+    device float* C        [[buffer(1)]],
+    constant float& low    [[buffer(2)]],
+    constant float& high   [[buffer(3)]],
+    uint i [[thread_position_in_grid]])
+{
+    C[i] = fmin(fmax(A[i], low), high);
+}
+
+inline float reduce_values(ReduceOp op, float a, float b) {
+    switch (op) {
+        case ReduceOp::Sum: return a + b;
+        case ReduceOp::Min: return fmin(a, b);
+        default: return fmax(a, b);
+    }
+}
+
+inline float reduce_identity(ReduceOp op) {
+    switch (op) {
+        case ReduceOp::Sum: return 0.0f;
+        case ReduceOp::Min: return INFINITY;
+        default: return -INFINITY;
+    }
+}
+
+// One round of a tree reduction: each threadgroup folds its own slice and writes
+// a single partial, so the host re-dispatches over the partials until one value
+// is left. Threads past the end read the identity, which is why the fold has to
+// be over an associative operation with one.
+//
+// Dispatched as whole threadgroups (never `dispatchThreads`): every thread in a
+// group must reach the barriers, and a ragged final group would not.
+kernel void reduce_partial(
+    device const float* input  [[buffer(0)]],
+    device float* partials     [[buffer(1)]],
+    constant uint& count       [[buffer(2)]],
+    constant ReduceOp& op      [[buffer(3)]],
+    uint gid   [[thread_position_in_grid]],
+    uint tid   [[thread_position_in_threadgroup]],
+    uint group [[threadgroup_position_in_grid]],
+    uint width [[threads_per_threadgroup]])
+{
+    threadgroup float scratch[REDUCE_GROUP];
+    scratch[tid] = gid < count ? input[gid] : reduce_identity(op);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = width / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] = reduce_values(op, scratch[tid], scratch[tid + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        partials[group] = scratch[0];
+    }
+}
+
+// One sweep of an inclusive Hillis–Steele scan, from `input` into `output`. The
+// host runs it for offsets 1, 2, 4, … and swaps the buffers between sweeps: the
+// pass cannot be done in place, since a thread reading `i - offset` would race
+// the thread writing it.
+//
+// `log n` sweeps of `n` adds is more arithmetic than the serial `n`, which is
+// the trade a scan makes to have any parallelism at all.
+kernel void scan_step(
+    device const float* input [[buffer(0)]],
+    device float* output      [[buffer(1)]],
+    constant uint& offset     [[buffer(2)]],
+    uint i [[thread_position_in_grid]])
+{
+    output[i] = i >= offset ? input[i] + input[i - offset] : input[i];
+}
+
+// The unsigned key that sorts floats in IEEE total order — the order
+// `f32::total_cmp` gives, and the reason this sort agrees with the CPU one on
+// NaNs and on -0.0 rather than only on ordinary values. Positive floats already
+// compare correctly as integers once the sign bit is set; negative ones need
+// every bit inverted, which both flips the sign bit and reverses the magnitude.
+inline uint sort_key(float value) {
+    uint bits = as_type<uint>(value);
+    return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+}
+
+// Copy into a power-of-two buffer, filling the tail with a value that sorts to
+// the end so the padding trims cleanly afterwards.
+kernel void sort_prepare(
+    device const float* input [[buffer(0)]],
+    device float* output      [[buffer(1)]],
+    constant uint& count      [[buffer(2)]],
+    constant float& padding   [[buffer(3)]],
+    uint i [[thread_position_in_grid]])
+{
+    output[i] = i < count ? input[i] : padding;
+}
+
+// One compare-exchange stage of a bitonic sort. `block` is the width of the
+// bitonic sequence being merged and `stride` the distance between partners;
+// within a block the direction alternates, which is what builds the next
+// sequence up. Only the lower index of each pair does the work, so the stage's
+// writes are disjoint and need no synchronization beyond the dispatch boundary.
+kernel void bitonic_stage(
+    device float* values   [[buffer(0)]],
+    constant uint& block   [[buffer(1)]],
+    constant uint& stride  [[buffer(2)]],
+    constant uint& ascending [[buffer(3)]],
+    uint i [[thread_position_in_grid]])
+{
+    uint partner = i ^ stride;
+    if (partner <= i) return;
+
+    bool up = ((i & block) == 0) == (ascending != 0);
+    float a = values[i];
+    float b = values[partner];
+    if ((sort_key(a) > sort_key(b)) == up) {
+        values[i] = b;
+        values[partner] = a;
+    }
 }
 
 // Valid cross-correlation: every output element is the window of `input` under
@@ -517,6 +661,11 @@ struct Gpu {
     broadcast: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     compare: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     compare_scalar: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    clamp: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    reduce: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    scan: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    sort_prepare: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    bitonic: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     stack_vector: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     concat_horizontal: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     merge_horizontal: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -570,6 +719,11 @@ fn build_gpu() -> Option<Gpu> {
         broadcast: pipeline("broadcast")?,
         compare: pipeline("compare")?,
         compare_scalar: pipeline("compare_scalar")?,
+        clamp: pipeline("clamp_values")?,
+        reduce: pipeline("reduce_partial")?,
+        scan: pipeline("scan_step")?,
+        sort_prepare: pipeline("sort_prepare")?,
+        bitonic: pipeline("bitonic_stage")?,
         stack_vector: pipeline("stack_vector")?,
         concat_horizontal: pipeline("concat_horizontal")?,
         merge_horizontal: pipeline("merge_horizontal")?,
@@ -885,6 +1039,120 @@ impl MetalBuffer {
             })?;
         }
         Some(output)
+    }
+
+    /// Confine every element to `[low, high]`, in one dispatch.
+    pub fn clamp(&self, low: f32, high: f32) -> Option<Self> {
+        let output = Self::allocate(self.len)?;
+        if self.len != 0 {
+            with_gpu(|gpu| encode_clamp(gpu, &self.raw, &output.raw, self.len, low, high))?;
+        }
+        Some(output)
+    }
+
+    /// Fold the whole buffer to one value with a tree reduction.
+    ///
+    /// Each round folds `REDUCE_GROUP` values per threadgroup, so the length
+    /// falls by that factor per dispatch — three rounds for a million elements.
+    /// The answer has to come back to the CPU, so this is one of the few
+    /// operations that ends in a synchronization rather than leaving work
+    /// queued.
+    pub fn reduce(&self, op: Reduce) -> Option<f32> {
+        if self.len == 0 {
+            return Some(op.identity());
+        }
+        if self.len == 1 {
+            return Some(self.as_slice()[0]);
+        }
+
+        // Ping-pong between two scratch buffers: a round reads one and writes
+        // the (much shorter) other.
+        let mut groups = self.len.div_ceil(REDUCE_GROUP);
+        let mut front = Self::allocate(groups)?;
+        with_gpu(|gpu| encode_reduce(gpu, &self.raw, &front.raw, self.len, groups, op))?;
+        let mut count = groups;
+        if count == 1 {
+            return Some(front.as_slice()[0]);
+        }
+
+        let mut back = Self::allocate(count.div_ceil(REDUCE_GROUP))?;
+        while count > 1 {
+            groups = count.div_ceil(REDUCE_GROUP);
+            with_gpu(|gpu| encode_reduce(gpu, &front.raw, &back.raw, count, groups, op))?;
+            std::mem::swap(&mut front, &mut back);
+            count = groups;
+        }
+        Some(front.as_slice()[0])
+    }
+
+    /// Inclusive prefix sum, `log2(len)` dispatches deep.
+    ///
+    /// Every sweep reads one buffer and writes the other, so the two allocations
+    /// alternate and the result is whichever one the last sweep wrote. The
+    /// additions land in a different order from the CPU's running total, which
+    /// is a rounding difference rather than a disagreement.
+    pub fn prefix_sum(&self) -> Option<Self> {
+        if self.len <= 1 {
+            return Self::from_slice(self.as_slice());
+        }
+        let mut front = Self::from_slice(self.as_slice())?;
+        let mut back = Self::allocate(self.len)?;
+        let mut offset = 1;
+        while offset < self.len {
+            with_gpu(|gpu| encode_scan(gpu, &front.raw, &back.raw, self.len, offset))?;
+            std::mem::swap(&mut front, &mut back);
+            offset *= 2;
+        }
+        Some(front)
+    }
+
+    /// Sort the elements in IEEE total order, on the GPU.
+    ///
+    /// A bitonic sort: `log²` stages of compare-exchange over a power-of-two
+    /// buffer, each stage one dispatch. The input is padded up to that length
+    /// with a value that sorts to the far end, so trimming the tail afterwards
+    /// leaves exactly the input's elements. The shader compares monotone
+    /// integer keys rather than the floats themselves, which is what makes the
+    /// result identical to a CPU [`f32::total_cmp`] sort rather than merely
+    /// similar: NaNs and `−0.0` land where the total order puts them instead of
+    /// wherever an unordered compare-exchange left them.
+    pub fn sort(&self, order: SortOrder) -> Option<Self> {
+        if self.len <= 1 {
+            return Self::from_slice(self.as_slice());
+        }
+        let padded = self.len.checked_next_power_of_two()?;
+        let ascending = order == SortOrder::Ascending;
+        // The extreme of the total order at the end the padding is trimmed
+        // from: the largest key for an ascending sort, the smallest for a
+        // descending one. Both are NaNs, which is the point — a NaN in the
+        // input can never sort past them.
+        let padding = if ascending {
+            f32::from_bits(0x7FFF_FFFF)
+        } else {
+            f32::from_bits(0xFFFF_FFFF)
+        };
+
+        let buffer = Self::allocate(padded)?;
+        with_gpu(|gpu| {
+            encode_sort_prepare(gpu, &self.raw, &buffer.raw, padded, self.len, padding)?;
+            let mut block = 2;
+            while block <= padded {
+                let mut stride = block / 2;
+                while stride > 0 {
+                    encode_bitonic_stage(gpu, &buffer.raw, padded, block, stride, ascending)?;
+                    stride /= 2;
+                }
+                block *= 2;
+            }
+            Some(())
+        })?;
+
+        if padded == self.len {
+            return Some(buffer);
+        }
+        // Trim the padding. The values are in shared memory, so this reads the
+        // sorted prefix in place rather than downloading it.
+        Self::from_slice(&buffer.as_slice()[..self.len])
     }
 
     /// Broadcast operation with a scalar. `op` has the same encoding as
@@ -1212,6 +1480,137 @@ fn encode_compare_scalar(
         encoder.setBytes_length_atIndex(NonNull::from(&scalar_left).cast(), 4, 4);
     }
     dispatch_1d(&encoder, len);
+    encoder.endEncoding();
+    commit(gpu, command)
+}
+
+fn encode_clamp(
+    gpu: &Gpu,
+    input: &ProtocolObject<dyn MTLBuffer>,
+    output: &ProtocolObject<dyn MTLBuffer>,
+    len: usize,
+    low: f32,
+    high: f32,
+) -> Option<()> {
+    let command = gpu.queue.commandBuffer()?;
+    let encoder = command.computeCommandEncoder()?;
+    encoder.setComputePipelineState(&gpu.clamp);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
+        encoder.setBytes_length_atIndex(NonNull::from(&low).cast(), 4, 2);
+        encoder.setBytes_length_atIndex(NonNull::from(&high).cast(), 4, 3);
+    }
+    dispatch_1d(&encoder, len);
+    encoder.endEncoding();
+    commit(gpu, command)
+}
+
+/// One round of the tree reduction, over `groups` whole threadgroups.
+///
+/// Dispatched by threadgroup rather than by thread: the kernel's barriers
+/// require every thread of a group to arrive, which a ragged final group under
+/// `dispatchThreads` would not do. The threads past `count` read the identity
+/// instead.
+fn encode_reduce(
+    gpu: &Gpu,
+    input: &ProtocolObject<dyn MTLBuffer>,
+    output: &ProtocolObject<dyn MTLBuffer>,
+    count: usize,
+    groups: usize,
+    op: Reduce,
+) -> Option<()> {
+    let command = gpu.queue.commandBuffer()?;
+    let encoder = command.computeCommandEncoder()?;
+    let count_u32 = u32::try_from(count).ok()?;
+    encoder.setComputePipelineState(&gpu.reduce);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
+        encoder.setBytes_length_atIndex(NonNull::from(&count_u32).cast(), 4, 2);
+        encoder.setBytes_length_atIndex(NonNull::from(&op).cast(), size_of::<Reduce>(), 3);
+    }
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: groups,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: REDUCE_GROUP,
+            height: 1,
+            depth: 1,
+        },
+    );
+    encoder.endEncoding();
+    commit(gpu, command)
+}
+
+fn encode_scan(
+    gpu: &Gpu,
+    input: &ProtocolObject<dyn MTLBuffer>,
+    output: &ProtocolObject<dyn MTLBuffer>,
+    len: usize,
+    offset: usize,
+) -> Option<()> {
+    let command = gpu.queue.commandBuffer()?;
+    let encoder = command.computeCommandEncoder()?;
+    let offset_u32 = u32::try_from(offset).ok()?;
+    encoder.setComputePipelineState(&gpu.scan);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
+        encoder.setBytes_length_atIndex(NonNull::from(&offset_u32).cast(), 4, 2);
+    }
+    dispatch_1d(&encoder, len);
+    encoder.endEncoding();
+    commit(gpu, command)
+}
+
+fn encode_sort_prepare(
+    gpu: &Gpu,
+    input: &ProtocolObject<dyn MTLBuffer>,
+    output: &ProtocolObject<dyn MTLBuffer>,
+    padded: usize,
+    count: usize,
+    padding: f32,
+) -> Option<()> {
+    let command = gpu.queue.commandBuffer()?;
+    let encoder = command.computeCommandEncoder()?;
+    let count_u32 = u32::try_from(count).ok()?;
+    encoder.setComputePipelineState(&gpu.sort_prepare);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
+        encoder.setBytes_length_atIndex(NonNull::from(&count_u32).cast(), 4, 2);
+        encoder.setBytes_length_atIndex(NonNull::from(&padding).cast(), 4, 3);
+    }
+    dispatch_1d(&encoder, padded);
+    encoder.endEncoding();
+    commit(gpu, command)
+}
+
+fn encode_bitonic_stage(
+    gpu: &Gpu,
+    values: &ProtocolObject<dyn MTLBuffer>,
+    padded: usize,
+    block: usize,
+    stride: usize,
+    ascending: bool,
+) -> Option<()> {
+    let command = gpu.queue.commandBuffer()?;
+    let encoder = command.computeCommandEncoder()?;
+    let block_u32 = u32::try_from(block).ok()?;
+    let stride_u32 = u32::try_from(stride).ok()?;
+    let ascending_u32 = u32::from(ascending);
+    encoder.setComputePipelineState(&gpu.bitonic);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(values), 0, 0);
+        encoder.setBytes_length_atIndex(NonNull::from(&block_u32).cast(), 4, 1);
+        encoder.setBytes_length_atIndex(NonNull::from(&stride_u32).cast(), 4, 2);
+        encoder.setBytes_length_atIndex(NonNull::from(&ascending_u32).cast(), 4, 3);
+    }
+    dispatch_1d(&encoder, padded);
     encoder.endEncoding();
     commit(gpu, command)
 }

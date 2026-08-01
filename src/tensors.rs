@@ -54,7 +54,7 @@ pub use dual::{
     DualMatrix, DualVector, gradient, gradient_wrt_matrix, jacobian, jacobian_wrt_matrix,
     matrix_gradient,
 };
-pub use kernels::{Analytic, BinaryOp, Compare, Kernels};
+pub use kernels::{Analytic, BinaryOp, Compare, Kernels, Reduce, SortOrder};
 pub use tape::{MatrixVar, ScalarVar, Tape, Var, VectorVar};
 
 // ---- shape checking ---------------------------------------------------------
@@ -78,6 +78,20 @@ fn assert_same_shape(left: (usize, usize), right: (usize, usize), operation: &st
         left.1,
         right.0,
         right.1
+    );
+}
+
+/// Panics unless a clamp's bounds describe a non-empty range.
+///
+/// Written as "not greater" rather than "less or equal" so that a NaN bound —
+/// which is unordered against everything, including itself — passes rather than
+/// panicking: `x.max(NaN)` is `x` on every path here, so such a bound is inert
+/// rather than wrong.
+#[track_caller]
+fn assert_ordered_bounds<T: PartialOrd>(low: &T, high: &T) {
+    assert!(
+        !matches!(low.partial_cmp(high), Some(Ordering::Greater)),
+        "clamp: the lower bound exceeds the upper one"
     );
 }
 
@@ -110,7 +124,7 @@ mod simd_dispatch {
 
     use std::any::TypeId;
 
-    use super::{BinaryOp, Complex};
+    use super::{BinaryOp, Compare, Complex, Reduce};
     use crate::numbers::Coefficient;
 
     // Below these lengths the generic scalar loop is already fine (and the
@@ -228,6 +242,115 @@ mod simd_dispatch {
             }
         }
         false
+    }
+
+    /// Writes the elementwise comparison into `out`, returning whether the SIMD
+    /// path ran.
+    pub fn compare<T: Coefficient>(a: &[T], b: &[T], op: Compare, out: &mut [T]) -> bool {
+        if a.len() < MIN_ELEMENTS {
+            return false;
+        }
+        debug_assert!(b.len() == a.len() && out.len() == a.len());
+        unsafe {
+            if let (Some(a), Some(b), Some(out)) = (
+                as_slice::<T, f32>(a),
+                as_slice::<T, f32>(b),
+                as_slice_mut::<T, f32>(out),
+            ) {
+                crate::simd::f32k::compare(a, b, op, out);
+                return true;
+            }
+            if let (Some(a), Some(b), Some(out)) = (
+                as_slice::<T, f64>(a),
+                as_slice::<T, f64>(b),
+                as_slice_mut::<T, f64>(out),
+            ) {
+                crate::simd::f64k::compare(a, b, op, out);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Writes the comparison against a splatted scalar into `out`, returning
+    /// whether the SIMD path ran.
+    pub fn compare_scalar<T: Coefficient>(
+        values: &[T],
+        scalar: T,
+        op: Compare,
+        scalar_left: bool,
+        out: &mut [T],
+    ) -> bool {
+        if values.len() < MIN_ELEMENTS {
+            return false;
+        }
+        debug_assert_eq!(out.len(), values.len());
+        unsafe {
+            if let (Some(v), Some(s), Some(out)) = (
+                as_slice::<T, f32>(values),
+                as_slice::<T, f32>(std::slice::from_ref(&scalar)),
+                as_slice_mut::<T, f32>(out),
+            ) {
+                crate::simd::f32k::compare_scalar(v, s[0], op, scalar_left, out);
+                return true;
+            }
+            if let (Some(v), Some(s), Some(out)) = (
+                as_slice::<T, f64>(values),
+                as_slice::<T, f64>(std::slice::from_ref(&scalar)),
+                as_slice_mut::<T, f64>(out),
+            ) {
+                crate::simd::f64k::compare_scalar(v, s[0], op, scalar_left, out);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Writes the clamped values into `out`, returning whether the SIMD path
+    /// ran.
+    pub fn clamp<T: Coefficient>(values: &[T], low: T, high: T, out: &mut [T]) -> bool {
+        if values.len() < MIN_ELEMENTS {
+            return false;
+        }
+        debug_assert_eq!(out.len(), values.len());
+        unsafe {
+            if let (Some(v), Some(low), Some(high), Some(out)) = (
+                as_slice::<T, f32>(values),
+                as_slice::<T, f32>(std::slice::from_ref(&low)),
+                as_slice::<T, f32>(std::slice::from_ref(&high)),
+                as_slice_mut::<T, f32>(out),
+            ) {
+                crate::simd::f32k::clamp(v, low[0], high[0], out);
+                return true;
+            }
+            if let (Some(v), Some(low), Some(high), Some(out)) = (
+                as_slice::<T, f64>(values),
+                as_slice::<T, f64>(std::slice::from_ref(&low)),
+                as_slice::<T, f64>(std::slice::from_ref(&high)),
+                as_slice_mut::<T, f64>(out),
+            ) {
+                crate::simd::f64k::clamp(v, low[0], high[0], out);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The whole-slice fold, or `None` for an element type the kernels do not
+    /// cover (and for slices too short to be worth the dispatch).
+    pub fn reduce<T: Coefficient>(values: &[T], op: Reduce) -> Option<T> {
+        if values.len() < MIN_ELEMENTS {
+            return None;
+        }
+        unsafe {
+            if let Some(v) = as_slice::<T, f32>(values) {
+                return Some(from_f32(crate::simd::f32k::reduce(v, op)));
+            }
+            if let Some(v) = as_slice::<T, f64>(values) {
+                return Some(from_f64(crate::simd::f64k::reduce(v, op)));
+            }
+        }
+        None
     }
 
     /// Writes `a·b` into `out`, returning whether the SIMD path ran.
@@ -502,6 +625,30 @@ impl<B: Backend> Vector<f32, B> {
         }
     }
 
+    /// An arithmetic progression: `start`, `start + step`, `start + 2·step`, …
+    ///
+    /// Index vectors are what make position-dependent arithmetic — "divide the
+    /// running total by how many terms it covers", "which entry was this?" —
+    /// expressible as whole-tensor operations rather than as a loop. Each
+    /// element is computed from its own index rather than from the one before,
+    /// so an integer ramp is exact.
+    ///
+    /// ```
+    /// use tensorcrate::tensors::{Host, Vector};
+    ///
+    /// let counts = Vector::<f32, Host>::ramp(4, 1.0, 1.0);
+    /// assert_eq!(counts.as_slice(), [1.0, 2.0, 3.0, 4.0]);
+    /// ```
+    pub fn ramp(len: usize, start: f32, step: f32) -> Self {
+        let values = (0..len)
+            .map(|index| start + step * index as f32)
+            .collect::<Vec<_>>();
+        Vector {
+            len,
+            data: B::store_vector(&values),
+        }
+    }
+
     /// Borrow the elements as a slice, without copying.
     pub fn as_slice(&self) -> &[f32] {
         B::vector_slice(&self.data)
@@ -768,6 +915,286 @@ impl<T: Coefficient> Vector<T, Host> {
 
         radix2_fft(&mut output, false);
         Vector::new(output)
+    }
+}
+
+/// The smaller of two values, ordering NaN the way [`f32::min`] does: an
+/// unordered pair keeps whichever operand is not NaN.
+///
+/// The vector kernels use `fminnm`, which is that same rule in hardware, so the
+/// two paths agree on every input rather than only on the ordered ones.
+fn ordered_min<T: PartialOrd + Copy>(a: T, b: T) -> T {
+    match a.partial_cmp(&b) {
+        Some(Ordering::Greater) => b,
+        Some(_) => a,
+        // Unordered: a value that does not compare with itself is the NaN, so
+        // the other operand wins.
+        None if a.partial_cmp(&a).is_none() => b,
+        None => a,
+    }
+}
+
+/// The larger of two values; see [`ordered_min`].
+fn ordered_max<T: PartialOrd + Copy>(a: T, b: T) -> T {
+    match a.partial_cmp(&b) {
+        Some(Ordering::Less) => b,
+        Some(_) => a,
+        None if a.partial_cmp(&a).is_none() => b,
+        None => a,
+    }
+}
+
+impl<T> Vector<T, Host> {
+    /// Sort in place under an arbitrary comparator.
+    ///
+    /// This is [`slice::sort_by`], so the sort is stable and the comparator may
+    /// be anything — a key projection, a reversed order, a tie-break across two
+    /// fields. Floats have no total [`Ord`], which is exactly why the ordering
+    /// is a parameter here; [`f32::total_cmp`] is the usual argument, and
+    /// [`sort`](Vector::sort) is the name for it.
+    ///
+    /// ```
+    /// use tensorcrate::tensors::Vector;
+    ///
+    /// let mut v = Vector::new([3.0f32, -1.0, 2.0]);
+    /// v.sort_by(|left, right| right.total_cmp(left)); // descending
+    /// assert_eq!(v.data(), [3.0, 2.0, -1.0]);
+    /// ```
+    pub fn sort_by(&mut self, compare: impl FnMut(&T, &T) -> Ordering) {
+        self.data.sort_by(compare);
+    }
+
+    /// [`sort_by`](Vector::sort_by) into a new vector, leaving this one alone.
+    pub fn sorted_by(&self, compare: impl FnMut(&T, &T) -> Ordering) -> Self
+    where
+        T: Clone,
+    {
+        let mut sorted = self.clone();
+        sorted.sort_by(compare);
+        sorted
+    }
+}
+
+impl<T: Coefficient> Vector<T, Host> {
+    /// The sum of every element; `0` for an empty vector.
+    pub fn sum(&self) -> T {
+        #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
+        if let Some(total) = simd_dispatch::reduce(&self.data, Reduce::Sum) {
+            return total;
+        }
+        self.data
+            .iter()
+            .fold(T::zero(), |total, &value| total + value)
+    }
+
+    /// Inclusive prefix sum: element `i` of the result is the sum of elements
+    /// `0..=i`.
+    ///
+    /// The scan is the one operation here with a serial dependency — each output
+    /// needs the one before it — so the CPU path is an ordinary running total,
+    /// which is already about as fast as the memory it streams. The parallel
+    /// version is the GPU one: see
+    /// [`Kernels::vector_prefix_sum`](crate::tensors::Kernels::vector_prefix_sum),
+    /// where `log n` sweeps beat the serial chain because there are thousands of
+    /// threads to spend on it.
+    pub fn prefix_sum(&self) -> Self {
+        let mut running = T::zero();
+        let mut out = Vec::with_capacity(self.len);
+        for &value in &self.data {
+            running = running + value;
+            out.push(running);
+        }
+        Vector::new(out)
+    }
+}
+
+impl<T: Coefficient + PartialOrd> Vector<T, Host> {
+    /// Elementwise minimum with another vector.
+    ///
+    /// # Panics
+    ///
+    /// If the two lengths differ.
+    #[track_caller]
+    pub fn min(&self, other: &Self) -> Self {
+        assert_same_len(self.len, other.len, "min");
+        self.pairwise(other, Compare::Min, ordered_min)
+    }
+
+    /// Elementwise maximum with another vector.
+    ///
+    /// # Panics
+    ///
+    /// If the two lengths differ.
+    #[track_caller]
+    pub fn max(&self, other: &Self) -> Self {
+        assert_same_len(self.len, other.len, "max");
+        self.pairwise(other, Compare::Max, ordered_max)
+    }
+
+    /// The lesser of each element and `scalar`.
+    pub fn min_scalar(&self, scalar: T) -> Self {
+        self.against_scalar(scalar, Compare::Min, ordered_min)
+    }
+
+    /// The greater of each element and `scalar` — `max_scalar(0)` is a relu.
+    pub fn max_scalar(&self, scalar: T) -> Self {
+        self.against_scalar(scalar, Compare::Max, ordered_max)
+    }
+
+    /// Confine every element to `[low, high]`.
+    ///
+    /// One pass, rather than the two a `max_scalar` followed by a `min_scalar`
+    /// would make.
+    ///
+    /// ```
+    /// use tensorcrate::tensors::Vector;
+    ///
+    /// let v = Vector::new([-2.0f32, 0.5, 7.0]);
+    /// assert_eq!(v.clamp(0.0, 1.0).data(), [0.0, 0.5, 1.0]);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// If `low > high`, which has no answer to give. A NaN element clamps to
+    /// `low`, following `x.max(low).min(high)`.
+    #[track_caller]
+    pub fn clamp(&self, low: T, high: T) -> Self {
+        assert_ordered_bounds(&low, &high);
+        #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            let mut out = vec![T::zero(); self.len];
+            if simd_dispatch::clamp(&self.data, low, high, &mut out) {
+                return Vector::new(out);
+            }
+        }
+        self.map(|&value| ordered_min(ordered_max(value, low), high))
+    }
+
+    /// The smallest element, or `None` when there are none.
+    pub fn minimum(&self) -> Option<T> {
+        self.fold_extreme(Reduce::Min, ordered_min)
+    }
+
+    /// The largest element, or `None` when there are none.
+    pub fn maximum(&self) -> Option<T> {
+        self.fold_extreme(Reduce::Max, ordered_max)
+    }
+
+    fn pairwise(&self, other: &Self, op: Compare, scalar: fn(T, T) -> T) -> Self {
+        #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            let mut out = vec![T::zero(); self.len];
+            if simd_dispatch::compare(&self.data, &other.data, op, &mut out) {
+                return Vector::new(out);
+            }
+        }
+        let _ = op;
+        Vector::new(
+            self.data
+                .iter()
+                .zip(&other.data)
+                .map(|(&left, &right)| scalar(left, right))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn against_scalar(&self, value: T, op: Compare, scalar: fn(T, T) -> T) -> Self {
+        #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            let mut out = vec![T::zero(); self.len];
+            if simd_dispatch::compare_scalar(&self.data, value, op, false, &mut out) {
+                return Vector::new(out);
+            }
+        }
+        let _ = op;
+        self.map(|&element| scalar(element, value))
+    }
+
+    fn fold_extreme(&self, op: Reduce, scalar: fn(T, T) -> T) -> Option<T> {
+        if self.data.is_empty() {
+            return None;
+        }
+        #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
+        if let Some(extreme) = simd_dispatch::reduce(&self.data, op) {
+            return Some(extreme);
+        }
+        let _ = op;
+        let (&first, rest) = self.data.split_first()?;
+        Some(rest.iter().fold(first, |best, &value| scalar(best, value)))
+    }
+}
+
+impl Vector<f32, Host> {
+    /// Elementwise comparison with another vector.
+    ///
+    /// The same operation the [`Metal`] backend runs as one dispatch, so code
+    /// written against [`Kernels`] means the same thing on either.
+    ///
+    /// # Panics
+    ///
+    /// If the two lengths differ.
+    #[track_caller]
+    pub fn compare(&self, other: &Self, op: Compare) -> Self {
+        assert_same_len(self.len, other.len, "compare");
+        #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            let mut out = vec![0.0; self.len];
+            if simd_dispatch::compare(&self.data, &other.data, op, &mut out) {
+                return Vector::new(out);
+            }
+        }
+        Vector::new(
+            self.data
+                .iter()
+                .zip(&other.data)
+                .map(|(&left, &right)| op.value(left, right))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Elementwise comparison against a scalar; `scalar_left` puts the scalar on
+    /// the left, which matters for every op but `Min` and `Max`.
+    pub fn compare_scalar(&self, scalar: f32, op: Compare, scalar_left: bool) -> Self {
+        #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            let mut out = vec![0.0; self.len];
+            if simd_dispatch::compare_scalar(&self.data, scalar, op, scalar_left, &mut out) {
+                return Vector::new(out);
+            }
+        }
+        self.map(|&value| {
+            if scalar_left {
+                op.value(scalar, value)
+            } else {
+                op.value(value, scalar)
+            }
+        })
+    }
+
+    /// Fold the whole vector to one value. An empty vector gives
+    /// [`op.identity()`](Reduce::identity).
+    pub fn reduce(&self, op: Reduce) -> f32 {
+        #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
+        if let Some(total) = simd_dispatch::reduce(&self.data, op) {
+            return total;
+        }
+        op.fold(&self.data)
+    }
+
+    /// Sort in place, in [`SortOrder`]'s total order.
+    ///
+    /// The comparator is [`f32::total_cmp`], so `−0.0` precedes `+0.0` and NaNs
+    /// sort to the ends by sign instead of landing wherever the partial order
+    /// left them. That is the same order the GPU sort produces.
+    pub fn sort(&mut self, order: SortOrder) {
+        self.data.sort_unstable_by(order.comparator());
+    }
+
+    /// [`sort`](Vector::sort) into a new vector.
+    pub fn sorted(&self, order: SortOrder) -> Self {
+        let mut sorted = self.clone();
+        sorted.sort(order);
+        sorted
     }
 }
 
@@ -2087,6 +2514,71 @@ impl<T: Coefficient> Matrix<T, Host> {
             }
         }
         Ok(Matrix::from_flat(n, n, inv))
+    }
+}
+
+impl<T: Coefficient + PartialOrd> Matrix<T, Host> {
+    /// Confine every element to `[low, high]`; see
+    /// [`Vector::clamp`](Vector::clamp).
+    ///
+    /// # Panics
+    ///
+    /// If `low > high`.
+    #[track_caller]
+    pub fn clamp(&self, low: T, high: T) -> Self {
+        assert_ordered_bounds(&low, &high);
+        #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            let mut out = vec![T::zero(); self.data.len()];
+            if simd_dispatch::clamp(&self.data, low, high, &mut out) {
+                return Matrix::from_flat(self.rows, self.cols, out);
+            }
+        }
+        self.map(|&value| ordered_min(ordered_max(value, low), high))
+    }
+}
+
+impl Matrix<f32, Host> {
+    /// Elementwise comparison with another matrix.
+    ///
+    /// # Panics
+    ///
+    /// If the two shapes differ.
+    #[track_caller]
+    pub fn compare(&self, other: &Self, op: Compare) -> Self {
+        assert_same_shape(self.shape(), other.shape(), "compare");
+        #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            let mut out = vec![0.0; self.data.len()];
+            if simd_dispatch::compare(&self.data, &other.data, op, &mut out) {
+                return Matrix::from_flat(self.rows, self.cols, out);
+            }
+        }
+        let values = self
+            .data
+            .iter()
+            .zip(&other.data)
+            .map(|(&left, &right)| op.value(left, right))
+            .collect::<Vec<_>>();
+        Matrix::from_flat(self.rows, self.cols, values)
+    }
+
+    /// Elementwise comparison against a scalar.
+    pub fn compare_scalar(&self, scalar: f32, op: Compare, scalar_left: bool) -> Self {
+        #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            let mut out = vec![0.0; self.data.len()];
+            if simd_dispatch::compare_scalar(&self.data, scalar, op, scalar_left, &mut out) {
+                return Matrix::from_flat(self.rows, self.cols, out);
+            }
+        }
+        self.map(|&value| {
+            if scalar_left {
+                op.value(scalar, value)
+            } else {
+                op.value(value, scalar)
+            }
+        })
     }
 }
 

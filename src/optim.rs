@@ -506,13 +506,17 @@ pub struct Constrained<'a, P, R> {
     phanom: std::marker::PhantomData<P>,
 }
 
-impl<'a, P, R> Constrained<'a, P, R> 
+impl<'a, P, R> Constrained<'a, P, R>
 where
     P: Parameter,
     R: Rule<P>,
 {
     pub fn new<S: Into<String>, F: Fn(&mut P) + 'a>(name: S, rule: R, projection: F) -> Self {
-        Constrained { rule, projection: DebugFn::new(name.into(), Arc::new(projection)), phanom: std::marker::PhantomData }
+        Constrained {
+            rule,
+            projection: DebugFn::new(name.into(), Arc::new(projection)),
+            phanom: std::marker::PhantomData,
+        }
     }
 }
 
