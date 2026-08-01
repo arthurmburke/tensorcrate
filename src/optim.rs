@@ -47,6 +47,8 @@
 //! `examples/optimizers.rs`, which does exactly that. The rules are the reusable
 //! part; the loop is four lines.
 
+use std::sync::Arc;
+
 use crate::tensors::tape::Adjoint;
 use crate::tensors::{Analytic, BinaryOp, Host, Kernels, Matrix, ScalarVar, Tape, Var, Vector};
 
@@ -467,6 +469,61 @@ impl<P: Parameter> Rule<P> for Adam<P> {
         self.first = None;
         self.second = None;
         self.steps = 0;
+    }
+}
+
+/// A simple wrapper around a function that allows us
+/// to use to in debug structs.
+#[derive(Clone)]
+struct DebugFn<F> {
+    name: String,
+    f: F,
+}
+
+impl<F> DebugFn<F> {
+    pub fn new<S: Into<String>>(name: S, f: F) -> Self {
+        DebugFn {
+            name: name.into(),
+            f,
+        }
+    }
+}
+
+impl<F> std::fmt::Debug for DebugFn<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DebugFn({})", self.name)
+    }
+}
+
+/// Constrained rule for a custom parameter type. Applies a
+/// projection after the update, so the parameter stays in a feasible set. The
+/// projection is a closure, so it can be anything: clipping, normalization,
+/// or a more complicated operation.
+#[derive(Clone, Debug)]
+pub struct Constrained<'a, P, R> {
+    rule: R,
+    projection: DebugFn<Arc<dyn Fn(&mut P) + 'a>>,
+    phanom: std::marker::PhantomData<P>,
+}
+
+impl<'a, P, R> Constrained<'a, P, R> 
+where
+    P: Parameter,
+    R: Rule<P>,
+{
+    pub fn new<S: Into<String>, F: Fn(&mut P) + 'a>(name: S, rule: R, projection: F) -> Self {
+        Constrained { rule, projection: DebugFn::new(name.into(), Arc::new(projection)), phanom: std::marker::PhantomData }
+    }
+}
+
+impl<'a, P: Parameter, R: Rule<P>> Rule<P> for Constrained<'a, P, R> {
+    fn update(&mut self, parameters: &mut P, gradient: &P) {
+        self.rule.update(parameters, gradient);
+        (self.projection.f)(parameters);
+    }
+
+    fn reset(&mut self) {
+        self.rule.reset();
     }
 }
 
