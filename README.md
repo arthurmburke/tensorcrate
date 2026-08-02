@@ -27,8 +27,8 @@ API to use for model training, dynamic data, and GPU execution.
 The repository pins the stable Rust toolchain. To work on the crate itself:
 
 ```console
-git clone https://github.com/arthurmburke/rinterp.git
-cd rinterp
+git clone https://github.com/arthurmburke/tensorcrate.git
+cd tensorcrate
 cargo test
 ```
 
@@ -36,7 +36,7 @@ To use the current Git version from another project:
 
 ```toml
 [dependencies]
-tensorcrate = { git = "https://github.com/arthurmburke/rinterp.git" }
+tensorcrate = { git = "https://github.com/arthurmburke/tensorcrate.git" }
 ```
 
 The default features are `simd` and `metal`. The Metal code is only compiled on macOS; other
@@ -44,10 +44,10 @@ platforms continue to use the host backend. To request a specific configuration:
 
 ```toml
 # Portable scalar host implementation only.
-tensorcrate = { git = "https://github.com/arthurmburke/rinterp.git", default-features = false }
+tensorcrate = { git = "https://github.com/arthurmburke/tensorcrate.git", default-features = false }
 
 # Host implementation with NEON or x86 SIMD.
-tensorcrate = { git = "https://github.com/arthurmburke/rinterp.git", default-features = false, features = ["simd"] }
+tensorcrate = { git = "https://github.com/arthurmburke/tensorcrate.git", default-features = false, features = ["simd"] }
 ```
 
 ## Quick start
