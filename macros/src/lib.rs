@@ -17,8 +17,13 @@
 //!
 //! Tensor products are selected symbolically from their inferred shapes:
 //! `A @ B` is matrix multiplication (including matrix/vector and vector/matrix
-//! products), while `v * u` is a vector dot product. Analytic functions such as
-//! `sin(A)` and `cos(v)` map elementwise over matrices and vectors.
+//! products), while `v * u` is a vector dot product and `v .* u` is explicitly
+//! elementwise. Analytic functions such as `sin(A)` and `cos(v)` map
+//! elementwise over matrices and vectors.
+//!
+//! Tensors use the host backend by default. A leading `backend = Metal;`
+//! directive selects resident `f32` Metal tensors instead; `backend = Host;`
+//! is the explicit spelling of the default.
 //!
 //! The input is parsed with `syn` as Rust syntax, which gives operator
 //! precedence, parentheses, grouping and array literals for free. The only
@@ -59,6 +64,33 @@ struct Ty {
     shape: Shape,
 }
 
+/// Where tensor literals and operations emitted by a block live.
+///
+/// Host preserves the macro's original `f64` algebra. Metal shaders are
+/// `f32`, so selecting Metal also selects `f32` coefficients.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+enum BackendChoice {
+    #[default]
+    Host,
+    Metal,
+}
+
+impl BackendChoice {
+    fn coefficient_type(self) -> TokenStream {
+        match self {
+            BackendChoice::Host => quote!(f64),
+            BackendChoice::Metal => quote!(f32),
+        }
+    }
+
+    fn tensor_backend_type(self) -> TokenStream {
+        match self {
+            BackendChoice::Host => quote!(::tensorcrate::tensors::Host),
+            BackendChoice::Metal => quote!(::tensorcrate::tensors::Metal),
+        }
+    }
+}
+
 impl Ty {
     const REAL: Ty = Ty {
         complex: false,
@@ -90,11 +122,12 @@ impl Ty {
     }
 
     /// The Rust type of a single element.
-    fn element_type(self) -> TokenStream {
+    fn element_type(self, backend: BackendChoice) -> TokenStream {
+        let real = backend.coefficient_type();
         let coefficient = if self.complex {
-            quote!(::tensorcrate::numbers::Complex<f64>)
+            quote!(::tensorcrate::numbers::Complex<#real>)
         } else {
-            quote!(f64)
+            real
         };
         if self.dual {
             quote!(::tensorcrate::numbers::Dual<#coefficient>)
@@ -104,16 +137,17 @@ impl Ty {
     }
 
     /// The Rust type this lowers to.
-    fn rust_type(self) -> TokenStream {
-        let element = self.element_type();
+    fn rust_type(self, backend: BackendChoice) -> TokenStream {
+        let element = self.element_type(backend);
+        let storage = backend.tensor_backend_type();
         match self.shape {
             Shape::Scalar => element,
             // The dimensions are runtime values now, so they are not part of
             // the type. The macro still *knows* them — that is what selects the
             // right product below and rejects a mismatched literal at expansion
             // time — they simply have nowhere to go in the emitted type.
-            Shape::Vector(_) => quote!(::tensorcrate::tensors::Vector<#element>),
-            Shape::Matrix(_, _) => quote!(::tensorcrate::tensors::Matrix<#element>),
+            Shape::Vector(_) => quote!(::tensorcrate::tensors::Vector<#element, #storage>),
+            Shape::Matrix(_, _) => quote!(::tensorcrate::tensors::Matrix<#element, #storage>),
         }
     }
 
@@ -141,35 +175,39 @@ type Env = HashMap<String, Ty>;
 
 #[proc_macro]
 pub fn math(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
-    match expand(rewrite_matmul_operator(input.into())) {
+    match expand(rewrite_custom_operators(input.into())) {
         Ok(ts) => ts.into(),
         Err(e) => e.to_compile_error().into(),
     }
 }
 
-/// `@` is not part of Rust's expression grammar. Rewrite it to a reserved
-/// `lhs / marker / rhs` form before `syn` parses the block. Division has the
-/// same precedence and associativity that matrix multiplication should have,
-/// and [`matmul_operands`] recognizes the resulting AST without confusing an
+/// `@` and `.*` are not part of Rust's expression grammar. Rewrite each to a
+/// reserved `lhs / marker / rhs` form before `syn` parses the block. Division
+/// has the same precedence and associativity these product operators should
+/// have, and [`marked_operands`] recovers the operands without confusing an
 /// ordinary `/`.
-fn rewrite_matmul_operator(input: TokenStream) -> TokenStream {
+fn rewrite_custom_operators(input: TokenStream) -> TokenStream {
     let mut output = TokenStream::new();
-    for token in input {
+    let mut tokens = input.into_iter().peekable();
+    while let Some(token) = tokens.next() {
         match token {
             TokenTree::Punct(at) if at.as_char() == '@' => {
-                let span = at.span();
-                let mut slash = Punct::new('/', Spacing::Alone);
-                slash.set_span(span);
-                output.extend([TokenTree::Punct(slash.clone())]);
-                output.extend([TokenTree::Ident(Ident::new(
-                    "__tensorcrate_matmul_operator__",
-                    span,
-                ))]);
-                output.extend([TokenTree::Punct(slash)]);
+                emit_marker(&mut output, "__tensorcrate_matmul_operator__", at.span());
+            }
+            TokenTree::Punct(dot)
+                if dot.as_char() == '.'
+                    && matches!(tokens.peek(), Some(TokenTree::Punct(star)) if star.as_char() == '*') =>
+            {
+                let star = tokens.next().expect("peeked at the elementwise `*`");
+                emit_marker(
+                    &mut output,
+                    "__tensorcrate_elementwise_mul_operator__",
+                    star.span(),
+                );
             }
             TokenTree::Group(group) => {
                 let mut rewritten =
-                    Group::new(group.delimiter(), rewrite_matmul_operator(group.stream()));
+                    Group::new(group.delimiter(), rewrite_custom_operators(group.stream()));
                 rewritten.set_span(group.span());
                 output.extend([TokenTree::Group(rewritten)]);
             }
@@ -179,26 +217,51 @@ fn rewrite_matmul_operator(input: TokenStream) -> TokenStream {
     output
 }
 
-fn is_matmul_marker(expr: &Expr) -> bool {
-    matches!(expr, Expr::Path(path) if path.path.is_ident("__tensorcrate_matmul_operator__"))
+fn emit_marker(output: &mut TokenStream, name: &str, span: Span) {
+    let mut slash = Punct::new('/', Spacing::Alone);
+    slash.set_span(span);
+    output.extend([TokenTree::Punct(slash.clone())]);
+    output.extend([TokenTree::Ident(Ident::new(name, span))]);
+    output.extend([TokenTree::Punct(slash)]);
 }
 
 /// Recover the operands from the reserved `(lhs / marker) / rhs` AST shape.
 fn matmul_operands(expr: &Expr) -> Option<(&Expr, &Expr)> {
-    let Expr::Binary(outer) = expr else {
-        return None;
-    };
-    matmul_binary_operands(outer)
+    marked_operands(expr, "__tensorcrate_matmul_operator__")
 }
 
 fn matmul_binary_operands(outer: &syn::ExprBinary) -> Option<(&Expr, &Expr)> {
+    marked_binary_operands(outer, "__tensorcrate_matmul_operator__")
+}
+
+fn elementwise_mul_operands(expr: &Expr) -> Option<(&Expr, &Expr)> {
+    marked_operands(expr, "__tensorcrate_elementwise_mul_operator__")
+}
+
+fn elementwise_mul_binary_operands(outer: &syn::ExprBinary) -> Option<(&Expr, &Expr)> {
+    marked_binary_operands(outer, "__tensorcrate_elementwise_mul_operator__")
+}
+
+fn marked_operands<'a>(expr: &'a Expr, marker: &str) -> Option<(&'a Expr, &'a Expr)> {
+    let Expr::Binary(outer) = expr else {
+        return None;
+    };
+    marked_binary_operands(outer, marker)
+}
+
+fn marked_binary_operands<'a>(
+    outer: &'a syn::ExprBinary,
+    marker: &str,
+) -> Option<(&'a Expr, &'a Expr)> {
     if !matches!(outer.op, BinOp::Div(_)) {
         return None;
     }
     let Expr::Binary(partial) = &*outer.left else {
         return None;
     };
-    if matches!(partial.op, BinOp::Div(_)) && is_matmul_marker(&partial.right) {
+    if matches!(partial.op, BinOp::Div(_))
+        && matches!(&*partial.right, Expr::Path(path) if path.path.is_ident(marker))
+    {
         Some((&partial.left, &outer.right))
     } else {
         None
@@ -206,7 +269,8 @@ fn matmul_binary_operands(outer: &syn::ExprBinary) -> Option<(&Expr, &Expr)> {
 }
 
 fn expand(input: TokenStream) -> syn::Result<TokenStream> {
-    let stmts = Block::parse_within.parse2(input)?;
+    let mut stmts = Block::parse_within.parse2(input)?;
+    let backend = take_backend_directive(&mut stmts)?;
     let Some((last, leading)) = stmts.split_last() else {
         return Err(syn::Error::new(
             Span::call_site(),
@@ -225,12 +289,13 @@ fn expand(input: TokenStream) -> syn::Result<TokenStream> {
     let mut env = Env::new();
     let mut out = Vec::new();
     for stmt in leading {
-        out.push(lower_let(stmt, &mut env)?);
+        out.push(lower_let(stmt, &mut env, backend)?);
     }
 
     let ty = infer(result, &env)?;
-    let body = lower(result, ty, &env)?;
-    let annotated = ty.rust_type();
+    validate_backend_type(ty, backend, result.span())?;
+    let body = lower(result, ty, &env, backend)?;
+    let annotated = ty.rust_type(backend);
 
     Ok(if fallible {
         quote! {
@@ -249,6 +314,47 @@ fn expand(input: TokenStream) -> syn::Result<TokenStream> {
             }
         }
     })
+}
+
+/// Remove an optional leading `backend = Host;` / `backend = Metal;` directive.
+fn take_backend_directive(stmts: &mut Vec<Stmt>) -> syn::Result<BackendChoice> {
+    let Some(Stmt::Expr(Expr::Assign(assign), Some(_))) = stmts.first() else {
+        return Ok(BackendChoice::Host);
+    };
+    let Expr::Path(left) = &*assign.left else {
+        return Ok(BackendChoice::Host);
+    };
+    if !left.path.is_ident("backend") {
+        return Ok(BackendChoice::Host);
+    }
+    let Expr::Path(right) = &*assign.right else {
+        return Err(syn::Error::new(
+            assign.right.span(),
+            "math! backend must be `Host` or `Metal`",
+        ));
+    };
+    let backend = if right.path.is_ident("Host") {
+        BackendChoice::Host
+    } else if right.path.is_ident("Metal") {
+        BackendChoice::Metal
+    } else {
+        return Err(syn::Error::new(
+            right.span(),
+            "math! backend must be `Host` or `Metal`",
+        ));
+    };
+    stmts.remove(0);
+    Ok(backend)
+}
+
+fn validate_backend_type(ty: Ty, backend: BackendChoice, span: Span) -> syn::Result<()> {
+    if backend == BackendChoice::Metal && (ty.complex || ty.dual) {
+        return Err(syn::Error::new(
+            span,
+            "the Metal backend supports real f32 values only (no `i` or `d` literals)",
+        ));
+    }
+    Ok(())
 }
 
 fn block_mentions_inverse(leading: &[Stmt], result: &Expr) -> bool {
@@ -277,7 +383,7 @@ fn mentions_inverse(expr: &Expr) -> bool {
 }
 
 /// Lower a `let` statement, recording the binding's inferred type.
-fn lower_let(stmt: &Stmt, env: &mut Env) -> syn::Result<TokenStream> {
+fn lower_let(stmt: &Stmt, env: &mut Env, backend: BackendChoice) -> syn::Result<TokenStream> {
     let Stmt::Local(local) = stmt else {
         return Err(syn::Error::new(
             stmt.span(),
@@ -301,9 +407,10 @@ fn lower_let(stmt: &Stmt, env: &mut Env) -> syn::Result<TokenStream> {
     }
 
     let ty = infer(&init.expr, env)?;
-    let value = lower(&init.expr, ty, env)?;
+    validate_backend_type(ty, backend, init.expr.span())?;
+    let value = lower(&init.expr, ty, env, backend)?;
     let name = &pat.ident;
-    let annotated = ty.rust_type();
+    let annotated = ty.rust_type(backend);
     env.insert(name.to_string(), ty);
     Ok(quote! { let #name: #annotated = #value; })
 }
@@ -433,6 +540,17 @@ fn infer(expr: &Expr, env: &Env) -> syn::Result<Ty> {
             if let Some((lhs, rhs)) = matmul_operands(expr) {
                 return infer_matmul(infer(lhs, env)?, infer(rhs, env)?, b.span());
             }
+            if let Some((lhs, rhs)) = elementwise_mul_operands(expr) {
+                let left = infer(lhs, env)?;
+                let right = infer(rhs, env)?;
+                if left.is_tensor() && right.is_tensor() && left.shape != right.shape {
+                    return Err(syn::Error::new(
+                        b.span(),
+                        "elementwise tensor operands must have the same shape",
+                    ));
+                }
+                return Ok(left.unify(right));
+            }
             let left = infer(&b.left, env)?;
             let right = infer(&b.right, env)?;
             if matches!(b.op, BinOp::Mul(_))
@@ -461,6 +579,67 @@ fn infer(expr: &Expr, env: &Env) -> syn::Result<Ty> {
             let arg_ty = |i: usize| infer(args[i], env);
 
             match (name.as_str(), args.len()) {
+                ("min" | "max", 2) => {
+                    let (a, b) = (arg_ty(0)?, arg_ty(1)?);
+                    require_real(a, args[0].span(), &name)?;
+                    require_real(b, args[1].span(), &name)?;
+                    if a.is_tensor() && b.is_tensor() && a.shape != b.shape {
+                        return Err(syn::Error::new(
+                            call.span(),
+                            format!("`{name}` tensor operands must have the same shape"),
+                        ));
+                    }
+                    Ok(a.unify(b))
+                }
+                ("clamp", 3) => {
+                    let value = arg_ty(0)?;
+                    let low = arg_ty(1)?;
+                    let high = arg_ty(2)?;
+                    require_real(value, args[0].span(), "clamp")?;
+                    require_real(low, args[1].span(), "clamp")?;
+                    require_real(high, args[2].span(), "clamp")?;
+                    if low.is_tensor() || high.is_tensor() {
+                        return Err(syn::Error::new(
+                            call.span(),
+                            "`clamp` bounds must be scalars",
+                        ));
+                    }
+                    Ok(value)
+                }
+                ("sum" | "minimum" | "maximum", 1) => {
+                    let value = arg_ty(0)?;
+                    if !matches!(value.shape, Shape::Vector(_)) {
+                        return Err(syn::Error::new(
+                            call.span(),
+                            format!("`{name}` expects a vector"),
+                        ));
+                    }
+                    if name != "sum" {
+                        require_real(value, args[0].span(), &name)?;
+                    }
+                    Ok(value.element())
+                }
+                ("prefix_sum", 1) => {
+                    let value = arg_ty(0)?;
+                    if !matches!(value.shape, Shape::Vector(_)) {
+                        return Err(syn::Error::new(
+                            call.span(),
+                            "`prefix_sum` expects a vector",
+                        ));
+                    }
+                    Ok(value)
+                }
+                ("sorted", 1 | 2) => {
+                    let value = arg_ty(0)?;
+                    require_real(value, args[0].span(), "sorted")?;
+                    if !matches!(value.shape, Shape::Vector(_)) {
+                        return Err(syn::Error::new(call.span(), "`sorted` expects a vector"));
+                    }
+                    if args.len() == 2 {
+                        sort_order(args[1])?;
+                    }
+                    Ok(value)
+                }
                 ("pow", 2) => {
                     let (a, b) = (arg_ty(0)?, arg_ty(1)?);
                     if a.is_tensor() && b.is_tensor() {
@@ -521,6 +700,35 @@ fn infer(expr: &Expr, env: &Env) -> syn::Result<Ty> {
         other => Err(syn::Error::new(
             other.span(),
             "unsupported expression in math!",
+        )),
+    }
+}
+
+fn require_real(ty: Ty, span: Span, operation: &str) -> syn::Result<()> {
+    if ty.complex || ty.dual {
+        Err(syn::Error::new(
+            span,
+            format!("`{operation}` requires real values"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn sort_order(expr: &Expr) -> syn::Result<bool> {
+    let Expr::Path(path) = expr else {
+        return Err(syn::Error::new(
+            expr.span(),
+            "sort order must be `ascending` or `descending`",
+        ));
+    };
+    let name = path_name(path)?;
+    match name.as_str() {
+        "ascending" | "Ascending" => Ok(false),
+        "descending" | "Descending" => Ok(true),
+        _ => Err(syn::Error::new(
+            expr.span(),
+            "sort order must be `ascending` or `descending`",
         )),
     }
 }
@@ -587,9 +795,9 @@ const ANALYTIC: &[(&str, &str)] = &[
 ];
 
 /// Emit `expr` as Rust of type `target`, widening subexpressions as needed.
-fn lower(expr: &Expr, target: Ty, env: &Env) -> syn::Result<TokenStream> {
+fn lower(expr: &Expr, target: Ty, env: &Env, backend: BackendChoice) -> syn::Result<TokenStream> {
     match expr {
-        Expr::Lit(lit) => lower_literal(lit, target),
+        Expr::Lit(lit) => lower_literal(lit, target, backend),
         Expr::Array(arr) => {
             let literal = tensor_literal(arr)?;
             let element = target.element();
@@ -598,37 +806,44 @@ fn lower(expr: &Expr, target: Ty, env: &Env) -> syn::Result<TokenStream> {
                 .iter()
                 .map(|row| {
                     row.iter()
-                        .map(|e| lower(e, element, env))
+                        .map(|e| lower(e, element, env, backend))
                         .collect::<syn::Result<Vec<_>>>()
                 })
                 .collect::<syn::Result<Vec<_>>>()?;
-            Ok(if literal.is_matrix {
-                quote!(::tensorcrate::tensors::Matrix::from_rows([#([#(#rows),*]),*]))
+            let element_type = element.element_type(backend);
+            let host = if literal.is_matrix {
+                quote!(::tensorcrate::tensors::Matrix::<#element_type, ::tensorcrate::tensors::Host>::from_rows([#([#(#rows),*]),*]))
             } else {
                 let values = &rows[0];
-                quote!(::tensorcrate::tensors::Vector::new([#(#values),*]))
+                quote!(::tensorcrate::tensors::Vector::<#element_type, ::tensorcrate::tensors::Host>::new([#(#values),*]))
+            };
+            Ok(match backend {
+                BackendChoice::Host => host,
+                BackendChoice::Metal => {
+                    quote!((#host).to_backend::<::tensorcrate::tensors::Metal>())
+                }
             })
         }
         Expr::Path(p) => {
             let name = path_name(p)?;
             let ident = &p.path.segments[0].ident;
             let ty = env.get(&name).copied().unwrap_or(Ty::REAL);
-            Ok(widen(quote!(#ident), ty, target))
+            Ok(widen(quote!(#ident), ty, target, backend))
         }
         Expr::Paren(p) => {
-            let inner = lower(&p.expr, target, env)?;
+            let inner = lower(&p.expr, target, env, backend)?;
             Ok(quote!((#inner)))
         }
-        Expr::Group(g) => lower(&g.expr, target, env),
+        Expr::Group(g) => lower(&g.expr, target, env, backend),
         Expr::Unary(u) => match u.op {
             UnOp::Neg(_) => {
-                let inner = lower(&u.expr, target, env)?;
+                let inner = lower(&u.expr, target, env, backend)?;
                 Ok(quote!(-(#inner)))
             }
             _ => Err(syn::Error::new(expr.span(), "unsupported unary operator")),
         },
-        Expr::Binary(b) => lower_binary(b, target, env),
-        Expr::Call(call) => lower_call(call, target, env),
+        Expr::Binary(b) => lower_binary(b, target, env, backend),
+        Expr::Call(call) => lower_call(call, target, env, backend),
         other => Err(syn::Error::new(
             other.span(),
             "unsupported expression in math!",
@@ -636,12 +851,19 @@ fn lower(expr: &Expr, target: Ty, env: &Env) -> syn::Result<TokenStream> {
     }
 }
 
-fn lower_literal(lit: &syn::ExprLit, target: Ty) -> syn::Result<TokenStream> {
+fn lower_literal(
+    lit: &syn::ExprLit,
+    target: Ty,
+    backend: BackendChoice,
+) -> syn::Result<TokenStream> {
     let (kind, digits) = classify_literal(&lit.lit)?;
     let value: f64 = digits
         .parse()
         .map_err(|_| syn::Error::new(lit.span(), "invalid numeric literal"))?;
-    let value = Literal::f64_suffixed(value);
+    let value = match backend {
+        BackendChoice::Host => Literal::f64_suffixed(value),
+        BackendChoice::Metal => Literal::f32_suffixed(value as f32),
+    };
 
     // Build the coefficient first: `2i` is `0 + 2i`, anything else is purely
     // real.
@@ -658,7 +880,7 @@ fn lower_literal(lit: &syn::ExprLit, target: Ty) -> syn::Result<TokenStream> {
     // Then place it on the real or the ε side of the dual.
     Ok(if target.dual {
         if kind == LitKind::Epsilon {
-            let zero = zero_of(target.complex);
+            let zero = zero_of(target.complex, backend);
             quote!(::tensorcrate::numbers::Dual::new(#zero, #coefficient))
         } else {
             quote!(::tensorcrate::numbers::Dual::constant(#coefficient))
@@ -668,10 +890,26 @@ fn lower_literal(lit: &syn::ExprLit, target: Ty) -> syn::Result<TokenStream> {
     })
 }
 
-fn lower_matmul(left: &Expr, right: &Expr, target: Ty, env: &Env) -> syn::Result<TokenStream> {
+fn lower_matmul(
+    left: &Expr,
+    right: &Expr,
+    target: Ty,
+    env: &Env,
+    backend: BackendChoice,
+) -> syn::Result<TokenStream> {
     let (left_ty, right_ty) = (infer(left, env)?, infer(right, env)?);
-    let left = lower(left, target.element().with_shape(left_ty.shape), env)?;
-    let right = lower(right, target.element().with_shape(right_ty.shape), env)?;
+    let left = lower(
+        left,
+        target.element().with_shape(left_ty.shape),
+        env,
+        backend,
+    )?;
+    let right = lower(
+        right,
+        target.element().with_shape(right_ty.shape),
+        env,
+        backend,
+    )?;
     Ok(match (left_ty.shape, right_ty.shape) {
         (Shape::Matrix(_, _), Shape::Matrix(_, _)) => quote!((#left).matmul(&(#right))),
         (Shape::Matrix(_, _), Shape::Vector(_)) => quote!((#left).matvec(&(#right))),
@@ -680,9 +918,17 @@ fn lower_matmul(left: &Expr, right: &Expr, target: Ty, env: &Env) -> syn::Result
     })
 }
 
-fn lower_binary(b: &syn::ExprBinary, target: Ty, env: &Env) -> syn::Result<TokenStream> {
+fn lower_binary(
+    b: &syn::ExprBinary,
+    target: Ty,
+    env: &Env,
+    backend: BackendChoice,
+) -> syn::Result<TokenStream> {
     if let Some((left, right)) = matmul_binary_operands(b) {
-        return lower_matmul(left, right, target, env);
+        return lower_matmul(left, right, target, env, backend);
+    }
+    if let Some((left, right)) = elementwise_mul_binary_operands(b) {
+        return lower_elementwise_binary(left, right, target, env, backend);
     }
 
     let (left_ty, right_ty) = (infer(&b.left, env)?, infer(&b.right, env)?);
@@ -693,8 +939,8 @@ fn lower_binary(b: &syn::ExprBinary, target: Ty, env: &Env) -> syn::Result<Token
         )
     {
         let vector_target = target.with_shape(left_ty.shape);
-        let left = lower(&b.left, vector_target, env)?;
-        let right = lower(&b.right, vector_target, env)?;
+        let left = lower(&b.left, vector_target, env, backend)?;
+        let right = lower(&b.right, vector_target, env, backend)?;
         return Ok(quote!((#left).dot(&(#right))));
     }
 
@@ -728,8 +974,8 @@ fn lower_binary(b: &syn::ExprBinary, target: Ty, env: &Env) -> syn::Result<Token
     };
 
     if !target.is_tensor() {
-        let left = lower(&b.left, target, env)?;
-        let right = lower(&b.right, target, env)?;
+        let left = lower(&b.left, target, env, backend)?;
+        let right = lower(&b.right, target, env, backend)?;
         return Ok(quote!((#left #op #right)));
     }
 
@@ -738,25 +984,65 @@ fn lower_binary(b: &syn::ExprBinary, target: Ty, env: &Env) -> syn::Result<Token
     let element = target.element();
     Ok(match (left_ty.is_tensor(), right_ty.is_tensor()) {
         (true, true) => {
-            let left = lower(&b.left, target, env)?;
-            let right = lower(&b.right, target, env)?;
+            let left = lower(&b.left, target, env, backend)?;
+            let right = lower(&b.right, target, env, backend)?;
             quote!((#left #op #right))
         }
         (true, false) => {
-            let left = lower(&b.left, target, env)?;
-            let right = lower(&b.right, element, env)?;
+            let left = lower(&b.left, target, env, backend)?;
+            let right = lower(&b.right, element, env, backend)?;
             quote!((#left).broadcast_right(#right, #broadcast_op))
         }
         (false, true) => {
-            let left = lower(&b.left, element, env)?;
-            let right = lower(&b.right, target, env)?;
+            let left = lower(&b.left, element, env, backend)?;
+            let right = lower(&b.right, target, env, backend)?;
             quote!((#right).broadcast_left(#left, #broadcast_op))
         }
         (false, false) => unreachable!("target is a tensor only if an operand is"),
     })
 }
 
-fn lower_call(call: &syn::ExprCall, target: Ty, env: &Env) -> syn::Result<TokenStream> {
+fn lower_elementwise_binary(
+    left: &Expr,
+    right: &Expr,
+    target: Ty,
+    env: &Env,
+    backend: BackendChoice,
+) -> syn::Result<TokenStream> {
+    let (left_ty, right_ty) = (infer(left, env)?, infer(right, env)?);
+    if !target.is_tensor() {
+        let left = lower(left, target, env, backend)?;
+        let right = lower(right, target, env, backend)?;
+        return Ok(quote!((#left * #right)));
+    }
+
+    let element = target.element();
+    Ok(match (left_ty.is_tensor(), right_ty.is_tensor()) {
+        (true, true) => {
+            let left = lower(left, target, env, backend)?;
+            let right = lower(right, target, env, backend)?;
+            quote!((#left * #right))
+        }
+        (true, false) => {
+            let left = lower(left, target, env, backend)?;
+            let right = lower(right, element, env, backend)?;
+            quote!((#left).broadcast_right(#right, ::tensorcrate::tensors::BinaryOp::Mul))
+        }
+        (false, true) => {
+            let left = lower(left, element, env, backend)?;
+            let right = lower(right, target, env, backend)?;
+            quote!((#right).broadcast_left(#left, ::tensorcrate::tensors::BinaryOp::Mul))
+        }
+        (false, false) => unreachable!("target is a tensor only if an operand is"),
+    })
+}
+
+fn lower_call(
+    call: &syn::ExprCall,
+    target: Ty,
+    env: &Env,
+    backend: BackendChoice,
+) -> syn::Result<TokenStream> {
     let name = call_name(call)?;
     let args: Vec<&Expr> = call.args.iter().collect();
 
@@ -769,32 +1055,75 @@ fn lower_call(call: &syn::ExprCall, target: Ty, env: &Env) -> syn::Result<TokenS
                 format!("`{name}` expects a tensor argument"),
             ));
         }
-        lower(args[i], target.element().with_shape(ty.shape), env)
+        lower(args[i], target.element().with_shape(ty.shape), env, backend)
     };
 
     match (name.as_str(), args.len()) {
+        ("min" | "max", 2) => lower_min_max(&name, args[0], args[1], target, env, backend),
+        ("clamp", 3) => {
+            let value = lower(args[0], target, env, backend)?;
+            let low = lower(args[1], target.element(), env, backend)?;
+            let high = lower(args[2], target.element(), env, backend)?;
+            Ok(quote!((#value).clamp(#low, #high)))
+        }
+        ("sum", 1) => {
+            let value = tensor_arg(0, env)?;
+            Ok(quote!((#value).sum()))
+        }
+        ("minimum", 1) => {
+            let value = tensor_arg(0, env)?;
+            Ok(quote!((#value).minimum().expect("math! vectors are non-empty")))
+        }
+        ("maximum", 1) => {
+            let value = tensor_arg(0, env)?;
+            Ok(quote!((#value).maximum().expect("math! vectors are non-empty")))
+        }
+        ("prefix_sum", 1) => {
+            let value = tensor_arg(0, env)?;
+            Ok(quote!((#value).prefix_sum()))
+        }
+        ("sorted", 1 | 2) => {
+            let value = tensor_arg(0, env)?;
+            let descending = args.get(1).map_or(Ok(false), |order| sort_order(order))?;
+            Ok(match backend {
+                BackendChoice::Host if descending => {
+                    quote!((#value).sorted_by(|__a, __b| __b.total_cmp(__a)))
+                }
+                BackendChoice::Host => {
+                    quote!((#value).sorted_by(|__a, __b| __a.total_cmp(__b)))
+                }
+                BackendChoice::Metal if descending => quote!((#value).sorted(
+                    ::tensorcrate::tensors::SortOrder::Descending
+                )),
+                BackendChoice::Metal => quote!((#value).sorted(
+                    ::tensorcrate::tensors::SortOrder::Ascending
+                )),
+            })
+        }
         ("pow", 2) => {
             let base_ty = infer(args[0], env)?;
             if target.is_tensor() {
                 let element = target.element();
                 if base_ty.is_tensor() {
-                    let base = lower(args[0], target, env)?;
-                    let exponent = lower(args[1], element, env)?;
-                    Ok(quote!({
+                    let base = lower(args[0], target, env, backend)?;
+                    let exponent = lower(args[1], element, env, backend)?;
+                    let mapped = quote!({
                         let __exponent = #exponent;
                         (#base).map(|&__x| ::tensorcrate::numbers::Power::power(__x, __exponent))
-                    }))
+                    });
+                    Ok(host_map_if_needed(mapped, base, exponent, true, backend))
                 } else {
-                    let base = lower(args[0], element, env)?;
-                    let exponent = lower(args[1], target, env)?;
-                    Ok(quote!({
+                    let base = lower(args[0], element, env, backend)?;
+                    let exponent = lower(args[1], target, env, backend)?;
+                    let mapped = quote!({
                         let __base = #base;
                         (#exponent).map(|&__x| ::tensorcrate::numbers::Power::power(__base, __x))
-                    }))
+                    });
+                    Ok(host_map_if_needed(mapped, exponent, base, false, backend))
                 }
             } else {
-                let base = lower(args[0], target, env)?;
-                let exponent = lower(args[1], target, env)?;
+                let base = lower(args[0], target, env, backend)?;
+                let exponent = lower(args[1], target, env, backend)?;
                 Ok(quote!(::tensorcrate::numbers::Power::power(#base, #exponent)))
             }
         }
@@ -818,14 +1147,25 @@ fn lower_call(call: &syn::ExprCall, target: Ty, env: &Env) -> syn::Result<TokenS
         }
         ("inv", 1) => {
             let a = tensor_arg(0, env)?;
-            Ok(quote!((#a).inverse()?))
+            Ok(match backend {
+                BackendChoice::Host => quote!((#a).inverse()?),
+                BackendChoice::Metal => quote!((#a)
+                    .to_backend::<::tensorcrate::tensors::Host>()
+                    .inverse()?
+                    .to_backend::<::tensorcrate::tensors::Metal>()),
+            })
         }
         ("det", 1) => {
             let a = tensor_arg(0, env)?;
-            Ok(quote!((#a).determinant()))
+            Ok(match backend {
+                BackendChoice::Host => quote!((#a).determinant()),
+                BackendChoice::Metal => quote!((#a)
+                    .to_backend::<::tensorcrate::tensors::Host>()
+                    .determinant()),
+            })
         }
         ("conj", 1) => {
-            let inner = lower(args[0], target, env)?;
+            let inner = lower(args[0], target, env, backend)?;
             if target.dual {
                 let conjugate_dual = |value: TokenStream| {
                     quote!({
@@ -854,17 +1194,87 @@ fn lower_call(call: &syn::ExprCall, target: Ty, env: &Env) -> syn::Result<TokenS
             let (_, trait_name) = ANALYTIC.iter().find(|(n, _)| *n == name).unwrap();
             let trait_ident = syn::Ident::new(trait_name, call.func.span());
             let method = syn::Ident::new(&name, call.func.span());
-            let inner = lower(args[0], target, env)?;
-            Ok(elementwise(
-                quote!(::tensorcrate::numbers::#trait_ident::#method),
-                inner,
-                target,
-            ))
+            let inner = lower(args[0], target, env, backend)?;
+            Ok(if target.is_tensor() && backend == BackendChoice::Metal {
+                quote!((#inner).analytic(::tensorcrate::tensors::Analytic::#trait_ident))
+            } else {
+                elementwise(
+                    quote!(::tensorcrate::numbers::#trait_ident::#method),
+                    inner,
+                    target,
+                )
+            })
         }
         (_, n) => Err(syn::Error::new(
             call.span(),
             format!("`{name}` does not take {n} argument(s) in math!"),
         )),
+    }
+}
+
+fn lower_min_max(
+    operation: &str,
+    left: &Expr,
+    right: &Expr,
+    target: Ty,
+    env: &Env,
+    backend: BackendChoice,
+) -> syn::Result<TokenStream> {
+    let (left_ty, right_ty) = (infer(left, env)?, infer(right, env)?);
+    let method = Ident::new(operation, left.span());
+    let scalar_method = Ident::new(&format!("{operation}_scalar"), left.span());
+    Ok(match (left_ty.is_tensor(), right_ty.is_tensor()) {
+        (false, false) => {
+            let left = lower(left, target, env, backend)?;
+            let right = lower(right, target, env, backend)?;
+            quote!((#left).#method(#right))
+        }
+        (true, true) => {
+            let left = lower(left, target, env, backend)?;
+            let right = lower(right, target, env, backend)?;
+            quote!((#left).#method(&(#right)))
+        }
+        (true, false) => {
+            let left = lower(left, target, env, backend)?;
+            let right = lower(right, target.element(), env, backend)?;
+            quote!((#left).#scalar_method(#right))
+        }
+        (false, true) => {
+            let left = lower(left, target.element(), env, backend)?;
+            let right = lower(right, target, env, backend)?;
+            quote!((#right).#scalar_method(#left))
+        }
+    })
+}
+
+/// `pow` has no Metal kernel. Keep the result on the selected backend while
+/// making the host fallback explicit in generated code.
+fn host_map_if_needed(
+    host_expression: TokenStream,
+    tensor: TokenStream,
+    scalar: TokenStream,
+    tensor_is_base: bool,
+    backend: BackendChoice,
+) -> TokenStream {
+    if backend == BackendChoice::Host {
+        return host_expression;
+    }
+    if tensor_is_base {
+        quote!({
+            let __exponent = #scalar;
+            (#tensor)
+                .to_backend::<::tensorcrate::tensors::Host>()
+                .map(|&__x| ::tensorcrate::numbers::Power::power(__x, __exponent))
+                .to_backend::<::tensorcrate::tensors::Metal>()
+        })
+    } else {
+        quote!({
+            let __base = #scalar;
+            (#tensor)
+                .to_backend::<::tensorcrate::tensors::Host>()
+                .map(|&__x| ::tensorcrate::numbers::Power::power(__base, __x))
+                .to_backend::<::tensorcrate::tensors::Metal>()
+        })
     }
 }
 
@@ -879,11 +1289,15 @@ fn elementwise(function: TokenStream, value: TokenStream, target: Ty) -> TokenSt
 }
 
 /// Zero of the coefficient type.
-fn zero_of(complex: bool) -> TokenStream {
+fn zero_of(complex: bool, backend: BackendChoice) -> TokenStream {
+    let zero = match backend {
+        BackendChoice::Host => quote!(0f64),
+        BackendChoice::Metal => quote!(0f32),
+    };
     if complex {
-        quote!(::tensorcrate::numbers::Complex::constant(0f64))
+        quote!(::tensorcrate::numbers::Complex::constant(#zero))
     } else {
-        quote!(0f64)
+        zero
     }
 }
 
@@ -892,14 +1306,17 @@ fn zero_of(complex: bool) -> TokenStream {
 /// The axes are handled in order: lift the coefficients to complex, then wrap in
 /// a dual. A tensor is widened by mapping the same conversion over its elements.
 /// Narrowing never happens — `infer` already unified to the wider type.
-fn widen(value: TokenStream, from: Ty, to: Ty) -> TokenStream {
+fn widen(value: TokenStream, from: Ty, to: Ty, backend: BackendChoice) -> TokenStream {
     if from.is_tensor() {
         // The element conversion, expressed on a bound element.
         let converted = widen_scalar(quote!(__x), from.element(), to.element());
         return if converted.to_string() == "__x" {
             value
         } else {
-            quote!((#value).map(|&__x| #converted))
+            match backend {
+                BackendChoice::Host => quote!((#value).map(|&__x| #converted)),
+                BackendChoice::Metal => unreachable!("Metal values cannot require widening"),
+            }
         };
     }
     widen_scalar(value, from, to)
@@ -937,5 +1354,49 @@ fn call_name(call: &syn::ExprCall) -> syn::Result<String> {
     match &*call.func {
         Expr::Path(p) => path_name(p),
         other => Err(syn::Error::new(other.span(), "expected a function name")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quote::quote;
+
+    fn expansion_error(input: TokenStream) -> String {
+        expand(rewrite_custom_operators(input))
+            .expect_err("the macro input should be rejected")
+            .to_string()
+    }
+
+    #[test]
+    fn backend_directives_are_validated() {
+        assert!(
+            expansion_error(quote! { backend = Cpu; [1, 2] })
+                .contains("backend must be `Host` or `Metal`")
+        );
+        assert!(
+            expansion_error(quote! { backend = Metal; [1 + 1i] })
+                .contains("Metal backend supports real f32 values only")
+        );
+    }
+
+    #[test]
+    fn ordering_shapes_and_orders_are_checked_during_expansion() {
+        assert!(
+            expansion_error(quote! { min([1, 2], [1, 2, 3]) }).contains("must have the same shape")
+        );
+        assert!(expansion_error(quote! { sorted([[1, 2], [3, 4]]) }).contains("expects a vector"));
+        assert!(
+            expansion_error(quote! { sorted([1, 2], sideways) })
+                .contains("must be `ascending` or `descending`")
+        );
+    }
+
+    #[test]
+    fn explicit_elementwise_products_check_shapes() {
+        assert!(
+            expansion_error(quote! { [1, 2] .* [1, 2, 3] })
+                .contains("elementwise tensor operands must have the same shape")
+        );
     }
 }

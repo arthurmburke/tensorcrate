@@ -216,7 +216,7 @@ fn analytic_functions_and_power_preserve_complex_duals() {
 
 // ---- tensors ----------------------------------------------------------------
 
-use tensorcrate::tensors::{Matrix, Vector};
+use tensorcrate::tensors::{Host, Matrix, Vector};
 
 #[test]
 fn vector_and_matrix_literals() {
@@ -423,4 +423,124 @@ fn elementwise_functions_map_over_tensors() {
 
     let cosine: Vector<f64> = math! { cos([0, 0, 0]) };
     assert_eq!(cosine.data(), &[1.0, 1.0, 1.0]);
+}
+
+#[test]
+fn explicit_elementwise_multiplication_distinguishes_dot_products() {
+    let elementwise: Vector<f64> = math! { [1, 2, 3] .* [4, 5, 6] };
+    assert_eq!(elementwise.data(), &[4.0, 10.0, 18.0]);
+
+    let dot: f64 = math! { [1, 2, 3] * [4, 5, 6] };
+    assert_eq!(dot, 32.0);
+
+    let matrix: Matrix<f64> = math! {
+        [[1, 2], [3, 4]] .* [[2, 3], [4, 5]]
+    };
+    assert_eq!(matrix.to_rows(), [[2.0, 6.0], [12.0, 20.0]]);
+
+    // `.*`, `*`, `/`, and `@` share multiplicative precedence and associate
+    // left-to-right. Parentheses can force the elementwise product first.
+    let mixed: f64 = math! { ([1, 2, 3] .* [4, 5, 6]) * [1, 1, 1] };
+    assert_eq!(mixed, 32.0);
+}
+
+#[test]
+fn ordering_reduction_scan_and_sort_functions() {
+    let pairwise_min: Vector<f64> = math! { min([3, -1, 5], [2, 4, 1]) };
+    let pairwise_max: Vector<f64> = math! { max([3, -1, 5], [2, 4, 1]) };
+    assert_eq!(pairwise_min.data(), &[2.0, -1.0, 1.0]);
+    assert_eq!(pairwise_max.data(), &[3.0, 4.0, 5.0]);
+
+    let capped: Vector<f64> = math! { min([3, -1, 5], 2) };
+    let floored: Vector<f64> = math! { max(0, [-1, 0.5, 3]) };
+    assert_eq!(capped.data(), &[2.0, -1.0, 2.0]);
+    assert_eq!(floored.data(), &[0.0, 0.5, 3.0]);
+
+    let bounded: Matrix<f64> = math! { clamp([[-2, 0.5], [3, 1]], 0, 2) };
+    assert_eq!(bounded.to_rows(), [[0.0, 0.5], [2.0, 1.0]]);
+
+    let matrix_min: Matrix<f64> = math! {
+        min([[1, 5], [3, -2]], [[2, 4], [0, -1]])
+    };
+    let matrix_floor: Matrix<f64> = math! { max([[1, -5], [3, -2]], 0) };
+    assert_eq!(matrix_min.to_rows(), [[1.0, 4.0], [0.0, -2.0]]);
+    assert_eq!(matrix_floor.to_rows(), [[1.0, 0.0], [3.0, 0.0]]);
+
+    assert_eq!(math! { min(3, 7) }, 3.0);
+    assert_eq!(math! { max(3, 7) }, 7.0);
+    assert_eq!(math! { clamp(9, -1, 4) }, 4.0);
+    assert_eq!(math! { sum([1, 2, 3, 4]) }, 10.0);
+    assert_eq!(math! { minimum([3, -1, 5]) }, -1.0);
+    assert_eq!(math! { maximum([3, -1, 5]) }, 5.0);
+
+    let scanned: Vector<f64> = math! { prefix_sum([1, 2, 3, 4]) };
+    assert_eq!(scanned.data(), &[1.0, 3.0, 6.0, 10.0]);
+
+    let ascending: Vector<f64> = math! { sorted([3, -1, 2]) };
+    let descending: Vector<f64> = math! { sorted([3, -1, 2], descending) };
+    assert_eq!(ascending.data(), &[-1.0, 2.0, 3.0]);
+    assert_eq!(descending.data(), &[3.0, 2.0, -1.0]);
+}
+
+#[test]
+fn the_host_backend_can_be_selected_explicitly() {
+    let values: Vector<f64, Host> = math! {
+        backend = Host;
+        sorted(max([1, -2, 3], 0), descending)
+    };
+    assert_eq!(values.data(), &[3.0, 1.0, 0.0]);
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+fn metal_blocks_emit_resident_f32_tensors() {
+    use tensorcrate::tensors::Metal;
+
+    let values: Vector<f32, Metal> = math! {
+        backend = Metal;
+        let a = [1, -2, 3];
+        let b = [4, 5, 6];
+        sorted(clamp(max(a .* b, 0), 0, 10), descending)
+    };
+    assert_eq!(values.as_slice(), &[10.0, 4.0, 0.0]);
+
+    let product: Matrix<f32, Metal> = math! {
+        backend = Metal;
+        [[1, 2], [3, 4]] @ [[2, 0], [0, 2]]
+    };
+    assert_eq!(
+        product.to_backend::<Host>().to_rows(),
+        [[2.0, 4.0], [6.0, 8.0]]
+    );
+
+    let total: f32 = math! {
+        backend = Metal;
+        sum(prefix_sum([1, 2, 3]))
+    };
+    assert_eq!(total, 10.0);
+
+    let powers: Vector<f32, Metal> = math! {
+        backend = Metal;
+        pow([1, 2, 3], 2)
+    };
+    assert_eq!(powers.as_slice(), &[1.0, 4.0, 9.0]);
+
+    let determinant: f32 = math! {
+        backend = Metal;
+        det([[1, 2], [3, 4]])
+    };
+    assert_eq!(determinant, -2.0);
+
+    let matrix_max: Matrix<f32, Metal> = math! {
+        backend = Metal;
+        max([[1, -2], [3, -4]], 0)
+    };
+    assert_eq!(matrix_max.as_slice(), &[1.0, 0.0, 3.0, 0.0]);
+
+    let analytic: Vector<f32, Metal> = math! {
+        backend = Metal;
+        tanh([0, 1])
+    };
+    assert_eq!(analytic.as_slice()[0], 0.0);
+    assert!((analytic.as_slice()[1] - 1.0_f32.tanh()).abs() < 1e-6);
 }

@@ -407,6 +407,36 @@ impl Matrix<f32, Metal> {
         }
     }
 
+    /// Elementwise minimum with another resident matrix.
+    ///
+    /// # Panics
+    ///
+    /// If the two shapes differ.
+    #[track_caller]
+    pub fn min(&self, other: &Self) -> Self {
+        self.compare(other, Compare::Min)
+    }
+
+    /// Elementwise maximum with another resident matrix.
+    ///
+    /// # Panics
+    ///
+    /// If the two shapes differ.
+    #[track_caller]
+    pub fn max(&self, other: &Self) -> Self {
+        self.compare(other, Compare::Max)
+    }
+
+    /// The lesser of each element and `scalar`.
+    pub fn min_scalar(&self, scalar: f32) -> Self {
+        self.compare_scalar(scalar, Compare::Min, false)
+    }
+
+    /// The greater of each element and `scalar`.
+    pub fn max_scalar(&self, scalar: f32) -> Self {
+        self.compare_scalar(scalar, Compare::Max, false)
+    }
+
     /// Confine every element to `[low, high]`, in one dispatch.
     ///
     /// # Panics

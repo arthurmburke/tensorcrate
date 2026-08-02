@@ -2518,6 +2518,68 @@ impl<T: Coefficient> Matrix<T, Host> {
 }
 
 impl<T: Coefficient + PartialOrd> Matrix<T, Host> {
+    /// Elementwise minimum with another matrix.
+    ///
+    /// # Panics
+    ///
+    /// If the two shapes differ.
+    #[track_caller]
+    pub fn min(&self, other: &Self) -> Self {
+        assert_same_shape(self.shape(), other.shape(), "min");
+        #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            let mut out = vec![T::zero(); self.data.len()];
+            if simd_dispatch::compare(&self.data, &other.data, Compare::Min, &mut out) {
+                return Matrix::from_flat(self.rows, self.cols, out);
+            }
+        }
+        Matrix::from_flat(
+            self.rows,
+            self.cols,
+            self.data
+                .iter()
+                .zip(&other.data)
+                .map(|(&left, &right)| ordered_min(left, right))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Elementwise maximum with another matrix.
+    ///
+    /// # Panics
+    ///
+    /// If the two shapes differ.
+    #[track_caller]
+    pub fn max(&self, other: &Self) -> Self {
+        assert_same_shape(self.shape(), other.shape(), "max");
+        #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            let mut out = vec![T::zero(); self.data.len()];
+            if simd_dispatch::compare(&self.data, &other.data, Compare::Max, &mut out) {
+                return Matrix::from_flat(self.rows, self.cols, out);
+            }
+        }
+        Matrix::from_flat(
+            self.rows,
+            self.cols,
+            self.data
+                .iter()
+                .zip(&other.data)
+                .map(|(&left, &right)| ordered_max(left, right))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// The lesser of each element and `scalar`.
+    pub fn min_scalar(&self, scalar: T) -> Self {
+        self.against_scalar(scalar, Compare::Min, ordered_min)
+    }
+
+    /// The greater of each element and `scalar`.
+    pub fn max_scalar(&self, scalar: T) -> Self {
+        self.against_scalar(scalar, Compare::Max, ordered_max)
+    }
+
     /// Confine every element to `[low, high]`; see
     /// [`Vector::clamp`](Vector::clamp).
     ///
@@ -2535,6 +2597,18 @@ impl<T: Coefficient + PartialOrd> Matrix<T, Host> {
             }
         }
         self.map(|&value| ordered_min(ordered_max(value, low), high))
+    }
+
+    fn against_scalar(&self, value: T, op: Compare, scalar: fn(T, T) -> T) -> Self {
+        #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            let mut out = vec![T::zero(); self.data.len()];
+            if simd_dispatch::compare_scalar(&self.data, value, op, false, &mut out) {
+                return Matrix::from_flat(self.rows, self.cols, out);
+            }
+        }
+        let _ = op;
+        self.map(|&element| scalar(element, value))
     }
 }
 

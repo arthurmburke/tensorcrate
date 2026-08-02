@@ -18,8 +18,10 @@
 
 /// The `math!` macro: a small mathematical language that expands to
 /// statically-typed Rust using [`numbers`] and [`tensors`]. Matrix and
-/// matrix/vector products use `@`, vector `*` vector is a dot product, and
-/// analytic functions map elementwise over tensors.
+/// matrix/vector products use `@`, vector `*` vector is a dot product, `.*` is
+/// explicit elementwise multiplication, and analytic and ordering functions
+/// map over tensors. A leading `backend = Metal;` selects resident `f32` Metal
+/// tensors; `Host`/`f64` is the default.
 pub use tensorcrate_macros::math;
 
 pub mod errors;

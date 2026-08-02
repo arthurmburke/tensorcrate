@@ -27,8 +27,8 @@ API to use for model training, dynamic data, and GPU execution.
 The repository pins the stable Rust toolchain. To work on the crate itself:
 
 ```console
-git clone https://github.com/arthurmburke/tensorcrate.git
-cd tensorcrate
+git clone https://github.com/arthurmburke/rinterp.git
+cd rinterp
 cargo test
 ```
 
@@ -36,7 +36,7 @@ To use the current Git version from another project:
 
 ```toml
 [dependencies]
-tensorcrate = { git = "https://github.com/arthurmburke/tensorcrate.git" }
+tensorcrate = { git = "https://github.com/arthurmburke/rinterp.git" }
 ```
 
 The default features are `simd` and `metal`. The Metal code is only compiled on macOS; other
@@ -44,10 +44,10 @@ platforms continue to use the host backend. To request a specific configuration:
 
 ```toml
 # Portable scalar host implementation only.
-tensorcrate = { git = "https://github.com/arthurmburke/tensorcrate.git", default-features = false }
+tensorcrate = { git = "https://github.com/arthurmburke/rinterp.git", default-features = false }
 
 # Host implementation with NEON or x86 SIMD.
-tensorcrate = { git = "https://github.com/arthurmburke/tensorcrate.git", default-features = false, features = ["simd"] }
+tensorcrate = { git = "https://github.com/arthurmburke/rinterp.git", default-features = false, features = ["simd"] }
 ```
 
 ## Quick start
@@ -140,11 +140,23 @@ Inside `math!`:
 - `A @ B`, `A @ v`, and `v @ A` select matrix-matrix, matrix-vector, and vector-matrix products.
 - `v * u` is a dot product when both operands are vectors. This differs from the lower-level Rust
   tensor API, where `*` is elementwise.
+- `a .* b` always multiplies elementwise, including when both operands are vectors. `.*`, `*`,
+  `/`, and `@` have the same precedence and associate left-to-right.
 - Use `pow(base, exponent)` for powers. `^` is Rust's XOR operator and is deliberately rejected.
 
 The elementwise analytic functions are `sin`, `cos`, `tan`, `sec`, `csc`, `arcsin`, `arccos`,
 `arctan`, `exp`, `ln`, `sinh`, `cosh`, and `tanh`. The macro also supports `conj`, `pow`, `dot`,
 `matmul`, `transpose`, `det`, and `inv`.
+
+Ordering and reduction operations use function syntax:
+
+- `min(a, b)` and `max(a, b)` operate on scalars or elementwise on vectors and matrices; a scalar
+  argument broadcasts.
+- `clamp(value, low, high)` works on a scalar, vector, or matrix.
+- `sum(v)`, `minimum(v)`, and `maximum(v)` reduce a vector to a scalar.
+- `prefix_sum(v)` computes an inclusive scan.
+- `sorted(v)` sorts ascending. `sorted(v, ascending)` and `sorted(v, descending)` select an
+  explicit order.
 
 ```rust
 use tensorcrate::math;
@@ -160,6 +172,13 @@ assert_eq!(product.to_rows(), [[58.0, 64.0], [139.0, 154.0]]);
 let scores: Vector<f64> = math! {
     let x = [0, 1, 2];
     tanh(2 * x - 1)
+};
+
+let ranked: Vector<f64> = math! {
+    let values = [1, 2, 3];
+    let weights = [0.5, 0.25, 2];
+    let weighted = values .* weights;
+    sorted(clamp(weighted, 0, 4), descending)
 };
 ```
 
@@ -178,8 +197,53 @@ let inverse: Matrix<f64> = math! {
 
 `math!` supports `let` bindings and a final expression, but not arbitrary statements, control
 flow, assignments, or arbitrary function calls. Literal tensor shapes are checked while the macro
-expands. The macro currently creates host-backed tensors; use the regular tensor API for `f32`,
-runtime-built shapes, autodiff tapes, or Metal execution.
+expands.
+
+### Selecting a backend
+
+Blocks use `Host` by default and preserve the original `f64` behavior. Put a backend directive at
+the start of a block to make the choice explicit:
+
+```rust
+use tensorcrate::math;
+use tensorcrate::tensors::{Host, Vector};
+
+let values: Vector<f64, Host> = math! {
+    backend = Host;
+    max([1, -2, 3], 0)
+};
+```
+
+On macOS with the `metal` feature, `build.rs` compiles `src/kernel.metal` into a `.metallib` and
+embeds that library in the crate. Metal-enabled builds therefore require full Xcode with its Metal
+Toolchain component, not only the standalone Command Line Tools. Select Xcode and install the
+component if necessary:
+
+```sh
+sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
+xcodebuild -downloadComponent MetalToolchain
+```
+
+`backend = Metal;` emits real `f32` tensors directly on the Metal backend. Every tensor created in
+the block and every tensor intermediate stays on that backend when the operation has a resident
+kernel:
+
+```rust
+use tensorcrate::math;
+use tensorcrate::tensors::{Metal, Vector};
+
+let values: Vector<f32, Metal> = math! {
+    backend = Metal;
+    let values = [1, -2, 3];
+    let weights = [4, 5, 6];
+    sorted(clamp(values .* weights, 0, 10), descending)
+};
+```
+
+Metal blocks use `f32` because the shaders are 32-bit and reject complex (`i`) and dual (`d`)
+literals. `pow`, `det`, and `inv` currently make an explicit Host round trip because they do not
+have resident Metal kernels; the result is converted back to Metal when it is a tensor. Use the
+regular tensor API for runtime-built shapes and autodiff tapes.
 
 ## Automatic differentiation
 
