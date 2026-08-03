@@ -444,8 +444,9 @@ Important backend details:
   device is available, the Metal backend falls back to CPU storage and preserves the same answers.
 - Metal objects are thread-affine and are not `Send`.
 
-Use `matmul` when compact output is important, or `matmul_f32` when the product should accumulate
-and remain in FP32:
+Use `matmul` for same-format `f16`/`bf16` cooperative accumulation and compact output, or
+`matmul_f32` when the product should accumulate and remain in FP32. Same-format accumulation saves
+register and output bandwidth but loses precision more quickly as the inner dimension grows:
 
 ```rust
 use tensorcrate::numbers::{bf16, f16};

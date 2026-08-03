@@ -809,7 +809,7 @@ impl MetalBuffer<f32> {
 }
 
 impl MetalBuffer<f16> {
-    /// Multiply FP16 inputs and retain FP16 output for minimum bandwidth.
+    /// Multiply with an FP16 cooperative accumulator and FP16 output.
     pub(crate) fn matmul(&self, rhs: &Self, m: usize, k: usize, n: usize) -> Option<Self> {
         matmul_tensorops(self, rhs, m, k, n, f16::ZERO, |pipelines| &pipelines.f16)
     }
@@ -827,7 +827,7 @@ impl MetalBuffer<f16> {
 }
 
 impl MetalBuffer<bf16> {
-    /// Multiply BF16 inputs and retain BF16 output for minimum bandwidth.
+    /// Multiply with a BF16 cooperative accumulator and BF16 output.
     pub(crate) fn matmul(&self, rhs: &Self, m: usize, k: usize, n: usize) -> Option<Self> {
         matmul_tensorops(self, rhs, m, k, n, bf16::ZERO, |pipelines| &pipelines.bf16)
     }

@@ -98,8 +98,9 @@ macro_rules! low_precision_tensors {
                 self.storage().is_device_resident()
             }
 
-            /// TensorOps product with compact output storage. On non-M5 GPUs,
-            /// the operation transparently falls back through Host arithmetic.
+            /// TensorOps product with same-format cooperative accumulation and
+            /// compact output storage. On non-M5 GPUs, the operation
+            /// transparently falls back through Host arithmetic.
             #[track_caller]
             pub fn matmul(&self, other: &Self) -> Self {
                 assert_inner(self.shape(), other.shape(), "matmul");
