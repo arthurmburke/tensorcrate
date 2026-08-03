@@ -12,6 +12,8 @@ use std::ops::{Add, Div, Mul, Neg, Rem, Sub};
 
 use num_traits::{Float, Num, One, Zero};
 
+pub use half::{bf16, f16};
+
 /// What a numeric element must provide: the primitive integers and floats,
 /// [`Complex`], and [`Dual`] all implement it.
 ///
@@ -68,6 +70,25 @@ macro_rules! float_coefficient {
     )+};
 }
 float_coefficient!(f32, f64);
+
+macro_rules! half_coefficient {
+    ($($t:ty),+ $(,)?) => {$(
+        impl Coefficient for $t {
+            fn trunc_div(self, rhs: Self) -> Self {
+                Self::from_f32((f32::from(self) / f32::from(rhs)).trunc())
+            }
+
+            fn round(self) -> Self {
+                Self::from_f32(f32::from(self).round())
+            }
+
+            fn magnitude(self) -> f64 {
+                f32::from(self).abs() as f64
+            }
+        }
+    )+};
+}
+half_coefficient!(f16, bf16);
 
 /// A numeric type usable for computing the result of `sin`.
 pub trait Sin {

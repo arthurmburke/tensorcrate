@@ -21,9 +21,10 @@
 //! tensor rather than the allocation, so a mismatched product panics before any
 //! dispatch is encoded.
 //!
-//! Operations with no GPU kernel at all — [`Matrix::determinant`],
-//! [`Matrix::inverse`], the Fourier transforms, and every element type other
-//! than `f32` — are not implemented for this backend. Reach them through
+//! Operations with no GPU kernel at all — such as [`Matrix::determinant`] and
+//! [`Matrix::inverse`] — are not implemented for this backend. The complete
+//! operation set is `f32`; `f16` and `bf16` expose conversion plus same-format
+//! and widened matrix products. Reach other operations through
 //! [`to_backend::<Host>()`](Matrix::to_backend).
 //!
 //! [`Matrix::determinant`]: super::Matrix::determinant
@@ -33,10 +34,108 @@ use std::cmp::Ordering;
 use std::fmt::{self, Display};
 use std::ops::{Add, Div, Mul, Neg, Rem, Sub};
 
+use half::{bf16, f16};
+
 use super::{
-    Analytic, BinaryOp, Compare, Host, Kernels, Matrix, Metal, Reduce, SortOrder, Vector,
+    Analytic, Backend, BinaryOp, Compare, Host, Kernels, Matrix, Metal, Reduce, SortOrder, Vector,
     assert_inner, assert_ordered_bounds, assert_same_len, assert_same_shape,
 };
+
+macro_rules! low_precision_tensors {
+    ($ty:ty) => {
+        impl Vector<$ty, Metal> {
+            /// Convert FP32 values into compact resident storage.
+            pub fn from_f32<B: Backend>(values: &Vector<f32, B>) -> Self {
+                let converted = values
+                    .as_slice()
+                    .iter()
+                    .copied()
+                    .map(<$ty>::from_f32)
+                    .collect::<Vec<_>>();
+                Vector::build(&converted)
+            }
+
+            /// Convert the compact values to FP32 on backend `B`.
+            pub fn to_f32<B: Backend>(&self) -> Vector<f32, B> {
+                let converted = self
+                    .as_slice()
+                    .iter()
+                    .copied()
+                    .map(f32::from)
+                    .collect::<Vec<_>>();
+                Vector::build(&converted)
+            }
+
+            pub fn is_device_resident(&self) -> bool {
+                self.storage().is_device_resident()
+            }
+        }
+
+        impl Matrix<$ty, Metal> {
+            /// Convert an FP32 matrix into compact resident row-major storage.
+            pub fn from_f32<B: Backend>(values: &Matrix<f32, B>) -> Self {
+                let converted = values
+                    .as_slice()
+                    .iter()
+                    .copied()
+                    .map(<$ty>::from_f32)
+                    .collect::<Vec<_>>();
+                Matrix::build(values.rows(), values.cols(), &converted)
+            }
+
+            /// Convert the compact matrix to FP32 on backend `B`.
+            pub fn to_f32<B: Backend>(&self) -> Matrix<f32, B> {
+                let converted = self
+                    .as_slice()
+                    .iter()
+                    .copied()
+                    .map(f32::from)
+                    .collect::<Vec<_>>();
+                Matrix::build(self.rows(), self.cols(), &converted)
+            }
+
+            pub fn is_device_resident(&self) -> bool {
+                self.storage().is_device_resident()
+            }
+
+            /// TensorOps product with compact output storage. On non-M5 GPUs,
+            /// the operation transparently falls back through Host arithmetic.
+            #[track_caller]
+            pub fn matmul(&self, other: &Self) -> Self {
+                assert_inner(self.shape(), other.shape(), "matmul");
+                let (rows, inner, cols) = (self.rows(), self.cols(), other.cols());
+                match self.storage().matmul(other.storage(), rows, inner, cols) {
+                    Some(data) => Matrix::from_storage(rows, cols, data),
+                    None => self
+                        .to_backend::<Host>()
+                        .matmul(&other.to_backend::<Host>())
+                        .to_backend(),
+                }
+            }
+
+            /// TensorOps product with widened FP32 accumulation and output.
+            #[track_caller]
+            pub fn matmul_f32(&self, other: &Self) -> Matrix<f32, Metal> {
+                assert_inner(self.shape(), other.shape(), "matmul_f32");
+                let (rows, inner, cols) = (self.rows(), self.cols(), other.cols());
+                match self
+                    .storage()
+                    .matmul_f32(other.storage(), rows, inner, cols)
+                {
+                    Some(data) => Matrix::from_storage(rows, cols, data),
+                    None => {
+                        let left = self.to_f32::<Host>();
+                        let right = other.to_f32::<Host>();
+                        left.matmul(&right).to_backend()
+                    }
+                }
+            }
+        }
+    };
+}
+
+low_precision_tensors!(f16);
+low_precision_tensors!(bf16);
 
 impl Vector<f32, Metal> {
     /// Whether the elements really are in GPU-shared memory.

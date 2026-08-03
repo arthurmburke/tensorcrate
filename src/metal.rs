@@ -2,8 +2,9 @@
 //!
 //! Compiled only with the `metal` feature on macOS. It offloads large `f32`
 //! matrix/vector products, elementwise and broadcast operations, and radix-2
-//! FFTs to the GPU. Metal compute shaders are 32-bit, so `f64`, matrix
-//! inversion, and non-radix-2 FFT leaves stay on the CPU path.
+//! FFTs to the GPU. M5 GPUs additionally use Metal 4 TensorOps for `f32`, `f16`,
+//! and `bf16` matrix products. `f64`, matrix inversion, and non-radix-2 FFT
+//! leaves stay on the CPU path.
 //!
 //! Every entry point returns `Option`: if no Metal device is available or an
 //! operation cannot be encoded, the caller falls back to the CPU kernel. A
@@ -26,23 +27,30 @@
 //! `Vector`/`Matrix` types do not fit.
 
 use std::cell::{OnceCell, RefCell};
+use std::marker::PhantomData;
 use std::mem::{ManuallyDrop, size_of};
 use std::ptr::NonNull;
 
 use dispatch2::DispatchData;
+use half::{bf16, f16};
 use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::NSString;
+use objc2_foundation::{NSRange, NSString};
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
     MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePipelineState,
-    MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily, MTLLibrary, MTLResourceOptions, MTLSize,
 };
 
 use crate::tensors::{Analytic, BinaryOp, Compare, Reduce, SortOrder};
 
 /// Threadgroup tile edge; must match `TILE` in the shader. 16×16 = 256 threads.
 const TILE: usize = 16;
+
+/// M5 TensorOps threadgroup tile. Four SIMD groups form a 2×2 arrangement of
+/// 32×32 SIMD-group tiles, matching Apple's recommended 16-bit starting point.
+const TENSOROPS_TILE_ROWS: usize = 64;
+const TENSOROPS_TILE_COLS: usize = 64;
 
 /// Threads per group in the tree reduction; must match `REDUCE_GROUP` in the
 /// shader, which sizes its threadgroup scratch array with it.
@@ -54,6 +62,8 @@ const REDUCE_GROUP: usize = 256;
 /// so each loaded value is reused `TILE` times, which is far more
 /// bandwidth-efficient than reading straight from device memory.
 const KERNEL_LIBRARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tensorcrate.metallib"));
+const TENSOROPS_LIBRARY: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/tensorcrate_tensorops.metallib"));
 
 /// A pool of reusable Metal buffers (recycled across calls to avoid repeated
 /// allocation). A buffer is reused when it is at least as large as requested.
@@ -111,6 +121,7 @@ struct Gpu {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     matmul: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    tensorops: Option<TensorOpsPipelines>,
     elementwise: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     broadcast: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     compare: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -134,6 +145,14 @@ struct Gpu {
     pool: RefCell<Pool>,
     /// Command buffers committed but not yet waited on — see [`commit`].
     pending: RefCell<Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>>,
+}
+
+struct TensorOpsPipelines {
+    f32: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    f16_f32: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    bf16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    bf16_f32: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 thread_local! {
@@ -167,8 +186,31 @@ fn build_gpu() -> Option<Gpu> {
             })
             .ok()
     };
+    let tensorops = (|| {
+        // Apple10 is the M5/A19 GPU family. Earlier families retain the tiled
+        // kernel even though they can load Metal 4 code.
+        if !device.supportsFamily(MTLGPUFamily::Apple10) {
+            return None;
+        }
+        let data = DispatchData::from_static_bytes(TENSOROPS_LIBRARY);
+        let library = device.newLibraryWithData_error(&data).ok()?;
+        let pipeline = |name: &str| {
+            let function = library.newFunctionWithName(&NSString::from_str(name))?;
+            device
+                .newComputePipelineStateWithFunction_error(&function)
+                .ok()
+        };
+        Some(TensorOpsPipelines {
+            f32: pipeline("matmul_tensorops_f32")?,
+            f16: pipeline("matmul_tensorops_f16")?,
+            f16_f32: pipeline("matmul_tensorops_f16_f32")?,
+            bf16: pipeline("matmul_tensorops_bf16")?,
+            bf16_f32: pipeline("matmul_tensorops_bf16_f32")?,
+        })
+    })();
     Some(Gpu {
         matmul: pipeline("matmul_tiled")?,
+        tensorops,
         elementwise: pipeline("elementwise")?,
         broadcast: pipeline("broadcast")?,
         compare: pipeline("compare")?,
@@ -201,8 +243,8 @@ fn with_gpu<R>(f: impl FnOnce(&Gpu) -> Option<R>) -> Option<R> {
 }
 
 /// Copy `src` into the front of a shared buffer's storage.
-fn upload(buffer: &ProtocolObject<dyn MTLBuffer>, src: &[f32]) {
-    let dst = buffer.contents().as_ptr() as *mut f32;
+fn upload<T: Copy>(buffer: &ProtocolObject<dyn MTLBuffer>, src: &[T]) {
+    let dst = buffer.contents().as_ptr() as *mut T;
     unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()) };
 }
 
@@ -214,7 +256,7 @@ fn download(buffer: &ProtocolObject<dyn MTLBuffer>, len: usize) -> Vec<f32> {
     out
 }
 
-/// An `f32` allocation in Apple-silicon shared memory.
+/// A typed allocation in Apple-silicon shared memory.
 ///
 /// Keeping intermediate values in this type avoids the upload/download copies
 /// made by the convenience functions below. The CPU may read the allocation in
@@ -227,37 +269,37 @@ fn download(buffer: &ProtocolObject<dyn MTLBuffer>, len: usize) -> Vec<f32> {
 ///
 /// Metal objects are thread-affine, so this type intentionally is not `Send`.
 /// Dropping one returns its allocation to the thread's buffer pool.
-pub struct MetalBuffer {
+pub struct MetalBuffer<T = f32> {
     /// Returned to the pool by `Drop`, hence `ManuallyDrop`.
     raw: ManuallyDrop<Retained<ProtocolObject<dyn MTLBuffer>>>,
     len: usize,
+    marker: PhantomData<T>,
 }
 
-impl MetalBuffer {
-    /// Allocate `len` floats of shared storage, recycling a pooled allocation
+impl<T: Copy + 'static> MetalBuffer<T> {
+    /// Allocate `len` values of shared storage, recycling a pooled allocation
     /// when one is big enough. The contents are unspecified, so every caller
     /// either uploads into it or has a kernel write every element.
     fn allocate(len: usize) -> Option<Self> {
+        let bytes = len.checked_mul(size_of::<T>())?.max(1);
         with_gpu(|gpu| {
-            let raw = gpu
-                .pool
-                .borrow_mut()
-                .acquire(&gpu.device, (len * 4).max(1))?;
+            let raw = gpu.pool.borrow_mut().acquire(&gpu.device, bytes)?;
             Some(Self {
                 raw: ManuallyDrop::new(raw),
                 len,
+                marker: PhantomData,
             })
         })
     }
 
     /// Allocate shared storage and initialize it from a CPU slice.
-    pub fn from_slice(values: &[f32]) -> Option<Self> {
+    pub fn from_slice(values: &[T]) -> Option<Self> {
         let buffer = Self::allocate(values.len())?;
         upload(&buffer.raw, values);
         Some(buffer)
     }
 
-    /// Number of stored `f32` values.
+    /// Number of stored values.
     pub fn len(&self) -> usize {
         self.len
     }
@@ -272,26 +314,28 @@ impl MetalBuffer {
     /// Operations are submitted without waiting, so this is one of the points
     /// where queued GPU work has to have actually happened; it blocks until it
     /// has. Every CPU read of a `Metal`-backed tensor comes through here.
-    pub fn as_slice(&self) -> &[f32] {
+    pub fn as_slice(&self) -> &[T] {
         with_gpu(|gpu| {
             sync_or_panic(gpu);
             Some(())
         })
         .expect("a Metal buffer cannot outlive its thread-local device");
         // SAFETY: `MTLStorageModeShared` memory is CPU-readable at
-        // `contents()`, and holds `len` initialized floats — a buffer is only
+        // `contents()`, and holds `len` initialized values — a buffer is only
         // handed out after an upload or a kernel that writes every element. The
         // `sync` above drained every command buffer that could still be writing
         // it, and nothing on this thread can submit more while the borrow is
         // alive, so no GPU write is in flight.
-        unsafe { std::slice::from_raw_parts(self.raw.contents().as_ptr().cast::<f32>(), self.len) }
+        unsafe { std::slice::from_raw_parts(self.raw.contents().as_ptr().cast::<T>(), self.len) }
     }
 
     /// Copy the shared allocation into an ordinary CPU vector.
-    pub fn to_vec(&self) -> Vec<f32> {
+    pub fn to_vec(&self) -> Vec<T> {
         self.as_slice().to_vec()
     }
+}
 
+impl MetalBuffer<f32> {
     /// Tiled matrix multiplication, with both inputs and the result remaining
     /// in shared Metal buffers.
     pub fn matmul(&self, rhs: &Self, m: usize, k: usize, n: usize) -> Option<Self> {
@@ -764,7 +808,81 @@ impl MetalBuffer {
     }
 }
 
-impl Drop for MetalBuffer {
+impl MetalBuffer<f16> {
+    /// Multiply FP16 inputs and retain FP16 output for minimum bandwidth.
+    pub(crate) fn matmul(&self, rhs: &Self, m: usize, k: usize, n: usize) -> Option<Self> {
+        matmul_tensorops(self, rhs, m, k, n, f16::ZERO, |pipelines| &pipelines.f16)
+    }
+
+    /// Multiply FP16 inputs with TensorOps and accumulate into FP32 output.
+    pub(crate) fn matmul_f32(
+        &self,
+        rhs: &Self,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Option<MetalBuffer<f32>> {
+        matmul_tensorops(self, rhs, m, k, n, 0.0, |pipelines| &pipelines.f16_f32)
+    }
+}
+
+impl MetalBuffer<bf16> {
+    /// Multiply BF16 inputs and retain BF16 output for minimum bandwidth.
+    pub(crate) fn matmul(&self, rhs: &Self, m: usize, k: usize, n: usize) -> Option<Self> {
+        matmul_tensorops(self, rhs, m, k, n, bf16::ZERO, |pipelines| &pipelines.bf16)
+    }
+
+    /// Multiply BF16 inputs with TensorOps and accumulate into FP32 output.
+    pub(crate) fn matmul_f32(
+        &self,
+        rhs: &Self,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Option<MetalBuffer<f32>> {
+        matmul_tensorops(self, rhs, m, k, n, 0.0, |pipelines| &pipelines.bf16_f32)
+    }
+}
+
+fn matmul_tensorops<T: Copy + 'static, U: Copy + 'static>(
+    left: &MetalBuffer<T>,
+    right: &MetalBuffer<T>,
+    m: usize,
+    k: usize,
+    n: usize,
+    zero: U,
+    pipeline: impl Fn(&TensorOpsPipelines) -> &ProtocolObject<dyn MTLComputePipelineState>,
+) -> Option<MetalBuffer<U>> {
+    if left.len != m.checked_mul(k)? || right.len != k.checked_mul(n)? {
+        return None;
+    }
+    let output_len = m.checked_mul(n)?;
+    if output_len == 0 {
+        return MetalBuffer::from_slice(&[]);
+    }
+    if k == 0 {
+        return MetalBuffer::from_slice(&vec![zero; output_len]);
+    }
+    let output = MetalBuffer::<U>::allocate(output_len)?;
+    with_gpu(|gpu| {
+        let state = pipeline(gpu.tensorops.as_ref()?);
+        encode_tensorops_matmul(
+            gpu,
+            state,
+            &left.raw,
+            &right.raw,
+            &output.raw,
+            m,
+            k,
+            n,
+            false,
+            size_of::<U>(),
+        )
+    })?;
+    Some(output)
+}
+
+impl<T> Drop for MetalBuffer<T> {
     fn drop(&mut self) {
         // SAFETY: `raw` is live until here and this runs exactly once, so it is
         // never taken twice and nothing reads the field afterwards.
@@ -803,6 +921,20 @@ fn encode_matmul(
     n: usize,
     accumulate: bool,
 ) -> Option<()> {
+    if !accumulate && let Some(pipelines) = &gpu.tensorops {
+        return encode_tensorops_matmul(
+            gpu,
+            &pipelines.f32,
+            a,
+            b,
+            output,
+            m,
+            k,
+            n,
+            accumulate,
+            size_of::<f32>(),
+        );
+    }
     let command = gpu.queue.commandBuffer()?;
     let encoder = command.computeCommandEncoder()?;
     encoder.setComputePipelineState(&gpu.matmul);
@@ -832,6 +964,61 @@ fn encode_matmul(
         depth: 1,
     };
     encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, per_group);
+    encoder.endEncoding();
+    commit(gpu, command)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_tensorops_matmul(
+    gpu: &Gpu,
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    a: &ProtocolObject<dyn MTLBuffer>,
+    b: &ProtocolObject<dyn MTLBuffer>,
+    output: &ProtocolObject<dyn MTLBuffer>,
+    m: usize,
+    k: usize,
+    n: usize,
+    accumulate: bool,
+    output_element_size: usize,
+) -> Option<()> {
+    let command = gpu.queue.commandBuffer()?;
+    if !accumulate {
+        let clear = command.blitCommandEncoder()?;
+        clear.fillBuffer_range_value(
+            output,
+            NSRange::new(0, m.checked_mul(n)?.checked_mul(output_element_size)?),
+            0,
+        );
+        clear.endEncoding();
+    }
+
+    let encoder = command.computeCommandEncoder()?;
+    encoder.setComputePipelineState(pipeline);
+    let (mu, ku, nu) = (
+        u32::try_from(m).ok()?,
+        u32::try_from(k).ok()?,
+        u32::try_from(n).ok()?,
+    );
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(a), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(b), 0, 1);
+        encoder.setBuffer_offset_atIndex(Some(output), 0, 2);
+        encoder.setBytes_length_atIndex(NonNull::from(&mu).cast(), 4, 3);
+        encoder.setBytes_length_atIndex(NonNull::from(&ku).cast(), 4, 4);
+        encoder.setBytes_length_atIndex(NonNull::from(&nu).cast(), 4, 5);
+    }
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: n.div_ceil(TENSOROPS_TILE_COLS),
+            height: m.div_ceil(TENSOROPS_TILE_ROWS),
+            depth: 1,
+        },
+        MTLSize {
+            width: pipeline.threadExecutionWidth() * 4,
+            height: 1,
+            depth: 1,
+        },
+    );
     encoder.endEncoding();
     commit(gpu, command)
 }
@@ -1764,6 +1951,56 @@ mod tests {
         for (index, (actual, base)) in target.as_slice().iter().zip(&seed).enumerate() {
             let expected = base + product[index];
             assert!((actual - expected).abs() < 1e-4, "{actual} vs {expected}");
+        }
+    }
+
+    #[test]
+    fn tensorops_multiplies_half_and_bfloat_inputs() {
+        // Cross both 64×64 tile boundaries and leave partial tiles on each
+        // edge, so this covers the dispatch geometry as well as the data types.
+        let (m, k, n) = (70usize, 33usize, 69usize);
+        let left = (0..m * k)
+            .map(|index| ((index % 7) as f32 - 3.0) * 0.25)
+            .collect::<Vec<_>>();
+        let right = (0..k * n)
+            .map(|index| ((index % 5) as f32 - 2.0) * 0.125)
+            .collect::<Vec<_>>();
+        let expected = cpu_matmul(&left, &right, m, k, n);
+
+        let left_f16 = left.iter().copied().map(f16::from_f32).collect::<Vec<_>>();
+        let right_f16 = right.iter().copied().map(f16::from_f32).collect::<Vec<_>>();
+        let Some(left_f16) = MetalBuffer::<f16>::from_slice(&left_f16) else {
+            eprintln!("no Metal device; skipping TensorOps comparison");
+            return;
+        };
+        let right_f16 = MetalBuffer::<f16>::from_slice(&right_f16).unwrap();
+        let Some(compact_f16) = left_f16.matmul(&right_f16, m, k, n) else {
+            eprintln!("no Metal 4 TensorOps support; skipping TensorOps comparison");
+            return;
+        };
+        for (actual, expected) in compact_f16.as_slice().iter().zip(&expected) {
+            assert!((f32::from(*actual) - expected).abs() < 0.02);
+        }
+        let wide_f16 = left_f16.matmul_f32(&right_f16, m, k, n).unwrap();
+        for (actual, expected) in wide_f16.as_slice().iter().zip(&expected) {
+            assert!((actual - expected).abs() < 1e-4);
+        }
+
+        let left_bf16 = left.iter().copied().map(bf16::from_f32).collect::<Vec<_>>();
+        let right_bf16 = right
+            .iter()
+            .copied()
+            .map(bf16::from_f32)
+            .collect::<Vec<_>>();
+        let left_bf16 = MetalBuffer::<bf16>::from_slice(&left_bf16).unwrap();
+        let right_bf16 = MetalBuffer::<bf16>::from_slice(&right_bf16).unwrap();
+        let compact_bf16 = left_bf16.matmul(&right_bf16, m, k, n).unwrap();
+        for (actual, expected) in compact_bf16.as_slice().iter().zip(&expected) {
+            assert!((f32::from(*actual) - expected).abs() < 0.1);
+        }
+        let wide_bf16 = left_bf16.matmul_f32(&right_bf16, m, k, n).unwrap();
+        for (actual, expected) in wide_bf16.as_slice().iter().zip(&expected) {
+            assert!((actual - expected).abs() < 1e-4);
         }
     }
 

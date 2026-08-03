@@ -8,6 +8,7 @@
 
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
+use tensorcrate::numbers::{bf16, f16};
 use tensorcrate::tensors::{Backend, BinaryOp, Host, Matrix, Metal, Vector};
 
 /// Deterministic filler with a mix of signs and magnitudes, all integral so
@@ -247,6 +248,48 @@ fn products_match_the_host_backend() {
         thin.matmul(&wide).to_backend::<Host>().to_rows(),
         [[0.0f32; 3]; 3]
     );
+}
+
+#[test]
+fn low_precision_storage_supports_compact_and_f32_products() {
+    assert_eq!(size_of::<f16>(), 2);
+    assert_eq!(size_of::<bf16>(), 2);
+
+    let left = Matrix::from_rows([
+        [1.0f32, 2.0, -1.0, 0.5],
+        [0.0, 3.0, 2.0, -2.0],
+        [4.0, -1.0, 0.5, 2.0],
+    ]);
+    let right = Matrix::from_rows([[2.0f32, -1.0], [0.5, 3.0], [-2.0, 1.0], [4.0, 0.25]]);
+    let expected = left.matmul(&right);
+
+    let left_f16 = Matrix::<f16, Metal>::from_f32(&left);
+    let right_f16 = Matrix::<f16, Metal>::from_f32(&right);
+    let compact_f16 = left_f16.matmul(&right_f16).to_f32::<Host>();
+    let wide_f16 = left_f16.matmul_f32(&right_f16).to_backend::<Host>();
+    for ((compact, wide), expected) in compact_f16
+        .as_slice()
+        .iter()
+        .zip(wide_f16.as_slice())
+        .zip(expected.as_slice())
+    {
+        assert!((compact - expected).abs() < 0.02);
+        assert!((wide - expected).abs() < 1e-4);
+    }
+
+    let left_bf16 = Matrix::<bf16, Metal>::from_f32(&left);
+    let right_bf16 = Matrix::<bf16, Metal>::from_f32(&right);
+    let compact_bf16 = left_bf16.matmul(&right_bf16).to_f32::<Host>();
+    let wide_bf16 = left_bf16.matmul_f32(&right_bf16).to_backend::<Host>();
+    for ((compact, wide), expected) in compact_bf16
+        .as_slice()
+        .iter()
+        .zip(wide_bf16.as_slice())
+        .zip(expected.as_slice())
+    {
+        assert!((compact - expected).abs() < 0.1);
+        assert!((wide - expected).abs() < 1e-4);
+    }
 }
 
 #[test]

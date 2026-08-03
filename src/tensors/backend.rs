@@ -5,9 +5,10 @@
 //! row-major `Vec` they normally use — so `Vector<f64>` and `Matrix<i64>` keep
 //! meaning exactly what they meant before.
 //!
-//! The [`Metal`] backend (macOS, `metal` feature) instead keeps `f32` elements
-//! in `MTLStorageModeShared` memory, which the GPU kernels read and write in
-//! place. A chain of products or elementwise operations over `Metal`-backed
+//! The [`Metal`] backend (macOS, `metal` feature) instead keeps elements in
+//! `MTLStorageModeShared` memory, which the GPU kernels read and write in place.
+//! The full kernel set operates on `f32`; M5 TensorOps matrix products also use
+//! compact `f16` and `bf16` storage. A chain of operations over `Metal`-backed
 //! tensors therefore stays resident: no operand is uploaded and no result is
 //! downloaded until you ask for one. The [`Host`] backend's automatic offload
 //! (the `MIN_*` thresholds in [`crate::metal`]) cannot do that — it has to copy
@@ -29,14 +30,13 @@
 //! # }
 //! ```
 //!
-//! Only `f32` tensors can be built on a non-[`Host`] backend: the Metal shaders
-//! are 32-bit, and `f32` is the only element type they understand. The backend
-//! never changes an answer — it only decides which memory the answer is
-//! computed in.
+//! The backend never implicitly changes an element type. Compact matrices offer
+//! both same-format [`Matrix::matmul`](super::Matrix::matmul) output and an
+//! explicit `matmul_f32` widening path.
 //!
 //! # Shapes
 //!
-//! Storage here is shapeless: it is a run of `f32`, and the extents live in the
+//! Storage here is shapeless: it is a run of values, and the extents live in the
 //! [`Vector`](super::Vector) and [`Matrix`](super::Matrix) wrappers. That is why
 //! the reshaping operations below take no arguments — a row vector, a column
 //! vector and their flattening are all the same run of elements, so on either
@@ -55,21 +55,21 @@ pub trait Backend: sealed::Sealed + Sized + 'static {
     /// Storage for a matrix of `T`, in row-major order.
     type Matrix<T>;
 
-    /// Build vector storage from `f32` values.
-    fn store_vector(values: &[f32]) -> Self::Vector<f32>;
+    /// Build vector storage from typed values.
+    fn store_vector<T: Copy + 'static>(values: &[T]) -> Self::Vector<T>;
 
-    /// Build matrix storage from row-major `f32` values.
-    fn store_matrix(values: &[f32]) -> Self::Matrix<f32>;
+    /// Build matrix storage from typed row-major values.
+    fn store_matrix<T: Copy + 'static>(values: &[T]) -> Self::Matrix<T>;
 
-    /// Borrow this vector storage as a flat `f32` slice.
+    /// Borrow this vector storage as a flat typed slice.
     ///
     /// Nothing is copied: for the [`Metal`] backend this borrows the shared
     /// allocation itself, which the CPU can read directly.
-    fn vector_slice(storage: &Self::Vector<f32>) -> &[f32];
+    fn vector_slice<T: Copy + 'static>(storage: &Self::Vector<T>) -> &[T];
 
-    /// Borrow this matrix storage as a flat row-major `f32` slice, again without
+    /// Borrow this matrix storage as a flat row-major typed slice, again without
     /// copying.
-    fn matrix_slice(storage: &Self::Matrix<f32>) -> &[f32];
+    fn matrix_slice<T: Copy + 'static>(storage: &Self::Matrix<T>) -> &[T];
 
     /// Reinterpret a vector as a matrix, filling rows in order.
     ///
@@ -77,10 +77,10 @@ pub trait Backend: sealed::Sealed + Sized + 'static {
     /// let a matrix input be differentiated by the vector machinery. Both are
     /// free on either backend — the elements are already in the right order —
     /// which is why they take ownership rather than borrowing.
-    fn vector_into_matrix(vector: Self::Vector<f32>) -> Self::Matrix<f32>;
+    fn vector_into_matrix<T: Copy + 'static>(vector: Self::Vector<T>) -> Self::Matrix<T>;
 
     /// Reinterpret a matrix as its row-major flattening.
-    fn matrix_into_flattened(matrix: Self::Matrix<f32>) -> Self::Vector<f32>;
+    fn matrix_into_flattened<T: Copy + 'static>(matrix: Self::Matrix<T>) -> Self::Vector<T>;
 
     /// Build a matrix from vectors stacked along the vertical axis (the vectors
     /// are rows), each of length `len`.
@@ -131,29 +131,29 @@ impl Backend for Host {
     type Vector<T> = Vec<T>;
     type Matrix<T> = Vec<T>;
 
-    fn store_vector(values: &[f32]) -> Vec<f32> {
+    fn store_vector<T: Copy + 'static>(values: &[T]) -> Vec<T> {
         values.to_vec()
     }
 
-    fn store_matrix(values: &[f32]) -> Vec<f32> {
+    fn store_matrix<T: Copy + 'static>(values: &[T]) -> Vec<T> {
         values.to_vec()
     }
 
-    fn vector_slice(storage: &Vec<f32>) -> &[f32] {
+    fn vector_slice<T: Copy + 'static>(storage: &Vec<T>) -> &[T] {
         storage
     }
 
-    fn matrix_slice(storage: &Vec<f32>) -> &[f32] {
+    fn matrix_slice<T: Copy + 'static>(storage: &Vec<T>) -> &[T] {
         storage
     }
 
     // A vector and a matrix are the same run of elements in the same order, so
     // both reshapes are the identity.
-    fn vector_into_matrix(vector: Vec<f32>) -> Vec<f32> {
+    fn vector_into_matrix<T: Copy + 'static>(vector: Vec<T>) -> Vec<T> {
         vector
     }
 
-    fn matrix_into_flattened(matrix: Vec<f32>) -> Vec<f32> {
+    fn matrix_into_flattened<T: Copy + 'static>(matrix: Vec<T>) -> Vec<T> {
         matrix
     }
 
@@ -232,16 +232,18 @@ pub use gpu::{Metal, MetalStorage};
 mod gpu {
     use std::fmt;
 
+    use half::{bf16, f16};
+
     use super::{Backend, sealed};
     use crate::metal::MetalBuffer;
     use crate::tensors::{Analytic, BinaryOp, Compare, Reduce, SortOrder};
 
-    /// A backend that keeps `f32` elements in GPU-shared memory, so the Metal
-    /// kernels read and write them in place.
+    /// A backend that keeps elements in GPU-shared memory, so the Metal kernels
+    /// read and write them in place.
     ///
-    /// Only `f32` tensors can be built here: `Vector<f32, Metal>` and
-    /// `Matrix<f32, Metal>` have constructors, any other element type names a
-    /// type with none.
+    /// `f32` has the complete Metal operation set. `f16` and `bf16` use the
+    /// crate's re-exported [`half`](https://docs.rs/half) types for compact M5
+    /// TensorOps products.
     ///
     /// Metal objects are thread-affine, so these tensors are not `Send`. They do
     /// clone (into a fresh allocation with the same values) and compare by
@@ -252,32 +254,32 @@ mod gpu {
     impl sealed::Sealed for Metal {}
 
     impl Backend for Metal {
-        type Vector<T> = MetalStorage;
-        type Matrix<T> = MetalStorage;
+        type Vector<T> = MetalStorage<T>;
+        type Matrix<T> = MetalStorage<T>;
 
-        fn store_vector(values: &[f32]) -> MetalStorage {
+        fn store_vector<T: Copy + 'static>(values: &[T]) -> MetalStorage<T> {
             MetalStorage::from_slice(values)
         }
 
-        fn store_matrix(values: &[f32]) -> MetalStorage {
+        fn store_matrix<T: Copy + 'static>(values: &[T]) -> MetalStorage<T> {
             MetalStorage::from_slice(values)
         }
 
-        fn vector_slice(storage: &MetalStorage) -> &[f32] {
+        fn vector_slice<T: Copy + 'static>(storage: &MetalStorage<T>) -> &[T] {
             storage.as_slice()
         }
 
-        fn matrix_slice(storage: &MetalStorage) -> &[f32] {
+        fn matrix_slice<T: Copy + 'static>(storage: &MetalStorage<T>) -> &[T] {
             storage.as_slice()
         }
 
         // A vector and a matrix are the same shared allocation, and row-major
         // flattening is the identity on it: these move, they do not copy.
-        fn vector_into_matrix(vector: MetalStorage) -> MetalStorage {
+        fn vector_into_matrix<T: Copy + 'static>(vector: MetalStorage<T>) -> MetalStorage<T> {
             vector
         }
 
-        fn matrix_into_flattened(matrix: MetalStorage) -> MetalStorage {
+        fn matrix_into_flattened<T: Copy + 'static>(matrix: MetalStorage<T>) -> MetalStorage<T> {
             matrix
         }
 
@@ -375,17 +377,17 @@ mod gpu {
     /// numbers that come out.
     ///
     /// [`Host`]: super::Host
-    pub struct MetalStorage(Residency);
+    pub struct MetalStorage<T = f32>(Residency<T>);
 
-    enum Residency {
+    enum Residency<T> {
         /// A shared allocation the GPU can read without a copy.
-        Device(MetalBuffer),
+        Device(MetalBuffer<T>),
         /// No Metal device was available; the CPU kernels run over this instead.
-        Host(Vec<f32>),
+        Host(Vec<T>),
     }
 
-    impl MetalStorage {
-        pub(crate) fn from_slice(values: &[f32]) -> Self {
+    impl<T: Copy + 'static> MetalStorage<T> {
+        pub(crate) fn from_slice(values: &[T]) -> Self {
             match MetalBuffer::from_slice(values) {
                 Some(buffer) => Self(Residency::Device(buffer)),
                 None => Self(Residency::Host(values.to_vec())),
@@ -400,7 +402,7 @@ mod gpu {
             matches!(self.0, Residency::Device(_))
         }
 
-        /// Number of stored `f32` values.
+        /// Number of stored values.
         pub fn len(&self) -> usize {
             match &self.0 {
                 Residency::Device(buffer) => buffer.len(),
@@ -415,7 +417,7 @@ mod gpu {
 
         /// Borrow the values as a flat slice, without copying: shared storage is
         /// ordinary cached memory as far as the CPU is concerned.
-        pub(crate) fn as_slice(&self) -> &[f32] {
+        pub(crate) fn as_slice(&self) -> &[T] {
             match &self.0 {
                 Residency::Device(buffer) => buffer.as_slice(),
                 Residency::Host(values) => values,
@@ -423,13 +425,15 @@ mod gpu {
         }
 
         /// The shared allocation, when there is one.
-        fn device(&self) -> Option<&MetalBuffer> {
+        fn device(&self) -> Option<&MetalBuffer<T>> {
             match &self.0 {
                 Residency::Device(buffer) => Some(buffer),
                 Residency::Host(_) => None,
             }
         }
+    }
 
+    impl MetalStorage<f32> {
         fn vstack(inputs: &[Self], vector_len: usize) -> Option<Self> {
             let buffers = inputs
                 .iter()
@@ -643,20 +647,51 @@ mod gpu {
         }
     }
 
-    impl Clone for MetalStorage {
+    macro_rules! low_precision_storage {
+        ($ty:ty) => {
+            impl MetalStorage<$ty> {
+                pub(crate) fn matmul(
+                    &self,
+                    rhs: &Self,
+                    m: usize,
+                    k: usize,
+                    n: usize,
+                ) -> Option<Self> {
+                    let product = self.device()?.matmul(rhs.device()?, m, k, n)?;
+                    Some(Self(Residency::Device(product)))
+                }
+
+                pub(crate) fn matmul_f32(
+                    &self,
+                    rhs: &Self,
+                    m: usize,
+                    k: usize,
+                    n: usize,
+                ) -> Option<MetalStorage<f32>> {
+                    let product = self.device()?.matmul_f32(rhs.device()?, m, k, n)?;
+                    Some(MetalStorage(Residency::Device(product)))
+                }
+            }
+        };
+    }
+
+    low_precision_storage!(f16);
+    low_precision_storage!(bf16);
+
+    impl<T: Copy + 'static> Clone for MetalStorage<T> {
         /// Clones the values into a fresh allocation on the same backend.
         fn clone(&self) -> Self {
             Self::from_slice(self.as_slice())
         }
     }
 
-    impl PartialEq for MetalStorage {
+    impl<T: Copy + PartialEq + 'static> PartialEq for MetalStorage<T> {
         fn eq(&self, other: &Self) -> bool {
             self.as_slice() == other.as_slice()
         }
     }
 
-    impl fmt::Debug for MetalStorage {
+    impl<T: Copy + fmt::Debug + 'static> fmt::Debug for MetalStorage<T> {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             self.as_slice().fmt(f)
         }

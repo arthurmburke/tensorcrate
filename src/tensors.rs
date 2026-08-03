@@ -22,10 +22,12 @@
 //!
 //! Both types take a second parameter, the storage [`Backend`], which defaults
 //! to [`Host`] — the `Vec` just described. On macOS with the `metal` feature,
-//! `f32` tensors can instead be placed on the [`Metal`] backend, whose elements
-//! live in GPU-shared memory so a chain of operations runs without copying
-//! between CPU and GPU pools. [`Vector::to_backend`] and [`Matrix::to_backend`]
-//! move between the two; see the [`backend`] module for the details.
+//! tensors can instead be placed on the [`Metal`] backend, whose elements live
+//! in GPU-shared memory so a chain of operations runs without copying between
+//! CPU and GPU pools. The full operation set is available for `f32`; `f16` and
+//! `bf16` provide compact storage and M5 TensorOps matrix products.
+//! [`Vector::to_backend`] and [`Matrix::to_backend`] move between the two; see
+//! the [`backend`] module for the details.
 
 use std::cmp::Ordering;
 use std::fmt::{self, Display};
@@ -108,6 +110,173 @@ fn assert_inner(left: (usize, usize), right: (usize, usize), operation: &str) {
     );
 }
 
+/// Minimum scalar multiply-accumulates before a Host matrix product leaves the
+/// generic loop. Accelerate and the architecture-specific SIMD kernels share
+/// this gate so adding the macOS fast path does not change dispatch semantics.
+const HOST_MATMUL_DISPATCH_OPS: usize = 512;
+
+#[cfg(target_os = "macos")]
+mod accelerate_dispatch {
+    //! Dense Host products through Apple's Accelerate BLAS. Accelerate owns the
+    //! processor-specific choice (including Apple-silicon matrix hardware), so
+    //! this stays on public APIs rather than binding undocumented instructions.
+
+    use std::any::TypeId;
+    use std::ffi::{c_double, c_float, c_int};
+
+    use super::{Coefficient, HOST_MATMUL_DISPATCH_OPS};
+
+    const CBLAS_ROW_MAJOR: c_int = 101;
+    const CBLAS_NO_TRANS: c_int = 111;
+
+    #[link(name = "Accelerate", kind = "framework")]
+    unsafe extern "C" {
+        fn cblas_sgemm(
+            order: c_int,
+            transpose_a: c_int,
+            transpose_b: c_int,
+            m: c_int,
+            n: c_int,
+            k: c_int,
+            alpha: c_float,
+            a: *const c_float,
+            leading_a: c_int,
+            b: *const c_float,
+            leading_b: c_int,
+            beta: c_float,
+            c: *mut c_float,
+            leading_c: c_int,
+        );
+
+        fn cblas_dgemm(
+            order: c_int,
+            transpose_a: c_int,
+            transpose_b: c_int,
+            m: c_int,
+            n: c_int,
+            k: c_int,
+            alpha: c_double,
+            a: *const c_double,
+            leading_a: c_int,
+            b: *const c_double,
+            leading_b: c_int,
+            beta: c_double,
+            c: *mut c_double,
+            leading_c: c_int,
+        );
+    }
+
+    pub fn matmul<T: Coefficient>(
+        a: &[T],
+        b: &[T],
+        rows: usize,
+        inner: usize,
+        cols: usize,
+        output: &mut [T],
+        accumulate: bool,
+    ) -> bool {
+        if rows.saturating_mul(inner).saturating_mul(cols) < HOST_MATMUL_DISPATCH_OPS {
+            return false;
+        }
+        let Ok(m) = c_int::try_from(rows) else {
+            return false;
+        };
+        let Ok(k) = c_int::try_from(inner) else {
+            return false;
+        };
+        let Ok(n) = c_int::try_from(cols) else {
+            return false;
+        };
+
+        if TypeId::of::<T>() == TypeId::of::<f32>() {
+            // SAFETY: TypeId equality proves the element layouts, all slices
+            // have been shape-checked by the caller, and BLAS writes exactly
+            // m*n row-major values into `output`.
+            unsafe {
+                cblas_sgemm(
+                    CBLAS_ROW_MAJOR,
+                    CBLAS_NO_TRANS,
+                    CBLAS_NO_TRANS,
+                    m,
+                    n,
+                    k,
+                    1.0,
+                    a.as_ptr().cast(),
+                    k,
+                    b.as_ptr().cast(),
+                    n,
+                    f32::from(accumulate),
+                    output.as_mut_ptr().cast(),
+                    n,
+                );
+            }
+            return true;
+        }
+
+        if TypeId::of::<T>() == TypeId::of::<f64>() {
+            // SAFETY: As above, with f64 established by TypeId equality.
+            unsafe {
+                cblas_dgemm(
+                    CBLAS_ROW_MAJOR,
+                    CBLAS_NO_TRANS,
+                    CBLAS_NO_TRANS,
+                    m,
+                    n,
+                    k,
+                    1.0,
+                    a.as_ptr().cast(),
+                    k,
+                    b.as_ptr().cast(),
+                    n,
+                    f64::from(accumulate),
+                    output.as_mut_ptr().cast(),
+                    n,
+                );
+            }
+            return true;
+        }
+
+        false
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod accelerate_tests {
+    use super::accelerate_dispatch;
+
+    #[test]
+    fn sgemm_and_dgemm_dispatch_at_the_host_threshold() {
+        const SIDE: usize = 8;
+
+        let a32 = vec![1.0f32; SIDE * SIDE];
+        let b32 = vec![2.0f32; SIDE * SIDE];
+        let mut c32 = vec![3.0f32; SIDE * SIDE];
+        assert!(accelerate_dispatch::matmul(
+            &a32, &b32, SIDE, SIDE, SIDE, &mut c32, true,
+        ));
+        assert_eq!(c32, vec![19.0f32; SIDE * SIDE]);
+
+        let a64 = vec![1.0f64; SIDE * SIDE];
+        let b64 = vec![2.0f64; SIDE * SIDE];
+        let mut c64 = vec![0.0f64; SIDE * SIDE];
+        assert!(accelerate_dispatch::matmul(
+            &a64, &b64, SIDE, SIDE, SIDE, &mut c64, false,
+        ));
+        assert_eq!(c64, vec![16.0f64; SIDE * SIDE]);
+
+        let mut small = [0.0f32; 1];
+        assert!(!accelerate_dispatch::matmul(
+            &[1.0],
+            &[2.0],
+            1,
+            1,
+            1,
+            &mut small,
+            false,
+        ));
+    }
+}
+
 #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
 mod simd_dispatch {
     //! CPU SIMD tier: sits between `metal_dispatch` and the generic scalar
@@ -130,7 +299,7 @@ mod simd_dispatch {
     // Below these lengths the generic scalar loop is already fine (and the
     // reinterpret/dispatch bookkeeping is not worth it).
     const MIN_ELEMENTS: usize = 16;
-    const MIN_MATMUL_OPS: usize = 512;
+    const MIN_MATMUL_OPS: usize = super::HOST_MATMUL_DISPATCH_OPS;
     const MIN_FFT_LENGTH: usize = 8;
 
     fn is<T: 'static, U: 'static>() -> bool {
@@ -592,9 +761,9 @@ impl<T, B: Backend> Vector<T, B> {
     }
 }
 
-/// `f32` vectors on any backend. These are the operations that do not depend on
-/// where the elements live — everything else is implemented per backend.
-impl<B: Backend> Vector<f32, B> {
+/// Copyable vectors on any backend. These are storage operations; arithmetic
+/// remains implemented for the element/backend combinations with kernels.
+impl<T: Copy + 'static, B: Backend> Vector<T, B> {
     /// Move this vector's elements onto backend `B2`.
     ///
     /// This is the operation that copies: onto [`Metal`] it is an upload into
@@ -609,7 +778,7 @@ impl<B: Backend> Vector<f32, B> {
     /// assert_eq!(resident.to_backend::<Host>(), v);
     /// # }
     /// ```
-    pub fn to_backend<B2: Backend>(&self) -> Vector<f32, B2> {
+    pub fn to_backend<B2: Backend>(&self) -> Vector<T, B2> {
         Vector {
             len: self.len,
             data: B2::store_vector(B::vector_slice(&self.data)),
@@ -618,44 +787,20 @@ impl<B: Backend> Vector<f32, B> {
 
     /// A vector of `len` elements, every one set to `value`, allocated directly
     /// on backend `B`.
-    pub fn filled(len: usize, value: f32) -> Self {
+    pub fn filled(len: usize, value: T) -> Self {
         Vector {
             len,
             data: B::store_vector(&vec![value; len]),
         }
     }
 
-    /// An arithmetic progression: `start`, `start + step`, `start + 2·step`, …
-    ///
-    /// Index vectors are what make position-dependent arithmetic — "divide the
-    /// running total by how many terms it covers", "which entry was this?" —
-    /// expressible as whole-tensor operations rather than as a loop. Each
-    /// element is computed from its own index rather than from the one before,
-    /// so an integer ramp is exact.
-    ///
-    /// ```
-    /// use tensorcrate::tensors::{Host, Vector};
-    ///
-    /// let counts = Vector::<f32, Host>::ramp(4, 1.0, 1.0);
-    /// assert_eq!(counts.as_slice(), [1.0, 2.0, 3.0, 4.0]);
-    /// ```
-    pub fn ramp(len: usize, start: f32, step: f32) -> Self {
-        let values = (0..len)
-            .map(|index| start + step * index as f32)
-            .collect::<Vec<_>>();
-        Vector {
-            len,
-            data: B::store_vector(&values),
-        }
-    }
-
     /// Borrow the elements as a slice, without copying.
-    pub fn as_slice(&self) -> &[f32] {
+    pub fn as_slice(&self) -> &[T] {
         B::vector_slice(&self.data)
     }
 
-    /// Build from `f32` values on backend `B`. The length is the slice's.
-    pub(crate) fn build(values: &[f32]) -> Self {
+    /// Build from values on backend `B`. The length is the slice's.
+    pub(crate) fn build(values: &[T]) -> Self {
         Vector {
             len: values.len(),
             data: B::store_vector(values),
@@ -664,29 +809,29 @@ impl<B: Backend> Vector<f32, B> {
 
     /// Attach a length to storage that already holds exactly that many values —
     /// how a tensor is rebuilt from the result of a kernel dispatch.
-    pub(crate) fn from_storage(len: usize, data: B::Vector<f32>) -> Self {
+    pub(crate) fn from_storage(len: usize, data: B::Vector<T>) -> Self {
         Vector { len, data }
     }
 
     /// The backend storage itself, which the kernels hand straight to a
     /// dispatch.
-    pub(crate) fn storage(&self) -> &B::Vector<f32> {
+    pub(crate) fn storage(&self) -> &B::Vector<T> {
         &self.data
     }
 
     /// The backend storage itself, for a dispatch that accumulates in place.
-    pub(crate) fn storage_mut(&mut self) -> &mut B::Vector<f32> {
+    pub(crate) fn storage_mut(&mut self) -> &mut B::Vector<T> {
         &mut self.data
     }
 
     /// Consume this vector and take its storage, which is how a reshape moves
     /// the elements instead of copying them.
-    pub(crate) fn into_storage(self) -> B::Vector<f32> {
+    pub(crate) fn into_storage(self) -> B::Vector<T> {
         self.data
     }
 
     /// Copy the elements into a `Vec`.
-    pub fn to_vec(&self) -> Vec<f32> {
+    pub fn to_vec(&self) -> Vec<T> {
         self.as_slice().to_vec()
     }
 
@@ -694,7 +839,7 @@ impl<B: Backend> Vector<f32, B> {
     ///
     /// On the Metal backend this only changes the recorded shape; the existing
     /// allocation is reused without a copy or kernel dispatch.
-    pub fn into_row_matrix(self) -> Matrix<f32, B> {
+    pub fn into_row_matrix(self) -> Matrix<T, B> {
         Matrix {
             rows: 1,
             cols: self.len,
@@ -706,11 +851,24 @@ impl<B: Backend> Vector<f32, B> {
     ///
     /// As with [`into_row_matrix`](Self::into_row_matrix), Metal reuses the
     /// existing allocation.
-    pub fn into_column_matrix(self) -> Matrix<f32, B> {
+    pub fn into_column_matrix(self) -> Matrix<T, B> {
         Matrix {
             rows: self.len,
             cols: 1,
             data: B::vector_into_matrix(self.data),
+        }
+    }
+}
+
+impl<B: Backend> Vector<f32, B> {
+    /// An arithmetic progression: `start`, `start + step`, `start + 2·step`, …
+    pub fn ramp(len: usize, start: f32, step: f32) -> Self {
+        let values = (0..len)
+            .map(|index| start + step * index as f32)
+            .collect::<Vec<_>>();
+        Vector {
+            len,
+            data: B::store_vector(&values),
         }
     }
 }
@@ -1505,13 +1663,13 @@ impl<T, B: Backend> Matrix<T, B> {
     }
 }
 
-/// `f32` matrices on any backend, as for [`Vector`] above.
-impl<B: Backend> Matrix<f32, B> {
+/// Copyable matrix storage operations on any backend, as for [`Vector`] above.
+impl<T: Copy + 'static, B: Backend> Matrix<T, B> {
     /// Move this matrix's elements onto backend `B2`.
     ///
     /// The counterpart to [`Vector::to_backend`], and the only place a
     /// `Metal`-backed chain copies between CPU and GPU memory.
-    pub fn to_backend<B2: Backend>(&self) -> Matrix<f32, B2> {
+    pub fn to_backend<B2: Backend>(&self) -> Matrix<T, B2> {
         Matrix {
             rows: self.rows,
             cols: self.cols,
@@ -1521,7 +1679,7 @@ impl<B: Backend> Matrix<f32, B> {
 
     /// A `rows × cols` matrix with every element set to `value`, allocated
     /// directly on backend `B`.
-    pub fn filled(rows: usize, cols: usize, value: f32) -> Self {
+    pub fn filled(rows: usize, cols: usize, value: T) -> Self {
         Matrix {
             rows,
             cols,
@@ -1530,12 +1688,12 @@ impl<B: Backend> Matrix<f32, B> {
     }
 
     /// Borrow the elements as one flat row-major slice, without copying.
-    pub fn as_slice(&self) -> &[f32] {
+    pub fn as_slice(&self) -> &[T] {
         B::matrix_slice(&self.data)
     }
 
-    /// Build from row-major `f32` values on backend `B`.
-    pub(crate) fn build(rows: usize, cols: usize, values: &[f32]) -> Self {
+    /// Build from typed row-major values on backend `B`.
+    pub(crate) fn build(rows: usize, cols: usize, values: &[T]) -> Self {
         debug_assert_eq!(values.len(), rows * cols);
         Matrix {
             rows,
@@ -1546,24 +1704,24 @@ impl<B: Backend> Matrix<f32, B> {
 
     /// Attach a shape to storage that already holds exactly `rows * cols`
     /// values — how a tensor is rebuilt from the result of a kernel dispatch.
-    pub(crate) fn from_storage(rows: usize, cols: usize, data: B::Matrix<f32>) -> Self {
+    pub(crate) fn from_storage(rows: usize, cols: usize, data: B::Matrix<T>) -> Self {
         Matrix { rows, cols, data }
     }
 
     /// The backend storage itself, which the kernels hand straight to a
     /// dispatch.
-    pub(crate) fn storage(&self) -> &B::Matrix<f32> {
+    pub(crate) fn storage(&self) -> &B::Matrix<T> {
         &self.data
     }
 
     /// The backend storage itself, for a dispatch that accumulates in place.
-    pub(crate) fn storage_mut(&mut self) -> &mut B::Matrix<f32> {
+    pub(crate) fn storage_mut(&mut self) -> &mut B::Matrix<T> {
         &mut self.data
     }
 
     /// Consume this matrix and take its storage, which is how a reshape moves
     /// the elements instead of copying them.
-    pub(crate) fn into_storage(self) -> B::Matrix<f32> {
+    pub(crate) fn into_storage(self) -> B::Matrix<T> {
         self.data
     }
 }
@@ -2277,6 +2435,12 @@ impl<T: Coefficient> Matrix<T, Host> {
         let (rows, inner, cols) = (self.rows, self.cols, other.cols);
         let mut out = vec![T::zero(); rows * cols];
 
+        #[cfg(target_os = "macos")]
+        if accelerate_dispatch::matmul(&self.data, &other.data, rows, inner, cols, &mut out, false)
+        {
+            return Matrix::from_flat(rows, cols, out);
+        }
+
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         if simd_dispatch::matmul(&self.data, &other.data, rows, inner, cols, &mut out) {
             return Matrix::from_flat(rows, cols, out);
@@ -2308,6 +2472,19 @@ impl<T: Coefficient> Matrix<T, Host> {
         assert_same_shape(addend.shape(), (self.rows, other.cols), "matmul_add addend");
         let (rows, inner, cols) = (self.rows, self.cols, other.cols);
         let mut output = addend;
+
+        #[cfg(target_os = "macos")]
+        if accelerate_dispatch::matmul(
+            &self.data,
+            &other.data,
+            rows,
+            inner,
+            cols,
+            &mut output.data,
+            true,
+        ) {
+            return output;
+        }
 
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         if simd_dispatch::matmul_add(&self.data, &other.data, rows, inner, cols, &mut output.data) {

@@ -19,7 +19,7 @@ API to use for model training, dynamic data, and GPU execution.
 - Reverse-mode autodiff with a tape and forward-mode autodiff with dual tensors.
 - SGD, Momentum/Nesterov, AdaGrad, RMSProp, and Adam.
 - Projected gradient descent for box, norm-ball, simplex, or custom constraints.
-- A generic host backend, optional CPU SIMD, and a resident Apple Metal `f32` backend.
+- A generic host backend, Accelerate and SIMD CPU paths, and resident Apple Metal storage.
 - Saving and loading host tensors without an external serialization framework.
 
 ## Requirements and installation
@@ -40,7 +40,10 @@ tensorcrate = { git = "https://github.com/arthurmburke/tensorcrate.git" }
 ```
 
 The default features are `simd` and `metal`. The Metal code is only compiled on macOS; other
-platforms continue to use the host backend. To request a specific configuration:
+platforms continue to use the host backend. Building the Metal feature on macOS requires the Metal
+4 compiler supplied with current Xcode because the M5 TensorOps library is compiled by `build.rs`.
+The resulting crate still uses the older tiled kernel at runtime on pre-M5 GPUs. To request a
+specific configuration:
 
 ```toml
 # Portable scalar host implementation only.
@@ -394,12 +397,16 @@ A tensor's second type parameter selects where its values live:
 | --- | --- | --- |
 | Host, scalar | `Vector<T, Host>` / `Matrix<T, Host>` | Maximum portability and all supported element types |
 | Host with `simd` | Same host types | Faster `f32`/`f64` CPU operations on AArch64 and x86-64 |
+| Host on macOS | Same host types | Accelerate SGEMM/DGEMM for dispatched `f32`/`f64` products |
 | Apple Metal | `Vector<f32, Metal>` / `Matrix<f32, Metal>` | Long `f32` operation chains that should remain GPU-resident |
+| M5 Metal 4 | `Matrix<f16, Metal>` / `Matrix<bf16, Metal>` | Compact TensorOps matrix products |
 
 `Host` is the default, so `Vector<f32>` means `Vector<f32, Host>`. With the `simd` feature, host
 operations select NEON on AArch64 or AVX2/FMA with an SSE2 fallback on x86-64. Small tensors and
 unsupported operations use the ordinary scalar implementation automatically. SIMD is an execution
-tier of `Host`, not a separate storage type.
+tier of `Host`, not a separate storage type. On macOS, Host `f32` and `f64` matrix products at the
+existing 512 multiply-accumulate dispatch threshold use Accelerate SGEMM or DGEMM before the SIMD
+path is considered.
 
 ### Apple Metal
 
@@ -423,7 +430,12 @@ assert_eq!(result, host.matmul(&host).matmul(&host));
 
 Important backend details:
 
-- Metal tensors support `f32` only.
+- On M5/Apple10 GPUs, ordinary `f32` matrix multiplication uses Metal 4 TensorOps. Older GPUs use
+  the existing tiled `f32` kernel. Fused `matmul_add` also retains the tiled path.
+- Metal `f16` and `bf16` storage uses the Rust [`half`](https://crates.io/crates/half) crate, whose
+  two-byte values map directly to Metal `half` and `bfloat` buffers.
+- The full Metal operation set is available for `f32`. Compact types currently provide storage,
+  FP32 conversion, and matrix multiplication.
 - Operands in one operation must use the same backend.
 - `to_backend` is the explicit transfer boundary; avoid moving back and forth inside a hot loop.
 - Optimizers, projections, forward autodiff, and reverse autodiff are generic over `Host` and
@@ -431,6 +443,32 @@ Important backend details:
 - `is_device_resident()` reports whether a Metal tensor has a live GPU allocation. If no Metal
   device is available, the Metal backend falls back to CPU storage and preserves the same answers.
 - Metal objects are thread-affine and are not `Send`.
+
+Use `matmul` when compact output is important, or `matmul_f32` when the product should accumulate
+and remain in FP32:
+
+```rust
+use tensorcrate::numbers::{bf16, f16};
+use tensorcrate::tensors::{Host, Matrix, Metal};
+
+let a = Matrix::<f32>::from_rows([[1.0, 2.0], [3.0, 4.0]]);
+let b = Matrix::<f32>::from_rows([[5.0, 6.0], [7.0, 8.0]]);
+
+let a16 = Matrix::<f16, Metal>::from_f32(&a);
+let b16 = Matrix::<f16, Metal>::from_f32(&b);
+let compact: Matrix<f16, Metal> = a16.matmul(&b16);
+let widened: Matrix<f32, Metal> = a16.matmul_f32(&b16);
+
+let abf16 = Matrix::<bf16, Metal>::from_f32(&a);
+let bbf16 = Matrix::<bf16, Metal>::from_f32(&b);
+let compact_bf16: Matrix<bf16, Metal> = abf16.matmul(&bbf16);
+
+let host_result = widened.to_backend::<Host>();
+assert_eq!(host_result.shape(), (2, 2));
+```
+
+On a pre-M5 Mac, the compact APIs transparently convert through the Host backend; their return
+types and numerical format stay the same.
 
 Run the backend comparison on macOS with:
 

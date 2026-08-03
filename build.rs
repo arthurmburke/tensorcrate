@@ -4,6 +4,7 @@ use std::process::{Command, Output};
 
 fn main() {
     println!("cargo:rerun-if-changed=metal/kernel.metal");
+    println!("cargo:rerun-if-changed=metal/tensorops.metal");
     println!("cargo:rerun-if-env-changed=DEVELOPER_DIR");
 
     if env::var_os("CARGO_FEATURE_METAL").is_none()
@@ -15,11 +16,28 @@ fn main() {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let source = manifest_dir.join("metal/kernel.metal");
+    let tensorops_source = manifest_dir.join("metal/tensorops.metal");
     let air = out_dir.join("tensorcrate.air");
+    let tensorops_air = out_dir.join("tensorcrate_tensorops.air");
     let library = out_dir.join("tensorcrate.metallib");
+    let tensorops_library = out_dir.join("tensorcrate_tensorops.metallib");
 
     run_xcrun("metal", &["-c", path(&source), "-o", path(&air)]);
     run_xcrun("metallib", &[path(&air), "-o", path(&library)]);
+    run_xcrun(
+        "metal",
+        &[
+            "-std=metal4.0",
+            "-c",
+            path(&tensorops_source),
+            "-o",
+            path(&tensorops_air),
+        ],
+    );
+    run_xcrun(
+        "metallib",
+        &[path(&tensorops_air), "-o", path(&tensorops_library)],
+    );
 }
 
 fn path(path: &Path) -> &str {
