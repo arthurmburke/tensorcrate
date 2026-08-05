@@ -792,6 +792,7 @@ const ANALYTIC: &[(&str, &str)] = &[
     ("sinh", "Sinh"),
     ("cosh", "Cosh"),
     ("tanh", "Tanh"),
+    ("sqrt", "Sqrt"),
 ];
 
 /// Emit `expr` as Rust of type `target`, widening subexpressions as needed.
@@ -1195,14 +1196,13 @@ fn lower_call(
             let trait_ident = syn::Ident::new(trait_name, call.func.span());
             let method = syn::Ident::new(&name, call.func.span());
             let inner = lower(args[0], target, env, backend)?;
-            Ok(if target.is_tensor() && backend == BackendChoice::Metal {
-                quote!((#inner).analytic(::tensorcrate::tensors::Analytic::#trait_ident))
+            // A tensor has the function as an inherent method on both backends:
+            // the host maps the scalar op over its elements, a resident tensor
+            // runs the unary kernel and stays on the GPU.
+            Ok(if target.is_tensor() {
+                quote!((#inner).#method())
             } else {
-                elementwise(
-                    quote!(::tensorcrate::numbers::#trait_ident::#method),
-                    inner,
-                    target,
-                )
+                quote!(::tensorcrate::numbers::#trait_ident::#method(#inner))
             })
         }
         (_, n) => Err(syn::Error::new(

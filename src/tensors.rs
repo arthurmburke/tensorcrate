@@ -38,6 +38,7 @@ use num_traits::{Float, NumCast};
 use crate::errors::Error;
 use crate::numbers::{Coefficient, Complex};
 
+pub mod analytic;
 pub mod backend;
 pub mod dual;
 pub mod kernels;
@@ -49,6 +50,7 @@ pub mod tape;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod metal_backend;
 
+pub use analytic::Transcendental;
 pub use backend::{Backend, Host};
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub use backend::{Metal, MetalStorage};
@@ -56,7 +58,9 @@ pub use dual::{
     DualMatrix, DualVector, gradient, gradient_wrt_matrix, jacobian, jacobian_wrt_matrix,
     matrix_gradient,
 };
-pub use kernels::{Analytic, BinaryOp, Compare, Kernels, Ordered, Reduce, SortOrder};
+pub use kernels::{
+    Analytic, Axis, BinaryOp, Compare, Family, Kernels, Ordered, Reduce, SortOrder, Statistic,
+};
 pub use tape::{MatrixVar, ScalarVar, Tape, Var, VectorVar};
 
 // ---- shape checking ---------------------------------------------------------
@@ -278,7 +282,7 @@ mod accelerate_tests {
 }
 
 #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
-mod simd_dispatch {
+pub(crate) mod simd_dispatch {
     //! CPU SIMD tier: sits between `metal_dispatch` and the generic scalar
     //! loops. Each entry point downcasts the generic element type to a concrete
     //! float via `TypeId` (returning `None` — i.e. defer to scalar — for every
@@ -520,6 +524,86 @@ mod simd_dispatch {
             }
         }
         None
+    }
+
+    /// `Σ(xᵢ − mean)²`, or `None` for an element type the kernels do not cover.
+    pub fn sum_squared_deviations<T: Coefficient>(values: &[T], mean: T) -> Option<T> {
+        if values.len() < MIN_ELEMENTS {
+            return None;
+        }
+        unsafe {
+            if let (Some(v), Some(mean)) = (
+                as_slice::<T, f32>(values),
+                as_slice::<T, f32>(std::slice::from_ref(&mean)),
+            ) {
+                return Some(from_f32(crate::simd::f32k::sum_squared_deviations(
+                    v, mean[0],
+                )));
+            }
+            if let (Some(v), Some(mean)) = (
+                as_slice::<T, f64>(values),
+                as_slice::<T, f64>(std::slice::from_ref(&mean)),
+            ) {
+                return Some(from_f64(crate::simd::f64k::sum_squared_deviations(
+                    v, mean[0],
+                )));
+            }
+        }
+        None
+    }
+
+    /// `totals += values`, returning whether the SIMD path ran.
+    pub fn accumulate<T: Coefficient>(totals: &mut [T], values: &[T]) -> bool {
+        if totals.len() < MIN_ELEMENTS {
+            return false;
+        }
+        debug_assert_eq!(values.len(), totals.len());
+        unsafe {
+            if let (Some(v), Some(totals)) =
+                (as_slice::<T, f32>(values), as_slice_mut::<T, f32>(totals))
+            {
+                crate::simd::f32k::accumulate(totals, v);
+                return true;
+            }
+            if let (Some(v), Some(totals)) =
+                (as_slice::<T, f64>(values), as_slice_mut::<T, f64>(totals))
+            {
+                crate::simd::f64k::accumulate(totals, v);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `totals += (values − means)²`, returning whether the SIMD path ran.
+    pub fn accumulate_squared_deviations<T: Coefficient>(
+        totals: &mut [T],
+        values: &[T],
+        means: &[T],
+    ) -> bool {
+        if totals.len() < MIN_ELEMENTS {
+            return false;
+        }
+        debug_assert!(values.len() == totals.len() && means.len() == totals.len());
+        unsafe {
+            if let (Some(v), Some(m), Some(totals)) = (
+                as_slice::<T, f32>(values),
+                as_slice::<T, f32>(means),
+                as_slice_mut::<T, f32>(totals),
+            ) {
+                crate::simd::f32k::accumulate_squared_deviations(totals, v, m);
+                return true;
+            }
+            if let (Some(v), Some(m), Some(totals)) = (
+                as_slice::<T, f64>(values),
+                as_slice::<T, f64>(means),
+                as_slice_mut::<T, f64>(totals),
+            ) {
+                crate::simd::f64k::accumulate_squared_deviations(totals, v, m);
+                return true;
+            }
+        }
+        false
     }
 
     /// Writes `a·b` into `out`, returning whether the SIMD path ran.

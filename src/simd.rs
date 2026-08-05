@@ -392,6 +392,92 @@ macro_rules! neon_kernels {
                 total
             }
 
+            /// `Σ(xᵢ − mean)²` — the second pass of a two-pass variance.
+            ///
+            /// The subtraction and the square fuse into one FMA per register,
+            /// so this costs barely more than the plain sum that produced the
+            /// mean. Four accumulators again, for the reason [`dot`] keeps
+            /// them.
+            #[inline]
+            pub fn sum_squared_deviations(values: &[$t], mean: $t) -> $t {
+                let n = values.len();
+                let mut i = 0;
+                let mut total: $t;
+                unsafe {
+                    let center = $dup(mean);
+                    let mut acc = [$dup(0 as $t); 4];
+                    while i + 4 * LANES <= n {
+                        let mut k = 0;
+                        while k < 4 {
+                            let d = $sub($load(values.as_ptr().add(i + k * LANES)), center);
+                            acc[k] = $fma(acc[k], d, d);
+                            k += 1;
+                        }
+                        i += 4 * LANES;
+                    }
+                    let partial = $add($add(acc[0], acc[1]), $add(acc[2], acc[3]));
+                    total = $addv(partial);
+                    while i + LANES <= n {
+                        let d = $sub($load(values.as_ptr().add(i)), center);
+                        total += $addv($mul(d, d));
+                        i += LANES;
+                    }
+                }
+                while i < n {
+                    let d = values[i] - mean;
+                    total += d * d;
+                    i += 1;
+                }
+                total
+            }
+
+            /// `totals += values`, elementwise and in place.
+            ///
+            /// This is what makes a column-wise reduction read the matrix in
+            /// storage order: one row of partial sums at a time, with unit
+            /// stride on both sides, instead of striding down each column in
+            /// turn.
+            #[inline]
+            pub fn accumulate(totals: &mut [$t], values: &[$t]) {
+                let n = totals.len();
+                debug_assert_eq!(values.len(), n);
+                let mut i = 0;
+                unsafe {
+                    while i + LANES <= n {
+                        let t = $load(totals.as_ptr().add(i));
+                        let v = $load(values.as_ptr().add(i));
+                        $store(totals.as_mut_ptr().add(i), $add(t, v));
+                        i += LANES;
+                    }
+                }
+                while i < n {
+                    totals[i] += values[i];
+                    i += 1;
+                }
+            }
+
+            /// `totals += (values − means)²`, elementwise and in place — the
+            /// column-wise counterpart of [`sum_squared_deviations`].
+            #[inline]
+            pub fn accumulate_squared_deviations(totals: &mut [$t], values: &[$t], means: &[$t]) {
+                let n = totals.len();
+                debug_assert!(values.len() == n && means.len() == n);
+                let mut i = 0;
+                unsafe {
+                    while i + LANES <= n {
+                        let d = $sub($load(values.as_ptr().add(i)), $load(means.as_ptr().add(i)));
+                        let t = $load(totals.as_ptr().add(i));
+                        $store(totals.as_mut_ptr().add(i), $fma(t, d, d));
+                        i += LANES;
+                    }
+                }
+                while i < n {
+                    let d = values[i] - means[i];
+                    totals[i] += d * d;
+                    i += 1;
+                }
+            }
+
             /// Row-major matrix multiply: `a` is `m×k`, `b` is `k×n`, `out` is
             /// `m×n` (must be pre-sized; it is overwritten).
             ///

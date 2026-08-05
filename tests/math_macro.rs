@@ -423,6 +423,46 @@ fn elementwise_functions_map_over_tensors() {
 
     let cosine: Vector<f64> = math! { cos([0, 0, 0]) };
     assert_eq!(cosine.data(), &[1.0, 1.0, 1.0]);
+
+    let roots: Vector<f64> = math! { sqrt([1, 4, 9]) };
+    assert_eq!(roots.data(), &[1.0, 2.0, 3.0]);
+
+    // Every function in the language maps, on both shapes, with the shape kept.
+    let logarithm: Matrix<f64> = math! { ln([[1, 1], [1, 1]]) };
+    assert_eq!(logarithm.to_rows(), [[0.0, 0.0], [0.0, 0.0]]);
+
+    let hyperbolic: Vector<f64> = math! { tanh([0, 0]) };
+    assert_eq!(hyperbolic.data(), &[0.0, 0.0]);
+
+    // Composition stays elementwise the whole way down.
+    let composed: Vector<f64> = math! { ln(exp([1, 2, 3])) };
+    assert!(
+        composed
+            .data()
+            .iter()
+            .zip([1.0, 2.0, 3.0])
+            .all(|(&got, want)| close(got, want))
+    );
+}
+
+#[test]
+fn elementwise_functions_apply_to_bound_tensors_and_complex_elements() {
+    // A `let`-bound tensor, not just a literal.
+    let scaled: Vector<f64> = math! {
+        let v = [0, 1, 2];
+        exp(v * 1)
+    };
+    assert!(close(scaled.data()[2], 2.0_f64.exp()));
+
+    // Complex elements follow the complex definition: exp(iπ) = −1.
+    let rotated: Vector<Complex<f64>> = math! { exp([1i, 1i] * 3.141592653589793) };
+    assert!(close(rotated.data()[0].real, -1.0));
+    assert!(close(rotated.data()[0].im, 0.0));
+
+    // Dual elements carry the derivative in the ε part: d/dx exp(x) at 1 = e.
+    let differentiated: Vector<Dual<f64>> = math! { exp([1 + 1d, 1 + 1d]) };
+    assert!(close(differentiated.data()[0].real, 1.0_f64.exp()));
+    assert!(close(differentiated.data()[0].dual, 1.0_f64.exp()));
 }
 
 #[test]
@@ -543,4 +583,18 @@ fn metal_blocks_emit_resident_f32_tensors() {
     };
     assert_eq!(analytic.as_slice()[0], 0.0);
     assert!((analytic.as_slice()[1] - 1.0_f32.tanh()).abs() < 1e-6);
+
+    // Elementwise on a resident matrix, and on the shader's own `sqrt`.
+    let roots: Matrix<f32, Metal> = math! {
+        backend = Metal;
+        sqrt([[1, 4], [9, 16]])
+    };
+    assert_eq!(roots.as_slice(), &[1.0, 2.0, 3.0, 4.0]);
+
+    let logarithm: Vector<f32, Metal> = math! {
+        backend = Metal;
+        ln(exp([1, 2]))
+    };
+    assert!((logarithm.as_slice()[0] - 1.0).abs() < 1e-5);
+    assert!((logarithm.as_slice()[1] - 2.0).abs() < 1e-5);
 }

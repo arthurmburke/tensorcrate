@@ -183,10 +183,11 @@ impl Vector<f32, Metal> {
 
     /// Apply an analytic function elementwise, on the GPU.
     ///
-    /// The host backend reaches these through `math!` or
-    /// [`map`](Vector::map) with the traits in [`crate::numbers`]; those go
-    /// through `Float`, which the 32-bit shaders cannot, so resident tensors get
-    /// this instead.
+    /// The host tensor of the same name maps the scalar trait from
+    /// [`crate::numbers`] over its elements; those go through `Float`, which the
+    /// 32-bit shaders cannot, so resident tensors run the unary kernel instead.
+    /// Both spellings — this and the named methods in
+    /// [`analytic`](crate::tensors::analytic) — are the same operation.
     pub fn analytic(&self, f: Analytic) -> Self {
         match self.storage().unary(f) {
             Some(data) => Vector::from_storage(self.len(), data),

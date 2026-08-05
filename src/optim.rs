@@ -495,6 +495,8 @@ impl<F> std::fmt::Debug for DebugFn<F> {
     }
 }
 
+type Proj<'a, P> = DebugFn<Arc<dyn Fn(&mut P) + 'a>>;
+
 /// Constrained rule for a custom parameter type. Applies a
 /// projection after the update, so the parameter stays in a feasible set. The
 /// projection is a closure, so it can be anything: clipping, normalization,
@@ -502,7 +504,7 @@ impl<F> std::fmt::Debug for DebugFn<F> {
 #[derive(Clone, Debug)]
 pub struct Constrained<'a, P, R> {
     rule: R,
-    projection: DebugFn<Arc<dyn Fn(&mut P) + 'a>>,
+    projection: Proj<'a, P>,
     phanom: std::marker::PhantomData<P>,
 }
 

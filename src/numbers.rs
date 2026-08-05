@@ -183,6 +183,13 @@ pub trait Tanh {
     fn tanh(self) -> <Self as Tanh>::Output;
 }
 
+/// A numeric type usable for computing the principal square root `√x`.
+pub trait Sqrt {
+    type Output;
+
+    fn sqrt(self) -> <Self as Sqrt>::Output;
+}
+
 /// A numeric type usable for raising a base to a power, `x^y`.
 pub trait Power<Rhs = Self> {
     type Output;
@@ -481,6 +488,15 @@ impl<T: Float> Tanh for Dual<T> {
     }
 }
 
+impl<T: Float> Sqrt for Dual<T> {
+    type Output = Dual<T>;
+    /// `d/dx √x = 1/(2√x)`.
+    fn sqrt(self) -> Dual<T> {
+        let root = self.real.sqrt();
+        Dual::new(root, self.dual / ((T::one() + T::one()) * root))
+    }
+}
+
 impl<T: Float> Power for Dual<T> {
     type Output = Dual<T>;
     /// `(a + bε)^(c + dε)`. Via `x^y = exp(y·ln x)`, the real part is `a^c` and
@@ -604,6 +620,16 @@ impl<T: Float + Coefficient> Tanh for Dual<Complex<T>> {
     fn tanh(self) -> Dual<Complex<T>> {
         let t = self.real.tanh();
         Dual::new(t, self.dual * (Complex::<T>::one() - t * t))
+    }
+}
+
+impl<T: Float + Coefficient> Sqrt for Dual<Complex<T>> {
+    type Output = Dual<Complex<T>>;
+    /// `d/dx √x = 1/(2√x)`, on the principal branch of the root.
+    fn sqrt(self) -> Dual<Complex<T>> {
+        let root = self.real.sqrt();
+        let two = Complex::<T>::one() + Complex::<T>::one();
+        Dual::new(root, self.dual / (two * root))
     }
 }
 
@@ -1014,6 +1040,16 @@ impl<T: Float + Coefficient> Tanh for Complex<T> {
     }
 }
 
+impl<T: Float + Coefficient> Sqrt for Complex<T> {
+    type Output = Complex<T>;
+
+    /// The principal square root; the inherent [`Complex::sqrt`] is the same
+    /// root, reachable without importing this trait.
+    fn sqrt(self) -> Complex<T> {
+        Complex::sqrt(self)
+    }
+}
+
 impl<T: Float + Coefficient> Power for Complex<T> {
     type Output = Complex<T>;
 
@@ -1085,6 +1121,7 @@ unary_number_impls!(Ln, ln, x, x.ln());
 unary_number_impls!(Sinh, sinh, x, x.sinh());
 unary_number_impls!(Cosh, cosh, x, x.cosh());
 unary_number_impls!(Tanh, tanh, x, x.tanh());
+unary_number_impls!(Sqrt, sqrt, x, x.sqrt());
 unary_number_impls!(Recip, recip, x, x.recip());
 
 impl Power for f32 {

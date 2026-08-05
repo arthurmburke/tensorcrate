@@ -19,6 +19,7 @@ API to use for model training, dynamic data, and GPU execution.
 - Reverse-mode autodiff with a tape and forward-mode autodiff with dual tensors.
 - SGD, Momentum/Nesterov, AdaGrad, RMSProp, and Adam.
 - Projected gradient descent for box, norm-ball, simplex, or custom constraints.
+- Means, variances, and normal or inverse-Gaussian distribution functions, whole-tensor or by axis.
 - A generic host backend, Accelerate and SIMD CPU paths, and resident Apple Metal storage.
 - Saving and loading host tensors without an external serialization framework.
 
@@ -388,6 +389,112 @@ Built-in vector projections are:
 The projection closure can implement any other constraint and may capture configuration. The
 built-in projections are generic over the storage backend, so they work on host and resident Metal
 vectors without changing the surrounding optimizer code.
+
+## Statistics
+
+`tensorcrate::statistics` adds moments and distribution functions to the tensor types. Summaries
+come in a whole-tensor form and a per-axis form:
+
+```rust
+use tensorcrate::statistics::{Axis, Correction};
+use tensorcrate::tensors::Matrix;
+
+let observations = Matrix::<f64>::from_rows([
+    [1.0, 2.0, 3.0, 4.0],
+    [10.0, 12.0, 14.0, 16.0],
+]);
+
+assert_eq!(observations.mean(), 7.75);                      // every element
+assert_eq!(observations.mean_axis(Axis::Rows).to_vec(), [2.5, 13.0]); // one per row
+
+let spread = observations.stddev_axis(Axis::Columns, Correction::Sample);
+assert_eq!(spread.len(), 4);                                // one per column
+```
+
+`Axis` names what is *folded*, not what survives: `Axis::Rows` folds each row and leaves one value
+per row. Every variance and standard deviation takes a `Correction` — `Population` divides by `n`,
+`Sample` by `n − 1` — because neither is a safe default. `moments()` and `moments_axis()` return
+the count, mean, and summed squared deviations together, so asking for a mean and both variances
+costs one traversal rather than three.
+
+Two distribution families are available, each with a density, a distribution function, and a
+quantile:
+
+```rust
+use tensorcrate::statistics::Distribution;
+use tensorcrate::tensors::Vector;
+
+let standard = Distribution::<f64>::standard_normal();
+assert_eq!(standard.cdf(1.96), 0.9750021048517795);
+assert_eq!(standard.ppf(0.975), 1.9599639845400536);
+
+// The same functions apply elementwise to a tensor.
+let z = Vector::new([-1.0_f64, 0.0, 1.0]);
+let probabilities = z.cdf(&standard);
+assert_eq!(probabilities.data()[1], 0.5);
+assert_eq!(probabilities.ppf(&standard).data()[2].round(), 1.0);
+```
+
+`Distribution::InverseGaussian { mean, shape }` is the Wald distribution — the first-passage time
+of a drifting Brownian motion. It lives on the positive reals and is right-skewed, which makes it
+the counterpart to the normal for durations and latencies.
+
+Fitting a distribution per row or column and mapping the elements through it is the probability
+integral transform, which puts rows measured on different scales onto one `[0, 1]` scale:
+
+```rust
+use tensorcrate::statistics::{Axis, Correction, Family};
+use tensorcrate::tensors::Matrix;
+
+let raw = Matrix::<f64>::from_rows([
+    [1.0, 2.0, 3.0, 4.0, 5.0],
+    [1000.0, 2000.0, 3000.0, 4000.0, 5000.0],
+]);
+
+let fits = raw.fit_axis(Axis::Rows, Family::Normal, Correction::Population);
+let ranked = raw.cdf_axis(Axis::Rows, &fits);
+
+// Each row is now its own median at the centre, whatever its original scale.
+assert!((ranked[(0, 2)] - 0.5).abs() < 1e-12);
+assert!((ranked[(1, 2)] - 0.5).abs() < 1e-12);
+
+// `ppf_axis` is the inverse, taking probabilities back to the original units.
+let recovered = ranked.ppf_axis(Axis::Rows, &fits);
+assert!((recovered[(1, 4)] - 5000.0).abs() < 1e-6);
+```
+
+The methods above are inherent on `Host` tensors of any float element type. On `Metal`, and in code
+generic over the backend, the same operations come from the `Statistics` and `AxisStatistics`
+traits:
+
+```rust
+use tensorcrate::statistics::{Axis, AxisStatistics, Correction, Distribution, Statistics};
+use tensorcrate::tensors::{Matrix, Metal};
+
+let resident = Matrix::<f32>::from_rows([[1.0, 2.0], [3.0, 4.0]]).to_backend::<Metal>();
+
+let mean = resident.mean();                        // one reduction, on the GPU
+let spread = resident.stddev_axis(Axis::Rows, Correction::Sample);
+let ranked = resident.cdf(&Distribution::standard_normal());
+
+// Both results are still in GPU-shared memory; nothing came back to the CPU.
+assert!(spread.is_device_resident());
+assert!(ranked.is_device_resident());
+```
+
+A few things worth knowing about the numbers:
+
+- Variances are computed in two passes — mean first, then squared deviations from it — rather than
+  through the one-pass `E[x²] − E[x]²` identity, which loses every significant digit when the mean
+  is large relative to the spread.
+- A column-wise fold accumulates a whole row of partial sums at a time, so it reads the matrix in
+  storage order with unit stride on both sides rather than striding down each column.
+- The host evaluates the distribution functions in `f64` whatever the tensor's element type, so a
+  `f32` tensor gets results correct to the last `f32` bit. The Metal shaders evaluate in `f32`
+  throughout, so the two backends agree to about `1e-6` relative rather than exactly. Moments agree
+  far more closely, differing only in summation order.
+- `statistics::special` exposes the scalar functions underneath — `erf`, `erfc`, `ln_erfc`,
+  `erf_inv`, and each family's density, distribution function, and quantile.
 
 ## Compute backends
 

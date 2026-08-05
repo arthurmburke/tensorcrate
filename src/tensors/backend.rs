@@ -236,7 +236,7 @@ mod gpu {
 
     use super::{Backend, sealed};
     use crate::metal::MetalBuffer;
-    use crate::tensors::{Analytic, BinaryOp, Compare, Reduce, SortOrder};
+    use crate::tensors::{Analytic, Axis, BinaryOp, Compare, Family, Reduce, SortOrder, Statistic};
 
     /// A backend that keeps elements in GPU-shared memory, so the Metal kernels
     /// read and write them in place.
@@ -644,6 +644,61 @@ mod gpu {
         /// Analytic function applied elementwise; `op` is an
         pub(crate) fn unary(&self, op: Analytic) -> Option<Self> {
             Some(Self(Residency::Device(self.device()?.unary(op)?)))
+        }
+
+        /// `Σ(xᵢ − mean)²` over the whole allocation. Like
+        /// [`reduce`](Self::reduce) this ends on the CPU, since its result is a
+        /// number.
+        pub(crate) fn sum_squared_deviations(&self, mean: f32) -> Option<f32> {
+            self.device()?.sum_squared_deviations(mean)
+        }
+
+        /// Per-row or per-column means and deviation sums, both staying in
+        /// shared memory.
+        pub(crate) fn axis_moments(
+            &self,
+            rows: usize,
+            cols: usize,
+            axis: Axis,
+        ) -> Option<(Self, Self)> {
+            let (means, deviations) = self.device()?.axis_moments(rows, cols, axis)?;
+            Some((
+                Self(Residency::Device(means)),
+                Self(Residency::Device(deviations)),
+            ))
+        }
+
+        /// A distribution function applied elementwise.
+        pub(crate) fn distribution(
+            &self,
+            family: Family,
+            statistic: Statistic,
+            parameters: (f32, f32),
+        ) -> Option<Self> {
+            let output = self.device()?.distribution(family, statistic, parameters)?;
+            Some(Self(Residency::Device(output)))
+        }
+
+        /// The same, with one parameter pair per row or column.
+        pub(crate) fn axis_distribution(
+            &self,
+            first: &Self,
+            second: &Self,
+            shape: (usize, usize),
+            axis: Axis,
+            family: Family,
+            statistic: Statistic,
+        ) -> Option<Self> {
+            let output = self.device()?.axis_distribution(
+                first.device()?,
+                second.device()?,
+                shape.0,
+                shape.1,
+                axis,
+                family,
+                statistic,
+            )?;
+            Some(Self(Residency::Device(output)))
         }
     }
 

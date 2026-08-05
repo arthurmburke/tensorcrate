@@ -42,7 +42,7 @@ use objc2_metal::{
     MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily, MTLLibrary, MTLResourceOptions, MTLSize,
 };
 
-use crate::tensors::{Analytic, BinaryOp, Compare, Reduce, SortOrder};
+use crate::tensors::{Analytic, Axis, BinaryOp, Compare, Family, Reduce, SortOrder, Statistic};
 
 /// Threadgroup tile edge; must match `TILE` in the shader. 16×16 = 256 threads.
 const TILE: usize = 16;
@@ -140,6 +140,10 @@ struct Gpu {
     flip_both: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     unary: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     unary_dual: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    deviation: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    axis_moments: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    distribution: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    axis_distribution: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     fft_bit_reverse: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     fft_stage: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pool: RefCell<Pool>,
@@ -229,6 +233,10 @@ fn build_gpu() -> Option<Gpu> {
         flip_both: pipeline("flip_both")?,
         unary: pipeline("unary")?,
         unary_dual: pipeline("unary_dual")?,
+        deviation: pipeline("deviation_partial")?,
+        axis_moments: pipeline("axis_moments")?,
+        distribution: pipeline("distribution")?,
+        axis_distribution: pipeline("axis_distribution")?,
         fft_bit_reverse: pipeline("fft_bit_reverse")?,
         fft_stage: pipeline("fft_stage")?,
         pool: RefCell::new(Pool::default()),
@@ -651,6 +659,134 @@ impl MetalBuffer<f32> {
         // Trim the padding. The values are in shared memory, so this reads the
         // sorted prefix in place rather than downloading it.
         Self::from_slice(&buffer.as_slice()[..self.len])
+    }
+
+    /// `Σ(xᵢ − mean)²` over the whole buffer.
+    ///
+    /// The first round is its own kernel, which forms and squares each
+    /// deviation as it reads the value; every round after it is the ordinary
+    /// summing reduction over the partials. So the buffer is read once, not
+    /// once to write an elementwise result and again to fold it.
+    pub fn sum_squared_deviations(&self, mean: f32) -> Option<f32> {
+        if self.len == 0 {
+            return Some(0.0);
+        }
+        if self.len == 1 {
+            let deviation = self.as_slice()[0] - mean;
+            return Some(deviation * deviation);
+        }
+
+        let mut groups = self.len.div_ceil(REDUCE_GROUP);
+        let mut front = Self::allocate(groups)?;
+        with_gpu(|gpu| encode_deviation(gpu, &self.raw, &front.raw, self.len, groups, mean))?;
+        let mut count = groups;
+        if count == 1 {
+            return Some(front.as_slice()[0]);
+        }
+
+        let mut back = Self::allocate(count.div_ceil(REDUCE_GROUP))?;
+        while count > 1 {
+            groups = count.div_ceil(REDUCE_GROUP);
+            with_gpu(|gpu| encode_reduce(gpu, &front.raw, &back.raw, count, groups, Reduce::Sum))?;
+            std::mem::swap(&mut front, &mut back);
+            count = groups;
+        }
+        Some(front.as_slice()[0])
+    }
+
+    /// One mean and one `Σ(xᵢ − mean)²` per row or per column of a
+    /// `rows × cols` matrix, as `(means, deviations)`.
+    ///
+    /// One dispatch with a thread per result, rather than one whole-buffer
+    /// reduction per slice: a `1024 × 1024` matrix reduced by rows is a
+    /// thousand folds of a thousand values each, and a thousand separate
+    /// dispatches would cost more in command buffers than in arithmetic.
+    pub fn axis_moments(&self, rows: usize, cols: usize, axis: Axis) -> Option<(Self, Self)> {
+        if self.len != rows.checked_mul(cols)? {
+            return None;
+        }
+        let extent = axis.extent((rows, cols));
+        let means = Self::allocate(extent)?;
+        let deviations = Self::allocate(extent)?;
+        if extent != 0 && axis.depth((rows, cols)) != 0 {
+            with_gpu(|gpu| {
+                encode_axis_moments(
+                    gpu,
+                    &self.raw,
+                    &means.raw,
+                    &deviations.raw,
+                    rows,
+                    cols,
+                    extent,
+                    axis,
+                )
+            })?;
+        }
+        Some((means, deviations))
+    }
+
+    /// A distribution function applied elementwise, with one parameter pair for
+    /// the whole buffer.
+    pub fn distribution(
+        &self,
+        family: Family,
+        statistic: Statistic,
+        parameters: (f32, f32),
+    ) -> Option<Self> {
+        let output = Self::allocate(self.len)?;
+        if self.len != 0 {
+            with_gpu(|gpu| {
+                encode_distribution(
+                    gpu,
+                    &self.raw,
+                    &output.raw,
+                    self.len,
+                    family,
+                    statistic,
+                    parameters,
+                )
+            })?;
+        }
+        Some(output)
+    }
+
+    /// The same, with a parameter pair per row or per column.
+    ///
+    /// `first` and `second` hold one parameter each per slice along `axis`, in
+    /// the order [`axis_moments`](Self::axis_moments) produces them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn axis_distribution(
+        &self,
+        first: &Self,
+        second: &Self,
+        rows: usize,
+        cols: usize,
+        axis: Axis,
+        family: Family,
+        statistic: Statistic,
+    ) -> Option<Self> {
+        let extent = axis.extent((rows, cols));
+        if self.len != rows.checked_mul(cols)? || first.len != extent || second.len != extent {
+            return None;
+        }
+        let output = Self::allocate(self.len)?;
+        if self.len != 0 {
+            with_gpu(|gpu| {
+                encode_axis_distribution(
+                    gpu,
+                    &self.raw,
+                    &output.raw,
+                    &first.raw,
+                    &second.raw,
+                    self.len,
+                    cols,
+                    axis,
+                    family,
+                    statistic,
+                )
+            })?;
+        }
+        Some(output)
     }
 
     /// Broadcast operation with a scalar. `op` has the same encoding as
@@ -1452,6 +1588,139 @@ fn encode_vmerge(
             );
         }
     }
+    encoder.endEncoding();
+    commit(gpu, command)
+}
+
+/// The first round of a deviation fold: one partial per threadgroup.
+///
+/// Dispatched as whole threadgroups for the same reason [`encode_reduce`] is —
+/// every thread in a group has to reach the barriers.
+fn encode_deviation(
+    gpu: &Gpu,
+    input: &ProtocolObject<dyn MTLBuffer>,
+    output: &ProtocolObject<dyn MTLBuffer>,
+    count: usize,
+    groups: usize,
+    mean: f32,
+) -> Option<()> {
+    let command = gpu.queue.commandBuffer()?;
+    let encoder = command.computeCommandEncoder()?;
+    let count_u32 = u32::try_from(count).ok()?;
+    encoder.setComputePipelineState(&gpu.deviation);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
+        encoder.setBytes_length_atIndex(NonNull::from(&count_u32).cast(), 4, 2);
+        encoder.setBytes_length_atIndex(NonNull::from(&mean).cast(), 4, 3);
+    }
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: groups,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: REDUCE_GROUP,
+            height: 1,
+            depth: 1,
+        },
+    );
+    encoder.endEncoding();
+    commit(gpu, command)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_axis_moments(
+    gpu: &Gpu,
+    input: &ProtocolObject<dyn MTLBuffer>,
+    means: &ProtocolObject<dyn MTLBuffer>,
+    deviations: &ProtocolObject<dyn MTLBuffer>,
+    rows: usize,
+    cols: usize,
+    extent: usize,
+    axis: Axis,
+) -> Option<()> {
+    let command = gpu.queue.commandBuffer()?;
+    let encoder = command.computeCommandEncoder()?;
+    let (rows_u32, cols_u32) = (u32::try_from(rows).ok()?, u32::try_from(cols).ok()?);
+    encoder.setComputePipelineState(&gpu.axis_moments);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(means), 0, 1);
+        encoder.setBuffer_offset_atIndex(Some(deviations), 0, 2);
+        encoder.setBytes_length_atIndex(NonNull::from(&rows_u32).cast(), 4, 3);
+        encoder.setBytes_length_atIndex(NonNull::from(&cols_u32).cast(), 4, 4);
+        encoder.setBytes_length_atIndex(NonNull::from(&axis).cast(), size_of::<Axis>(), 5);
+    }
+    dispatch_1d(&encoder, extent);
+    encoder.endEncoding();
+    commit(gpu, command)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_distribution(
+    gpu: &Gpu,
+    input: &ProtocolObject<dyn MTLBuffer>,
+    output: &ProtocolObject<dyn MTLBuffer>,
+    len: usize,
+    family: Family,
+    statistic: Statistic,
+    parameters: (f32, f32),
+) -> Option<()> {
+    let command = gpu.queue.commandBuffer()?;
+    let encoder = command.computeCommandEncoder()?;
+    encoder.setComputePipelineState(&gpu.distribution);
+    let (first, second) = parameters;
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
+        encoder.setBytes_length_atIndex(NonNull::from(&family).cast(), size_of::<Family>(), 2);
+        encoder.setBytes_length_atIndex(
+            NonNull::from(&statistic).cast(),
+            size_of::<Statistic>(),
+            3,
+        );
+        encoder.setBytes_length_atIndex(NonNull::from(&first).cast(), 4, 4);
+        encoder.setBytes_length_atIndex(NonNull::from(&second).cast(), 4, 5);
+    }
+    dispatch_1d(&encoder, len);
+    encoder.endEncoding();
+    commit(gpu, command)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_axis_distribution(
+    gpu: &Gpu,
+    input: &ProtocolObject<dyn MTLBuffer>,
+    output: &ProtocolObject<dyn MTLBuffer>,
+    first: &ProtocolObject<dyn MTLBuffer>,
+    second: &ProtocolObject<dyn MTLBuffer>,
+    len: usize,
+    cols: usize,
+    axis: Axis,
+    family: Family,
+    statistic: Statistic,
+) -> Option<()> {
+    let command = gpu.queue.commandBuffer()?;
+    let encoder = command.computeCommandEncoder()?;
+    let cols_u32 = u32::try_from(cols).ok()?;
+    encoder.setComputePipelineState(&gpu.axis_distribution);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
+        encoder.setBuffer_offset_atIndex(Some(first), 0, 2);
+        encoder.setBuffer_offset_atIndex(Some(second), 0, 3);
+        encoder.setBytes_length_atIndex(NonNull::from(&cols_u32).cast(), 4, 4);
+        encoder.setBytes_length_atIndex(NonNull::from(&axis).cast(), size_of::<Axis>(), 5);
+        encoder.setBytes_length_atIndex(NonNull::from(&family).cast(), size_of::<Family>(), 6);
+        encoder.setBytes_length_atIndex(
+            NonNull::from(&statistic).cast(),
+            size_of::<Statistic>(),
+            7,
+        );
+    }
+    dispatch_1d(&encoder, len);
     encoder.endEncoding();
     commit(gpu, command)
 }

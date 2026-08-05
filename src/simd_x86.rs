@@ -708,6 +708,193 @@ macro_rules! x86_kernels {
                 total
             }
 
+            /// `Σ(xᵢ − mean)²` — the second pass of a two-pass variance.
+            ///
+            /// Four accumulators, as in [`reduce`]; the AVX2 path fuses the
+            /// square and the accumulation into one FMA, and the SSE2 baseline
+            /// spells the same arithmetic as a multiply and an add.
+            #[inline]
+            pub fn sum_squared_deviations(values: &[$t], mean: $t) -> $t {
+                if has_avx2_fma() {
+                    unsafe { sum_squared_deviations_avx(values, mean) }
+                } else {
+                    unsafe { sum_squared_deviations_sse(values, mean) }
+                }
+            }
+
+            #[target_feature(enable = "avx2,fma")]
+            unsafe fn sum_squared_deviations_avx(values: &[$t], mean: $t) -> $t {
+                let center = $avx_set1(mean);
+                let mut acc: [$avx_vec; 4] = [$avx_zero(); 4];
+                let mut i = 0;
+                while i + 4 * $avx_lanes <= values.len() {
+                    for lane in 0..4 {
+                        let offset = i + lane * $avx_lanes;
+                        let d = $avx_sub($avx_load(values.as_ptr().add(offset)), center);
+                        acc[lane] = $avx_fma(d, d, acc[lane]);
+                    }
+                    i += 4 * $avx_lanes;
+                }
+                while i + $avx_lanes <= values.len() {
+                    let d = $avx_sub($avx_load(values.as_ptr().add(i)), center);
+                    acc[0] = $avx_fma(d, d, acc[0]);
+                    i += $avx_lanes;
+                }
+                let total = $avx_add($avx_add(acc[0], acc[1]), $avx_add(acc[2], acc[3]));
+                let mut lanes = [0 as $t; $avx_lanes];
+                $avx_store(lanes.as_mut_ptr(), total);
+                scalar_squared_deviations(values, mean, lanes.into_iter().sum(), i)
+            }
+
+            #[target_feature(enable = "sse2")]
+            unsafe fn sum_squared_deviations_sse(values: &[$t], mean: $t) -> $t {
+                let center = $sse_set1(mean);
+                let mut acc: [$sse_vec; 4] = [$sse_zero(); 4];
+                let mut i = 0;
+                while i + 4 * $sse_lanes <= values.len() {
+                    for lane in 0..4 {
+                        let offset = i + lane * $sse_lanes;
+                        let d = $sse_sub($sse_load(values.as_ptr().add(offset)), center);
+                        acc[lane] = $sse_add(acc[lane], $sse_mul(d, d));
+                    }
+                    i += 4 * $sse_lanes;
+                }
+                while i + $sse_lanes <= values.len() {
+                    let d = $sse_sub($sse_load(values.as_ptr().add(i)), center);
+                    acc[0] = $sse_add(acc[0], $sse_mul(d, d));
+                    i += $sse_lanes;
+                }
+                let total = $sse_add($sse_add(acc[0], acc[1]), $sse_add(acc[2], acc[3]));
+                let mut lanes = [0 as $t; $sse_lanes];
+                $sse_store(lanes.as_mut_ptr(), total);
+                scalar_squared_deviations(values, mean, lanes.into_iter().sum(), i)
+            }
+
+            fn scalar_squared_deviations(
+                values: &[$t],
+                mean: $t,
+                mut total: $t,
+                start: usize,
+            ) -> $t {
+                for i in start..values.len() {
+                    let d = values[i] - mean;
+                    total += d * d;
+                }
+                total
+            }
+
+            /// `totals += values`, elementwise and in place.
+            ///
+            /// This is what makes a column-wise reduction read the matrix in
+            /// storage order: one row of partial sums at a time, with unit
+            /// stride on both sides, instead of striding down each column in
+            /// turn.
+            #[inline]
+            pub fn accumulate(totals: &mut [$t], values: &[$t]) {
+                debug_assert_eq!(totals.len(), values.len());
+                if has_avx2() {
+                    unsafe { accumulate_avx(totals, values) };
+                } else {
+                    unsafe { accumulate_sse(totals, values) };
+                }
+            }
+
+            #[target_feature(enable = "avx2")]
+            unsafe fn accumulate_avx(totals: &mut [$t], values: &[$t]) {
+                let mut i = 0;
+                while i + $avx_lanes <= totals.len() {
+                    let sum = $avx_add(
+                        $avx_load(totals.as_ptr().add(i)),
+                        $avx_load(values.as_ptr().add(i)),
+                    );
+                    $avx_store(totals.as_mut_ptr().add(i), sum);
+                    i += $avx_lanes;
+                }
+                scalar_accumulate(totals, values, i);
+            }
+
+            #[target_feature(enable = "sse2")]
+            unsafe fn accumulate_sse(totals: &mut [$t], values: &[$t]) {
+                let mut i = 0;
+                while i + $sse_lanes <= totals.len() {
+                    let sum = $sse_add(
+                        $sse_load(totals.as_ptr().add(i)),
+                        $sse_load(values.as_ptr().add(i)),
+                    );
+                    $sse_store(totals.as_mut_ptr().add(i), sum);
+                    i += $sse_lanes;
+                }
+                scalar_accumulate(totals, values, i);
+            }
+
+            fn scalar_accumulate(totals: &mut [$t], values: &[$t], start: usize) {
+                for i in start..totals.len() {
+                    totals[i] += values[i];
+                }
+            }
+
+            /// `totals += (values − means)²`, elementwise and in place — the
+            /// column-wise counterpart of [`sum_squared_deviations`].
+            #[inline]
+            pub fn accumulate_squared_deviations(totals: &mut [$t], values: &[$t], means: &[$t]) {
+                debug_assert!(values.len() == totals.len() && means.len() == totals.len());
+                if has_avx2_fma() {
+                    unsafe { accumulate_squared_deviations_avx(totals, values, means) };
+                } else {
+                    unsafe { accumulate_squared_deviations_sse(totals, values, means) };
+                }
+            }
+
+            #[target_feature(enable = "avx2,fma")]
+            unsafe fn accumulate_squared_deviations_avx(
+                totals: &mut [$t],
+                values: &[$t],
+                means: &[$t],
+            ) {
+                let mut i = 0;
+                while i + $avx_lanes <= totals.len() {
+                    let d = $avx_sub(
+                        $avx_load(values.as_ptr().add(i)),
+                        $avx_load(means.as_ptr().add(i)),
+                    );
+                    let total = $avx_fma(d, d, $avx_load(totals.as_ptr().add(i)));
+                    $avx_store(totals.as_mut_ptr().add(i), total);
+                    i += $avx_lanes;
+                }
+                scalar_accumulate_squared_deviations(totals, values, means, i);
+            }
+
+            #[target_feature(enable = "sse2")]
+            unsafe fn accumulate_squared_deviations_sse(
+                totals: &mut [$t],
+                values: &[$t],
+                means: &[$t],
+            ) {
+                let mut i = 0;
+                while i + $sse_lanes <= totals.len() {
+                    let d = $sse_sub(
+                        $sse_load(values.as_ptr().add(i)),
+                        $sse_load(means.as_ptr().add(i)),
+                    );
+                    let total = $sse_add($sse_load(totals.as_ptr().add(i)), $sse_mul(d, d));
+                    $sse_store(totals.as_mut_ptr().add(i), total);
+                    i += $sse_lanes;
+                }
+                scalar_accumulate_squared_deviations(totals, values, means, i);
+            }
+
+            fn scalar_accumulate_squared_deviations(
+                totals: &mut [$t],
+                values: &[$t],
+                means: &[$t],
+                start: usize,
+            ) {
+                for i in start..totals.len() {
+                    let d = values[i] - means[i];
+                    totals[i] += d * d;
+                }
+            }
+
             #[inline]
             pub fn matmul(a: &[$t], b: &[$t], m: usize, k: usize, n: usize, out: &mut [$t]) {
                 out.fill(0 as $t);

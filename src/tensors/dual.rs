@@ -718,6 +718,7 @@ analytic_methods!(
     sinh => Sinh,
     cosh => Cosh,
     tanh => Tanh,
+    sqrt => Sqrt,
 );
 
 // ---- interoperating with `Dual` elements ------------------------------------

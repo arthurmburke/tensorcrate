@@ -17,6 +17,7 @@
 use std::cmp::Ordering;
 
 use super::{Backend, Host, Matrix, Vector};
+use crate::statistics::{Distribution, Moments};
 
 /// An elementwise binary operation.
 ///
@@ -380,16 +381,147 @@ impl TryFrom<u16> for Analytic {
     }
 }
 
+/// Which way a matrix reduction folds.
+///
+/// The name says what is *folded*, not what survives: [`Rows`](Axis::Rows)
+/// folds each row and leaves one value per row. Reducing a `3×5` matrix along
+/// `Rows` therefore gives three results and along
+/// [`Columns`](Axis::Columns) five — the opposite of the convention that names
+/// an axis by the index it keeps, and the one that makes `matrix.mean_axis(Rows)`
+/// read as "the mean of each row".
+///
+/// Like the operation enums above, the representation is part of the Metal
+/// shader ABI.
+#[repr(u16)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Axis {
+    /// Fold each row, giving one result per row.
+    Rows = 0,
+    /// Fold each column, giving one result per column.
+    Columns = 1,
+}
+
+impl Axis {
+    /// How many results a fold along this axis produces for a `rows × cols`
+    /// matrix.
+    pub fn extent(self, shape: (usize, usize)) -> usize {
+        match self {
+            Axis::Rows => shape.0,
+            Axis::Columns => shape.1,
+        }
+    }
+
+    /// How many elements each of those results folds together.
+    pub fn depth(self, shape: (usize, usize)) -> usize {
+        match self {
+            Axis::Rows => shape.1,
+            Axis::Columns => shape.0,
+        }
+    }
+}
+
+impl From<Axis> for u16 {
+    fn from(axis: Axis) -> Self {
+        axis as u16
+    }
+}
+
+impl TryFrom<u16> for Axis {
+    type Error = u16;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Rows),
+            1 => Ok(Self::Columns),
+            value => Err(value),
+        }
+    }
+}
+
+/// A distribution family, as an operation code.
+///
+/// The parameters travel separately, as a pair of `f32`, because that is the
+/// only shape a shader argument can take — see
+/// [`Distribution`](crate::statistics::Distribution) for the typed form these
+/// two are decomposed from.
+///
+/// The representation is part of the Metal shader ABI.
+#[repr(u16)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Family {
+    /// The normal (Gaussian) distribution, parameterized by mean and standard
+    /// deviation.
+    Normal = 0,
+    /// The inverse Gaussian (Wald) distribution, parameterized by mean and
+    /// shape.
+    InverseGaussian = 1,
+}
+
+impl From<Family> for u16 {
+    fn from(family: Family) -> Self {
+        family as u16
+    }
+}
+
+impl TryFrom<u16> for Family {
+    type Error = u16;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Normal),
+            1 => Ok(Self::InverseGaussian),
+            value => Err(value),
+        }
+    }
+}
+
+/// Which function of a distribution to evaluate.
+///
+/// The representation is part of the Metal shader ABI.
+#[repr(u16)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Statistic {
+    /// The probability density function, `f(x)`.
+    Pdf = 0,
+    /// The cumulative distribution function, `F(x) = P(X ≤ x)`.
+    Cdf = 1,
+    /// The percent point function, `F⁻¹(p)` — the quantile at probability `p`,
+    /// and the inverse of [`Cdf`](Statistic::Cdf).
+    Ppf = 2,
+}
+
+impl From<Statistic> for u16 {
+    fn from(statistic: Statistic) -> Self {
+        statistic as u16
+    }
+}
+
+impl TryFrom<u16> for Statistic {
+    type Error = u16;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Pdf),
+            1 => Ok(Self::Cdf),
+            2 => Ok(Self::Ppf),
+            value => Err(value),
+        }
+    }
+}
+
 #[cfg(test)]
 mod operation_tests {
     use std::mem::size_of;
 
-    use super::{Analytic, BinaryOp};
+    use super::{Analytic, Axis, BinaryOp, Family, Statistic};
 
     #[test]
     fn operation_enums_have_a_stable_u16_representation() {
         assert_eq!(size_of::<BinaryOp>(), size_of::<u16>());
         assert_eq!(size_of::<Analytic>(), size_of::<u16>());
+        assert_eq!(size_of::<Axis>(), size_of::<u16>());
+        assert_eq!(size_of::<Family>(), size_of::<u16>());
+        assert_eq!(size_of::<Statistic>(), size_of::<u16>());
 
         for op in [
             BinaryOp::Add,
@@ -403,8 +535,20 @@ mod operation_tests {
         for op in Analytic::ALL {
             assert_eq!(Analytic::try_from(u16::from(op)), Ok(op));
         }
+        for axis in [Axis::Rows, Axis::Columns] {
+            assert_eq!(Axis::try_from(u16::from(axis)), Ok(axis));
+        }
+        for family in [Family::Normal, Family::InverseGaussian] {
+            assert_eq!(Family::try_from(u16::from(family)), Ok(family));
+        }
+        for statistic in [Statistic::Pdf, Statistic::Cdf, Statistic::Ppf] {
+            assert_eq!(Statistic::try_from(u16::from(statistic)), Ok(statistic));
+        }
         assert_eq!(BinaryOp::try_from(u16::MAX), Err(u16::MAX));
         assert_eq!(Analytic::try_from(u16::MAX), Err(u16::MAX));
+        assert_eq!(Axis::try_from(u16::MAX), Err(u16::MAX));
+        assert_eq!(Family::try_from(u16::MAX), Err(u16::MAX));
+        assert_eq!(Statistic::try_from(u16::MAX), Err(u16::MAX));
     }
 }
 
@@ -753,6 +897,51 @@ pub trait Kernels: Backend {
 
     /// Reverse both axes.
     fn flip(input: &Matrix<f32, Self>) -> Matrix<f32, Self>;
+
+    /// The mean and `Σ(xᵢ − mean)²` of a vector, as `(mean, deviations)`.
+    ///
+    /// Both passes in one call, because on a GPU the mean has to come back to
+    /// the CPU before the second pass can be encoded — returning it alongside
+    /// the deviations means the caller never has to ask twice.
+    fn vector_moments(a: &Vector<f32, Self>) -> (f32, f32);
+
+    /// The same over every element of a matrix, ignoring its shape.
+    fn matrix_moments(a: &Matrix<f32, Self>) -> (f32, f32);
+
+    /// The same along one axis: one mean and one deviation sum per row or per
+    /// column, as `(means, deviations)`.
+    fn matrix_axis_moments(
+        a: &Matrix<f32, Self>,
+        axis: Axis,
+    ) -> (Vector<f32, Self>, Vector<f32, Self>);
+
+    /// A distribution function applied elementwise, with one parameter pair for
+    /// the whole vector.
+    fn vector_distribution(
+        a: &Vector<f32, Self>,
+        family: Family,
+        statistic: Statistic,
+        parameters: (f32, f32),
+    ) -> Vector<f32, Self>;
+
+    /// The same over a matrix.
+    fn matrix_distribution(
+        a: &Matrix<f32, Self>,
+        family: Family,
+        statistic: Statistic,
+        parameters: (f32, f32),
+    ) -> Matrix<f32, Self>;
+
+    /// The same, with one parameter pair per row or per column: `first` and
+    /// `second` hold one parameter each per slice along `axis`.
+    fn matrix_axis_distribution(
+        a: &Matrix<f32, Self>,
+        axis: Axis,
+        family: Family,
+        statistic: Statistic,
+        first: &Vector<f32, Self>,
+        second: &Vector<f32, Self>,
+    ) -> Matrix<f32, Self>;
 }
 
 /// Every operation here already exists as an inherent method or an operator on
@@ -1066,6 +1255,78 @@ impl Kernels for Host {
         }
         Matrix::from_flat(padded_rows, padded_cols, out)
     }
+
+    fn vector_moments(a: &Vector<f32, Self>) -> (f32, f32) {
+        moments_pair(&a.moments())
+    }
+
+    fn matrix_moments(a: &Matrix<f32, Self>) -> (f32, f32) {
+        moments_pair(&a.moments())
+    }
+
+    fn matrix_axis_moments(
+        a: &Matrix<f32, Self>,
+        axis: Axis,
+    ) -> (Vector<f32, Self>, Vector<f32, Self>) {
+        let moments = a.moments_axis(axis);
+        (moments.means, moments.sum_squared_deviations)
+    }
+
+    fn vector_distribution(
+        a: &Vector<f32, Self>,
+        family: Family,
+        statistic: Statistic,
+        parameters: (f32, f32),
+    ) -> Vector<f32, Self> {
+        a.distribution(
+            statistic,
+            &Distribution::from_parameters(family, parameters),
+        )
+    }
+
+    fn matrix_distribution(
+        a: &Matrix<f32, Self>,
+        family: Family,
+        statistic: Statistic,
+        parameters: (f32, f32),
+    ) -> Matrix<f32, Self> {
+        a.distribution(
+            statistic,
+            &Distribution::from_parameters(family, parameters),
+        )
+    }
+
+    fn matrix_axis_distribution(
+        a: &Matrix<f32, Self>,
+        axis: Axis,
+        family: Family,
+        statistic: Statistic,
+        first: &Vector<f32, Self>,
+        second: &Vector<f32, Self>,
+    ) -> Matrix<f32, Self> {
+        a.distribution_axis(axis, statistic, &axis_distributions(family, first, second))
+    }
+}
+
+/// The pair the kernel interface passes moments around as, out of the named
+/// summary the tensor API returns.
+pub(crate) fn moments_pair(moments: &Moments<f32>) -> (f32, f32) {
+    (moments.mean, moments.sum_squared_deviations)
+}
+
+/// Rebuild one distribution per row or column from the two parameter vectors
+/// the axis kernels carry them in.
+pub(crate) fn axis_distributions<B: Backend>(
+    family: Family,
+    first: &Vector<f32, B>,
+    second: &Vector<f32, B>,
+) -> Vec<Distribution<f32>> {
+    first
+        .as_slice()
+        .iter()
+        .zip(second.as_slice())
+        .map(|(&first, &second)| Distribution::from_parameters(family, (first, second)))
+        .collect()
 }
 
 /// The output shape of a valid correlation, which is also where the "does the
@@ -1086,10 +1347,11 @@ pub(crate) fn correlation_shape(input: (usize, usize), window: (usize, usize)) -
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod gpu {
     use super::{
-        Analytic, BinaryOp, Compare, Kernels, Matrix, Reduce, SortOrder, Vector, correlation_shape,
+        Analytic, Axis, BinaryOp, Compare, Family, Kernels, Matrix, Reduce, SortOrder, Statistic,
+        Vector, correlation_shape,
     };
     use crate::tensors::metal_backend::{matrix_elementwise, vector_elementwise};
-    use crate::tensors::{Host, Metal};
+    use crate::tensors::{Host, Metal, MetalStorage};
 
     /// Forwarding again, but to the resident operations: every one of these
     /// leaves its result in GPU-shared memory.
@@ -1363,5 +1625,122 @@ mod gpu {
                 None => Host::pad(&input.to_backend::<Host>(), pad_rows, pad_cols).to_backend(),
             }
         }
+
+        fn vector_moments(a: &Vector<f32, Self>) -> (f32, f32) {
+            resident_moments(a.storage(), a.len())
+                .unwrap_or_else(|| Host::vector_moments(&a.to_backend::<Host>()))
+        }
+
+        fn matrix_moments(a: &Matrix<f32, Self>) -> (f32, f32) {
+            resident_moments(a.storage(), a.rows() * a.cols())
+                .unwrap_or_else(|| Host::matrix_moments(&a.to_backend::<Host>()))
+        }
+
+        fn matrix_axis_moments(
+            a: &Matrix<f32, Self>,
+            axis: Axis,
+        ) -> (Vector<f32, Self>, Vector<f32, Self>) {
+            let (rows, cols) = a.shape();
+            let extent = axis.extent((rows, cols));
+            // An empty fold has no mean, and the shader has no thread to write
+            // that NaN with; the host owns the convention.
+            let resident = (rows != 0 && cols != 0)
+                .then(|| a.storage().axis_moments(rows, cols, axis))
+                .flatten();
+            match resident {
+                Some((means, deviations)) => (
+                    Vector::from_storage(extent, means),
+                    Vector::from_storage(extent, deviations),
+                ),
+                None => {
+                    let (means, deviations) =
+                        Host::matrix_axis_moments(&a.to_backend::<Host>(), axis);
+                    (means.to_backend(), deviations.to_backend())
+                }
+            }
+        }
+
+        fn vector_distribution(
+            a: &Vector<f32, Self>,
+            family: Family,
+            statistic: Statistic,
+            parameters: (f32, f32),
+        ) -> Vector<f32, Self> {
+            match a.storage().distribution(family, statistic, parameters) {
+                Some(data) => Vector::from_storage(a.len(), data),
+                None => Host::vector_distribution(
+                    &a.to_backend::<Host>(),
+                    family,
+                    statistic,
+                    parameters,
+                )
+                .to_backend(),
+            }
+        }
+
+        fn matrix_distribution(
+            a: &Matrix<f32, Self>,
+            family: Family,
+            statistic: Statistic,
+            parameters: (f32, f32),
+        ) -> Matrix<f32, Self> {
+            let (rows, cols) = a.shape();
+            match a.storage().distribution(family, statistic, parameters) {
+                Some(data) => Matrix::from_storage(rows, cols, data),
+                None => Host::matrix_distribution(
+                    &a.to_backend::<Host>(),
+                    family,
+                    statistic,
+                    parameters,
+                )
+                .to_backend(),
+            }
+        }
+
+        fn matrix_axis_distribution(
+            a: &Matrix<f32, Self>,
+            axis: Axis,
+            family: Family,
+            statistic: Statistic,
+            first: &Vector<f32, Self>,
+            second: &Vector<f32, Self>,
+        ) -> Matrix<f32, Self> {
+            let (rows, cols) = a.shape();
+            let resident = a.storage().axis_distribution(
+                first.storage(),
+                second.storage(),
+                (rows, cols),
+                axis,
+                family,
+                statistic,
+            );
+            match resident {
+                Some(data) => Matrix::from_storage(rows, cols, data),
+                None => Host::matrix_axis_distribution(
+                    &a.to_backend::<Host>(),
+                    axis,
+                    family,
+                    statistic,
+                    &first.to_backend::<Host>(),
+                    &second.to_backend::<Host>(),
+                )
+                .to_backend(),
+            }
+        }
+    }
+
+    /// Both moment passes over one resident allocation.
+    ///
+    /// The mean has to reach the CPU before the deviation pass can be encoded
+    /// with it, so this is two dispatched reductions with a synchronization
+    /// between them rather than one fused kernel — the same shape the two-pass
+    /// variance takes everywhere else. `None` where there is no device, which
+    /// sends the caller to the host.
+    fn resident_moments(storage: &MetalStorage, len: usize) -> Option<(f32, f32)> {
+        if len == 0 {
+            return None;
+        }
+        let mean = storage.reduce(Reduce::Sum)? / len as f32;
+        Some((mean, storage.sum_squared_deviations(mean)?))
     }
 }
