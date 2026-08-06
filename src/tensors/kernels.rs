@@ -774,6 +774,22 @@ pub trait Kernels: Backend {
     /// `f(a)`, elementwise.
     fn vector_unary(a: &Vector<f32, Self>, f: Analytic) -> Vector<f32, Self>;
 
+    /// Elementwise `a^b`.
+    ///
+    /// A power is not a [`BinaryOp`]: that enum's variants are the operators
+    /// defined for every [`Coefficient`](crate::numbers::Coefficient), and
+    /// raising an integer to an integer leaves the integers. So it travels as
+    /// its own kernel rather than a fifth arithmetic code.
+    fn vector_power(a: &Vector<f32, Self>, b: &Vector<f32, Self>) -> Vector<f32, Self>;
+
+    /// The same with one operand fixed: `scalar_left` selects `scalar^x` over
+    /// `x^scalar`.
+    fn vector_power_scalar(
+        a: &Vector<f32, Self>,
+        scalar: f32,
+        scalar_left: bool,
+    ) -> Vector<f32, Self>;
+
     /// `(f(value), f'(value) ⊙ tangent)` — one forward-mode step.
     fn vector_unary_dual(
         value: &Vector<f32, Self>,
@@ -830,6 +846,16 @@ pub trait Kernels: Backend {
 
     /// `f(a)`, elementwise.
     fn matrix_unary(a: &Matrix<f32, Self>, f: Analytic) -> Matrix<f32, Self>;
+
+    /// Elementwise `a^b` over matrices; see [`vector_power`](Self::vector_power).
+    fn matrix_power(a: &Matrix<f32, Self>, b: &Matrix<f32, Self>) -> Matrix<f32, Self>;
+
+    /// The same with one operand fixed.
+    fn matrix_power_scalar(
+        a: &Matrix<f32, Self>,
+        scalar: f32,
+        scalar_left: bool,
+    ) -> Matrix<f32, Self>;
 
     /// `(f(value), f'(value) ⊙ tangent)` — one forward-mode step.
     fn matrix_unary_dual(
@@ -1011,6 +1037,22 @@ impl Kernels for Host {
         a.map(|&x| f.value(x))
     }
 
+    fn vector_power(a: &Vector<f32, Self>, b: &Vector<f32, Self>) -> Vector<f32, Self> {
+        a.pow_elementwise(b)
+    }
+
+    fn vector_power_scalar(
+        a: &Vector<f32, Self>,
+        scalar: f32,
+        scalar_left: bool,
+    ) -> Vector<f32, Self> {
+        if scalar_left {
+            a.map(|&x| scalar.powf(x))
+        } else {
+            a.pow(scalar)
+        }
+    }
+
     fn vector_unary_dual(
         value: &Vector<f32, Self>,
         tangent: &Vector<f32, Self>,
@@ -1100,6 +1142,22 @@ impl Kernels for Host {
 
     fn matrix_unary(a: &Matrix<f32, Self>, f: Analytic) -> Matrix<f32, Self> {
         a.map(|&x| f.value(x))
+    }
+
+    fn matrix_power(a: &Matrix<f32, Self>, b: &Matrix<f32, Self>) -> Matrix<f32, Self> {
+        a.pow_elementwise(b)
+    }
+
+    fn matrix_power_scalar(
+        a: &Matrix<f32, Self>,
+        scalar: f32,
+        scalar_left: bool,
+    ) -> Matrix<f32, Self> {
+        if scalar_left {
+            a.map(|&x| scalar.powf(x))
+        } else {
+            a.pow(scalar)
+        }
     }
 
     fn matrix_unary_dual(
@@ -1414,6 +1472,18 @@ mod gpu {
             a.analytic(f)
         }
 
+        fn vector_power(a: &Vector<f32, Self>, b: &Vector<f32, Self>) -> Vector<f32, Self> {
+            a.pow_elementwise(b)
+        }
+
+        fn vector_power_scalar(
+            a: &Vector<f32, Self>,
+            scalar: f32,
+            scalar_left: bool,
+        ) -> Vector<f32, Self> {
+            a.power_scalar(scalar, scalar_left)
+        }
+
         fn vector_unary_dual(
             value: &Vector<f32, Self>,
             tangent: &Vector<f32, Self>,
@@ -1499,6 +1569,18 @@ mod gpu {
 
         fn matrix_unary(a: &Matrix<f32, Self>, f: Analytic) -> Matrix<f32, Self> {
             a.analytic(f)
+        }
+
+        fn matrix_power(a: &Matrix<f32, Self>, b: &Matrix<f32, Self>) -> Matrix<f32, Self> {
+            a.pow_elementwise(b)
+        }
+
+        fn matrix_power_scalar(
+            a: &Matrix<f32, Self>,
+            scalar: f32,
+            scalar_left: bool,
+        ) -> Matrix<f32, Self> {
+            a.power_scalar(scalar, scalar_left)
         }
 
         fn matrix_unary_dual(

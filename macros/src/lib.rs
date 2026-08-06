@@ -642,10 +642,10 @@ fn infer(expr: &Expr, env: &Env) -> syn::Result<Ty> {
                 }
                 ("pow", 2) => {
                     let (a, b) = (arg_ty(0)?, arg_ty(1)?);
-                    if a.is_tensor() && b.is_tensor() {
+                    if a.is_tensor() && b.is_tensor() && a.shape != b.shape {
                         return Err(syn::Error::new(
                             call.span(),
-                            "`pow` accepts at most one tensor argument",
+                            "`pow` expects tensors of the same shape",
                         ));
                     }
                     Ok(a.unify(b))
@@ -1103,24 +1103,37 @@ fn lower_call(
         }
         ("pow", 2) => {
             let base_ty = infer(args[0], env)?;
+            let exponent_ty = infer(args[1], env)?;
             if target.is_tensor() {
                 let element = target.element();
-                if base_ty.is_tensor() {
-                    let base = lower(args[0], target, env, backend)?;
-                    let exponent = lower(args[1], element, env, backend)?;
-                    let mapped = quote!({
-                        let __exponent = #exponent;
-                        (#base).map(|&__x| ::tensorcrate::numbers::Power::power(__x, __exponent))
-                    });
-                    Ok(host_map_if_needed(mapped, base, exponent, true, backend))
-                } else {
-                    let base = lower(args[0], element, env, backend)?;
-                    let exponent = lower(args[1], target, env, backend)?;
-                    let mapped = quote!({
-                        let __base = #base;
-                        (#exponent).map(|&__x| ::tensorcrate::numbers::Power::power(__base, __x))
-                    });
-                    Ok(host_map_if_needed(mapped, exponent, base, false, backend))
+                // Every order goes through `Power`, which the tensor references
+                // implement alongside the numbers. Each has a resident kernel,
+                // so a `backend = Metal` block stays on the GPU.
+                match (base_ty.is_tensor(), exponent_ty.is_tensor()) {
+                    (true, true) => {
+                        let base = lower(args[0], target, env, backend)?;
+                        let exponent = lower(args[1], target, env, backend)?;
+                        Ok(quote!(::tensorcrate::numbers::Power::power(
+                            &(#base),
+                            &(#exponent)
+                        )))
+                    }
+                    (true, false) => {
+                        let base = lower(args[0], target, env, backend)?;
+                        let exponent = lower(args[1], element, env, backend)?;
+                        Ok(quote!(::tensorcrate::numbers::Power::power(
+                            &(#base),
+                            #exponent
+                        )))
+                    }
+                    _ => {
+                        let base = lower(args[0], element, env, backend)?;
+                        let exponent = lower(args[1], target, env, backend)?;
+                        Ok(quote!(::tensorcrate::numbers::Power::power(
+                            #base,
+                            &(#exponent)
+                        )))
+                    }
                 }
             } else {
                 let base = lower(args[0], target, env, backend)?;
@@ -1247,36 +1260,6 @@ fn lower_min_max(
     })
 }
 
-/// `pow` has no Metal kernel. Keep the result on the selected backend while
-/// making the host fallback explicit in generated code.
-fn host_map_if_needed(
-    host_expression: TokenStream,
-    tensor: TokenStream,
-    scalar: TokenStream,
-    tensor_is_base: bool,
-    backend: BackendChoice,
-) -> TokenStream {
-    if backend == BackendChoice::Host {
-        return host_expression;
-    }
-    if tensor_is_base {
-        quote!({
-            let __exponent = #scalar;
-            (#tensor)
-                .to_backend::<::tensorcrate::tensors::Host>()
-                .map(|&__x| ::tensorcrate::numbers::Power::power(__x, __exponent))
-                .to_backend::<::tensorcrate::tensors::Metal>()
-        })
-    } else {
-        quote!({
-            let __base = #scalar;
-            (#tensor)
-                .to_backend::<::tensorcrate::tensors::Host>()
-                .map(|&__x| ::tensorcrate::numbers::Power::power(__base, __x))
-                .to_backend::<::tensorcrate::tensors::Metal>()
-        })
-    }
-}
 
 /// Apply a scalar function, mapping over the elements when the value is a
 /// tensor.

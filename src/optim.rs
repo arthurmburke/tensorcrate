@@ -505,7 +505,6 @@ type Proj<'a, P> = DebugFn<Arc<dyn Fn(&mut P) + 'a>>;
 pub struct Constrained<'a, P, R> {
     rule: R,
     projection: Proj<'a, P>,
-    phanom: std::marker::PhantomData<P>,
 }
 
 impl<'a, P, R> Constrained<'a, P, R>
@@ -517,7 +516,6 @@ where
         Constrained {
             rule,
             projection: DebugFn::new(name.into(), Arc::new(projection)),
-            phanom: std::marker::PhantomData,
         }
     }
 }

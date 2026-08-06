@@ -36,6 +36,14 @@
 //! assert_eq!(decay(&Vector::new([0.0, 0.0])).data(), [1.0, 1.0]);
 //! ```
 //!
+//! [`pow`](Vector::pow) is the one member of the family that takes two operands.
+//! It is spelled the same three ways, and comes in an elementwise form —
+//! `aᵢ^bᵢ` between two tensors of the same shape — as well as the fixed-exponent
+//! one. It is deliberately not a [`BinaryOp`](super::kernels::BinaryOp): that
+//! enum's variants are the operators defined for every
+//! [`Coefficient`](crate::numbers::Coefficient), and raising an integer to an
+//! integer leaves the integers, so `pow` widens where `+` does not.
+//!
 //! Reciprocal is the one unary op in [`crate::numbers`] with no place here:
 //! there is no `recip` shader, and `1.0 / v` already divides elementwise.
 //!
@@ -43,12 +51,12 @@
 //! [`Matrix<T, Host>`]: Matrix
 
 use crate::numbers::{
-    Arccos, Arcsin, Arctan, Cos, Cosh, Csc, Exp, Ln, Sec, Sin, Sinh, Sqrt, Tan, Tanh,
+    Arccos, Arcsin, Arctan, Cos, Cosh, Csc, Exp, Ln, Power, Sec, Sin, Sinh, Sqrt, Tan, Tanh,
 };
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use crate::tensors::Metal;
 use crate::tensors::kernels::{Analytic, Kernels};
-use crate::tensors::{Host, Matrix, Vector};
+use crate::tensors::{Host, Matrix, Vector, assert_same_len, assert_same_shape};
 
 impl Vector<f32, Host> {
     /// Apply an analytic function to every element.
@@ -120,6 +128,16 @@ macro_rules! elementwise_analytic {
         pub trait Transcendental: Sized {
             /// Apply `f` to every element.
             fn analytic(&self, f: Analytic) -> Self;
+
+            /// Raise every element to `exponent`.
+            fn pow(&self, exponent: f32) -> Self;
+
+            /// Raise every element to the matching element of `exponents`.
+            ///
+            /// # Panics
+            ///
+            /// Unless the two tensors have the same shape.
+            fn pow_elementwise(&self, exponents: &Self) -> Self;
 
             $(
                 #[doc = concat!("Elementwise `", stringify!($method), "`.")]
@@ -220,14 +238,436 @@ elementwise_analytic!(
     sqrt => Sqrt,
 );
 
+
+// ---- powers ------------------------------------------------------------------
+
+impl<T: Power + Copy + 'static> Vector<T, Host> {
+
+    /// Raise every element to `exponent`.
+    ///
+    /// ```
+    /// use tensorcrate::tensors::Vector;
+    ///
+    /// let v = Vector::new([1.0, 2.0, 3.0]);
+    /// assert_eq!(v.pow(2.0).data(), [1.0, 4.0, 9.0]);
+    /// ```
+    ///
+    /// The exponent is inspected once rather than per element, so the common
+    /// powers — squaring, the square root, the reciprocal — run as the single
+    /// arithmetic operation they are instead of a call into `powf`.
+    ///
+    /// Each of those is one IEEE operation and therefore correctly rounded,
+    /// which `powf` is not: it is accurate to under an ulp, so on about one
+    /// input in a thousand the two disagree in the last bit, with the fast path
+    /// holding the better answer. A cube is *not* on the list, because `x·x·x`
+    /// rounds twice and would be the worse one.
+    pub fn pow(&self, exponent: T) -> Vector<<T as Power>::Output, Host>
+    where
+        <T as Power>::Output: 'static,
+    {
+        Vector::new(power_scalar(self.data(), exponent))
+    }
+
+    /// Raise every element to the matching element of `exponents`.
+    ///
+    /// # Panics
+    ///
+    /// Unless the two vectors have the same length.
+    #[track_caller]
+    pub fn pow_elementwise(
+        &self,
+        exponents: &Vector<T, Host>,
+    ) -> Vector<<T as Power>::Output, Host> {
+        assert_same_len(self.len(), exponents.len(), "pow");
+        Vector::new(power_pairs(self.data(), exponents.data()))
+    }
+}
+
+impl<T: Power + Copy + 'static> Matrix<T, Host> {
+
+    /// Raise every element to `exponent`; see [`Vector::pow`].
+    pub fn pow(&self, exponent: T) -> Matrix<<T as Power>::Output, Host>
+    where
+        <T as Power>::Output: 'static,
+    {
+        Matrix::from_flat(self.rows(), self.cols(), power_scalar(self.data(), exponent))
+    }
+
+    /// Raise every element to the matching element of `exponents`.
+    ///
+    /// # Panics
+    ///
+    /// Unless the two matrices have the same shape.
+    #[track_caller]
+    pub fn pow_elementwise(
+        &self,
+        exponents: &Matrix<T, Host>,
+    ) -> Matrix<<T as Power>::Output, Host> {
+        assert_same_shape(self.shape(), exponents.shape(), "pow");
+        Matrix::from_flat(
+            self.rows(),
+            self.cols(),
+            power_pairs(self.data(), exponents.data()),
+        )
+    }
+}
+
+/// `values^exponent` over a whole buffer, through a fast path where the
+/// exponent allows one.
+fn power_scalar<T: Power + Copy + 'static>(values: &[T], exponent: T) -> Vec<<T as Power>::Output>
+where
+    <T as Power>::Output: 'static,
+{
+    if let Some(fast) = fast_power(values, exponent) {
+        return fast;
+    }
+    values.iter().map(|&value| value.power(exponent)).collect()
+}
+
+/// The exponents that reduce to a single arithmetic operation.
+///
+/// Being *one* operation is the criterion for membership, because a single
+/// IEEE operation is correctly rounded — so the fast path is never less
+/// accurate than the `powf` it replaces, and is sometimes a bit more so.
+/// (`powf` is accurate to under an ulp rather than correctly rounded, so the
+/// two differ in the last bit on roughly one input in a thousand.) A cube is
+/// excluded for the same reason the others are included: `x·x·x` rounds twice,
+/// which would be a real loss rather than a rounding difference. `x⁻²` is
+/// excluded likewise.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum FastExponent {
+    /// `x⁰ = 1`, for every `x` including NaN. Exactly what `powf` answers.
+    Zero,
+    /// `x¹ = x`, sign of zero and NaN payload intact. Also exact.
+    One,
+    Square,
+    /// `x^½`. `sqrt` answers `−0` where `powf` answers `+0`, which is the one
+    /// disagreement between them and what the added zero repairs.
+    Root,
+    Reciprocal,
+}
+
+impl FastExponent {
+    /// Recognize an exponent, comparing as `f64` because that holds every `f32`
+    /// exactly.
+    fn of(exponent: f64) -> Option<Self> {
+        Some(match exponent {
+            e if e == 0.0 => Self::Zero,
+            e if e == 1.0 => Self::One,
+            e if e == 2.0 => Self::Square,
+            e if e == 0.5 => Self::Root,
+            e if e == -1.0 => Self::Reciprocal,
+            _ => return None,
+        })
+    }
+}
+
+/// Generates the specialized loop for one float type. Each arm is written as
+/// its own pass so the body carries no branch and vectorizes.
+macro_rules! fast_power_impl {
+    ($name:ident, $t:ty) => {
+        fn $name(values: &[$t], exponent: $t) -> Option<Vec<$t>> {
+            let mut out = Vec::with_capacity(values.len());
+            match FastExponent::of(exponent as f64)? {
+                FastExponent::Zero => out.resize(values.len(), 1.0),
+                FastExponent::One => out.extend_from_slice(values),
+                FastExponent::Square => out.extend(values.iter().map(|&x| x * x)),
+                FastExponent::Root => out.extend(values.iter().map(|&x| x.sqrt() + 0.0)),
+                FastExponent::Reciprocal => out.extend(values.iter().map(|&x| 1.0 / x)),
+            }
+            Some(out)
+        }
+    };
+}
+
+fast_power_impl!(fast_power_f32, f32);
+fast_power_impl!(fast_power_f64, f64);
+
+/// Try the fast path, for the element types that have one.
+///
+/// The two conditions are that the element is `f32` or `f64` and that raising
+/// it leaves it in the same type — which is why the integers, whose powers
+/// widen to `f64`, do not come through here.
+fn fast_power<T: Power + Copy + 'static>(
+    values: &[T],
+    exponent: T,
+) -> Option<Vec<<T as Power>::Output>>
+where
+    <T as Power>::Output: 'static,
+{
+    // SAFETY for all three casts below: the `TypeId` comparisons establish that
+    // `T` and the output type are exactly the concrete float named, so the
+    // slice, the scalar, and the returned buffer all have identical layout.
+    unsafe {
+        if same::<T, f32>() && same::<<T as Power>::Output, f32>() {
+            let values = std::slice::from_raw_parts(values.as_ptr().cast::<f32>(), values.len());
+            let exponent = std::ptr::read((&exponent as *const T).cast::<f32>());
+            return fast_power_f32(values, exponent).map(|out| retype(out));
+        }
+        if same::<T, f64>() && same::<<T as Power>::Output, f64>() {
+            let values = std::slice::from_raw_parts(values.as_ptr().cast::<f64>(), values.len());
+            let exponent = std::ptr::read((&exponent as *const T).cast::<f64>());
+            return fast_power_f64(values, exponent).map(|out| retype(out));
+        }
+    }
+    None
+}
+
+fn same<T: 'static, U: 'static>() -> bool {
+    std::any::TypeId::of::<T>() == std::any::TypeId::of::<U>()
+}
+
+/// Reinterpret a `Vec<T>` as a `Vec<U>`.
+///
+/// # Safety
+///
+/// `T` and `U` must be the same type; every caller has just checked that with
+/// [`same`].
+unsafe fn retype<T, U>(values: Vec<T>) -> Vec<U> {
+    let mut values = std::mem::ManuallyDrop::new(values);
+    unsafe { Vec::from_raw_parts(values.as_mut_ptr().cast::<U>(), values.len(), values.capacity()) }
+}
+
+/// `basesᵢ^exponentsᵢ` over two equal-length buffers.
+fn power_pairs<T: Power + Copy>(bases: &[T], exponents: &[T]) -> Vec<<T as Power>::Output> {
+    bases
+        .iter()
+        .zip(exponents)
+        .map(|(&base, &exponent)| base.power(exponent))
+        .collect()
+}
+
+// ---- the scalar trait, so generic code accepts tensors ----
+
+impl<T: Power + Copy + 'static> Power<T> for &Vector<T, Host>
+where
+    <T as Power>::Output: 'static,
+{
+    type Output = Vector<<T as Power>::Output, Host>;
+
+    fn power(self, exponent: T) -> Self::Output {
+        self.pow(exponent)
+    }
+}
+
+impl<T: Power + Copy + 'static> Power<T> for &Matrix<T, Host>
+where
+    <T as Power>::Output: 'static,
+{
+    type Output = Matrix<<T as Power>::Output, Host>;
+
+    fn power(self, exponent: T) -> Self::Output {
+        self.pow(exponent)
+    }
+}
+
+impl<T: Power + Copy + 'static> Power<&Vector<T, Host>> for &Vector<T, Host> {
+    type Output = Vector<<T as Power>::Output, Host>;
+
+    #[track_caller]
+    fn power(self, exponents: &Vector<T, Host>) -> Self::Output {
+        self.pow_elementwise(exponents)
+    }
+}
+
+impl<T: Power + Copy + 'static> Power<&Matrix<T, Host>> for &Matrix<T, Host> {
+    type Output = Matrix<<T as Power>::Output, Host>;
+
+    #[track_caller]
+    fn power(self, exponents: &Matrix<T, Host>) -> Self::Output {
+        self.pow_elementwise(exponents)
+    }
+}
+
+/// A scalar base with a tensor exponent — `2^v`, elementwise.
+///
+/// This is the one order with no method to hang it on, since the tensor is the
+/// argument rather than the receiver. The element types are named concretely
+/// because a blanket impl over the scalar would collide with the two above.
+macro_rules! scalar_base_power {
+    ($($t:ty),+ $(,)?) => {$(
+        impl Power<&Vector<$t, Host>> for $t {
+            type Output = Vector<$t, Host>;
+
+            fn power(self, exponents: &Vector<$t, Host>) -> Self::Output {
+                exponents.map(|&exponent| <$t as Power>::power(self, exponent))
+            }
+        }
+
+        impl Power<&Matrix<$t, Host>> for $t {
+            type Output = Matrix<$t, Host>;
+
+            fn power(self, exponents: &Matrix<$t, Host>) -> Self::Output {
+                exponents.map(|&exponent| <$t as Power>::power(self, exponent))
+            }
+        }
+    )+};
+}
+
+scalar_base_power!(f32, f64);
+
+// ---- resident tensors: the GPU power kernels ----
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+mod resident {
+    use super::{Matrix, Metal, Power, Vector, assert_same_len, assert_same_shape};
+    use crate::tensors::Host;
+
+    impl Vector<f32, Metal> {
+        /// Raise every element to `exponent`, on the GPU.
+        pub fn pow(&self, exponent: f32) -> Self {
+            self.power_scalar(exponent, false)
+        }
+
+        /// Raise every element to the matching element of `exponents`.
+        ///
+        /// # Panics
+        ///
+        /// Unless the two vectors have the same length.
+        #[track_caller]
+        pub fn pow_elementwise(&self, exponents: &Self) -> Self {
+            assert_same_len(self.len(), exponents.len(), "pow");
+            match self.storage().power(exponents.storage()) {
+                Some(data) => Vector::from_storage(self.len(), data),
+                None => self
+                    .to_backend::<Host>()
+                    .pow_elementwise(&exponents.to_backend::<Host>())
+                    .to_backend(),
+            }
+        }
+
+        /// Elementwise power with one operand fixed; `scalar_left` selects
+        /// `scalar^x` over `x^scalar`.
+        pub(crate) fn power_scalar(&self, scalar: f32, scalar_left: bool) -> Self {
+            match self.storage().power_scalar(scalar, scalar_left) {
+                Some(data) => Vector::from_storage(self.len(), data),
+                None => {
+                    let host = self.to_backend::<Host>();
+                    if scalar_left {
+                        scalar.power(&host).to_backend()
+                    } else {
+                        host.pow(scalar).to_backend()
+                    }
+                }
+            }
+        }
+    }
+
+    impl Matrix<f32, Metal> {
+        /// Raise every element to `exponent`, on the GPU.
+        pub fn pow(&self, exponent: f32) -> Self {
+            self.power_scalar(exponent, false)
+        }
+
+        /// Raise every element to the matching element of `exponents`.
+        ///
+        /// # Panics
+        ///
+        /// Unless the two matrices have the same shape.
+        #[track_caller]
+        pub fn pow_elementwise(&self, exponents: &Self) -> Self {
+            assert_same_shape(self.shape(), exponents.shape(), "pow");
+            let (rows, cols) = self.shape();
+            match self.storage().power(exponents.storage()) {
+                Some(data) => Matrix::from_storage(rows, cols, data),
+                None => self
+                    .to_backend::<Host>()
+                    .pow_elementwise(&exponents.to_backend::<Host>())
+                    .to_backend(),
+            }
+        }
+
+        pub(crate) fn power_scalar(&self, scalar: f32, scalar_left: bool) -> Self {
+            let (rows, cols) = self.shape();
+            match self.storage().power_scalar(scalar, scalar_left) {
+                Some(data) => Matrix::from_storage(rows, cols, data),
+                None => {
+                    let host = self.to_backend::<Host>();
+                    if scalar_left {
+                        scalar.power(&host).to_backend()
+                    } else {
+                        host.pow(scalar).to_backend()
+                    }
+                }
+            }
+        }
+    }
+
+    impl Power<f32> for &Vector<f32, Metal> {
+        type Output = Vector<f32, Metal>;
+
+        fn power(self, exponent: f32) -> Self::Output {
+            self.pow(exponent)
+        }
+    }
+
+    impl Power<f32> for &Matrix<f32, Metal> {
+        type Output = Matrix<f32, Metal>;
+
+        fn power(self, exponent: f32) -> Self::Output {
+            self.pow(exponent)
+        }
+    }
+
+    impl Power<&Vector<f32, Metal>> for &Vector<f32, Metal> {
+        type Output = Vector<f32, Metal>;
+
+        #[track_caller]
+        fn power(self, exponents: &Vector<f32, Metal>) -> Self::Output {
+            self.pow_elementwise(exponents)
+        }
+    }
+
+    impl Power<&Matrix<f32, Metal>> for &Matrix<f32, Metal> {
+        type Output = Matrix<f32, Metal>;
+
+        #[track_caller]
+        fn power(self, exponents: &Matrix<f32, Metal>) -> Self::Output {
+            self.pow_elementwise(exponents)
+        }
+    }
+
+    impl Power<&Vector<f32, Metal>> for f32 {
+        type Output = Vector<f32, Metal>;
+
+        fn power(self, exponents: &Vector<f32, Metal>) -> Self::Output {
+            exponents.power_scalar(self, true)
+        }
+    }
+
+    impl Power<&Matrix<f32, Metal>> for f32 {
+        type Output = Matrix<f32, Metal>;
+
+        fn power(self, exponents: &Matrix<f32, Metal>) -> Self::Output {
+            exponents.power_scalar(self, true)
+        }
+    }
+}
+
 impl<B: Kernels> Transcendental for Vector<f32, B> {
     fn analytic(&self, f: Analytic) -> Self {
         B::vector_unary(self, f)
+    }
+
+    fn pow(&self, exponent: f32) -> Self {
+        B::vector_power_scalar(self, exponent, false)
+    }
+
+    fn pow_elementwise(&self, exponents: &Self) -> Self {
+        B::vector_power(self, exponents)
     }
 }
 
 impl<B: Kernels> Transcendental for Matrix<f32, B> {
     fn analytic(&self, f: Analytic) -> Self {
         B::matrix_unary(self, f)
+    }
+
+    fn pow(&self, exponent: f32) -> Self {
+        B::matrix_power_scalar(self, exponent, false)
+    }
+
+    fn pow_elementwise(&self, exponents: &Self) -> Self {
+        B::matrix_power(self, exponents)
     }
 }

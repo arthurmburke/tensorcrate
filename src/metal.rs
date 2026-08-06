@@ -140,6 +140,8 @@ struct Gpu {
     flip_both: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     unary: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     unary_dual: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    power: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    power_scalar: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     deviation: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     axis_moments: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     distribution: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -233,6 +235,8 @@ fn build_gpu() -> Option<Gpu> {
         flip_both: pipeline("flip_both")?,
         unary: pipeline("unary")?,
         unary_dual: pipeline("unary_dual")?,
+        power: pipeline("power")?,
+        power_scalar: pipeline("power_scalar")?,
         deviation: pipeline("deviation_partial")?,
         axis_moments: pipeline("axis_moments")?,
         distribution: pipeline("distribution")?,
@@ -445,6 +449,30 @@ impl MetalBuffer<f32> {
         if self.len != 0 {
             with_gpu(|gpu| {
                 encode_elementwise(gpu, &self.raw, &rhs.raw, &output.raw, self.len, op)
+            })?;
+        }
+        Some(output)
+    }
+
+    /// Elementwise `self^rhs`.
+    pub fn power(&self, rhs: &Self) -> Option<Self> {
+        if self.len != rhs.len {
+            return None;
+        }
+        let output = Self::allocate(self.len)?;
+        if self.len != 0 {
+            with_gpu(|gpu| encode_power(gpu, &self.raw, &rhs.raw, &output.raw, self.len))?;
+        }
+        Some(output)
+    }
+
+    /// Elementwise power with one operand fixed. `scalar_left` selects
+    /// `scalar^x` over `x^scalar`.
+    pub fn power_scalar(&self, scalar: f32, scalar_left: bool) -> Option<Self> {
+        let output = Self::allocate(self.len)?;
+        if self.len != 0 {
+            with_gpu(|gpu| {
+                encode_power_scalar(gpu, &self.raw, &output.raw, self.len, scalar, scalar_left)
             })?;
         }
         Some(output)
@@ -1719,6 +1747,49 @@ fn encode_axis_distribution(
             size_of::<Statistic>(),
             7,
         );
+    }
+    dispatch_1d(&encoder, len);
+    encoder.endEncoding();
+    commit(gpu, command)
+}
+
+fn encode_power(
+    gpu: &Gpu,
+    a: &ProtocolObject<dyn MTLBuffer>,
+    b: &ProtocolObject<dyn MTLBuffer>,
+    output: &ProtocolObject<dyn MTLBuffer>,
+    len: usize,
+) -> Option<()> {
+    let command = gpu.queue.commandBuffer()?;
+    let encoder = command.computeCommandEncoder()?;
+    encoder.setComputePipelineState(&gpu.power);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(a), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(b), 0, 1);
+        encoder.setBuffer_offset_atIndex(Some(output), 0, 2);
+    }
+    dispatch_1d(&encoder, len);
+    encoder.endEncoding();
+    commit(gpu, command)
+}
+
+fn encode_power_scalar(
+    gpu: &Gpu,
+    input: &ProtocolObject<dyn MTLBuffer>,
+    output: &ProtocolObject<dyn MTLBuffer>,
+    len: usize,
+    scalar: f32,
+    scalar_left: bool,
+) -> Option<()> {
+    let command = gpu.queue.commandBuffer()?;
+    let encoder = command.computeCommandEncoder()?;
+    encoder.setComputePipelineState(&gpu.power_scalar);
+    let scalar_left = u32::from(scalar_left);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
+        encoder.setBytes_length_atIndex(NonNull::from(&scalar).cast(), 4, 2);
+        encoder.setBytes_length_atIndex(NonNull::from(&scalar_left).cast(), 4, 3);
     }
     dispatch_1d(&encoder, len);
     encoder.endEncoding();

@@ -641,6 +641,17 @@ mod gpu {
             Some(Self(Residency::Device(self.device()?.sort(order)?)))
         }
 
+        /// Elementwise `self^rhs`.
+        pub(crate) fn power(&self, rhs: &Self) -> Option<Self> {
+            Some(Self(Residency::Device(self.device()?.power(rhs.device()?)?)))
+        }
+
+        /// Elementwise power with one operand fixed.
+        pub(crate) fn power_scalar(&self, scalar: f32, scalar_left: bool) -> Option<Self> {
+            let output = self.device()?.power_scalar(scalar, scalar_left)?;
+            Some(Self(Residency::Device(output)))
+        }
+
         /// Analytic function applied elementwise; `op` is an
         pub(crate) fn unary(&self, op: Analytic) -> Option<Self> {
             Some(Self(Residency::Device(self.device()?.unary(op)?)))

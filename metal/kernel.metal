@@ -127,6 +127,34 @@ kernel void elementwise(
     }
 }
 
+// Elementwise `a^b`. Kept out of `elementwise` above rather than added to
+// `BinaryOp`, because that enum's contract is that every variant is an operator
+// defined for every `Coefficient` — and a power is not: raising an integer to an
+// integer leaves the integers. The host side has the same split for the same
+// reason.
+kernel void power(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* C       [[buffer(2)]],
+    uint i [[thread_position_in_grid]])
+{
+    C[i] = pow(A[i], B[i]);
+}
+
+// The same with one operand held fixed: `scalar_left` selects `scalar^A[i]`
+// over `A[i]^scalar`.
+kernel void power_scalar(
+    device const float* A      [[buffer(0)]],
+    device float* C            [[buffer(1)]],
+    constant float& scalar     [[buffer(2)]],
+    constant uint& scalar_left [[buffer(3)]],
+    uint i [[thread_position_in_grid]])
+{
+    float a = scalar_left ? scalar : A[i];
+    float b = scalar_left ? A[i] : scalar;
+    C[i] = pow(a, b);
+}
+
 kernel void broadcast(
     device const float* A [[buffer(0)]],
     device float* C       [[buffer(1)]],

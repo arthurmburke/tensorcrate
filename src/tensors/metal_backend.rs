@@ -35,6 +35,7 @@ use std::fmt::{self, Display};
 use std::ops::{Add, Div, Mul, Neg, Rem, Sub};
 
 use half::{bf16, f16};
+use num_traits::PrimInt;
 
 use super::{
     Analytic, Backend, BinaryOp, Compare, Host, Kernels, Matrix, Metal, Reduce, SortOrder, Vector,
@@ -381,6 +382,35 @@ impl Matrix<f32, Metal> {
                 .matmul(&other.to_backend::<Host>())
                 .to_backend(),
         }
+    }
+
+
+    /// Matrix exponentiation using efficient integer powers.
+    /// 
+    /// # Panics 
+    /// 
+    /// If this matrix is non-square.
+    #[track_caller]
+    pub fn powi<I: PrimInt>(&self, power: I) -> Self {
+        let (r, c) = self.shape();
+        assert!(r == c, "matrix powers must be square");
+
+        let mut power = power.to_i32().expect("expected a valid integer");
+
+        // Requires a single memcpy of memory on the host to metal.
+        let mut result = Matrix::<f32, Host>::identity(r).to_backend::<Metal>();
+        let mut base = self.clone();
+
+        while power > 0 {
+            if power & 1 == 1 {
+                result = result.matmul(&base);
+            }
+
+            base = base.matmul(&base);
+            power >>= 1;
+        }
+
+        result
     }
 
     /// Fused matrix multiply-add: `self·other + addend`.
