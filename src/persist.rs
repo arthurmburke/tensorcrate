@@ -6,8 +6,8 @@
 //! the tensor's extents, and a file written by one program can be read by
 //! another that has no idea how big it is.
 //!
-//! The element type needs protection that a shape no longer does, and is the
-//! harder half. The numeric tower in [`numbers`](crate::numbers) has twelve leaf
+//! The element type needs protection that a shape does not, and is the harder
+//! half. The numeric tower in [`numbers`](crate::numbers) has twelve leaf
 //! types and lets [`Complex`] and [`Dual`] nest without limit, and it
 //! deliberately carries no runtime type tag. Nothing in four `f32` distinguishes
 //! them from four `i32` once they reach a file, so the format records an element

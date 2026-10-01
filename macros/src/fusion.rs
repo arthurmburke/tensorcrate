@@ -51,12 +51,10 @@ use std::collections::{HashMap, HashSet};
 
 use proc_macro2::{Ident, Literal, Span, TokenStream};
 use quote::{format_ident, quote};
-use syn::{BinOp, Expr, UnOp};
 
-use crate::{
-    ANALYTIC, BackendChoice, Env, Shape, Ty, call_name, elementwise_mul_operands, infer, lower,
-    matmul_operands, path_name,
-};
+use crate::ast::{Arith, Binding, Builtin, Expr, ExprKind, Function};
+use crate::emit::{Env, lower};
+use crate::types::{BackendChoice, Shape, Ty};
 
 /// Operations a value may take and still be recomputed at every use rather
 /// than materialized.
@@ -68,86 +66,56 @@ const MAX_INPUTS: usize = 16;
 pub(crate) const MAX_OUTPUTS: usize = 8;
 const MAX_INSTRUCTIONS: usize = 256;
 
-// ---- recognizing elementwise operations ----------------------------------------
+/// The bindings fused lowering substitutes into their consumers.
+type Inline = HashMap<String, Expr<Ty>>;
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Arith {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Rem,
-}
+// ---- recognizing elementwise operations ----------------------------------------
 
 /// One elementwise operation, with its operands.
 enum Kind<'a> {
     /// Parentheses or an invisible group: no operation at all.
-    Pass(&'a Expr),
-    Binary(Arith, &'a Expr, &'a Expr),
-    Neg(&'a Expr),
-    Unary(&'static str, &'a Expr),
+    Pass(&'a Expr<Ty>),
+    Binary(Arith, &'a Expr<Ty>, &'a Expr<Ty>),
+    Neg(&'a Expr<Ty>),
+    Unary(Function, &'a Expr<Ty>),
     /// `max` when true.
-    MinMax(bool, &'a Expr, &'a Expr),
-    Clamp(&'a Expr, &'a Expr, &'a Expr),
-    Transpose(&'a Expr),
+    MinMax(bool, &'a Expr<Ty>, &'a Expr<Ty>),
+    Clamp(&'a Expr<Ty>, &'a Expr<Ty>, &'a Expr<Ty>),
+    Transpose(&'a Expr<Ty>),
 }
 
 fn is_real_tensor(ty: Ty) -> bool {
-    ty.is_tensor() && !ty.complex && !ty.dual
+    ty.is_tensor() && ty.is_real()
 }
 
 /// `expr` as an elementwise operation, if it is one: a real tensor result built
 /// by one of the operations a group can hold.
-fn kind<'a>(expr: &'a Expr, env: &Env) -> syn::Result<Option<Kind<'a>>> {
-    let ty = infer(expr, env)?;
-    if !is_real_tensor(ty) {
-        return Ok(None);
+fn kind(expr: &Expr<Ty>) -> Option<Kind<'_>> {
+    if !is_real_tensor(expr.ty) {
+        return None;
     }
-    Ok(match expr {
-        Expr::Paren(p) => Some(Kind::Pass(&p.expr)),
-        Expr::Group(g) => Some(Kind::Pass(&g.expr)),
-        Expr::Unary(u) if matches!(u.op, UnOp::Neg(_)) => Some(Kind::Neg(&u.expr)),
-        Expr::Binary(b) => {
-            if matmul_operands(expr).is_some() {
-                None
-            } else if let Some((left, right)) = elementwise_mul_operands(expr) {
-                Some(Kind::Binary(Arith::Mul, left, right))
-            } else {
-                let arith = match b.op {
-                    BinOp::Add(_) => Arith::Add,
-                    BinOp::Sub(_) => Arith::Sub,
-                    // A product of two vectors is a dot product, which is not
-                    // elementwise — but then the result is a scalar, which the
-                    // tensor check above has already turned away.
-                    BinOp::Mul(_) => Arith::Mul,
-                    BinOp::Div(_) => Arith::Div,
-                    BinOp::Rem(_) => Arith::Rem,
-                    _ => return Ok(None),
-                };
-                Some(Kind::Binary(arith, &b.left, &b.right))
-            }
-        }
-        Expr::Call(call) => {
-            let name = call_name(call)?;
-            let args: Vec<&Expr> = call.args.iter().collect();
-            match (name.as_str(), args.len()) {
-                ("min", 2) => Some(Kind::MinMax(false, args[0], args[1])),
-                ("max", 2) => Some(Kind::MinMax(true, args[0], args[1])),
-                ("clamp", 3) => Some(Kind::Clamp(args[0], args[1], args[2])),
-                ("transpose", 1) => Some(Kind::Transpose(args[0])),
-                (_, 1) => ANALYTIC
-                    .iter()
-                    .find(|(n, _)| *n == name)
-                    .map(|(n, _)| Kind::Unary(n, args[0])),
-                _ => None,
-            }
-        }
+    match &expr.kind {
+        ExprKind::Group { inner, .. } => Some(Kind::Pass(inner)),
+        ExprKind::Neg(inner) => Some(Kind::Neg(inner)),
+        ExprKind::ElementwiseMul(left, right) => Some(Kind::Binary(Arith::Mul, left, right)),
+        // A product of two vectors is a dot product, which is not elementwise —
+        // but then the result is a scalar, which the tensor check above has
+        // already turned away.
+        ExprKind::Binary { op, left, right } => Some(Kind::Binary(*op, left, right)),
+        ExprKind::Call { builtin, args, .. } => match builtin {
+            Builtin::Min => Some(Kind::MinMax(false, &args[0], &args[1])),
+            Builtin::Max => Some(Kind::MinMax(true, &args[0], &args[1])),
+            Builtin::Clamp => Some(Kind::Clamp(&args[0], &args[1], &args[2])),
+            Builtin::Transpose => Some(Kind::Transpose(&args[0])),
+            Builtin::Analytic(function) => Some(Kind::Unary(*function, &args[0])),
+            _ => None,
+        },
         _ => None,
-    })
+    }
 }
 
 /// The operands of an elementwise operation, in order.
-fn operands<'a>(kind: &Kind<'a>) -> Vec<&'a Expr> {
+fn operands<'a>(kind: &Kind<'a>) -> Vec<&'a Expr<Ty>> {
     match *kind {
         Kind::Pass(e) | Kind::Neg(e) | Kind::Unary(_, e) | Kind::Transpose(e) => vec![e],
         Kind::Binary(_, a, b) | Kind::MinMax(_, a, b) => vec![a, b],
@@ -155,17 +123,22 @@ fn operands<'a>(kind: &Kind<'a>) -> Vec<&'a Expr> {
     }
 }
 
+/// The value `expr` stands for when it names an inlined binding.
+fn inlined<'a>(expr: &Expr<Ty>, inline: &'a Inline) -> Option<&'a Expr<Ty>> {
+    match &expr.kind {
+        ExprKind::Var(ident) => inline.get(&ident.to_string()),
+        _ => None,
+    }
+}
+
 /// How many operations fusing `expr` would save a kernel for, looking through
 /// inlined bindings, and whether any of them is transcendental.
-fn weigh(expr: &Expr, env: &Env) -> syn::Result<(usize, bool)> {
-    if let Expr::Path(p) = expr
-        && let Ok(name) = path_name(p)
-        && let Some(inlined) = env.inline.get(&name)
-    {
-        return weigh(&inlined.clone(), env);
+fn weigh(expr: &Expr<Ty>, inline: &Inline) -> (usize, bool) {
+    if let Some(value) = inlined(expr, inline) {
+        return weigh(value, inline);
     }
-    let Some(kind) = kind(expr, env)? else {
-        return Ok((0, false));
+    let Some(kind) = kind(expr) else {
+        return (0, false);
     };
     let (mut count, mut expensive) = match kind {
         Kind::Pass(_) => (0, false),
@@ -173,58 +146,33 @@ fn weigh(expr: &Expr, env: &Env) -> syn::Result<(usize, bool)> {
         _ => (1, false),
     };
     for operand in operands(&kind) {
-        let (c, e) = weigh(operand, env)?;
+        let (c, e) = weigh(operand, inline);
         count += c;
         expensive |= e;
     }
-    Ok((count, expensive))
+    (count, expensive)
 }
 
 // ---- deciding what to inline ------------------------------------------------------
 
 /// Every identifier `expr` reads, function names aside.
-pub(crate) fn names(expr: &Expr, out: &mut HashSet<String>) {
-    match expr {
-        Expr::Path(p) => {
-            if let Some(ident) = p.path.get_ident() {
-                out.insert(ident.to_string());
-            }
-        }
-        Expr::Paren(p) => names(&p.expr, out),
-        Expr::Group(g) => names(&g.expr, out),
-        Expr::Unary(u) => names(&u.expr, out),
-        Expr::Binary(b) => {
-            names(&b.left, out);
-            names(&b.right, out);
-        }
-        Expr::Call(c) => c.args.iter().for_each(|a| names(a, out)),
-        Expr::Array(a) => a.elems.iter().for_each(|e| names(e, out)),
-        _ => {}
+fn names(expr: &Expr<Ty>, out: &mut HashSet<String>) {
+    if let ExprKind::Var(ident) = &expr.kind {
+        out.insert(ident.to_string());
+    }
+    for child in expr.children() {
+        names(child, out);
     }
 }
 
 /// Record each use of a binding in `expr`, and whether it sits directly inside
 /// an elementwise operation — the only place inlining can put it.
-fn uses(
-    expr: &Expr,
-    env: &Env,
-    in_group: bool,
-    out: &mut HashMap<String, Vec<bool>>,
-) -> syn::Result<()> {
-    if let Expr::Path(p) = expr {
-        if let Some(ident) = p.path.get_ident() {
-            out.entry(ident.to_string()).or_default().push(in_group);
-        }
-        return Ok(());
+fn uses(expr: &Expr<Ty>, in_group: bool, out: &mut HashMap<String, Vec<bool>>) {
+    if let ExprKind::Var(ident) = &expr.kind {
+        out.entry(ident.to_string()).or_default().push(in_group);
+        return;
     }
-    // A product's operands are read whole, never elementwise. (`@` is spelled
-    // `a / marker / b` underneath, so this must come before the `/` below
-    // mistakes the inner half for a division.)
-    if let Some((left, right)) = matmul_operands(expr) {
-        uses(left, env, false, out)?;
-        return uses(right, env, false, out);
-    }
-    if let Some(kind) = kind(expr, env)? {
+    if let Some(kind) = kind(expr) {
         // A real-tensor operand of an elementwise operation can be inlined into
         // it; a scalar operand only ever becomes a constant.
         let inside = match kind {
@@ -232,42 +180,29 @@ fn uses(
             _ => true,
         };
         for operand in operands(&kind) {
-            let tensor = is_real_tensor(infer(operand, env)?);
-            uses(operand, env, inside && tensor, out)?;
+            uses(operand, inside && is_real_tensor(operand.ty), out);
         }
-        return Ok(());
+        return;
     }
-    match expr {
-        Expr::Paren(p) => uses(&p.expr, env, false, out),
-        Expr::Group(g) => uses(&g.expr, env, false, out),
-        Expr::Unary(u) => uses(&u.expr, env, false, out),
-        Expr::Binary(b) => {
-            uses(&b.left, env, false, out)?;
-            uses(&b.right, env, false, out)
-        }
-        Expr::Call(c) => c.args.iter().try_for_each(|a| uses(a, env, false, out)),
-        Expr::Array(a) => a.elems.iter().try_for_each(|e| uses(e, env, false, out)),
-        _ => Ok(()),
+    // Anything else — a product's operands among them — reads its operands
+    // whole, never elementwise.
+    for child in expr.children() {
+        uses(child, false, out);
     }
 }
 
 /// Decide which bindings fused lowering substitutes into their consumers.
 ///
 /// `bindings` are the block's `let`s in order and `result` its final
-/// expression; `envs[k]` is the environment binding `k` was typed in, and
-/// `envs[bindings.len()]` the one the result is typed in.
-pub(crate) fn plan_inlining(
-    bindings: &[(String, &Expr)],
-    result: &Expr,
-    envs: &[Env],
-) -> syn::Result<HashMap<String, Expr>> {
-    let mut inline: HashMap<String, Expr> = HashMap::new();
-    for (k, (name, init)) in bindings.iter().enumerate() {
-        let env = &envs[k];
-        let Some(root) = kind(init, env)? else {
+/// expression.
+pub(crate) fn plan_inlining(bindings: &[Binding<Ty>], result: &Expr<Ty>) -> Inline {
+    let mut inline = Inline::new();
+    for (k, binding) in bindings.iter().enumerate() {
+        let (name, init) = (binding.name.to_string(), &binding.value);
+        let Some(root) = kind(init) else {
             continue;
         };
-        if matches!(root, Kind::Pass(_)) && weigh(init, env)?.0 == 0 {
+        if matches!(root, Kind::Pass(_)) && weigh(init, &Inline::new()).0 == 0 {
             continue;
         }
         // Substitution moves the expression to its uses, so nothing it reads
@@ -276,32 +211,30 @@ pub(crate) fn plan_inlining(
         let mut read = HashSet::new();
         names(init, &mut read);
         let later = &bindings[k + 1..];
-        if later
-            .iter()
-            .any(|(other, _)| other == name || read.contains(other))
-        {
+        if later.iter().any(|other| {
+            let other = other.name.to_string();
+            other == name || read.contains(&other)
+        }) {
             continue;
         }
 
         let mut found: HashMap<String, Vec<bool>> = HashMap::new();
-        for (j, (_, other)) in later.iter().enumerate() {
-            uses(other, &envs[k + 1 + j], false, &mut found)?;
+        for other in later {
+            uses(&other.value, false, &mut found);
         }
-        uses(result, &envs[bindings.len()], false, &mut found)?;
-        let Some(sites) = found.get(name) else {
+        uses(result, false, &mut found);
+        let Some(sites) = found.get(&name) else {
             continue; // unused: keep it as written
         };
         if !sites.iter().all(|&in_group| in_group) {
             continue;
         }
-        let mut weighing = env.clone();
-        weighing.inline.clone_from(&inline);
-        let (operations, expensive) = weigh(init, &weighing)?;
+        let (operations, expensive) = weigh(init, &inline);
         if sites.len() == 1 || (operations <= CHEAP_OPERATIONS && !expensive) {
-            inline.insert(name.clone(), (*init).clone());
+            inline.insert(name, init.clone());
         }
     }
-    Ok(inline)
+    inline
 }
 
 // ---- groups --------------------------------------------------------------------------
@@ -313,7 +246,7 @@ enum Node {
     Scalar(usize),
     Binary(Arith, Box<Node>, Box<Node>),
     Neg(Box<Node>),
-    Unary(&'static str, Box<Node>),
+    Unary(Function, Box<Node>),
     MinMax(bool, Box<Node>, Box<Node>),
     /// The value and the scalar indices of its bounds.
     Clamp(Box<Node>, usize, usize),
@@ -392,30 +325,31 @@ impl<'e> Site<'e> {
         }
     }
 
-    fn scalar(&mut self, expr: &Expr) -> syn::Result<Node> {
+    fn scalar(&mut self, expr: &Expr<Ty>) -> syn::Result<Node> {
         let value = lower(expr, Ty::REAL, self.env, self.backend)?;
         self.scalars.push(value);
         Ok(Node::Scalar(self.scalars.len() - 1))
     }
 
-    fn leaf(&mut self, expr: &Expr, transposed: bool) -> syn::Result<Node> {
-        let ty = infer(expr, self.env)?;
-        let value = lower(expr, ty, self.env, self.backend)?;
+    fn leaf(&mut self, expr: &Expr<Ty>, transposed: bool) -> syn::Result<Node> {
+        let value = lower(expr, expr.ty, self.env, self.backend)?;
         let key = format!("{transposed}:{value}");
         if let Some(i) = self.leaves.iter().position(|leaf| leaf.key == key) {
             return Ok(Node::Leaf(i));
         }
         let ident = format_ident!("__fused_in{}", self.leaves.len());
-        let product = match matmul_operands(expr) {
-            Some((left, right)) if self.backend.is_metal() => {
-                let (left_ty, right_ty) = (infer(left, self.env)?, infer(right, self.env)?);
-                match (left_ty.shape, right_ty.shape) {
-                    (Shape::Matrix(..), Shape::Matrix(..)) => Some((
-                        lower(left, left_ty, self.env, self.backend)?,
-                        lower(right, right_ty, self.env, self.backend)?,
-                    )),
-                    _ => None,
-                }
+        let product = match &expr.kind {
+            ExprKind::MatMul(left, right)
+                if self.backend.is_metal()
+                    && matches!(
+                        (left.ty.shape, right.ty.shape),
+                        (Shape::Matrix(..), Shape::Matrix(..))
+                    ) =>
+            {
+                Some((
+                    lower(left, left.ty, self.env, self.backend)?,
+                    lower(right, right.ty, self.env, self.backend)?,
+                ))
             }
             _ => None,
         };
@@ -432,18 +366,14 @@ impl<'e> Site<'e> {
 
     /// Build the elementwise tree for `expr`, whose elements are read in
     /// transposed order when `transposed` is set.
-    fn collect(&mut self, expr: &Expr, transposed: bool) -> syn::Result<Node> {
-        let ty = infer(expr, self.env)?;
-        if !ty.is_tensor() {
+    fn collect(&mut self, expr: &Expr<Ty>, transposed: bool) -> syn::Result<Node> {
+        if !expr.ty.is_tensor() {
             return self.scalar(expr);
         }
-        if let Expr::Path(p) = expr
-            && let Ok(name) = path_name(p)
-            && let Some(inlined) = self.env.inline.get(&name)
-        {
-            return self.collect(&inlined.clone(), transposed);
+        if let Some(value) = inlined(expr, &self.env.inline) {
+            return self.collect(value, transposed);
         }
-        let Some(kind) = kind(expr, self.env)? else {
+        let Some(kind) = kind(expr) else {
             return self.leaf(expr, transposed);
         };
         Ok(match kind {
@@ -455,7 +385,9 @@ impl<'e> Site<'e> {
                 Box::new(self.collect(b, transposed)?),
             ),
             Kind::Neg(a) => Node::Neg(Box::new(self.collect(a, transposed)?)),
-            Kind::Unary(name, a) => Node::Unary(name, Box::new(self.collect(a, transposed)?)),
+            Kind::Unary(function, a) => {
+                Node::Unary(function, Box::new(self.collect(a, transposed)?))
+            }
             Kind::MinMax(max, a, b) => Node::MinMax(
                 max,
                 Box::new(self.collect(a, transposed)?),
@@ -487,24 +419,22 @@ struct Root {
 
 /// Whether `expr` should be lowered as a fused group: an elementwise operation
 /// on real tensors that saves at least one kernel.
-fn worth_fusing(expr: &Expr, target: Ty, env: &Env) -> syn::Result<bool> {
-    if !env.fuse || !is_real_tensor(target) || infer(expr, env)? != target {
-        return Ok(false);
-    }
-    if kind(expr, env)?.is_none() {
-        return Ok(false);
-    }
-    Ok(weigh(expr, env)?.0 >= 2)
+fn worth_fusing(expr: &Expr<Ty>, target: Ty, env: &Env) -> bool {
+    env.fuse
+        && is_real_tensor(target)
+        && expr.ty == target
+        && kind(expr).is_some()
+        && weigh(expr, &env.inline).0 >= 2
 }
 
 /// Lower `expr` as one fused kernel, or `None` to lower it as written.
 pub(crate) fn try_fuse(
-    expr: &Expr,
+    expr: &Expr<Ty>,
     target: Ty,
     env: &Env,
     backend: BackendChoice,
 ) -> syn::Result<Option<TokenStream>> {
-    if !worth_fusing(expr, target, env)? {
+    if !worth_fusing(expr, target, env) {
         return Ok(None);
     }
     let mut site = Site::new(env, backend);
@@ -517,10 +447,10 @@ pub(crate) fn try_fuse(
 }
 
 /// Lower several bindings as one horizontally fused kernel, or `None` when they
-/// do not form one. Each binding is `(name, value, type)`; the result binds the
-/// names in one `let`.
+/// do not form one. Each binding is `(name, value)`; the result binds the names
+/// in one `let`.
 pub(crate) fn try_fuse_horizontally(
-    bindings: &[(Ident, &Expr, Ty)],
+    bindings: &[(Ident, &Expr<Ty>)],
     env: &Env,
     backend: BackendChoice,
 ) -> syn::Result<Option<TokenStream>> {
@@ -529,10 +459,10 @@ pub(crate) fn try_fuse_horizontally(
     }
     let mut site = Site::new(env, backend);
     let mut roots = Vec::new();
-    for (_, expr, ty) in bindings {
+    for (_, expr) in bindings {
         roots.push(Root {
             node: site.collect(expr, false)?,
-            shape: ty.shape,
+            shape: expr.ty.shape,
         });
     }
     if backend.is_metal() {
@@ -543,8 +473,8 @@ pub(crate) fn try_fuse_horizontally(
             return Ok(None);
         }
     }
-    let names = bindings.iter().map(|(name, ..)| name);
-    let types = bindings.iter().map(|(_, _, ty)| ty.rust_type(backend));
+    let names = bindings.iter().map(|(name, _)| name);
+    let types = bindings.iter().map(|(_, expr)| expr.ty.rust_type(backend));
     let value = emit(site, roots)?;
     Ok(Some(quote! { let (#(#names),*): (#(#types),*) = #value; }))
 }
@@ -552,30 +482,31 @@ pub(crate) fn try_fuse_horizontally(
 /// Whether binding `expr` may join a horizontal group of `shape`: an
 /// elementwise operation over that shape that reads none of `earlier`.
 pub(crate) fn joins_horizontally(
-    expr: &Expr,
-    ty: Ty,
+    expr: &Expr<Ty>,
     shape: Option<Shape>,
     earlier: &HashSet<String>,
     env: &Env,
-) -> syn::Result<bool> {
-    if !env.fuse || !is_real_tensor(ty) || shape.is_some_and(|shape| shape != ty.shape) {
-        return Ok(false);
-    }
-    if kind(expr, env)?.is_none() || weigh(expr, env)?.0 == 0 {
-        return Ok(false);
+) -> bool {
+    if !env.fuse
+        || !is_real_tensor(expr.ty)
+        || shape.is_some_and(|shape| shape != expr.ty.shape)
+        || kind(expr).is_none()
+        || weigh(expr, &env.inline).0 == 0
+    {
+        return false;
     }
     let mut read = HashSet::new();
-    expanded_names(expr, env, &mut read);
-    Ok(read.is_disjoint(earlier))
+    expanded_names(expr, &env.inline, &mut read);
+    read.is_disjoint(earlier)
 }
 
 /// The names `expr` reads once inlined bindings are substituted.
-fn expanded_names(expr: &Expr, env: &Env, out: &mut HashSet<String>) {
+fn expanded_names(expr: &Expr<Ty>, inline: &Inline, out: &mut HashSet<String>) {
     let mut direct = HashSet::new();
     names(expr, &mut direct);
     for name in direct {
-        if let Some(inlined) = env.inline.get(&name) {
-            expanded_names(&inlined.clone(), env, out);
+        if let Some(value) = inline.get(&name) {
+            expanded_names(value, inline, out);
         }
         out.insert(name);
     }
@@ -729,12 +660,11 @@ fn host_expr(node: &Node) -> TokenStream {
             let a = host_expr(a);
             quote!((-#a))
         }
-        Node::Unary(name, a) => {
+        Node::Unary(function, a) => {
             let a = host_expr(a);
-            let (_, trait_name) = ANALYTIC.iter().find(|(n, _)| n == name).unwrap();
             let (trait_ident, method) = (
-                Ident::new(trait_name, Span::call_site()),
-                Ident::new(name, Span::call_site()),
+                Ident::new(function.trait_name(), Span::call_site()),
+                Ident::new(function.name(), Span::call_site()),
             );
             // The same scalar function the unfused host kernel maps.
             quote!(::tensorcrate::numbers::#trait_ident::#method(#a))
@@ -766,7 +696,7 @@ enum Ins {
     Load { dst: u8, input: usize },
     Const { dst: u8, value: Constant },
     Binary { dst: u8, op: Arith, a: u8, b: u8 },
-    Unary { dst: u8, name: &'static str, a: u8 },
+    Unary { dst: u8, function: Function, a: u8 },
     Cmp { dst: u8, max: bool, a: u8, b: u8 },
     Store { src: u8, output: usize },
 }
@@ -881,11 +811,15 @@ impl Allocator<'_> {
                     b,
                 })
             }
-            Node::Unary(name, a) => {
+            Node::Unary(function, a) => {
                 let (a, owner) = self.eval(a)?;
                 self.release(a, owner);
                 let dst = self.allocate()?;
-                self.code.push(Ins::Unary { dst, name, a });
+                self.code.push(Ins::Unary {
+                    dst,
+                    function: *function,
+                    a,
+                });
                 Ok((dst, Owner::Temporary))
             }
             Node::Clamp(a, low, high) => {
@@ -1062,7 +996,10 @@ fn emit_metal(site: &mut Site<'_>, mut roots: Vec<Root>) -> syn::Result<TokenStr
 
 /// The identifiers a product's two operands are bound to.
 fn operand_idents(ident: &Ident) -> (Ident, Ident) {
-    (format_ident!("{ident}_left"), format_ident!("{ident}_right"))
+    (
+        format_ident!("{ident}_left"),
+        format_ident!("{ident}_right"),
+    )
 }
 
 /// Make the program the epilogue of a matrix product it reads, if it reads
@@ -1080,7 +1017,10 @@ fn as_epilogue(site: &mut Site<'_>, shape: Shape, inputs: &mut [usize], code: &m
     };
     // A product read both straight and transposed is two leaves; the
     // transposed read still needs it materialized.
-    let key = site.leaves[inputs[slot]].key.split_once(':').map(|(_, value)| value.to_owned());
+    let key = site.leaves[inputs[slot]]
+        .key
+        .split_once(':')
+        .map(|(_, value)| value.to_owned());
     let read_twice = site
         .leaves
         .iter()
@@ -1144,9 +1084,8 @@ fn metal_program(
             };
             quote!(#fused::Instr::<f32>::Binary { dst: #dst, op: ::tensorcrate::tensors::BinaryOp::#op, a: #a, b: #b })
         }
-        Ins::Unary { dst, name, a } => {
-            let (_, variant) = ANALYTIC.iter().find(|(n, _)| *n == name).unwrap();
-            let variant = Ident::new(variant, Span::call_site());
+        Ins::Unary { dst, function, a } => {
+            let variant = Ident::new(function.trait_name(), Span::call_site());
             quote!(#fused::Instr::<f32>::Unary { dst: #dst, op: ::tensorcrate::tensors::Analytic::#variant, a: #a })
         }
         Ins::Cmp { dst, max, a, b } => {

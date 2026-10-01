@@ -382,3 +382,47 @@ fn reduce_lets_numbers_beat_nans() {
     assert_eq!(f32k::reduce(&values, Reduce::Max), 31.0);
     assert!(f32k::reduce(&values, Reduce::Sum).is_nan());
 }
+
+// The kernels are safe functions over raw-pointer loops, so a length mismatch
+// must panic in every build profile rather than read past a slice.
+
+#[test]
+#[should_panic(expected = "slice lengths differ")]
+fn dot_rejects_mismatched_lengths() {
+    f32k::dot(&[1.0; 64], &[1.0; 8]);
+}
+
+#[test]
+#[should_panic(expected = "slice lengths differ")]
+fn elementwise_rejects_a_short_output() {
+    let mut out = [0.0f64; 8];
+    f64k::elementwise(&[1.0; 64], &[1.0; 64], BinaryOp::Add, &mut out);
+}
+
+#[test]
+#[should_panic(expected = "slice lengths differ")]
+fn accumulate_rejects_a_short_input() {
+    let mut totals = [0.0f32; 64];
+    f32k::accumulate(&mut totals, &[1.0; 8]);
+}
+
+#[test]
+#[should_panic(expected = "do not hold")]
+fn matmul_rejects_extents_larger_than_the_slices() {
+    let mut out = [0.0f32; 4];
+    f32k::matmul_accumulate(&[1.0; 4], &[1.0; 4], 2, 16, 2, &mut out);
+}
+
+#[test]
+#[should_panic(expected = "do not hold")]
+fn matmul_rejects_extents_whose_product_overflows() {
+    let mut out = [0.0f32; 0];
+    f32k::matmul(&[], &[], usize::MAX, 2, 0, &mut out);
+}
+
+#[test]
+#[should_panic(expected = "not a power of two")]
+fn fft_rejects_a_length_that_is_not_a_power_of_two() {
+    let mut buf = [0.0f32; 24];
+    fft_f32::radix2(&mut buf, 12, -1.0);
+}

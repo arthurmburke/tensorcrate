@@ -100,9 +100,9 @@ use crate::numbers::Real;
 pub trait Adjoint<B: Backend>: Sized + 'static {
     /// The additive identity of *this value's* shape.
     ///
-    /// A zero adjoint has to match the value it belongs to, and with runtime
-    /// dimensions the type no longer says what that shape is — so the zero is
-    /// built from an existing value rather than conjured from nothing.
+    /// A zero adjoint has to match the value it belongs to, and the shape is a
+    /// runtime value the type does not carry — so the zero is built from an
+    /// existing value rather than conjured from nothing.
     fn zeros_like(&self) -> Self;
 
     /// A second copy of this value on the same backend.

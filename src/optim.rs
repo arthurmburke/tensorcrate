@@ -785,30 +785,28 @@ fn descend<T: Real>(
     b.sub(p, step)
 }
 
-/// A simple wrapper around a function that allows us
-/// to use to in debug structs.
-#[derive(Clone)]
-struct DebugFn<F> {
+/// The named projection a [`Constrained`] rule applies after each update.
+///
+/// A closure has no `Debug`, so the name stands in for it there.
+struct Projection<'a, P> {
     name: String,
-    f: F,
+    apply: Arc<dyn Fn(&mut P) + 'a>,
 }
 
-impl<F> DebugFn<F> {
-    pub fn new<S: Into<String>>(name: S, f: F) -> Self {
-        DebugFn {
-            name: name.into(),
-            f,
+impl<P> Clone for Projection<'_, P> {
+    fn clone(&self) -> Self {
+        Projection {
+            name: self.name.clone(),
+            apply: Arc::clone(&self.apply),
         }
     }
 }
 
-impl<F> std::fmt::Debug for DebugFn<F> {
+impl<P> std::fmt::Debug for Projection<'_, P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "DebugFn({})", self.name)
+        write!(f, "Projection({})", self.name)
     }
 }
-
-type Proj<'a, P> = DebugFn<Arc<dyn Fn(&mut P) + 'a>>;
 
 /// Constrained rule for a custom parameter type. Applies a
 /// projection after the update, so the parameter stays in a feasible set. The
@@ -817,7 +815,7 @@ type Proj<'a, P> = DebugFn<Arc<dyn Fn(&mut P) + 'a>>;
 #[derive(Clone, Debug)]
 pub struct Constrained<'a, P, R> {
     rule: R,
-    projection: Proj<'a, P>,
+    projection: Projection<'a, P>,
 }
 
 impl<'a, P, R> Constrained<'a, P, R>
@@ -825,10 +823,15 @@ where
     P: Parameter,
     R: Rule<P>,
 {
+    /// Wrap `rule` so that `projection` runs after every update. `name`
+    /// identifies the projection in `Debug` output.
     pub fn new<S: Into<String>, F: Fn(&mut P) + 'a>(name: S, rule: R, projection: F) -> Self {
         Constrained {
             rule,
-            projection: DebugFn::new(name.into(), Arc::new(projection)),
+            projection: Projection {
+                name: name.into(),
+                apply: Arc::new(projection),
+            },
         }
     }
 }
@@ -836,7 +839,7 @@ where
 impl<'a, P: Parameter, R: Rule<P>> Rule<P> for Constrained<'a, P, R> {
     fn update(&mut self, parameters: &mut P, gradient: &P) {
         self.rule.update(parameters, gradient);
-        (self.projection.f)(parameters);
+        (self.projection.apply)(parameters);
     }
 
     fn reset(&mut self) {

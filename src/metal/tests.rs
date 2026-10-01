@@ -1,0 +1,460 @@
+//! Tests of the Metal module against the device on the test machine.
+
+use std::mem::size_of;
+
+use half::{bf16, f16};
+
+use crate::tensors::{Analytic, BinaryOp};
+
+use super::buffer::MetalBuffer;
+use super::device::GPU;
+use super::slices::{broadcast_f32, elementwise_f32, fft_f32_interleaved, ifft_f32_interleaved};
+use super::sync::synchronize;
+
+fn cpu_matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+    let mut c = vec![0.0f32; m * n];
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0.0f32;
+            for p in 0..k {
+                acc += a[i * k + p] * b[p * n + j];
+            }
+            c[i * n + j] = acc;
+        }
+    }
+    c
+}
+
+#[test]
+fn gpu_elementwise_matches_cpu() {
+    let a: Vec<f32> = (0..1000).map(|i| i as f32 * 0.1).collect();
+    let b: Vec<f32> = (0..1000).map(|i| (i % 9) as f32 + 1.0).collect();
+    for (op, f) in [
+        (BinaryOp::Add, (|x: f32, y| x + y) as fn(f32, f32) -> f32),
+        (BinaryOp::Sub, |x, y| x - y),
+        (BinaryOp::Mul, |x, y| x * y),
+        (BinaryOp::Div, |x, y| x / y),
+    ] {
+        if let Some(gpu) = elementwise_f32(&a, &b, op) {
+            for (i, g) in gpu.iter().enumerate() {
+                let want = f(a[i], b[i]);
+                assert!((g - want).abs() < 1e-3, "op {op:?} at {i}: {g} vs {want}");
+            }
+        }
+    }
+}
+
+#[test]
+fn gpu_broadcast_matches_cpu() {
+    let values: Vec<f32> = (0..1000).map(|i| i as f32 * 0.125 - 3.0).collect();
+    if let Some(gpu) = broadcast_f32(&values, 2.5, BinaryOp::Mul, false) {
+        for (actual, value) in gpu.iter().zip(values) {
+            assert!((actual - value * 2.5).abs() < 1e-5);
+        }
+    }
+}
+
+#[test]
+fn gpu_fft_and_ifft_match_the_cpu_definition() {
+    let count = 1024usize;
+    let mut input = Vec::with_capacity(count * 2);
+    for i in 0..count {
+        input.push((i % 17) as f32 * 0.25 - 2.0);
+        input.push((i % 11) as f32 * -0.125 + 0.5);
+    }
+
+    let Some(spectrum) = fft_f32_interleaved(&input) else {
+        eprintln!("no Metal device; skipping GPU comparison");
+        return;
+    };
+    let reconstructed = ifft_f32_interleaved(&spectrum).unwrap();
+    for (actual, expected) in reconstructed.iter().zip(input) {
+        assert!(
+            (actual - expected).abs() < 2e-4,
+            "gpu={actual} cpu={expected}"
+        );
+    }
+}
+
+#[test]
+fn accumulating_matmul_adds_into_its_target() {
+    let (m, k, n) = (3usize, 4usize, 2usize);
+    let a: Vec<f32> = (0..m * k).map(|i| (i % 5) as f32 - 2.0).collect();
+    let b: Vec<f32> = (0..k * n).map(|i| (i % 3) as f32 * 0.5).collect();
+    let Some(buf_a) = MetalBuffer::from_slice(&a) else {
+        eprintln!("no Metal device; skipping accumulation comparison");
+        return;
+    };
+    let buf_b = MetalBuffer::from_slice(&b).unwrap();
+
+    let product = cpu_matmul(&a, &b, m, k, n);
+    let seed: Vec<f32> = (0..m * n).map(|i| i as f32).collect();
+    let mut target = MetalBuffer::from_slice(&seed).unwrap();
+    buf_a
+        .matmul_accumulate(&buf_b, &mut target, m, k, n)
+        .expect("accumulating dispatch");
+
+    for (index, (actual, base)) in target.as_slice().iter().zip(&seed).enumerate() {
+        let expected = base + product[index];
+        assert!((actual - expected).abs() < 1e-4, "{actual} vs {expected}");
+    }
+}
+
+#[test]
+fn tensorops_multiplies_half_and_bfloat_inputs() {
+    // Cross both 64×64 tile boundaries and leave partial tiles on each
+    // edge, so this covers the dispatch geometry as well as the data types.
+    let (m, k, n) = (70usize, 33usize, 69usize);
+    let left = (0..m * k)
+        .map(|index| ((index % 7) as f32 - 3.0) * 0.25)
+        .collect::<Vec<_>>();
+    let right = (0..k * n)
+        .map(|index| ((index % 5) as f32 - 2.0) * 0.125)
+        .collect::<Vec<_>>();
+    let expected = cpu_matmul(&left, &right, m, k, n);
+
+    let left_f16 = left.iter().copied().map(f16::from_f32).collect::<Vec<_>>();
+    let right_f16 = right.iter().copied().map(f16::from_f32).collect::<Vec<_>>();
+    let Some(left_f16) = MetalBuffer::<f16>::from_slice(&left_f16) else {
+        eprintln!("no Metal device; skipping TensorOps comparison");
+        return;
+    };
+    let right_f16 = MetalBuffer::<f16>::from_slice(&right_f16).unwrap();
+    let Some(compact_f16) = left_f16.matmul(&right_f16, m, k, n) else {
+        eprintln!("no Metal 4 TensorOps support; skipping TensorOps comparison");
+        return;
+    };
+    for (actual, expected) in compact_f16.as_slice().iter().zip(&expected) {
+        assert!((f32::from(*actual) - expected).abs() < 0.02);
+    }
+    let wide_f16 = left_f16.matmul_f32(&right_f16, m, k, n).unwrap();
+    for (actual, expected) in wide_f16.as_slice().iter().zip(&expected) {
+        assert!((actual - expected).abs() < 1e-4);
+    }
+
+    let left_bf16 = left.iter().copied().map(bf16::from_f32).collect::<Vec<_>>();
+    let right_bf16 = right
+        .iter()
+        .copied()
+        .map(bf16::from_f32)
+        .collect::<Vec<_>>();
+    let left_bf16 = MetalBuffer::<bf16>::from_slice(&left_bf16).unwrap();
+    let right_bf16 = MetalBuffer::<bf16>::from_slice(&right_bf16).unwrap();
+    let compact_bf16 = left_bf16.matmul(&right_bf16, m, k, n).unwrap();
+    for (actual, expected) in compact_bf16.as_slice().iter().zip(&expected) {
+        assert!((f32::from(*actual) - expected).abs() < 0.1);
+    }
+    let wide_bf16 = left_bf16.matmul_f32(&right_bf16, m, k, n).unwrap();
+    for (actual, expected) in wide_bf16.as_slice().iter().zip(&expected) {
+        assert!((actual - expected).abs() < 1e-4);
+    }
+}
+
+#[test]
+fn unary_dual_applies_a_function_and_its_derivative() {
+    let value: Vec<f32> = (0..64).map(|i| (i % 9) as f32 * 0.1 + 0.05).collect();
+    let tangent: Vec<f32> = (0..64).map(|i| (i % 4) as f32 - 1.5).collect();
+    let Some(buf_value) = MetalBuffer::from_slice(&value) else {
+        eprintln!("no Metal device; skipping unary comparison");
+        return;
+    };
+    let buf_tangent = MetalBuffer::from_slice(&tangent).unwrap();
+
+    // Op 12 is tanh: f' = 1 − tanh².
+    let (values, tangents) = buf_value.unary_dual(&buf_tangent, Analytic::Tanh).unwrap();
+    for (index, (&actual, &expected)) in values.as_slice().iter().zip(&value).enumerate() {
+        let want = expected.tanh();
+        assert!((actual - want).abs() < 1e-4, "value at {index}");
+        let derivative = 1.0 - want * want;
+        let want_tangent = derivative * tangent[index];
+        assert!(
+            (tangents.as_slice()[index] - want_tangent).abs() < 1e-4,
+            "tangent at {index}"
+        );
+    }
+
+    assert_eq!(size_of::<BinaryOp>(), 2);
+    assert_eq!(size_of::<Analytic>(), 2);
+}
+
+#[test]
+fn a_recycled_allocation_is_never_clobbered_by_queued_work() {
+    // Work is committed without waiting, so an allocation dropped while its
+    // dispatch is still queued must not be handed straight back out: the
+    // kernel would land on top of whatever the next owner put there. Ten
+    // rounds, because the failure is a race the GPU can win by luck.
+    let input: Vec<f32> = (0..256).map(|i| (i % 13) as f32 * 0.1).collect();
+    let Some(source) = MetalBuffer::from_slice(&input) else {
+        eprintln!("no Metal device; skipping the recycling check");
+        return;
+    };
+
+    let known: Vec<f32> = (0..256).map(|i| i as f32).collect();
+    for round in 0..10 {
+        // Queue a dispatch and drop its output immediately.
+        drop(source.unary(Analytic::Tanh).expect("unary dispatch"));
+        // This may reuse that allocation; its contents must be what was
+        // uploaded, not what the queued kernel owed its previous owner.
+        let fresh = MetalBuffer::from_slice(&known).expect("upload");
+        assert_eq!(fresh.to_vec(), known, "round {round}");
+    }
+}
+
+#[test]
+fn shared_buffers_keep_chained_operations_gpu_resident() {
+    let a = vec![1.0f32, 2.0, 3.0, 4.0];
+    let b = vec![5.0f32, 6.0, 7.0, 8.0];
+    let Some(a) = MetalBuffer::from_slice(&a) else {
+        eprintln!("no Metal device; skipping shared-buffer comparison");
+        return;
+    };
+    let b = MetalBuffer::from_slice(&b).unwrap();
+    let product = a.matmul(&b, 2, 2, 2).unwrap();
+    let scaled = product.broadcast(0.5, BinaryOp::Mul, false).unwrap();
+    assert_eq!(scaled.to_vec(), vec![9.5, 11.0, 21.5, 25.0]);
+
+    let complex = MetalBuffer::from_slice(&[1.0, 0.0, 2.0, -1.0, 0.5, 3.0, -2.0, 0.25]).unwrap();
+    let reconstructed = complex.fft().unwrap().ifft().unwrap().to_vec();
+    for (actual, expected) in reconstructed.iter().zip(complex.to_vec()) {
+        assert!((actual - expected).abs() < 1e-5);
+    }
+}
+
+#[test]
+fn stacking_reads_queued_device_results_without_host_staging() {
+    let Some(first) = MetalBuffer::from_slice(&[1.0, 2.0, 3.0]) else {
+        eprintln!("no Metal device; skipping device stacking comparison");
+        return;
+    };
+    let second = MetalBuffer::from_slice(&[4.0, 5.0, 6.0]).unwrap();
+
+    // Leave both inputs as pending GPU results. The stack dispatch must
+    // consume those buffers directly, in command-queue order.
+    let first = first.broadcast(10.0, BinaryOp::Add, false).unwrap();
+    let second = second.broadcast(20.0, BinaryOp::Add, false).unwrap();
+
+    let vertical = MetalBuffer::vstack(&[&first, &second], 3).unwrap();
+    assert_eq!(vertical.to_vec(), vec![11.0, 12.0, 13.0, 24.0, 25.0, 26.0]);
+
+    let horizontal = MetalBuffer::hstack(&[&first, &second], 3).unwrap();
+    assert_eq!(
+        horizontal.to_vec(),
+        vec![11.0, 24.0, 12.0, 25.0, 13.0, 26.0]
+    );
+}
+
+#[test]
+fn tiled_transpose_stays_queued_and_handles_partial_tiles() {
+    const ROWS: usize = 19;
+    const COLS: usize = 23;
+    synchronize();
+
+    let values = (0..ROWS * COLS)
+        .map(|index| index as f32)
+        .collect::<Vec<_>>();
+    let Some(input) = MetalBuffer::from_slice(&values) else {
+        eprintln!("no Metal device; skipping device transpose comparison");
+        return;
+    };
+    let queued = input.broadcast(1.0, BinaryOp::Add, false).unwrap();
+    let transposed = queued.transpose(ROWS, COLS).unwrap();
+
+    let pending = GPU.with(|cell| {
+        cell.get()
+            .and_then(Option::as_ref)
+            .map_or(0, |gpu| gpu.pending.borrow().len())
+    });
+    assert_eq!(pending, 2, "transpose unexpectedly synchronized GPU work");
+
+    let expected = (0..COLS)
+        .flat_map(|col| (0..ROWS).map(move |row| (row * COLS + col) as f32 + 1.0))
+        .collect::<Vec<_>>();
+    assert_eq!(transposed.to_vec(), expected);
+
+    let empty = MetalBuffer::<f32>::from_slice(&[]).unwrap();
+    assert!(empty.transpose(0, COLS).unwrap().is_empty());
+}
+
+#[test]
+fn matrix_concat_and_stack_stay_on_the_device() {
+    const ROWS: usize = 19;
+    const LEFT_COLS: usize = 13;
+    const RIGHT_COLS: usize = 7;
+    synchronize();
+
+    let left_values = (0..ROWS * LEFT_COLS)
+        .map(|index| index as f32)
+        .collect::<Vec<_>>();
+    let right_values = (0..ROWS * RIGHT_COLS)
+        .map(|index| 1_000.0 + index as f32)
+        .collect::<Vec<_>>();
+    let Some(left) = MetalBuffer::from_slice(&left_values) else {
+        eprintln!("no Metal device; skipping matrix assembly comparison");
+        return;
+    };
+    let right = MetalBuffer::from_slice(&right_values).unwrap();
+    let left = left.broadcast(1.0, BinaryOp::Add, false).unwrap();
+    let right = right.broadcast(2.0, BinaryOp::Add, false).unwrap();
+    let concat = left
+        .concat_matrix(&right, ROWS, LEFT_COLS, RIGHT_COLS)
+        .unwrap();
+
+    const TOP_ROWS: usize = 5;
+    const BOTTOM_ROWS: usize = 7;
+    const COLS: usize = 11;
+    let top_values = (0..TOP_ROWS * COLS)
+        .map(|index| index as f32)
+        .collect::<Vec<_>>();
+    let bottom_values = (0..BOTTOM_ROWS * COLS)
+        .map(|index| 500.0 + index as f32)
+        .collect::<Vec<_>>();
+    let top = MetalBuffer::from_slice(&top_values)
+        .unwrap()
+        .broadcast(3.0, BinaryOp::Add, false)
+        .unwrap();
+    let bottom = MetalBuffer::from_slice(&bottom_values)
+        .unwrap()
+        .broadcast(4.0, BinaryOp::Add, false)
+        .unwrap();
+    let stack = top
+        .stack_matrix(&bottom, TOP_ROWS, BOTTOM_ROWS, COLS)
+        .unwrap();
+
+    let pending = GPU.with(|cell| {
+        cell.get()
+            .and_then(Option::as_ref)
+            .map_or(0, |gpu| gpu.pending.borrow().len())
+    });
+    assert_eq!(
+        pending, 6,
+        "matrix assembly unexpectedly synchronized GPU work"
+    );
+
+    let mut expected_concat = Vec::with_capacity(ROWS * (LEFT_COLS + RIGHT_COLS));
+    for row in 0..ROWS {
+        expected_concat.extend(
+            left_values[row * LEFT_COLS..(row + 1) * LEFT_COLS]
+                .iter()
+                .map(|value| value + 1.0),
+        );
+        expected_concat.extend(
+            right_values[row * RIGHT_COLS..(row + 1) * RIGHT_COLS]
+                .iter()
+                .map(|value| value + 2.0),
+        );
+    }
+    assert_eq!(concat.to_vec(), expected_concat);
+
+    let expected_stack = top_values
+        .iter()
+        .map(|value| value + 3.0)
+        .chain(bottom_values.iter().map(|value| value + 4.0))
+        .collect::<Vec<_>>();
+    assert_eq!(stack.to_vec(), expected_stack);
+}
+
+#[test]
+fn matrix_merges_consume_queued_device_buffers() {
+    const MATRICES: usize = 3;
+    const ROWS: usize = 19;
+    const COLS: usize = 7;
+    synchronize();
+
+    let host = (0..MATRICES)
+        .map(|matrix| {
+            (0..ROWS * COLS)
+                .map(|index| matrix as f32 * 1_000.0 + index as f32)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let Some(inputs) = host
+        .iter()
+        .map(|values| MetalBuffer::from_slice(values))
+        .collect::<Option<Vec<_>>>()
+    else {
+        eprintln!("no Metal device; skipping matrix merge comparison");
+        return;
+    };
+    let queued = inputs
+        .iter()
+        .enumerate()
+        .map(|(index, input)| {
+            input
+                .broadcast(index as f32 + 1.0, BinaryOp::Add, false)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let buffers = queued.iter().collect::<Vec<_>>();
+
+    let horizontal = MetalBuffer::hmerge(&buffers, ROWS, COLS).unwrap();
+    let vertical = MetalBuffer::vmerge(&buffers, ROWS, COLS).unwrap();
+
+    let pending = GPU.with(|cell| {
+        cell.get()
+            .and_then(Option::as_ref)
+            .map_or(0, |gpu| gpu.pending.borrow().len())
+    });
+    assert_eq!(
+        pending, 5,
+        "matrix merge unexpectedly synchronized GPU work"
+    );
+
+    let mut expected_horizontal = Vec::with_capacity(MATRICES * ROWS * COLS);
+    for row in 0..ROWS {
+        for (matrix, values) in host.iter().enumerate() {
+            expected_horizontal.extend(
+                values[row * COLS..(row + 1) * COLS]
+                    .iter()
+                    .map(|value| value + matrix as f32 + 1.0),
+            );
+        }
+    }
+    assert_eq!(horizontal.to_vec(), expected_horizontal);
+
+    let expected_vertical = host
+        .iter()
+        .enumerate()
+        .flat_map(|(matrix, values)| values.iter().map(move |value| value + matrix as f32 + 1.0))
+        .collect::<Vec<_>>();
+    assert_eq!(vertical.to_vec(), expected_vertical);
+}
+
+/// Operations are committed without waiting, so a long dependent chain is
+/// the thing that would break if command buffers on one queue did not run in
+/// commit order, or if a kernel could start before its input was written.
+/// Each link here depends on the previous one and every link is exactly
+/// representable, so any reordering, overlap, or dropped stage is an
+/// unambiguous mismatch rather than a rounding difference.
+#[test]
+fn deferred_completion_preserves_the_order_of_a_dependent_chain() {
+    const LINKS: usize = 250; // past the 64-buffer flush point, several times
+    let start: Vec<f32> = (0..64).map(|i| i as f32).collect();
+    let Some(mut buffer) = MetalBuffer::from_slice(&start) else {
+        eprintln!("no Metal device; skipping deferred-completion chain");
+        return;
+    };
+
+    let ones = MetalBuffer::from_slice(&vec![1.0f32; 64]).unwrap();
+    for _ in 0..LINKS {
+        // +1 via broadcast, then +1 via elementwise: two kernels per link,
+        // each reading what the one before it just wrote.
+        buffer = buffer.broadcast(1.0, BinaryOp::Add, false).unwrap();
+        buffer = buffer.elementwise(&ones, BinaryOp::Add).unwrap();
+    }
+
+    let expected: Vec<f32> = (0..64).map(|i| (i + 2 * LINKS) as f32).collect();
+    assert_eq!(buffer.to_vec(), expected);
+}
+
+/// `synchronize` has to be enough on its own: after it returns, work queued
+/// earlier must be visible to a later read that does not itself sync.
+#[test]
+fn synchronize_makes_queued_work_observable() {
+    let Some(buffer) = MetalBuffer::from_slice(&[3.0f32; 32]) else {
+        eprintln!("no Metal device; skipping synchronize check");
+        return;
+    };
+    let doubled = buffer.broadcast(2.0, BinaryOp::Mul, false).unwrap();
+    synchronize();
+    assert_eq!(doubled.to_vec(), vec![6.0f32; 32]);
+}

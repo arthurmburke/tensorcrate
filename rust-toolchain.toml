@@ -1,8 +1,6 @@
-# Dimensions are ordinary runtime values now, so nothing needs
-# `generic_const_exprs` any more and the crate builds on stable. Pinning the
-# channel here means the toolchain travels with the repository instead of living
-# in a per-directory rustup override — which is what broke when the crate was
-# renamed.
+# The crate builds on stable. Pinning the channel here means the toolchain
+# travels with the repository instead of living in a per-directory rustup
+# override.
 [toolchain]
 channel = "stable"
 components = ["clippy", "rustfmt"]

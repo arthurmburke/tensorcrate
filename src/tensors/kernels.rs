@@ -1566,7 +1566,7 @@ pub(crate) fn axis_distributions<T: Real, B: Backend>(
 }
 
 /// The output shape of a valid correlation, which is also where the "does the
-/// window fit" check lives now that both shapes are runtime values.
+/// window fit" check lives, since both shapes are runtime values.
 #[track_caller]
 pub(crate) fn correlation_shape(input: (usize, usize), window: (usize, usize)) -> (usize, usize) {
     assert!(
