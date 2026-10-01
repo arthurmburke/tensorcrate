@@ -2,6 +2,7 @@
 //! every element type, and the buffer pool, built once on first use.
 
 use std::cell::{Cell, OnceCell, RefCell};
+use std::collections::VecDeque;
 
 use dispatch2::DispatchData;
 use half::{bf16, f16};
@@ -9,8 +10,8 @@ use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandQueue, MTLComputePipelineState, MTLCreateSystemDefaultDevice,
-    MTLDevice, MTLGPUFamily, MTLLibrary,
+    MTLBuffer, MTLCommandBuffer, MTLCommandQueue, MTLComputePipelineState,
+    MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily, MTLLibrary,
 };
 
 use super::MetalElement;
@@ -41,9 +42,30 @@ pub(super) struct Gpu {
     pub(super) fft_bit_reverse: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub(super) fft_stage: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub(super) pool: RefCell<Pool>,
-    /// Command buffers committed but not yet waited on — see [`commit`](super::sync::commit).
-    pub(super) pending: RefCell<Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>>,
+    /// Command buffers committed but not yet known to have finished, oldest
+    /// first, each with its sequence number — see [`commit`](super::sync::commit).
+    pub(super) pending: RefCell<VecDeque<(u64, CommandBuffer)>>,
+    /// The sequence number of the last command buffer committed.
+    pub(super) committed: Cell<u64>,
+    /// Every command buffer up to this sequence number has completed.
+    pub(super) completed: Cell<u64>,
+    /// How many times the CPU has blocked on the GPU, for the tests.
+    pub(super) waits: Cell<u64>,
+    /// How many operations have been encoded, for the tests.
+    pub(super) operations: Cell<u64>,
+    /// The command buffer operations are being encoded into, not yet committed
+    /// — see [`compute`](super::sync::compute).
+    pub(super) open: RefCell<Option<super::sync::Batch>>,
 }
+
+/// Command buffers kept queued ahead of the GPU before an allocation waits for
+/// an old one to finish rather than making a new one.
+const QUEUE_DEPTH: u64 = 4;
+
+/// The smallest allocation worth waiting for rather than making afresh.
+const WAIT_FOR_BYTES: usize = 1 << 20;
+
+pub(super) type CommandBuffer = Retained<ProtocolObject<dyn MTLCommandBuffer>>;
 
 pub(super) type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 
@@ -53,6 +75,9 @@ pub(super) struct Typed {
     pub(super) matmul: Pipeline,
     /// The TensorOps product for this type, on M5-class GPUs.
     pub(super) tensorops: Option<Pipeline>,
+    /// The same with relaxed precision, for [`MatmulPrecision::Relaxed`]; `f32`
+    /// only.
+    pub(super) tensorops_relaxed: Option<Pipeline>,
     pub(super) elementwise: Pipeline,
     pub(super) broadcast: Pipeline,
     pub(super) compare: Pipeline,
@@ -83,12 +108,39 @@ pub(super) struct Typed {
     pub(super) matmul_epilogue: Pipeline,
     /// The same on TensorOps, on M5-class GPUs.
     pub(super) tensorops_epilogue: Option<Pipeline>,
+    /// The same with relaxed precision; `f32` only.
+    pub(super) tensorops_epilogue_relaxed: Option<Pipeline>,
 }
 
 impl Gpu {
     /// The pipelines compiled for element type `T`.
     pub(super) fn kernels<T: MetalElement>(&self) -> &Typed {
         &self.typed[T::INDEX]
+    }
+
+    /// The TensorOps product for `T` at this thread's [`MatmulPrecision`], if
+    /// the GPU has TensorOps and they are enabled.
+    pub(super) fn tensorops_matmul<T: MetalElement>(&self) -> Option<&Pipeline> {
+        let kernels = self.kernels::<T>();
+        let relaxed = match matmul_precision() {
+            MatmulPrecision::Relaxed => kernels.tensorops_relaxed.as_ref(),
+            MatmulPrecision::Exact => None,
+        };
+        relaxed
+            .or(kernels.tensorops.as_ref())
+            .filter(|_| tensorops_enabled())
+    }
+
+    /// The same for a product with a fused epilogue.
+    pub(super) fn tensorops_epilogue<T: MetalElement>(&self) -> Option<&Pipeline> {
+        let kernels = self.kernels::<T>();
+        let relaxed = match matmul_precision() {
+            MatmulPrecision::Relaxed => kernels.tensorops_epilogue_relaxed.as_ref(),
+            MatmulPrecision::Exact => None,
+        };
+        relaxed
+            .or(kernels.tensorops_epilogue.as_ref())
+            .filter(|_| tensorops_enabled())
     }
 }
 
@@ -100,6 +152,39 @@ pub(super) struct TensorOpsPipelines {
 thread_local! {
     pub(super) static GPU: OnceCell<Option<Gpu>> = const { OnceCell::new() };
     pub(super) static TENSOROPS: Cell<bool> = const { Cell::new(true) };
+    static PRECISION: Cell<MatmulPrecision> = const { Cell::new(MatmulPrecision::Exact) };
+}
+
+/// How exactly the GPU must compute an `f32` matrix product.
+///
+/// On M5-class GPUs a product runs on the matrix units of TensorOps. Asked for
+/// full `f32` accuracy they reach about 15 TFLOP/s on a large product; allowed to
+/// trade accuracy for speed, about 24 — at a relative error near `1e-3`, about
+/// what `f16` inputs give. That is usually plenty for training a network, and
+/// rarely enough for anything that solves a system or compares results
+/// exactly, so it is opt-in.
+///
+/// Storing the operands as `f16` or `bf16` is faster again — about 55–60
+/// TFLOP/s, with `matmul_f32` keeping an `f32` result — at the cost of the
+/// storage format. On GPUs without TensorOps the setting changes nothing.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
+pub enum MatmulPrecision {
+    /// Every product is computed to `f32` accuracy. The default.
+    #[default]
+    Exact,
+    /// `f32` products may run in reduced precision internally, for speed.
+    Relaxed,
+}
+
+/// Set how exactly `f32` matrix products on this thread's GPU are computed,
+/// including the products a fused epilogue runs on.
+pub fn set_matmul_precision(precision: MatmulPrecision) {
+    PRECISION.with(|cell| cell.set(precision));
+}
+
+/// This thread's [`MatmulPrecision`].
+pub fn matmul_precision() -> MatmulPrecision {
+    PRECISION.with(Cell::get)
 }
 
 /// Whether matrix products on this thread may use TensorOps where the GPU has
@@ -169,6 +254,7 @@ pub(super) fn build_gpu() -> Option<Gpu> {
         Some(Typed {
             matmul: kernel("matmul_tiled")?,
             tensorops: tensorops_pipeline(&format!("matmul_tensorops_{suffix}")),
+            tensorops_relaxed: tensorops_pipeline(&format!("matmul_tensorops_{suffix}_relaxed")),
             elementwise: kernel("elementwise")?,
             broadcast: kernel("broadcast")?,
             compare: kernel("compare")?,
@@ -197,6 +283,9 @@ pub(super) fn build_gpu() -> Option<Gpu> {
             fused: kernel("fused_elementwise")?,
             matmul_epilogue: kernel("matmul_epilogue")?,
             tensorops_epilogue: tensorops_pipeline(&format!("matmul_tensorops_epilogue_{suffix}")),
+            tensorops_epilogue_relaxed: tensorops_pipeline(&format!(
+                "matmul_tensorops_epilogue_{suffix}_relaxed"
+            )),
         })
     };
     Some(Gpu {
@@ -210,7 +299,12 @@ pub(super) fn build_gpu() -> Option<Gpu> {
         fft_bit_reverse: pipeline("fft_bit_reverse")?,
         fft_stage: pipeline("fft_stage")?,
         pool: RefCell::new(Pool::default()),
-        pending: RefCell::new(Vec::new()),
+        pending: RefCell::new(VecDeque::new()),
+        committed: Cell::new(0),
+        completed: Cell::new(0),
+        waits: Cell::new(0),
+        operations: Cell::new(0),
+        open: RefCell::new(None),
         device,
         queue,
     })
@@ -218,4 +312,52 @@ pub(super) fn build_gpu() -> Option<Gpu> {
 
 pub(super) fn with_gpu<R>(f: impl FnOnce(&Gpu) -> Option<R>) -> Option<R> {
     autoreleasepool(|_| GPU.with(|cell| cell.get_or_init(build_gpu).as_ref().and_then(f)))
+}
+
+impl Gpu {
+    /// A shared allocation of at least `len` bytes: a pooled one if a suitable
+    /// one is free, after reclaiming whatever the GPU has finished with since the
+    /// last look, and otherwise a new one.
+    pub(super) fn acquire(&self, len: usize) -> Option<Retained<ProtocolObject<dyn MTLBuffer>>> {
+        if let Some(buffer) = self.pool.borrow_mut().take(len) {
+            return Some(buffer);
+        }
+        super::sync::reclaim(self);
+        if let Some(buffer) = self.pool.borrow_mut().take(len) {
+            return Some(buffer);
+        }
+        // When the CPU has run well ahead of the GPU, every intermediate it
+        // dropped is still owed to a queued kernel. For a large tensor,
+        // allocating afresh then costs more than the kernel itself — Metal
+        // zero-fills new memory — and grows without bound, so once enough work
+        // is queued to keep the GPU busy, wait for the oldest command holding a
+        // suitable allocation instead. A small allocation is cheaper than the
+        // wait, so it is simply made.
+        let fence = (len >= WAIT_FOR_BYTES)
+            .then(|| self.pool.borrow().oldest_fitting(len))
+            .flatten();
+        if let Some(fence) = fence
+            && fence + QUEUE_DEPTH <= self.committed.get()
+            && super::sync::wait_through(self, fence)
+            && let Some(buffer) = self.pool.borrow_mut().take(len)
+        {
+            return Some(buffer);
+        }
+        Pool::allocate(&self.device, len)
+    }
+
+    /// The fence for an allocation released now: the last command buffer that
+    /// could still use it, or `None` if no GPU work is outstanding. When the
+    /// queue cannot be inspected, the allocation is assumed to be in use.
+    pub(super) fn fence(&self) -> Option<u64> {
+        // Work still being encoded will be the next command buffer committed.
+        match self.open.try_borrow() {
+            Ok(open) if open.is_none() => {}
+            _ => return Some(self.committed.get() + 1),
+        }
+        match self.pending.try_borrow() {
+            Ok(pending) if pending.is_empty() => None,
+            _ => Some(self.committed.get()),
+        }
+    }
 }

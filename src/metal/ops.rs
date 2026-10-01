@@ -2,8 +2,6 @@
 //! the output and encodes one or more kernels. A `None` means the caller should
 //! run the CPU kernel instead.
 
-use std::mem::size_of;
-
 use half::{bf16, f16};
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLComputePipelineState;
@@ -731,18 +729,7 @@ pub(super) fn matmul_tensorops<T: Copy + 'static, U: Copy + 'static>(
     let output = MetalBuffer::<U>::allocate(output_len)?;
     with_gpu(|gpu| {
         let state = pipeline(gpu.tensorops.as_ref()?);
-        encode_tensorops_matmul(
-            gpu,
-            state,
-            &left.raw,
-            &right.raw,
-            &output.raw,
-            m,
-            k,
-            n,
-            false,
-            size_of::<U>(),
-        )
+        encode_tensorops_matmul(gpu, state, &left.raw, &right.raw, &output.raw, m, k, n)
     })?;
     Some(output)
 }

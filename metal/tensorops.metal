@@ -3,7 +3,7 @@
 
 using namespace mpp::tensor_ops;
 
-template <typename Input, typename Output>
+template <typename Input, typename Output, bool Relaxed = false>
 METAL_FUNC void tensorcrate_matmul(
     device Input* A,
     device Input* B,
@@ -22,7 +22,7 @@ METAL_FUNC void tensorcrate_matmul(
         static_cast<int>(dynamic_extent),
         false,
         false,
-        false
+        Relaxed
     );
     auto tensor_a = tensor(
         A,
@@ -44,7 +44,7 @@ METAL_FUNC void tensorcrate_matmul(
     auto tile_a = tensor_a.slice(0, group.y * 64);
     auto tile_b = tensor_b.slice(group.x * 64, 0);
     auto tile_c = tensor_c.slice(group.x * 64, group.y * 64);
-    auto accumulator = operation.get_destination_cooperative_tensor<
+    auto accumulator = operation.template get_destination_cooperative_tensor<
         decltype(tile_a),
         decltype(tile_b),
         Output
@@ -147,6 +147,20 @@ kernel void NAME(                                                            \
 }
 
 TENSORCRATE_MATMUL_KERNEL(matmul_tensorops_f32, float, float)
+
+// `float` storage, with the implementation free to trade accuracy for speed —
+// on M5, to run the product on its 16-bit matrix hardware.
+kernel void matmul_tensorops_f32_relaxed(
+    device float* A [[buffer(0)]],
+    device float* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& K [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    uint2 group [[threadgroup_position_in_grid]])
+{
+    tensorcrate_matmul<float, float, true>(A, B, C, M, K, N, group);
+}
 TENSORCRATE_MATMUL_NARROW_KERNEL(matmul_tensorops_f16, half, half)
 TENSORCRATE_MATMUL_KERNEL(matmul_tensorops_f16_f32, half, float)
 TENSORCRATE_MATMUL_NARROW_KERNEL(matmul_tensorops_bf16, bfloat, bfloat)
@@ -156,7 +170,7 @@ TENSORCRATE_MATMUL_KERNEL(matmul_tensorops_bf16_f32, bfloat, float)
 // narrow kernels, and each thread runs the fused program on its share of it
 // instead of a plain store. Buffer layout as `matmul_epilogue` in
 // `kernel.metal`.
-template <typename T>
+template <typename T, bool Relaxed = false>
 METAL_FUNC void tensorcrate_matmul_epilogue(
     constant FusedInstr* code,
     constant FusedShape& shape,
@@ -177,7 +191,7 @@ METAL_FUNC void tensorcrate_matmul_epilogue(
         static_cast<int>(dynamic_extent),
         false,
         false,
-        false
+        Relaxed
     );
     auto tensor_a = tensor(
         A,
@@ -198,7 +212,7 @@ METAL_FUNC void tensorcrate_matmul_epilogue(
     matmul2d<descriptor, execution_simdgroups<4>> operation;
     auto tile_a = tensor_a.slice(0, group.y * 64);
     auto tile_b = tensor_b.slice(group.x * 64, 0);
-    auto accumulator = operation.get_destination_cooperative_tensor<
+    auto accumulator = operation.template get_destination_cooperative_tensor<
         decltype(tile_a),
         decltype(tile_b),
         float
@@ -216,7 +230,7 @@ METAL_FUNC void tensorcrate_matmul_epilogue(
     }
 }
 
-#define TENSORCRATE_MATMUL_EPILOGUE_KERNEL(NAME, T)                           \
+#define TENSORCRATE_MATMUL_EPILOGUE_KERNEL(NAME, T, RELAXED)                  \
 kernel void NAME(                                                            \
     constant FusedInstr* code [[buffer(0)]],                                  \
     constant FusedShape& shape [[buffer(1)]],                                 \
@@ -256,10 +270,11 @@ kernel void NAME(                                                            \
           in8, in9, in10, in11, in12, in13, in14, in15 },                    \
         { out0, out1, out2, out3, out4, out5, out6, out7 }                   \
     };                                                                       \
-    tensorcrate_matmul_epilogue<T>(                                          \
+    tensorcrate_matmul_epilogue<T, RELAXED>(                                 \
         code, shape, A, B, K, buffers, group, lane.x, threads.x, staging);   \
 }
 
-TENSORCRATE_MATMUL_EPILOGUE_KERNEL(matmul_tensorops_epilogue_f32, float)
-TENSORCRATE_MATMUL_EPILOGUE_KERNEL(matmul_tensorops_epilogue_f16, half)
-TENSORCRATE_MATMUL_EPILOGUE_KERNEL(matmul_tensorops_epilogue_bf16, bfloat)
+TENSORCRATE_MATMUL_EPILOGUE_KERNEL(matmul_tensorops_epilogue_f32, float, false)
+TENSORCRATE_MATMUL_EPILOGUE_KERNEL(matmul_tensorops_epilogue_f16, half, false)
+TENSORCRATE_MATMUL_EPILOGUE_KERNEL(matmul_tensorops_epilogue_bf16, bfloat, false)
+TENSORCRATE_MATMUL_EPILOGUE_KERNEL(matmul_tensorops_epilogue_f32_relaxed, float, true)

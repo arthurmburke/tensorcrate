@@ -3,6 +3,7 @@
 use std::mem::size_of;
 
 use half::{bf16, f16};
+use objc2_metal::MTLBuffer;
 
 use crate::tensors::{Analytic, BinaryOp};
 
@@ -10,6 +11,15 @@ use super::buffer::MetalBuffer;
 use super::device::GPU;
 use super::slices::{broadcast_f32, elementwise_f32, fft_f32_interleaved, ifft_f32_interleaved};
 use super::sync::synchronize;
+
+/// Operations encoded and blocking waits so far on this thread.
+fn activity() -> Option<(u64, u64)> {
+    GPU.with(|cell| {
+        cell.get()
+            .and_then(Option::as_ref)
+            .map(|gpu| (gpu.operations.get(), gpu.waits.get()))
+    })
+}
 
 fn cpu_matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
     let mut c = vec![0.0f32; m * n];
@@ -248,6 +258,7 @@ fn tiled_transpose_stays_queued_and_handles_partial_tiles() {
     const ROWS: usize = 19;
     const COLS: usize = 23;
     synchronize();
+    let before = activity().unwrap_or_default();
 
     let values = (0..ROWS * COLS)
         .map(|index| index as f32)
@@ -259,12 +270,12 @@ fn tiled_transpose_stays_queued_and_handles_partial_tiles() {
     let queued = input.broadcast(1.0, BinaryOp::Add, false).unwrap();
     let transposed = queued.transpose(ROWS, COLS).unwrap();
 
-    let pending = GPU.with(|cell| {
-        cell.get()
-            .and_then(Option::as_ref)
-            .map_or(0, |gpu| gpu.pending.borrow().len())
-    });
-    assert_eq!(pending, 2, "transpose unexpectedly synchronized GPU work");
+    let (operations, waits) = activity().unwrap();
+    assert_eq!(
+        waits, before.1,
+        "transpose unexpectedly synchronized GPU work"
+    );
+    assert_eq!(operations - before.0, 2, "unexpected number of operations");
 
     let expected = (0..COLS)
         .flat_map(|col| (0..ROWS).map(move |row| (row * COLS + col) as f32 + 1.0))
@@ -281,6 +292,7 @@ fn matrix_concat_and_stack_stay_on_the_device() {
     const LEFT_COLS: usize = 13;
     const RIGHT_COLS: usize = 7;
     synchronize();
+    let before = activity().unwrap_or_default();
 
     let left_values = (0..ROWS * LEFT_COLS)
         .map(|index| index as f32)
@@ -320,15 +332,12 @@ fn matrix_concat_and_stack_stay_on_the_device() {
         .stack_matrix(&bottom, TOP_ROWS, BOTTOM_ROWS, COLS)
         .unwrap();
 
-    let pending = GPU.with(|cell| {
-        cell.get()
-            .and_then(Option::as_ref)
-            .map_or(0, |gpu| gpu.pending.borrow().len())
-    });
+    let (operations, waits) = activity().unwrap();
     assert_eq!(
-        pending, 6,
+        waits, before.1,
         "matrix assembly unexpectedly synchronized GPU work"
     );
+    assert_eq!(operations - before.0, 6, "unexpected number of operations");
 
     let mut expected_concat = Vec::with_capacity(ROWS * (LEFT_COLS + RIGHT_COLS));
     for row in 0..ROWS {
@@ -359,6 +368,7 @@ fn matrix_merges_consume_queued_device_buffers() {
     const ROWS: usize = 19;
     const COLS: usize = 7;
     synchronize();
+    let before = activity().unwrap_or_default();
 
     let host = (0..MATRICES)
         .map(|matrix| {
@@ -389,15 +399,12 @@ fn matrix_merges_consume_queued_device_buffers() {
     let horizontal = MetalBuffer::hmerge(&buffers, ROWS, COLS).unwrap();
     let vertical = MetalBuffer::vmerge(&buffers, ROWS, COLS).unwrap();
 
-    let pending = GPU.with(|cell| {
-        cell.get()
-            .and_then(Option::as_ref)
-            .map_or(0, |gpu| gpu.pending.borrow().len())
-    });
+    let (operations, waits) = activity().unwrap();
     assert_eq!(
-        pending, 5,
+        waits, before.1,
         "matrix merge unexpectedly synchronized GPU work"
     );
+    assert_eq!(operations - before.0, 5, "unexpected number of operations");
 
     let mut expected_horizontal = Vec::with_capacity(MATRICES * ROWS * COLS);
     for row in 0..ROWS {
@@ -457,4 +464,119 @@ fn synchronize_makes_queued_work_observable() {
     let doubled = buffer.broadcast(2.0, BinaryOp::Mul, false).unwrap();
     synchronize();
     assert_eq!(doubled.to_vec(), vec![6.0f32; 32]);
+}
+
+/// An allocation dropped while its kernel was queued comes back into service
+/// once the GPU has finished with it, without anyone blocking on a sync — which
+/// is what lets a long queued chain recycle its intermediates.
+#[test]
+fn a_finished_allocation_is_reused_without_a_sync() {
+    let Some(source) = MetalBuffer::from_slice(&[1.0f32; 4096]) else {
+        eprintln!("no Metal device; skipping the reclaim check");
+        return;
+    };
+    synchronize();
+    let before = activity().unwrap();
+    let output = source.unary(Analytic::Exp).unwrap();
+    let address = output.raw().contents();
+    drop(output);
+
+    // Wait for the GPU without `sync`: commit the batch, then poll until the
+    // command buffer reports completion, as `reclaim` would see it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    GPU.with(|cell| {
+        let gpu = cell.get().and_then(Option::as_ref).unwrap();
+        super::sync::flush(gpu).unwrap();
+        while gpu.completed.get() < gpu.committed.get() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the GPU never finished"
+            );
+            super::sync::reclaim(gpu);
+            std::thread::yield_now();
+        }
+    });
+
+    let reused = MetalBuffer::<f32>::allocate(4096).unwrap();
+    assert_eq!(
+        reused.raw().contents(),
+        address,
+        "the finished allocation was not reused"
+    );
+    assert_eq!(
+        activity().unwrap().1,
+        before.1,
+        "reclaiming blocked on the GPU"
+    );
+}
+
+/// Copying a tensor to the backend it is already on — what the tape does to
+/// duplicate an adjoint, and what `outer` does to its operands — is a GPU copy
+/// queued behind the kernel still writing the source, not a sync.
+#[test]
+fn a_same_backend_copy_does_not_wait_for_the_gpu() {
+    use crate::tensors::{Host, Matrix, Metal, Vector};
+
+    let values: Vec<f32> = (0..4096).map(|i| i as f32 * 0.25).collect();
+    let vector = Vector::new(values.clone()).to_backend::<Metal>();
+    if !vector.is_device_resident() {
+        eprintln!("no Metal device; skipping the same-backend copy check");
+        return;
+    }
+    let matrix = Matrix::from_flat(64, 64, values.clone()).to_backend::<Metal>();
+    synchronize();
+    let before = activity().unwrap();
+
+    let doubled = vector.scale(2.0);
+    let copied = doubled.to_backend::<Metal>();
+    let matrix_copy = matrix.scale(3.0).to_backend::<Metal>();
+    let cloned = copied.clone();
+    assert_eq!(
+        activity().unwrap().1,
+        before.1,
+        "a same-backend copy blocked"
+    );
+
+    let twice: Vec<f32> = values.iter().map(|v| v * 2.0).collect();
+    assert_eq!(copied.to_backend::<Host>().into_vec(), twice);
+    assert_eq!(cloned.to_backend::<Host>().into_vec(), twice);
+    let thrice: Vec<f32> = values.iter().map(|v| v * 3.0).collect();
+    assert_eq!(matrix_copy.to_backend::<Host>().into_vec(), thrice);
+}
+
+/// A relaxed-precision product agrees with the exact one to the accuracy it
+/// promises, and the setting is per thread and restorable.
+#[test]
+fn relaxed_matmul_stays_close_to_the_exact_product() {
+    use super::device::{MatmulPrecision, matmul_precision, set_matmul_precision};
+    use crate::tensors::{Host, Matrix, Metal};
+
+    const N: usize = 192;
+    let values = |seed: usize| -> Vec<f32> {
+        (0..N * N)
+            .map(|i| (((i * 2654435761 + seed * 40503) % 1000) as f32 / 500.0) - 1.0)
+            .collect()
+    };
+    let a = Matrix::from_flat(N, N, values(1)).to_backend::<Metal>();
+    let b = Matrix::from_flat(N, N, values(2)).to_backend::<Metal>();
+    if !a.is_device_resident() {
+        eprintln!("no Metal device; skipping the relaxed product check");
+        return;
+    }
+    assert_eq!(matmul_precision(), MatmulPrecision::Exact);
+    let exact = a.matmul(&b).to_backend::<Host>().into_vec();
+    set_matmul_precision(MatmulPrecision::Relaxed);
+    let relaxed = a.matmul(&b).to_backend::<Host>().into_vec();
+    set_matmul_precision(MatmulPrecision::Exact);
+
+    // Reduced precision errs in proportion to the size of the products being
+    // summed, so measure against the result's scale, not each element's own
+    // size — an element whose terms cancel to near zero errs as much as any.
+    let scale = (exact.iter().map(|e| e * e).sum::<f32>() / exact.len() as f32).sqrt();
+    for (index, (r, e)) in relaxed.iter().zip(&exact).enumerate() {
+        assert!(
+            (r - e).abs() <= 2e-2 * (1.0 + scale),
+            "element {index}: relaxed {r} against exact {e} (scale {scale})"
+        );
+    }
 }

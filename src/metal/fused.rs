@@ -4,15 +4,12 @@ use std::mem::size_of;
 use std::ptr::NonNull;
 
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLSize,
-};
+use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize};
 
 use super::MetalElement;
-use super::device::{tensorops_enabled, with_gpu};
+use super::device::with_gpu;
 use super::encode::{TENSOROPS_TILE_COLS, TENSOROPS_TILE_ROWS, TILE, dispatch_1d};
-use super::sync::commit;
+use super::sync::{compute, queued};
 
 /// The iteration space and length of a fused program, as the shader's
 /// `FusedShape` reads them.
@@ -60,8 +57,7 @@ pub(crate) fn fused_elementwise<T: MetalElement>(
     }
     let filler = inputs.first().copied().unwrap_or(outputs[0]);
     with_gpu(|gpu| {
-        let command = gpu.queue.commandBuffer()?;
-        let encoder = command.computeCommandEncoder()?;
+        let encoder = compute(gpu)?;
         encoder.setComputePipelineState(&gpu.kernels::<T>().fused);
         unsafe {
             encoder.setBytes_length_atIndex(NonNull::from(&code[0]).cast(), code_bytes, 0);
@@ -80,8 +76,7 @@ pub(crate) fn fused_elementwise<T: MetalElement>(
             }
         }
         dispatch_1d(&encoder, len);
-        encoder.endEncoding();
-        commit(gpu, command)
+        queued(gpu, len.saturating_mul(code.len().div_ceil(4)))
     })
 }
 
@@ -122,12 +117,8 @@ pub(crate) fn matmul_epilogue<T: MetalElement>(
     }
     with_gpu(|gpu| {
         let kernels = gpu.kernels::<T>();
-        let command = gpu.queue.commandBuffer()?;
-        let encoder = command.computeCommandEncoder()?;
-        let tensorops = kernels
-            .tensorops_epilogue
-            .as_ref()
-            .filter(|_| tensorops_enabled());
+        let encoder = compute(gpu)?;
+        let tensorops = gpu.tensorops_epilogue::<T>();
         encoder.setComputePipelineState(tensorops.unwrap_or(&kernels.matmul_epilogue));
         unsafe {
             encoder.setBytes_length_atIndex(NonNull::from(&code[0]).cast(), code_bytes, 0);
@@ -174,7 +165,6 @@ pub(crate) fn matmul_epilogue<T: MetalElement>(
                 },
             ),
         }
-        encoder.endEncoding();
-        commit(gpu, command)
+        queued(gpu, m.saturating_mul(k).saturating_mul(n) / 128)
     })
 }

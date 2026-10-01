@@ -19,14 +19,11 @@ pub fn elementwise_f32(a: &[f32], b: &[f32], op: BinaryOp) -> Option<Vec<f32>> {
         return Some(Vec::new());
     }
     with_gpu(|gpu| {
-        let (buf_a, buf_b, buf_c) = {
-            let mut pool = gpu.pool.borrow_mut();
-            (
-                pool.acquire(&gpu.device, len * 4)?,
-                pool.acquire(&gpu.device, len * 4)?,
-                pool.acquire(&gpu.device, len * 4)?,
-            )
-        };
+        let (buf_a, buf_b, buf_c) = (
+            gpu.acquire(len * 4)?,
+            gpu.acquire(len * 4)?,
+            gpu.acquire(len * 4)?,
+        );
         upload(&buf_a, a);
         upload(&buf_b, b);
 
@@ -35,9 +32,9 @@ pub fn elementwise_f32(a: &[f32], b: &[f32], op: BinaryOp) -> Option<Vec<f32>> {
         sync(gpu)?;
         let out = download(&buf_c, len);
         let mut pool = gpu.pool.borrow_mut();
-        pool.release(buf_a, false);
-        pool.release(buf_b, false);
-        pool.release(buf_c, false);
+        pool.release(buf_a, None);
+        pool.release(buf_b, None);
+        pool.release(buf_c, None);
         Some(out)
     })
 }
@@ -59,13 +56,7 @@ pub fn broadcast_f32(
         return Some(Vec::new());
     }
     with_gpu(|gpu| {
-        let (input, output) = {
-            let mut pool = gpu.pool.borrow_mut();
-            (
-                pool.acquire(&gpu.device, len * 4)?,
-                pool.acquire(&gpu.device, len * 4)?,
-            )
-        };
+        let (input, output) = (gpu.acquire(len * 4)?, gpu.acquire(len * 4)?);
         upload(&input, values);
 
         encode_broadcast::<f32>(gpu, &input, &output, len, scalar, op, scalar_left)?;
@@ -73,8 +64,8 @@ pub fn broadcast_f32(
         sync(gpu)?;
         let out = download(&output, len);
         let mut pool = gpu.pool.borrow_mut();
-        pool.release(input, false);
-        pool.release(output, false);
+        pool.release(input, None);
+        pool.release(output, None);
         Some(out)
     })
 }
@@ -103,21 +94,15 @@ pub(super) fn fourier_transform_f32_interleaved(input: &[f32], inverse: bool) ->
     }
 
     with_gpu(|gpu| {
-        let (source, values) = {
-            let mut pool = gpu.pool.borrow_mut();
-            (
-                pool.acquire(&gpu.device, input.len() * 4)?,
-                pool.acquire(&gpu.device, input.len() * 4)?,
-            )
-        };
+        let (source, values) = (gpu.acquire(input.len() * 4)?, gpu.acquire(input.len() * 4)?);
         upload(&source, input);
 
         encode_fft(gpu, &source, &values, count, inverse)?;
         sync(gpu)?;
         let out = download(&values, input.len());
         let mut pool = gpu.pool.borrow_mut();
-        pool.release(source, false);
-        pool.release(values, false);
+        pool.release(source, None);
+        pool.release(values, None);
         Some(out)
     })
 }

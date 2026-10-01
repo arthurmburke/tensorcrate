@@ -50,6 +50,7 @@
 use std::sync::Arc;
 
 use num_traits::Float;
+use tensorcrate_macros::math;
 
 use crate::numbers::Real;
 use crate::tensors::fused::{Builder, Element, Fusable, Instr, Output, Program, Remap};

@@ -52,7 +52,7 @@ impl<T: Copy + 'static> MetalBuffer<T> {
     pub(crate) fn allocate(len: usize) -> Option<Self> {
         let bytes = len.checked_mul(size_of::<T>())?.max(1);
         with_gpu(|gpu| {
-            let raw = gpu.pool.borrow_mut().acquire(&gpu.device, bytes)?;
+            let raw = gpu.acquire(bytes)?;
             Some(Self {
                 raw: ManuallyDrop::new(raw),
                 len,
@@ -66,6 +66,17 @@ impl<T: Copy + 'static> MetalBuffer<T> {
         let buffer = Self::allocate(values.len())?;
         upload(&buffer.raw, values);
         Some(buffer)
+    }
+
+    /// A second allocation holding the same values, copied on the GPU timeline:
+    /// queued behind any kernel still writing this one, and without a sync.
+    pub(crate) fn duplicate(&self) -> Option<Self> {
+        let copy = Self::allocate(self.len)?;
+        if self.len != 0 {
+            let bytes = self.len.checked_mul(size_of::<T>())?;
+            with_gpu(|gpu| super::encode::encode_copy(gpu, &self.raw, &copy.raw, bytes))?;
+        }
+        Some(copy)
     }
 
     /// Number of stored values.
@@ -135,16 +146,14 @@ impl<T> Drop for MetalBuffer<T> {
         // it — thread-local teardown, or a drop during another allocation — and
         // then the allocation is simply released to Metal.
         let _ = GPU.try_with(|cell| {
-            if let Some(Some(gpu)) = cell.get()
-                && let Ok(mut pool) = gpu.pool.try_borrow_mut()
-            {
-                // Anything committed but not yet waited on may still reference
-                // this allocation, so it cannot go straight back into service.
-                let work_in_flight = gpu
-                    .pending
-                    .try_borrow()
-                    .is_ok_and(|queue| !queue.is_empty());
-                pool.release(raw, work_in_flight);
+            if let Some(Some(gpu)) = cell.get() {
+                // Anything committed but not yet known to be finished may still
+                // reference this allocation, so it cannot go straight back into
+                // service.
+                let fence = gpu.fence();
+                if let Ok(mut pool) = gpu.pool.try_borrow_mut() {
+                    pool.release(raw, fence);
+                }
             }
         });
     }

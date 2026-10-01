@@ -69,6 +69,73 @@ mod contract {
     }
 }
 
+/// Runs `$body` with `$name` bound to a constant equal to `$op`, once per
+/// arithmetic operation, so that the body — usually a loop — is compiled once
+/// per operation with the choice folded away, rather than deciding which
+/// operation it is again for every vector. `Rem` is not here: it has no vector
+/// form, and the kernels handle it before they specialize.
+#[cfg(target_arch = "aarch64")]
+macro_rules! specialize_binary {
+    ($op:expr, $name:ident => $body:expr) => {
+        match $op {
+            BinaryOp::Add => {
+                const $name: BinaryOp = BinaryOp::Add;
+                $body
+            }
+            BinaryOp::Sub => {
+                const $name: BinaryOp = BinaryOp::Sub;
+                $body
+            }
+            BinaryOp::Mul => {
+                const $name: BinaryOp = BinaryOp::Mul;
+                $body
+            }
+            BinaryOp::Div => {
+                const $name: BinaryOp = BinaryOp::Div;
+                $body
+            }
+            BinaryOp::Rem => unreachable!("remainder has no vector form"),
+        }
+    };
+}
+
+/// The same for the comparisons.
+#[cfg(target_arch = "aarch64")]
+macro_rules! specialize_compare {
+    ($op:expr, $name:ident => $body:expr) => {
+        match $op {
+            Compare::Min => {
+                const $name: Compare = Compare::Min;
+                $body
+            }
+            Compare::Max => {
+                const $name: Compare = Compare::Max;
+                $body
+            }
+            Compare::MaxShare => {
+                const $name: Compare = Compare::MaxShare;
+                $body
+            }
+            Compare::Less => {
+                const $name: Compare = Compare::Less;
+                $body
+            }
+            Compare::LessEqual => {
+                const $name: Compare = Compare::LessEqual;
+                $body
+            }
+            Compare::Greater => {
+                const $name: Compare = Compare::Greater;
+                $body
+            }
+            Compare::GreaterEqual => {
+                const $name: Compare = Compare::GreaterEqual;
+                $body
+            }
+        }
+    };
+}
+
 /// Generates the elementwise / reduction / matmul kernels for one float type.
 ///
 /// The four floating intrinsics differ only in name between `f32` (4-lane
@@ -136,6 +203,136 @@ macro_rules! neon_kernels {
                 total
             }
 
+            /// One pass of `vector` over `values` into `out`, four vectors per
+            /// iteration so several are in flight, and `scalar` over the tail.
+            ///
+            /// Always inlined, so each caller's closures — one operation, chosen
+            /// before the loop — compile into a loop of their own.
+            #[inline(always)]
+            fn map1(
+                values: &[$t],
+                out: &mut [$t],
+                vector: impl Fn($v) -> $v,
+                scalar: impl Fn($t) -> $t,
+            ) {
+                let n = values.len();
+                contract::same_len("map", &[n, out.len()]);
+                let mut i = 0;
+                // SAFETY: the lengths were checked above, and every vector
+                // access covers `LANES` elements that end at or before `n`.
+                unsafe {
+                    let (x, o) = (values.as_ptr(), out.as_mut_ptr());
+                    while i + 4 * LANES <= n {
+                        let v0 = $load(x.add(i));
+                        let v1 = $load(x.add(i + LANES));
+                        let v2 = $load(x.add(i + 2 * LANES));
+                        let v3 = $load(x.add(i + 3 * LANES));
+                        $store(o.add(i), vector(v0));
+                        $store(o.add(i + LANES), vector(v1));
+                        $store(o.add(i + 2 * LANES), vector(v2));
+                        $store(o.add(i + 3 * LANES), vector(v3));
+                        i += 4 * LANES;
+                    }
+                    while i + LANES <= n {
+                        $store(o.add(i), vector($load(x.add(i))));
+                        i += LANES;
+                    }
+                }
+                while i < n {
+                    out[i] = scalar(values[i]);
+                    i += 1;
+                }
+            }
+
+            /// [`map1`] over two operands.
+            #[inline(always)]
+            fn map2(
+                a: &[$t],
+                b: &[$t],
+                out: &mut [$t],
+                vector: impl Fn($v, $v) -> $v,
+                scalar: impl Fn($t, $t) -> $t,
+            ) {
+                let n = a.len();
+                contract::same_len("map", &[n, b.len(), out.len()]);
+                let mut i = 0;
+                // SAFETY: as in `map1`.
+                unsafe {
+                    let (x, y, o) = (a.as_ptr(), b.as_ptr(), out.as_mut_ptr());
+                    while i + 4 * LANES <= n {
+                        let a0 = $load(x.add(i));
+                        let a1 = $load(x.add(i + LANES));
+                        let a2 = $load(x.add(i + 2 * LANES));
+                        let a3 = $load(x.add(i + 3 * LANES));
+                        let b0 = $load(y.add(i));
+                        let b1 = $load(y.add(i + LANES));
+                        let b2 = $load(y.add(i + 2 * LANES));
+                        let b3 = $load(y.add(i + 3 * LANES));
+                        $store(o.add(i), vector(a0, b0));
+                        $store(o.add(i + LANES), vector(a1, b1));
+                        $store(o.add(i + 2 * LANES), vector(a2, b2));
+                        $store(o.add(i + 3 * LANES), vector(a3, b3));
+                        i += 4 * LANES;
+                    }
+                    while i + LANES <= n {
+                        $store(o.add(i), vector($load(x.add(i)), $load(y.add(i))));
+                        i += LANES;
+                    }
+                }
+                while i < n {
+                    out[i] = scalar(a[i], b[i]);
+                    i += 1;
+                }
+            }
+
+            /// [`map1`] of `f(scalar, x)` or `f(x, scalar)`, as `scalar_left`
+            /// says.
+            #[inline(always)]
+            fn map_scalar(
+                values: &[$t],
+                scalar: $t,
+                scalar_left: bool,
+                out: &mut [$t],
+                vector: impl Fn($v, $v) -> $v,
+                lane: impl Fn($t, $t) -> $t,
+            ) {
+                // SAFETY: NEON is part of the aarch64 baseline.
+                let splat = unsafe { $dup(scalar) };
+                if scalar_left {
+                    map1(values, out, |x| vector(splat, x), |x| lane(scalar, x));
+                } else {
+                    map1(values, out, |x| vector(x, splat), |x| lane(x, scalar));
+                }
+            }
+
+            /// `op` on two vectors. Called with a constant `op`, it inlines to
+            /// the one instruction.
+            #[inline(always)]
+            fn binary_vectors(op: BinaryOp, a: $v, b: $v) -> $v {
+                // SAFETY: NEON is part of the aarch64 baseline, and these
+                // intrinsics only touch registers.
+                unsafe {
+                    match op {
+                        BinaryOp::Add => $add(a, b),
+                        BinaryOp::Sub => $sub(a, b),
+                        BinaryOp::Mul => $mul(a, b),
+                        BinaryOp::Div => $div(a, b),
+                        BinaryOp::Rem => unreachable!("remainder has no vector form"),
+                    }
+                }
+            }
+
+            #[inline(always)]
+            fn binary_values(op: BinaryOp, a: $t, b: $t) -> $t {
+                match op {
+                    BinaryOp::Add => a + b,
+                    BinaryOp::Sub => a - b,
+                    BinaryOp::Mul => a * b,
+                    BinaryOp::Div => a / b,
+                    BinaryOp::Rem => a % b,
+                }
+            }
+
             /// Elementwise binary operation. Remainder has no NEON
             /// floating-point instruction, so it uses the scalar loop.
             #[inline]
@@ -148,35 +345,13 @@ macro_rules! neon_kernels {
                     }
                     return;
                 }
-                let mut i = 0;
-                // SAFETY: the slice lengths were checked on entry, and every
-                // vector access covers `LANES` elements that end at or before
-                // `n`.
-                unsafe {
-                    while i + LANES <= n {
-                        let va = $load(a.as_ptr().add(i));
-                        let vb = $load(b.as_ptr().add(i));
-                        let vr = match op {
-                            BinaryOp::Add => $add(va, vb),
-                            BinaryOp::Sub => $sub(va, vb),
-                            BinaryOp::Mul => $mul(va, vb),
-                            BinaryOp::Div => $div(va, vb),
-                            BinaryOp::Rem => unreachable!(),
-                        };
-                        $store(out.as_mut_ptr().add(i), vr);
-                        i += LANES;
-                    }
-                }
-                while i < n {
-                    out[i] = match op {
-                        BinaryOp::Add => a[i] + b[i],
-                        BinaryOp::Sub => a[i] - b[i],
-                        BinaryOp::Mul => a[i] * b[i],
-                        BinaryOp::Div => a[i] / b[i],
-                        BinaryOp::Rem => unreachable!(),
-                    };
-                    i += 1;
-                }
+                specialize_binary!(op, OP => map2(
+                    a,
+                    b,
+                    out,
+                    |x, y| binary_vectors(OP, x, y),
+                    |x, y| binary_values(OP, x, y),
+                ))
             }
 
             /// Tensor/scalar broadcast. `scalar_left` selects operand order for
@@ -201,42 +376,14 @@ macro_rules! neon_kernels {
                     }
                     return;
                 }
-                let mut i = 0;
-                // SAFETY: the slice lengths were checked on entry, and every
-                // vector access covers `LANES` elements that end at or before
-                // `n`.
-                unsafe {
-                    let vs = $dup(scalar);
-                    while i + LANES <= n {
-                        let vx = $load(values.as_ptr().add(i));
-                        let (lhs, rhs) = if scalar_left { (vs, vx) } else { (vx, vs) };
-                        let vr = match op {
-                            BinaryOp::Add => $add(lhs, rhs),
-                            BinaryOp::Sub => $sub(lhs, rhs),
-                            BinaryOp::Mul => $mul(lhs, rhs),
-                            BinaryOp::Div => $div(lhs, rhs),
-                            BinaryOp::Rem => unreachable!(),
-                        };
-                        $store(out.as_mut_ptr().add(i), vr);
-                        i += LANES;
-                    }
-                }
-                while i < n {
-                    let x = values[i];
-                    let (l, r) = if scalar_left {
-                        (scalar, x)
-                    } else {
-                        (x, scalar)
-                    };
-                    out[i] = match op {
-                        BinaryOp::Add => l + r,
-                        BinaryOp::Sub => l - r,
-                        BinaryOp::Mul => l * r,
-                        BinaryOp::Div => l / r,
-                        BinaryOp::Rem => unreachable!(),
-                    };
-                    i += 1;
-                }
+                specialize_binary!(op, OP => map_scalar(
+                    values,
+                    scalar,
+                    scalar_left,
+                    out,
+                    |x, y| binary_vectors(OP, x, y),
+                    |x, y| binary_values(OP, x, y),
+                ))
             }
 
             /// The scalar definition of every comparison, for the ragged tail —
@@ -247,7 +394,7 @@ macro_rules! neon_kernels {
             /// `f32::min` in the scalar path does. Plain `fmin`/`fmax` (the
             /// `vminq`/`vmaxq` intrinsics) propagate the NaN instead, so they
             /// would disagree with it.
-            #[inline]
+            #[inline(always)]
             fn compare_values(op: Compare, a: $t, b: $t) -> $t {
                 match op {
                     Compare::Min => a.min(b),
@@ -291,7 +438,7 @@ macro_rules! neon_kernels {
             /// One vector-wide comparison. The predicates turn a lane mask into
             /// `1.0`/`0.0` with a bitwise select, which is branchless and needs
             /// no conversion instruction.
-            #[inline]
+            #[inline(always)]
             unsafe fn compare_vectors(op: Compare, a: $v, b: $v) -> $v {
                 // SAFETY: NEON is part of the aarch64 baseline, and these
                 // intrinsics only touch registers.
@@ -318,24 +465,15 @@ macro_rules! neon_kernels {
             /// Elementwise comparison of two slices.
             #[inline]
             pub fn compare(a: &[$t], b: &[$t], op: Compare, out: &mut [$t]) {
-                let n = a.len();
-                contract::same_len("compare", &[n, b.len(), out.len()]);
-                let mut i = 0;
-                // SAFETY: the slice lengths were checked on entry, and every
-                // vector access covers `LANES` elements that end at or before
-                // `n`.
-                unsafe {
-                    while i + LANES <= n {
-                        let va = $load(a.as_ptr().add(i));
-                        let vb = $load(b.as_ptr().add(i));
-                        $store(out.as_mut_ptr().add(i), compare_vectors(op, va, vb));
-                        i += LANES;
-                    }
-                }
-                while i < n {
-                    out[i] = compare_values(op, a[i], b[i]);
-                    i += 1;
-                }
+                contract::same_len("compare", &[a.len(), b.len(), out.len()]);
+                specialize_compare!(op, OP => map2(
+                    a,
+                    b,
+                    out,
+                    // SAFETY: NEON is part of the aarch64 baseline.
+                    |x, y| unsafe { compare_vectors(OP, x, y) },
+                    |x, y| compare_values(OP, x, y),
+                ))
             }
 
             /// Comparison against a splatted scalar. `scalar_left` selects the
@@ -348,30 +486,16 @@ macro_rules! neon_kernels {
                 scalar_left: bool,
                 out: &mut [$t],
             ) {
-                let n = values.len();
-                contract::same_len("compare_scalar", &[n, out.len()]);
-                let mut i = 0;
-                // SAFETY: the slice lengths were checked on entry, and every
-                // vector access covers `LANES` elements that end at or before
-                // `n`.
-                unsafe {
-                    let vs = $dup(scalar);
-                    while i + LANES <= n {
-                        let vx = $load(values.as_ptr().add(i));
-                        let (lhs, rhs) = if scalar_left { (vs, vx) } else { (vx, vs) };
-                        $store(out.as_mut_ptr().add(i), compare_vectors(op, lhs, rhs));
-                        i += LANES;
-                    }
-                }
-                while i < n {
-                    let (lhs, rhs) = if scalar_left {
-                        (scalar, values[i])
-                    } else {
-                        (values[i], scalar)
-                    };
-                    out[i] = compare_values(op, lhs, rhs);
-                    i += 1;
-                }
+                contract::same_len("compare_scalar", &[values.len(), out.len()]);
+                specialize_compare!(op, OP => map_scalar(
+                    values,
+                    scalar,
+                    scalar_left,
+                    out,
+                    // SAFETY: NEON is part of the aarch64 baseline.
+                    |x, y| unsafe { compare_vectors(OP, x, y) },
+                    |x, y| compare_values(OP, x, y),
+                ))
             }
 
             /// Elementwise square root. `fsqrt` is correctly rounded, as IEEE

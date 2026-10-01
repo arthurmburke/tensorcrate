@@ -77,6 +77,13 @@ pub trait Backend: sealed::Sealed + Sized + 'static {
     #[doc(hidden)]
     fn vector_slice_mut<T: Copy + 'static>(storage: &mut Self::Vector<T>) -> &mut [T];
 
+    /// A second copy of some storage on this same backend — what
+    /// [`Vector::to_backend`](super::Vector::to_backend) does when it is asked
+    /// for the backend it is already on. On [`Metal`] the copy runs on the GPU
+    /// and nothing waits for it.
+    #[doc(hidden)]
+    fn duplicate<T: Copy + 'static>(storage: &Self::Vector<T>) -> Self::Vector<T>;
+
     /// Take ownership of values as vector storage — a move on [`Host`], one
     /// upload on [`Metal`].
     #[doc(hidden)]
@@ -151,6 +158,21 @@ mod sealed {
     pub trait Sealed {}
 }
 
+/// `storage` copied onto backend `B2` — by [`Backend::duplicate`] when `B2` is
+/// the backend it is already on, and otherwise through a slice of it.
+pub(crate) fn transfer<T: Copy + 'static, B: Backend, B2: Backend>(
+    storage: &B::Vector<T>,
+) -> B2::Vector<T> {
+    if std::any::TypeId::of::<B>() == std::any::TypeId::of::<B2>() {
+        let copy = std::mem::ManuallyDrop::new(B::duplicate(storage));
+        // SAFETY: `B` and `B2` are one type, so `B::Vector<T>` and
+        // `B2::Vector<T>` are too; the copy is moved, not duplicated, because
+        // the original is never dropped.
+        return unsafe { std::mem::transmute_copy::<B::Vector<T>, B2::Vector<T>>(&copy) };
+    }
+    B2::store_vector(B::vector_slice(storage))
+}
+
 /// The default backend: elements live in a flat row-major [`Vec`].
 ///
 /// Every element type is supported.
@@ -181,6 +203,10 @@ impl Backend for Host {
 
     fn vector_slice_mut<T: Copy + 'static>(storage: &mut Vec<T>) -> &mut [T] {
         storage
+    }
+
+    fn duplicate<T: Copy + 'static>(storage: &Vec<T>) -> Vec<T> {
+        storage.clone()
     }
 
     fn vector_from_vec<T: Copy + 'static>(values: Vec<T>) -> Vec<T> {
@@ -347,6 +373,10 @@ mod gpu {
 
         fn vector_slice_mut<T: Copy + 'static>(storage: &mut MetalStorage<T>) -> &mut [T] {
             storage.as_mut_slice()
+        }
+
+        fn duplicate<T: Copy + 'static>(storage: &MetalStorage<T>) -> MetalStorage<T> {
+            storage.duplicate()
         }
 
         fn vector_from_vec<T: Copy + 'static>(values: Vec<T>) -> MetalStorage<T> {
@@ -541,6 +571,18 @@ mod gpu {
             match MetalBuffer::from_slice(values) {
                 Some(buffer) => Self(Residency::Device(buffer)),
                 None => Self(Residency::Host(values.to_vec())),
+            }
+        }
+
+        /// A second copy on the same backend. A resident allocation is copied on
+        /// the GPU, queued like any kernel, so nothing waits.
+        pub(crate) fn duplicate(&self) -> Self {
+            match &self.0 {
+                Residency::Device(buffer) => match buffer.duplicate() {
+                    Some(copy) => Self(Residency::Device(copy)),
+                    None => Self::from_slice(buffer.as_slice()),
+                },
+                Residency::Host(values) => Self(Residency::Host(values.clone())),
             }
         }
 
@@ -906,7 +948,7 @@ mod gpu {
     impl<T: Copy + 'static> Clone for MetalStorage<T> {
         /// Clones the values into a fresh allocation on the same backend.
         fn clone(&self) -> Self {
-            Self::from_slice(self.as_slice())
+            self.duplicate()
         }
     }
 

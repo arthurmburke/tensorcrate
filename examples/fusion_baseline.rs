@@ -35,13 +35,14 @@ const STEPS: usize = 10;
 
 fn main() {
     println!(
-        "{:<26} {:<8} {:<8} {:>9} {:>10} {:>7} {:>8} {:>6} {:>10}",
+        "{:<26} {:<8} {:<8} {:>9} {:>10} {:>7} {:>8} {:>8} {:>6} {:>10}",
         "per step",
         "backend",
         "fusion",
         "kernels",
         "MB moved",
         "allocs",
+        "gpu ops",
         "cmdbufs",
         "syncs",
         "time"
@@ -89,7 +90,7 @@ fn run<B: Kernels>(backend: &str) {
 fn report(name: &str, backend: &str, mode: Mode, (counts, seconds): (Counts, f64)) {
     let per = |x: u64| x as f64 / STEPS as f64;
     println!(
-        "{name:<26} {backend:<8} {:<8} {:>9.1} {:>10.2} {:>7.1} {:>8.1} {:>6.1} {:>8.3}ms",
+        "{name:<26} {backend:<8} {:<8} {:>9.1} {:>10.2} {:>7.1} {:>8.1} {:>8.1} {:>6.1} {:>8.3}ms",
         match mode {
             Mode::Fused => "fused",
             Mode::Unfused => "unfused",
@@ -97,6 +98,7 @@ fn report(name: &str, backend: &str, mode: Mode, (counts, seconds): (Counts, f64
         per(counts.kernels),
         per(counts.bytes) / 1e6,
         per(counts.allocations),
+        per(counts.dispatches),
         per(counts.command_buffers),
         per(counts.syncs),
         seconds / STEPS as f64 * 1e3,

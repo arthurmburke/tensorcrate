@@ -176,23 +176,23 @@ fn the_result_type_is_unchanged() {
     assert_eq!(m.as_slice(), [1.828_427_1, 3.0]);
 }
 
-/// Kernel counts, measured as the Metal command buffers actually committed:
-/// every resident operation is one, so this counts what the GPU runs.
+/// Kernel counts, measured as the Metal operations actually queued: every
+/// resident operation is one dispatch, so this counts what the GPU runs.
 #[cfg(all(feature = "counters", feature = "metal", target_os = "macos"))]
 mod counts {
     use tensorcrate::counters;
     use tensorcrate::math;
     use tensorcrate::tensors::fused::{self, Mode};
 
-    fn command_buffers<R>(block: impl Fn() -> R) -> (u64, u64) {
+    fn dispatches<R>(block: impl Fn() -> R) -> (u64, u64) {
         let ((), fused) = counters::measure(|| drop(fused::with_mode(Mode::Fused, &block)));
         let ((), unfused) = counters::measure(|| drop(fused::with_mode(Mode::Unfused, &block)));
-        (fused.command_buffers, unfused.command_buffers)
+        (fused.dispatches, unfused.dispatches)
     }
 
     #[test]
     fn a_chain_is_one_kernel() {
-        let counts = command_buffers(|| {
+        let counts = dispatches(|| {
             math! {
                 backend = Metal;
                 let x = [1, 2, 3];
@@ -208,7 +208,7 @@ mod counts {
         // `a` and `b` each feed the product, so both are materialized — by one
         // kernel, not two; the product carries the final `* 3 + 1` as its
         // epilogue, which is one more.
-        let counts = command_buffers(|| {
+        let counts = dispatches(|| {
             math! {
                 backend = Metal;
                 let x = [[1, 2], [3, 4]];
@@ -222,7 +222,7 @@ mod counts {
 
     #[test]
     fn a_dense_layer_is_one_kernel() {
-        let counts = command_buffers(|| {
+        let counts = dispatches(|| {
             math! {
                 backend = Metal;
                 let x = [[1, 2], [3, 4], [5, 6]];
@@ -241,7 +241,7 @@ mod counts {
         let ((), counts) = counters::measure(|| {
             let _ = math! { backend = Metal; fuse = false; let x = [1, 2]; sin(x * 2 + 1) - x };
         });
-        assert_eq!(counts.command_buffers, 4);
+        assert_eq!(counts.dispatches, 4);
     }
 }
 

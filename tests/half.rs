@@ -472,9 +472,9 @@ mod metal {
 
     /// The resident results above could in principle have been computed on the
     /// host and uploaded — a fallback leaves its result resident too. The
-    /// command-buffer count is what shows the work ran on the GPU: one per
-    /// dispatch, and no synchronization, which a host fallback would need to
-    /// read its operands.
+    /// dispatch count is what shows the work ran on the GPU: one per operation,
+    /// and no synchronization, which a host fallback would need to read its
+    /// operands.
     #[cfg(feature = "counters")]
     #[test]
     fn half_precision_operations_dispatch_gpu_kernels() {
@@ -494,7 +494,7 @@ mod metal {
                 let product = m.matmul(&m);
                 (root, product)
             });
-            assert_eq!(counts.command_buffers, 4, "{counts:?}");
+            assert_eq!(counts.dispatches, 4, "{counts:?}");
             assert_eq!(counts.syncs, 0, "{counts:?}");
         }
         dispatches::<f16>();

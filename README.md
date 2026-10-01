@@ -662,6 +662,11 @@ Important backend details:
 
 - On M5/Apple10 GPUs, ordinary `f32` matrix multiplication uses Metal 4 TensorOps. Older GPUs use
   the existing tiled `f32` kernel. Fused `matmul_add` also retains the tiled path.
+- Operations are queued, not waited for: they are encoded into a shared command buffer that is
+  committed in batches, and the CPU blocks only when it reads a result (about 140 µs for the round
+  trip). A chain that stays on the device therefore costs a few microseconds per operation; one
+  that reads a value back after every step pays the round trip each time. `to_backend::<Metal>()`
+  on a tensor already on Metal is a GPU copy, not a round trip.
 - Metal `f16` and `bf16` storage uses the Rust [`half`](https://crates.io/crates/half) crate, whose
   two-byte values map directly to Metal `half` and `bfloat` buffers.
 - The full Metal operation set is available for `f32`, `f16` and `bf16`: every shader is compiled
@@ -700,6 +705,28 @@ assert_eq!(host_result.shape(), (2, 2));
 
 On a pre-M5 Mac, the compact APIs transparently convert through the Host backend; their return
 types and numerical format stay the same.
+
+On M5 the matrix units are much faster when they are allowed to work below full `f32` accuracy.
+Large products measured on an M5 Max, in TFLOP/s:
+
+| product                                   | 1024³ | 2048³ | 4096³ | typical error  |
+|-------------------------------------------|------:|------:|------:|---------------:|
+| `f32`, exact (the default)                |   6.5 |  11.8 |  15.5 |           1e-6 |
+| `f32`, `MatmulPrecision::Relaxed`         |  19.7 |  23.9 |  23.7 |           3e-3 |
+| `f16` operands, `matmul_f32`              |  25.0 |  44.0 |  61.1 |           3e-3 |
+
+The error column is relative to the size of the results: reduced precision errs in proportion to
+the products being summed, so an element whose terms cancel to near zero carries the same absolute
+error as its neighbours. Relaxed precision keeps `f32` storage and is opt-in per thread; it applies
+to products with a fused epilogue too:
+
+```rust
+use tensorcrate::metal::{MatmulPrecision, set_matmul_precision};
+
+set_matmul_precision(MatmulPrecision::Relaxed); // training: speed over the last digits
+// ...
+set_matmul_precision(MatmulPrecision::Exact);
+```
 
 Run the backend comparison on macOS with:
 
@@ -800,3 +827,29 @@ cargo clippy --all-targets --all-features
 
 The tests cover tensor algebra, complex and dual arithmetic, both autodiff modes, convolutions,
 optimization, persistence, ordering/projections, SIMD, and Metal/Host agreement.
+
+### Benchmarks
+
+`benches/nn_ops.rs` times the operations neural networks are made of — activations, layer norm,
+softmax, dense layers, matrix products, reductions, the Adam update, and a whole MLP training
+step — and compares the ways the crate can run each one:
+
+- **fused and unfused**: the same fused program with fusion switched on and off, plus the plain
+  `Kernels` calls a caller would write without it;
+- **scalar, SIMD and Host API**: a plain loop, the architecture kernel called directly, and the
+  tensor method, which dispatches through Accelerate and SIMD and allocates its result;
+- **Host and Metal**: launch latency (waiting after every call), pipelined launches (waiting once
+  per batch), and the cost of uploading and downloading around each call.
+
+```console
+cargo bench --bench nn_ops                       # every size
+cargo bench --bench nn_ops -- --quick            # every other size, fewer samples
+cargo bench --bench nn_ops -- layer softmax      # only cases whose name contains a word
+cargo bench --bench nn_ops --features counters   # add kernels, bytes moved and GPU dispatches
+cargo test --release --bench nn_ops              # one quick pass of every case, as a check
+```
+
+Each case checks that its variants agree before timing them — fused with unfused bit for bit on
+the host, SIMD and Metal within a tolerance — so the one-pass form doubles as a correctness test of
+the fast paths. It is `std`-only and needs no benchmarking dependency; the module documentation in
+the file explains how to read the tables.

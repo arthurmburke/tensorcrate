@@ -89,7 +89,7 @@ impl<T: Copy + 'static, B: Backend> Vector<T, B> {
     pub fn to_backend<B2: Backend>(&self) -> Vector<T, B2> {
         Vector {
             len: self.len,
-            data: B2::store_vector(B::vector_slice(&self.data)),
+            data: super::backend::transfer::<T, B, B2>(&self.data),
         }
     }
 

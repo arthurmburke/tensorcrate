@@ -5,18 +5,16 @@ use std::mem::size_of;
 use std::ptr::NonNull;
 
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::NSRange;
 use objc2_metal::{
-    MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-    MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize,
+    MTLBlitCommandEncoder, MTLBuffer, MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize,
 };
 
 use crate::tensors::{Analytic, Axis, BinaryOp, Compare, Family, Reduce, Statistic};
 
 use super::MetalElement;
 use super::buffer::MetalBuffer;
-use super::device::{Gpu, tensorops_enabled};
-use super::sync::commit;
+use super::device::Gpu;
+use super::sync::{blit, compute, queued};
 
 /// Threadgroup tile edge; must match `TILE` in the shader. 16×16 = 256 threads.
 pub(super) const TILE: usize = 16;
@@ -43,25 +41,10 @@ pub(super) fn encode_matmul<T: MetalElement>(
     n: usize,
     accumulate: bool,
 ) -> Option<()> {
-    if !accumulate
-        && tensorops_enabled()
-        && let Some(pipeline) = &gpu.kernels::<T>().tensorops
-    {
-        return encode_tensorops_matmul(
-            gpu,
-            pipeline,
-            a,
-            b,
-            output,
-            m,
-            k,
-            n,
-            accumulate,
-            size_of::<T>(),
-        );
+    if !accumulate && let Some(pipeline) = gpu.tensorops_matmul::<T>() {
+        return encode_tensorops_matmul(gpu, pipeline, a, b, output, m, k, n);
     }
-    let command = gpu.queue.commandBuffer()?;
-    let encoder = command.computeCommandEncoder()?;
+    let encoder = compute(gpu)?;
     encoder.setComputePipelineState(&gpu.kernels::<T>().matmul);
     let (mu, ku, nu) = (
         u32::try_from(m).ok()?,
@@ -89,10 +72,12 @@ pub(super) fn encode_matmul<T: MetalElement>(
         depth: 1,
     };
     encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, per_group);
-    encoder.endEncoding();
-    commit(gpu, command)
+    queued(gpu, m.saturating_mul(k).saturating_mul(n) / 128)
 }
 
+/// A TensorOps product `output = a·b`. It writes every element of `output` —
+/// the cooperative store covers each in-bounds element of every tile, partial
+/// edge tiles included — so the allocation needs no clearing first.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn encode_tensorops_matmul(
     gpu: &Gpu,
@@ -103,21 +88,8 @@ pub(super) fn encode_tensorops_matmul(
     m: usize,
     k: usize,
     n: usize,
-    accumulate: bool,
-    output_element_size: usize,
 ) -> Option<()> {
-    let command = gpu.queue.commandBuffer()?;
-    if !accumulate {
-        let clear = command.blitCommandEncoder()?;
-        clear.fillBuffer_range_value(
-            output,
-            NSRange::new(0, m.checked_mul(n)?.checked_mul(output_element_size)?),
-            0,
-        );
-        clear.endEncoding();
-    }
-
-    let encoder = command.computeCommandEncoder()?;
+    let encoder = compute(gpu)?;
     encoder.setComputePipelineState(pipeline);
     let (mu, ku, nu) = (
         u32::try_from(m).ok()?,
@@ -144,8 +116,7 @@ pub(super) fn encode_tensorops_matmul(
             depth: 1,
         },
     );
-    encoder.endEncoding();
-    commit(gpu, command)
+    queued(gpu, m.saturating_mul(k).saturating_mul(n) / 128)
 }
 
 pub(super) fn encode_transpose<T: MetalElement>(
@@ -157,8 +128,7 @@ pub(super) fn encode_transpose<T: MetalElement>(
 ) -> Option<()> {
     let rows_u32 = u32::try_from(rows).ok()?;
     let cols_u32 = u32::try_from(cols).ok()?;
-    let command = gpu.queue.commandBuffer()?;
-    let encoder = command.computeCommandEncoder()?;
+    let encoder = compute(gpu)?;
     encoder.setComputePipelineState(&gpu.kernels::<T>().transpose);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
@@ -177,8 +147,7 @@ pub(super) fn encode_transpose<T: MetalElement>(
         depth: 1,
     };
     encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, per_group);
-    encoder.endEncoding();
-    commit(gpu, command)
+    queued(gpu, rows * cols)
 }
 
 pub(super) fn encode_elementwise<T: MetalElement>(
@@ -189,8 +158,7 @@ pub(super) fn encode_elementwise<T: MetalElement>(
     len: usize,
     op: BinaryOp,
 ) -> Option<()> {
-    let command = gpu.queue.commandBuffer()?;
-    let encoder = command.computeCommandEncoder()?;
+    let encoder = compute(gpu)?;
     encoder.setComputePipelineState(&gpu.kernels::<T>().elementwise);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(a), 0, 0);
@@ -199,8 +167,7 @@ pub(super) fn encode_elementwise<T: MetalElement>(
         encoder.setBytes_length_atIndex(NonNull::from(&op).cast(), size_of::<BinaryOp>(), 3);
     }
     dispatch_1d(&encoder, len);
-    encoder.endEncoding();
-    commit(gpu, command)
+    queued(gpu, len)
 }
 
 pub(super) fn encode_compare<T: MetalElement>(
@@ -211,8 +178,7 @@ pub(super) fn encode_compare<T: MetalElement>(
     len: usize,
     op: Compare,
 ) -> Option<()> {
-    let command = gpu.queue.commandBuffer()?;
-    let encoder = command.computeCommandEncoder()?;
+    let encoder = compute(gpu)?;
     encoder.setComputePipelineState(&gpu.kernels::<T>().compare);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(a), 0, 0);
@@ -221,8 +187,7 @@ pub(super) fn encode_compare<T: MetalElement>(
         encoder.setBytes_length_atIndex(NonNull::from(&op).cast(), size_of::<Compare>(), 3);
     }
     dispatch_1d(&encoder, len);
-    encoder.endEncoding();
-    commit(gpu, command)
+    queued(gpu, len)
 }
 
 pub(super) fn encode_compare_scalar<T: MetalElement>(
@@ -234,8 +199,7 @@ pub(super) fn encode_compare_scalar<T: MetalElement>(
     op: Compare,
     scalar_left: bool,
 ) -> Option<()> {
-    let command = gpu.queue.commandBuffer()?;
-    let encoder = command.computeCommandEncoder()?;
+    let encoder = compute(gpu)?;
     encoder.setComputePipelineState(&gpu.kernels::<T>().compare_scalar);
     let scalar_left = u32::from(scalar_left);
     unsafe {
@@ -246,8 +210,7 @@ pub(super) fn encode_compare_scalar<T: MetalElement>(
         encoder.setBytes_length_atIndex(NonNull::from(&scalar_left).cast(), 4, 4);
     }
     dispatch_1d(&encoder, len);
-    encoder.endEncoding();
-    commit(gpu, command)
+    queued(gpu, len)
 }
 
 pub(super) fn encode_clamp<T: MetalElement>(
@@ -258,8 +221,7 @@ pub(super) fn encode_clamp<T: MetalElement>(
     low: f32,
     high: f32,
 ) -> Option<()> {
-    let command = gpu.queue.commandBuffer()?;
-    let encoder = command.computeCommandEncoder()?;
+    let encoder = compute(gpu)?;
     encoder.setComputePipelineState(&gpu.kernels::<T>().clamp);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
@@ -268,8 +230,7 @@ pub(super) fn encode_clamp<T: MetalElement>(
         encoder.setBytes_length_atIndex(NonNull::from(&high).cast(), 4, 3);
     }
     dispatch_1d(&encoder, len);
-    encoder.endEncoding();
-    commit(gpu, command)
+    queued(gpu, len)
 }
 
 /// One round of the tree reduction, over `groups` whole threadgroups.
@@ -286,8 +247,7 @@ pub(super) fn encode_reduce<T: MetalElement>(
     groups: usize,
     op: Reduce,
 ) -> Option<()> {
-    let command = gpu.queue.commandBuffer()?;
-    let encoder = command.computeCommandEncoder()?;
+    let encoder = compute(gpu)?;
     let count_u32 = u32::try_from(count).ok()?;
     encoder.setComputePipelineState(&gpu.kernels::<T>().reduce);
     unsafe {
@@ -308,8 +268,7 @@ pub(super) fn encode_reduce<T: MetalElement>(
             depth: 1,
         },
     );
-    encoder.endEncoding();
-    commit(gpu, command)
+    queued(gpu, count)
 }
 
 /// One elementwise conversion between a typed buffer and an `f32` one —
@@ -321,16 +280,14 @@ pub(super) fn encode_convert(
     output: &ProtocolObject<dyn MTLBuffer>,
     len: usize,
 ) -> Option<()> {
-    let command = gpu.queue.commandBuffer()?;
-    let encoder = command.computeCommandEncoder()?;
+    let encoder = compute(gpu)?;
     encoder.setComputePipelineState(pipeline);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
         encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
     }
     dispatch_1d(&encoder, len);
-    encoder.endEncoding();
-    commit(gpu, command)
+    queued(gpu, len)
 }
 
 pub(super) fn encode_scan(
@@ -340,8 +297,7 @@ pub(super) fn encode_scan(
     len: usize,
     offset: usize,
 ) -> Option<()> {
-    let command = gpu.queue.commandBuffer()?;
-    let encoder = command.computeCommandEncoder()?;
+    let encoder = compute(gpu)?;
     let offset_u32 = u32::try_from(offset).ok()?;
     encoder.setComputePipelineState(&gpu.scan);
     unsafe {
@@ -350,8 +306,7 @@ pub(super) fn encode_scan(
         encoder.setBytes_length_atIndex(NonNull::from(&offset_u32).cast(), 4, 2);
     }
     dispatch_1d(&encoder, len);
-    encoder.endEncoding();
-    commit(gpu, command)
+    queued(gpu, len)
 }
 
 pub(super) fn encode_sort_prepare<T: MetalElement>(
@@ -362,8 +317,7 @@ pub(super) fn encode_sort_prepare<T: MetalElement>(
     count: usize,
     padding: T,
 ) -> Option<()> {
-    let command = gpu.queue.commandBuffer()?;
-    let encoder = command.computeCommandEncoder()?;
+    let encoder = compute(gpu)?;
     let count_u32 = u32::try_from(count).ok()?;
     encoder.setComputePipelineState(&gpu.kernels::<T>().sort_prepare);
     unsafe {
@@ -373,8 +327,7 @@ pub(super) fn encode_sort_prepare<T: MetalElement>(
         encoder.setBytes_length_atIndex(NonNull::from(&padding).cast(), size_of::<T>(), 3);
     }
     dispatch_1d(&encoder, padded);
-    encoder.endEncoding();
-    commit(gpu, command)
+    queued(gpu, padded)
 }
 
 pub(super) fn encode_bitonic_stage<T: MetalElement>(
@@ -385,8 +338,7 @@ pub(super) fn encode_bitonic_stage<T: MetalElement>(
     stride: usize,
     ascending: bool,
 ) -> Option<()> {
-    let command = gpu.queue.commandBuffer()?;
-    let encoder = command.computeCommandEncoder()?;
+    let encoder = compute(gpu)?;
     let block_u32 = u32::try_from(block).ok()?;
     let stride_u32 = u32::try_from(stride).ok()?;
     let ascending_u32 = u32::from(ascending);
@@ -398,8 +350,7 @@ pub(super) fn encode_bitonic_stage<T: MetalElement>(
         encoder.setBytes_length_atIndex(NonNull::from(&ascending_u32).cast(), 4, 3);
     }
     dispatch_1d(&encoder, padded);
-    encoder.endEncoding();
-    commit(gpu, command)
+    queued(gpu, padded)
 }
 
 pub(super) fn encode_broadcast<T: MetalElement>(
@@ -411,8 +362,7 @@ pub(super) fn encode_broadcast<T: MetalElement>(
     op: BinaryOp,
     scalar_left: bool,
 ) -> Option<()> {
-    let command = gpu.queue.commandBuffer()?;
-    let encoder = command.computeCommandEncoder()?;
+    let encoder = compute(gpu)?;
     encoder.setComputePipelineState(&gpu.kernels::<T>().broadcast);
     let scalar_left = u32::from(scalar_left);
     unsafe {
@@ -423,8 +373,7 @@ pub(super) fn encode_broadcast<T: MetalElement>(
         encoder.setBytes_length_atIndex(NonNull::from(&scalar_left).cast(), 4, 4);
     }
     dispatch_1d(&encoder, len);
-    encoder.endEncoding();
-    commit(gpu, command)
+    queued(gpu, len)
 }
 
 pub(super) fn encode_stack<T: MetalElement>(
@@ -441,8 +390,7 @@ pub(super) fn encode_stack<T: MetalElement>(
         .map(|index| u32::try_from(offset(index)).ok())
         .collect::<Option<Vec<_>>>()?;
 
-    let command = gpu.queue.commandBuffer()?;
-    let encoder = command.computeCommandEncoder()?;
+    let encoder = compute(gpu)?;
     encoder.setComputePipelineState(&gpu.kernels::<T>().stack_vector);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
@@ -456,8 +404,7 @@ pub(super) fn encode_stack<T: MetalElement>(
         }
         dispatch_1d(&encoder, vector_len);
     }
-    encoder.endEncoding();
-    commit(gpu, command)
+    queued(gpu, vector_len * inputs.len())
 }
 
 pub(super) fn encode_concat<T: MetalElement>(
@@ -474,8 +421,7 @@ pub(super) fn encode_concat<T: MetalElement>(
     let right_cols_u32 = u32::try_from(right_cols).ok()?;
     let output_cols = left_cols.checked_add(right_cols)?;
 
-    let command = gpu.queue.commandBuffer()?;
-    let encoder = command.computeCommandEncoder()?;
+    let encoder = compute(gpu)?;
     encoder.setComputePipelineState(&gpu.kernels::<T>().concat_horizontal);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(left), 0, 0);
@@ -496,8 +442,29 @@ pub(super) fn encode_concat<T: MetalElement>(
         depth: 1,
     };
     encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, per_group);
-    encoder.endEncoding();
-    commit(gpu, command)
+    queued(gpu, rows * output_cols)
+}
+
+/// Copy `bytes` from the front of `source` to the front of `destination` on the
+/// GPU timeline, so it waits for whatever is still writing `source` without the
+/// CPU having to.
+pub(super) fn encode_copy(
+    gpu: &Gpu,
+    source: &ProtocolObject<dyn MTLBuffer>,
+    destination: &ProtocolObject<dyn MTLBuffer>,
+    bytes: usize,
+) -> Option<()> {
+    let encoder = blit(gpu)?;
+    unsafe {
+        encoder.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+            source,
+            0,
+            destination,
+            0,
+            bytes,
+        );
+    }
+    queued(gpu, bytes / 4)
 }
 
 pub(super) fn encode_matrix_stack<T: MetalElement>(
@@ -510,8 +477,7 @@ pub(super) fn encode_matrix_stack<T: MetalElement>(
 ) -> Option<()> {
     let top_bytes = top_len.checked_mul(size_of::<T>())?;
     let bottom_bytes = bottom_len.checked_mul(size_of::<T>())?;
-    let command = gpu.queue.commandBuffer()?;
-    let encoder = command.blitCommandEncoder()?;
+    let encoder = blit(gpu)?;
     unsafe {
         if top_bytes != 0 {
             encoder.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
@@ -528,8 +494,7 @@ pub(super) fn encode_matrix_stack<T: MetalElement>(
             );
         }
     }
-    encoder.endEncoding();
-    commit(gpu, command)
+    queued(gpu, (top_bytes + bottom_bytes) / 4)
 }
 
 pub(super) fn encode_hmerge<T: MetalElement>(
@@ -547,8 +512,7 @@ pub(super) fn encode_hmerge<T: MetalElement>(
         .map(|index| u32::try_from(index.checked_mul(cols)?).ok())
         .collect::<Option<Vec<_>>>()?;
 
-    let command = gpu.queue.commandBuffer()?;
-    let encoder = command.computeCommandEncoder()?;
+    let encoder = compute(gpu)?;
     encoder.setComputePipelineState(&gpu.kernels::<T>().merge_horizontal);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
@@ -573,8 +537,7 @@ pub(super) fn encode_hmerge<T: MetalElement>(
         }
         encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, per_group);
     }
-    encoder.endEncoding();
-    commit(gpu, command)
+    queued(gpu, rows * output_cols)
 }
 
 pub(super) fn encode_vmerge<T: MetalElement>(
@@ -584,8 +547,7 @@ pub(super) fn encode_vmerge<T: MetalElement>(
     matrix_len: usize,
 ) -> Option<()> {
     let matrix_bytes = matrix_len.checked_mul(size_of::<T>())?;
-    let command = gpu.queue.commandBuffer()?;
-    let encoder = command.blitCommandEncoder()?;
+    let encoder = blit(gpu)?;
     for (index, input) in inputs.iter().enumerate() {
         let destination_offset = index.checked_mul(matrix_bytes)?;
         unsafe {
@@ -598,8 +560,7 @@ pub(super) fn encode_vmerge<T: MetalElement>(
             );
         }
     }
-    encoder.endEncoding();
-    commit(gpu, command)
+    queued(gpu, matrix_bytes / 4 * inputs.len())
 }
 
 /// The first round of a deviation fold: one partial per threadgroup.
@@ -614,8 +575,7 @@ pub(super) fn encode_deviation<T: MetalElement>(
     groups: usize,
     mean: f32,
 ) -> Option<()> {
-    let command = gpu.queue.commandBuffer()?;
-    let encoder = command.computeCommandEncoder()?;
+    let encoder = compute(gpu)?;
     let count_u32 = u32::try_from(count).ok()?;
     encoder.setComputePipelineState(&gpu.kernels::<T>().deviation);
     unsafe {
@@ -636,8 +596,7 @@ pub(super) fn encode_deviation<T: MetalElement>(
             depth: 1,
         },
     );
-    encoder.endEncoding();
-    commit(gpu, command)
+    queued(gpu, count)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -651,8 +610,7 @@ pub(super) fn encode_axis_moments<T: MetalElement>(
     extent: usize,
     axis: Axis,
 ) -> Option<()> {
-    let command = gpu.queue.commandBuffer()?;
-    let encoder = command.computeCommandEncoder()?;
+    let encoder = compute(gpu)?;
     let (rows_u32, cols_u32) = (u32::try_from(rows).ok()?, u32::try_from(cols).ok()?);
     encoder.setComputePipelineState(&gpu.kernels::<T>().axis_moments);
     unsafe {
@@ -664,8 +622,7 @@ pub(super) fn encode_axis_moments<T: MetalElement>(
         encoder.setBytes_length_atIndex(NonNull::from(&axis).cast(), size_of::<Axis>(), 5);
     }
     dispatch_1d(&encoder, extent);
-    encoder.endEncoding();
-    commit(gpu, command)
+    queued(gpu, rows * cols)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -678,8 +635,7 @@ pub(super) fn encode_distribution<T: MetalElement>(
     statistic: Statistic,
     parameters: (f32, f32),
 ) -> Option<()> {
-    let command = gpu.queue.commandBuffer()?;
-    let encoder = command.computeCommandEncoder()?;
+    let encoder = compute(gpu)?;
     encoder.setComputePipelineState(&gpu.kernels::<T>().distribution);
     let (first, second) = parameters;
     unsafe {
@@ -695,8 +651,7 @@ pub(super) fn encode_distribution<T: MetalElement>(
         encoder.setBytes_length_atIndex(NonNull::from(&second).cast(), 4, 5);
     }
     dispatch_1d(&encoder, len);
-    encoder.endEncoding();
-    commit(gpu, command)
+    queued(gpu, len)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -712,8 +667,7 @@ pub(super) fn encode_axis_distribution<T: MetalElement>(
     family: Family,
     statistic: Statistic,
 ) -> Option<()> {
-    let command = gpu.queue.commandBuffer()?;
-    let encoder = command.computeCommandEncoder()?;
+    let encoder = compute(gpu)?;
     let cols_u32 = u32::try_from(cols).ok()?;
     encoder.setComputePipelineState(&gpu.kernels::<T>().axis_distribution);
     unsafe {
@@ -731,8 +685,7 @@ pub(super) fn encode_axis_distribution<T: MetalElement>(
         );
     }
     dispatch_1d(&encoder, len);
-    encoder.endEncoding();
-    commit(gpu, command)
+    queued(gpu, len)
 }
 
 pub(super) fn encode_power<T: MetalElement>(
@@ -742,8 +695,7 @@ pub(super) fn encode_power<T: MetalElement>(
     output: &ProtocolObject<dyn MTLBuffer>,
     len: usize,
 ) -> Option<()> {
-    let command = gpu.queue.commandBuffer()?;
-    let encoder = command.computeCommandEncoder()?;
+    let encoder = compute(gpu)?;
     encoder.setComputePipelineState(&gpu.kernels::<T>().power);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(a), 0, 0);
@@ -751,8 +703,7 @@ pub(super) fn encode_power<T: MetalElement>(
         encoder.setBuffer_offset_atIndex(Some(output), 0, 2);
     }
     dispatch_1d(&encoder, len);
-    encoder.endEncoding();
-    commit(gpu, command)
+    queued(gpu, len)
 }
 
 pub(super) fn encode_power_scalar<T: MetalElement>(
@@ -763,8 +714,7 @@ pub(super) fn encode_power_scalar<T: MetalElement>(
     scalar: f32,
     scalar_left: bool,
 ) -> Option<()> {
-    let command = gpu.queue.commandBuffer()?;
-    let encoder = command.computeCommandEncoder()?;
+    let encoder = compute(gpu)?;
     encoder.setComputePipelineState(&gpu.kernels::<T>().power_scalar);
     let scalar_left = u32::from(scalar_left);
     unsafe {
@@ -774,8 +724,7 @@ pub(super) fn encode_power_scalar<T: MetalElement>(
         encoder.setBytes_length_atIndex(NonNull::from(&scalar_left).cast(), 4, 3);
     }
     dispatch_1d(&encoder, len);
-    encoder.endEncoding();
-    commit(gpu, command)
+    queued(gpu, len)
 }
 
 pub(super) fn encode_unary<T: MetalElement>(
@@ -785,8 +734,7 @@ pub(super) fn encode_unary<T: MetalElement>(
     len: usize,
     op: Analytic,
 ) -> Option<()> {
-    let command = gpu.queue.commandBuffer()?;
-    let encoder = command.computeCommandEncoder()?;
+    let encoder = compute(gpu)?;
     encoder.setComputePipelineState(&gpu.kernels::<T>().unary);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
@@ -794,8 +742,7 @@ pub(super) fn encode_unary<T: MetalElement>(
         encoder.setBytes_length_atIndex(NonNull::from(&op).cast(), size_of::<Analytic>(), 2);
     }
     dispatch_1d(&encoder, len);
-    encoder.endEncoding();
-    commit(gpu, command)
+    queued(gpu, len)
 }
 
 pub(super) fn encode_unary_dual<T: MetalElement>(
@@ -807,8 +754,7 @@ pub(super) fn encode_unary_dual<T: MetalElement>(
     len: usize,
     op: Analytic,
 ) -> Option<()> {
-    let command = gpu.queue.commandBuffer()?;
-    let encoder = command.computeCommandEncoder()?;
+    let encoder = compute(gpu)?;
     encoder.setComputePipelineState(&gpu.kernels::<T>().unary_dual);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(value), 0, 0);
@@ -818,8 +764,7 @@ pub(super) fn encode_unary_dual<T: MetalElement>(
         encoder.setBytes_length_atIndex(NonNull::from(&op).cast(), size_of::<Analytic>(), 4);
     }
     dispatch_1d(&encoder, len);
-    encoder.endEncoding();
-    commit(gpu, command)
+    queued(gpu, len)
 }
 
 pub(super) fn encode_fft(
@@ -829,12 +774,13 @@ pub(super) fn encode_fft(
     count: usize,
     inverse: bool,
 ) -> Option<()> {
-    let command = gpu.queue.commandBuffer()?;
     let count_u32 = u32::try_from(count).ok()?;
     let bits = count.trailing_zeros();
     let inverse_u32 = u32::from(inverse);
 
-    let encoder = command.computeCommandEncoder()?;
+    // Every stage goes to the same compute encoder, whose dispatches run in
+    // order, each seeing the one before it.
+    let encoder = compute(gpu)?;
     encoder.setComputePipelineState(&gpu.fft_bit_reverse);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
@@ -843,11 +789,9 @@ pub(super) fn encode_fft(
         encoder.setBytes_length_atIndex(NonNull::from(&bits).cast(), 4, 3);
     }
     dispatch_1d(&encoder, count);
-    encoder.endEncoding();
 
     let mut stage_length = 2u32;
     while stage_length <= count_u32 {
-        let encoder = command.computeCommandEncoder()?;
         encoder.setComputePipelineState(&gpu.fft_stage);
         unsafe {
             encoder.setBuffer_offset_atIndex(Some(output), 0, 0);
@@ -856,13 +800,12 @@ pub(super) fn encode_fft(
             encoder.setBytes_length_atIndex(NonNull::from(&inverse_u32).cast(), 4, 3);
         }
         dispatch_1d(&encoder, count / 2);
-        encoder.endEncoding();
         if stage_length == count_u32 {
             break;
         }
         stage_length *= 2;
     }
-    commit(gpu, command)
+    queued(gpu, count.saturating_mul(bits as usize + 1))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -877,8 +820,7 @@ pub(super) fn encode_correlate<T: MetalElement>(
     window_cols: usize,
     flip: bool,
 ) -> Option<()> {
-    let command = gpu.queue.commandBuffer()?;
-    let encoder = command.computeCommandEncoder()?;
+    let encoder = compute(gpu)?;
     encoder.setComputePipelineState(&gpu.kernels::<T>().correlate);
     let shape = [
         u32::try_from(rows).ok()?,
@@ -897,8 +839,10 @@ pub(super) fn encode_correlate<T: MetalElement>(
         encoder.setBytes_length_atIndex(NonNull::from(&flip).cast(), 4, 7);
     }
     dispatch_2d(&encoder, cols - window_cols + 1, rows - window_rows + 1);
-    encoder.endEncoding();
-    commit(gpu, command)
+    queued(
+        gpu,
+        (rows * cols).saturating_mul(window_rows * window_cols) / 4,
+    )
 }
 
 pub(super) fn encode_pad<T: MetalElement>(
@@ -910,8 +854,7 @@ pub(super) fn encode_pad<T: MetalElement>(
     pad_rows: usize,
     pad_cols: usize,
 ) -> Option<()> {
-    let command = gpu.queue.commandBuffer()?;
-    let encoder = command.computeCommandEncoder()?;
+    let encoder = compute(gpu)?;
     encoder.setComputePipelineState(&gpu.kernels::<T>().pad_zeros);
     let shape = [
         u32::try_from(rows).ok()?,
@@ -927,8 +870,7 @@ pub(super) fn encode_pad<T: MetalElement>(
         }
     }
     dispatch_2d(&encoder, cols + 2 * pad_cols, rows + 2 * pad_rows);
-    encoder.endEncoding();
-    commit(gpu, command)
+    queued(gpu, (rows + 2 * pad_rows) * (cols + 2 * pad_cols))
 }
 
 pub(super) fn encode_flip<T: MetalElement>(
@@ -938,8 +880,7 @@ pub(super) fn encode_flip<T: MetalElement>(
     rows: usize,
     cols: usize,
 ) -> Option<()> {
-    let command = gpu.queue.commandBuffer()?;
-    let encoder = command.computeCommandEncoder()?;
+    let encoder = compute(gpu)?;
     encoder.setComputePipelineState(&gpu.kernels::<T>().flip_both);
     let (rows_u, cols_u) = (u32::try_from(rows).ok()?, u32::try_from(cols).ok()?);
     unsafe {
@@ -949,8 +890,7 @@ pub(super) fn encode_flip<T: MetalElement>(
         encoder.setBytes_length_atIndex(NonNull::from(&cols_u).cast(), 4, 3);
     }
     dispatch_2d(&encoder, cols, rows);
-    encoder.endEncoding();
-    commit(gpu, command)
+    queued(gpu, rows * cols)
 }
 
 pub(super) fn dispatch_2d(

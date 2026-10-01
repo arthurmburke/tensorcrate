@@ -1254,6 +1254,23 @@ impl<B: Backend> Source<'_, B> {
         }
     }
 
+    /// The storage, if it holds `T`s.
+    fn typed<T: 'static>(&self) -> Option<&B::Vector<T>> {
+        fn cast<B: Backend, U: 'static, T: 'static>(
+            storage: &B::Vector<U>,
+        ) -> Option<&B::Vector<T>> {
+            // SAFETY: `U` is `T`, so the two storage types are one type.
+            (TypeId::of::<U>() == TypeId::of::<T>())
+                .then(|| unsafe { &*(storage as *const B::Vector<U>).cast::<B::Vector<T>>() })
+        }
+        match self.data {
+            SourceData::F32(storage) => cast::<B, f32, T>(storage),
+            SourceData::F16(storage) => cast::<B, f16, T>(storage),
+            SourceData::Bf16(storage) => cast::<B, bf16, T>(storage),
+            SourceData::F64(storage) => cast::<B, f64, T>(storage),
+        }
+    }
+
     pub(crate) fn slice(&self) -> Slice<'_> {
         match self.data {
             SourceData::F32(storage) => Slice::F32(B::vector_slice(storage)),
@@ -1523,23 +1540,42 @@ fn load_unfused<B: Kernels<T>, T: Real>(
         Remap::Row => (1, cols),
         Remap::Column => (rows, 1),
     };
-    let tensor = Matrix::build(stored_rows, stored_cols, &source.slice().widen::<T>());
+    // An input already of the program's type is copied on its own backend —
+    // on Metal, on the GPU — rather than read back through the CPU, which on a
+    // device would wait for every queued kernel.
+    let stored = match source.typed::<T>() {
+        Some(storage) => B::duplicate(storage),
+        None => B::store_vector(&source.slice().widen::<T>()),
+    };
+    let tensor = Matrix::from_storage(stored_rows, stored_cols, B::vector_into_matrix(stored));
     match remap {
         Remap::Identity => tensor,
         Remap::Transpose => B::transpose(&tensor),
-        Remap::Row => {
-            let copies: Vec<B::Vector<T>> = (0..rows)
-                .map(|_| B::store_vector(tensor.as_slice()))
-                .collect();
-            Matrix::from_storage(rows, cols, B::vstack(&copies, cols))
-        }
-        Remap::Column => {
-            let copies: Vec<B::Vector<T>> = (0..cols)
-                .map(|_| B::store_vector(tensor.as_slice()))
-                .collect();
-            Matrix::from_storage(rows, cols, B::hstack(&copies, rows))
+        Remap::Row | Remap::Column => {
+            let vector = B::matrix_as_vector(tensor.storage());
+            let count = if remap == Remap::Row { rows } else { cols };
+            let copies: Vec<B::Vector<T>> = (0..count).map(|_| B::duplicate(vector)).collect();
+            let storage = if remap == Remap::Row {
+                B::vstack(&copies, cols)
+            } else {
+                B::hstack(&copies, rows)
+            };
+            Matrix::from_storage(rows, cols, storage)
         }
     }
+}
+
+/// `storage` reinterpreted as storage of `U`, when `T` is `U`.
+fn retype<B: Backend, T: 'static, U: 'static>(
+    storage: B::Vector<T>,
+) -> Result<B::Vector<U>, B::Vector<T>> {
+    if TypeId::of::<T>() != TypeId::of::<U>() {
+        return Err(storage);
+    }
+    let storage = std::mem::ManuallyDrop::new(storage);
+    // SAFETY: `T` is `U`, so the two storage types are one type; the value is
+    // moved, since the original is never dropped.
+    Ok(unsafe { std::mem::transmute_copy::<B::Vector<T>, B::Vector<U>>(&storage) })
 }
 
 fn scalar_binary<T: Real>(op: BinaryOp, a: T, b: T) -> T {
@@ -1555,6 +1591,17 @@ fn scalar_binary<T: Real>(op: BinaryOp, a: T, b: T) -> T {
 /// Convert a `T` tensor to an output's storage type.
 fn narrow<B: Kernels<T>, T: Real>(tensor: Matrix<T, B>, dtype: DType) -> Fresh<B> {
     let storage = B::matrix_into_flattened(tensor.into_storage());
+    // Storage of the program's own type is the result as it stands.
+    let storage = match dtype {
+        DType::F32 => retype::<B, T, f32>(storage).map(Fresh::F32),
+        DType::F16 => retype::<B, T, f16>(storage).map(Fresh::F16),
+        DType::Bf16 => retype::<B, T, bf16>(storage).map(Fresh::Bf16),
+        DType::F64 => retype::<B, T, f64>(storage).map(Fresh::F64),
+    };
+    let storage = match storage {
+        Ok(fresh) => return fresh,
+        Err(storage) => storage,
+    };
     let values = B::vector_slice(&storage);
     match dtype {
         DType::F32 => Fresh::F32(B::vector_from_vec(convert(values))),
@@ -1646,9 +1693,55 @@ fn same_mut<T: 'static, U: 'static>(values: &mut [T]) -> Option<&mut [U]> {
 
 // ---- the host tile interpreter ------------------------------------------------
 
-/// Elements per tile. Sixteen registers of this many `f32`s plus a spare fill
-/// 68 KB, which stays in an Apple-silicon L1 and a typical x86 L2.
+/// The fewest elements per tile. Sixteen registers of this many `f32`s plus a
+/// spare fill 68 KB, which stays in an Apple-silicon L1 and a typical x86 L2.
 const TILE: usize = 1024;
+
+/// The most elements per tile.
+const MAX_TILE: usize = 16 * 1024;
+
+/// The scratch a tile's registers may fill. A program with few registers gets
+/// longer tiles inside this budget, which spreads the per-tile cost of
+/// interpreting — a dozen nanoseconds — over more elements: a one-operation
+/// program over a long tensor otherwise pays it often enough to show.
+const TILE_BYTES: usize = 64 * 1024;
+
+thread_local! {
+    /// The interpreter's register tiles, kept between programs so that a small
+    /// one does not pay for allocating and zeroing them every time.
+    static SCRATCH: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run `f` over `len` scratch elements of `T`. Their values are whatever the
+/// last program left — every bit pattern is a valid float, and the interpreter
+/// writes a tile before it reads it.
+fn with_scratch<T: Real, R>(len: usize, f: impl FnOnce(&mut [T]) -> R) -> R {
+    assert!(size_of::<T>() <= 8 && align_of::<T>() <= 8 && 8 % size_of::<T>() == 0);
+    let words = (len * size_of::<T>()).div_ceil(8);
+    let cast = |words: &mut [u64]| {
+        // SAFETY: `T` is a float of at most eight bytes dividing eight, so the
+        // words hold `len` of them, suitably aligned, and any bits are valid.
+        unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<T>(), len) }
+    };
+    SCRATCH.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut words_held) => {
+            if words_held.len() < words {
+                words_held.resize(words, 0);
+            }
+            f(cast(&mut words_held[..words]))
+        }
+        // Re-entered — a kernel that runs a program of its own — so use a
+        // scratch of this call's own.
+        Err(_) => f(cast(&mut vec![0u64; words])),
+    })
+}
+
+/// Elements per tile for `physical` register tiles of `T`.
+fn tile_len<T>(physical: usize, len: usize) -> usize {
+    let budget = TILE_BYTES / (physical * size_of::<T>()).max(1);
+    let tile = budget.clamp(TILE, MAX_TILE) / 64 * 64;
+    tile.min(len.max(1))
+}
 
 /// A typed input slice.
 #[doc(hidden)]
@@ -1669,6 +1762,16 @@ pub enum SliceMut<'a> {
 }
 
 impl Slice<'_> {
+    /// The values, if they are already `T`s.
+    fn typed<T: 'static>(&self) -> Option<&[T]> {
+        match self {
+            Slice::F32(values) => same(values),
+            Slice::F16(values) => same(values),
+            Slice::Bf16(values) => same(values),
+            Slice::F64(values) => same(values),
+        }
+    }
+
     fn widen<T: Real>(&self) -> Vec<T> {
         match self {
             Slice::F32(values) => convert(values),
@@ -1741,6 +1844,16 @@ impl Slice<'_> {
 }
 
 impl SliceMut<'_> {
+    /// The values, if they are `T`s.
+    fn typed<T: 'static>(&mut self) -> Option<&mut [T]> {
+        match self {
+            SliceMut::F32(values) => same_mut(values),
+            SliceMut::F16(values) => same_mut(values),
+            SliceMut::Bf16(values) => same_mut(values),
+            SliceMut::F64(values) => same_mut(values),
+        }
+    }
+
     fn view(&self) -> Slice<'_> {
         match self {
             SliceMut::F32(values) => Slice::F32(values),
@@ -1834,12 +1947,18 @@ pub(crate) fn interpret_on<B: Backend, T: Real>(
 
 /// The tile interpreter.
 ///
-/// The space is walked in tiles of [`TILE`] elements. Within a tile each
+/// The space is walked in tiles of [`TILE`] elements or more ([`tile_len`]). Within a tile each
 /// instruction runs the same vectorized kernel its unfused counterpart would,
 /// over tile-sized register slices that stay in cache, so the interpretation
 /// cost — one dispatch per instruction per tile — is spread over a thousand
 /// elements. Constants never fill a register: an operation with one becomes the
 /// scalar-broadcast kernel, exactly as in unfused code.
+///
+/// Registers avoid copies where they can (see [`Plan`]): a load of an input
+/// already in the program's type reads the input where it lies, and an
+/// operation whose result is only stored writes it straight into the output.
+/// A one-operation program is then one pass over memory, like the kernel it
+/// replaces, rather than a copy in, the operation, and a copy out.
 ///
 /// `outputs` holds the in-place tensors first; loads of the last
 /// `program.updated()` input slots read them.
@@ -1850,15 +1969,38 @@ fn interpret<T: Real>(
     outputs: &mut [SliceMut<'_>],
 ) {
     let len = shape.0 * shape.1;
-    let fresh_inputs = program.fresh_inputs();
+    let plan = Plan::new(program, inputs, outputs);
     // One physical tile per register, plus a spare that receives each result
     // so an instruction may overwrite one of its own operands.
     let physical = program.registers + 1;
-    let mut scratch = vec![T::zero(); physical * TILE.min(len.max(1))];
-    let tile_len = TILE.min(len.max(1));
+    let tile_len = tile_len::<T>(physical, len);
+    with_scratch::<T, _>(physical * tile_len, |scratch| {
+        run_tiles(program, shape, inputs, outputs, &plan, scratch, tile_len)
+    });
+}
+
+/// The tile loop of [`interpret`], over `scratch` holding one `tile_len` tile
+/// per physical register.
+fn run_tiles<T: Real>(
+    program: &Program<T>,
+    shape: (usize, usize),
+    inputs: &[Slice<'_>],
+    outputs: &mut [SliceMut<'_>],
+    plan: &Plan,
+    scratch: &mut [T],
+    tile_len: usize,
+) {
+    let len = shape.0 * shape.1;
+    let fresh_inputs = program.fresh_inputs();
+    let physical = program.registers + 1;
     let mut map: [usize; REGISTERS] = std::array::from_fn(|reg| reg.min(physical - 1));
     let mut spare = physical - 1;
     let mut constant: [Option<T>; REGISTERS] = [None; REGISTERS];
+    // A register whose value lies outside scratch — in an input it was loaded
+    // from, or an output it was written to — for the current tile. Its own
+    // tile in `map` is then unused, and comes back into play when it is next
+    // written through the spare.
+    let mut outside: [Option<*const T>; REGISTERS] = [None; REGISTERS];
 
     let mut start = 0;
     while start < len {
@@ -1866,11 +2008,35 @@ fn interpret<T: Real>(
         // The tiles are disjoint `n`-long windows of `scratch`.
         let base = scratch.as_mut_ptr();
         let tile = |physical: usize| unsafe { base.add(physical * tile_len) };
+        // SAFETY (for every `view`): a register's value is `n` elements, in its
+        // own scratch tile or in the window `[start, start + n)` of an input or
+        // output, and no instruction writes the memory it reads.
+        let place = |reg: Reg, outside: &[Option<*const T>; REGISTERS], map: &[usize]| {
+            outside[reg as usize].unwrap_or_else(|| tile(map[reg as usize]).cast_const())
+        };
 
-        for instr in &program.code {
+        for (index, instr) in program.code.iter().enumerate() {
+            // Where a computed result goes: its output, if the plan sends it
+            // there, and otherwise the spare tile.
+            let target = |outputs: &mut [SliceMut<'_>]| -> (*mut T, bool) {
+                match plan.direct[index] {
+                    Some(output) => {
+                        let values = outputs[output].typed::<T>().expect("planned");
+                        (unsafe { values.as_mut_ptr().add(start) }, true)
+                    }
+                    None => (tile(spare), false),
+                }
+            };
             match *instr {
                 Instr::Load { dst, input, remap } => {
                     let slot = usize::from(input);
+                    constant[dst as usize] = None;
+                    if plan.alias[index] {
+                        let values = inputs[slot].typed::<T>().expect("planned");
+                        outside[dst as usize] = Some(unsafe { values.as_ptr().add(start) });
+                        continue;
+                    }
+                    outside[dst as usize] = None;
                     // SAFETY: a register's tile is a distinct window of scratch.
                     let out = unsafe { std::slice::from_raw_parts_mut(tile(map[dst as usize]), n) };
                     if slot < fresh_inputs {
@@ -1880,48 +2046,69 @@ fn interpret<T: Real>(
                             .view()
                             .gather(start, shape, remap, out);
                     }
-                    constant[dst as usize] = None;
                 }
-                Instr::Const { dst, value } => constant[dst as usize] = Some(value),
+                Instr::Const { dst, value } => {
+                    constant[dst as usize] = Some(value);
+                    outside[dst as usize] = None;
+                }
                 Instr::Binary { dst, op, a, b } => {
                     let result = match (constant[a as usize], constant[b as usize]) {
-                        (Some(a), Some(b)) => Some(scalar_binary(op, a, b)),
+                        (Some(a), Some(b)) => Ok(scalar_binary(op, a, b)),
                         (ca, cb) => {
-                            // SAFETY: `spare` is never mapped to a register, so
-                            // the output window cannot overlap an operand.
-                            let out = unsafe { std::slice::from_raw_parts_mut(tile(spare), n) };
+                            let (out, direct) = target(outputs);
+                            // SAFETY: the target is the spare tile, which no
+                            // register maps, or an output no register reads
+                            // yet, so it cannot overlap an operand.
+                            let out = unsafe { std::slice::from_raw_parts_mut(out, n) };
                             let view = |reg: Reg| unsafe {
-                                std::slice::from_raw_parts(tile(map[reg as usize]), n)
+                                std::slice::from_raw_parts(place(reg, &outside, &map), n)
                             };
                             match (ca, cb) {
                                 (None, Some(b)) => kernel::broadcast(view(a), b, op, false, out),
                                 (Some(a), None) => kernel::broadcast(view(b), a, op, true, out),
                                 _ => kernel::elementwise(view(a), view(b), op, out),
                             }
-                            None
+                            Err(direct.then_some(out.as_ptr()))
                         }
                     };
-                    commit(dst, result, &mut map, &mut spare, &mut constant);
+                    commit(
+                        dst,
+                        result,
+                        &mut map,
+                        &mut spare,
+                        &mut constant,
+                        &mut outside,
+                    );
                 }
                 Instr::Unary { dst, op, a } => {
                     let result = match constant[a as usize] {
-                        Some(a) => Some(op.value(a)),
+                        Some(a) => Ok(op.value(a)),
                         None => {
-                            let out = unsafe { std::slice::from_raw_parts_mut(tile(spare), n) };
-                            let a = unsafe { std::slice::from_raw_parts(tile(map[a as usize]), n) };
+                            let (out, direct) = target(outputs);
+                            let out = unsafe { std::slice::from_raw_parts_mut(out, n) };
+                            let a =
+                                unsafe { std::slice::from_raw_parts(place(a, &outside, &map), n) };
                             kernel::unary(a, op, out);
-                            None
+                            Err(direct.then_some(out.as_ptr()))
                         }
                     };
-                    commit(dst, result, &mut map, &mut spare, &mut constant);
+                    commit(
+                        dst,
+                        result,
+                        &mut map,
+                        &mut spare,
+                        &mut constant,
+                        &mut outside,
+                    );
                 }
                 Instr::Cmp { dst, op, a, b } => {
                     let result = match (constant[a as usize], constant[b as usize]) {
-                        (Some(a), Some(b)) => Some(op.value(a, b)),
+                        (Some(a), Some(b)) => Ok(op.value(a, b)),
                         (ca, cb) => {
-                            let out = unsafe { std::slice::from_raw_parts_mut(tile(spare), n) };
+                            let (out, direct) = target(outputs);
+                            let out = unsafe { std::slice::from_raw_parts_mut(out, n) };
                             let view = |reg: Reg| unsafe {
-                                std::slice::from_raw_parts(tile(map[reg as usize]), n)
+                                std::slice::from_raw_parts(place(reg, &outside, &map), n)
                             };
                             match (ca, cb) {
                                 (None, Some(b)) => {
@@ -1932,19 +2119,32 @@ fn interpret<T: Real>(
                                 }
                                 _ => kernel::compare(view(a), view(b), op, out),
                             }
-                            None
+                            Err(direct.then_some(out.as_ptr()))
                         }
                     };
-                    commit(dst, result, &mut map, &mut spare, &mut constant);
+                    commit(
+                        dst,
+                        result,
+                        &mut map,
+                        &mut spare,
+                        &mut constant,
+                        &mut outside,
+                    );
                 }
                 Instr::Store { src, output } => {
                     let output = &mut outputs[usize::from(output)];
                     match constant[src as usize] {
                         Some(value) => output.fill(start, n, value),
                         None => {
-                            let values =
-                                unsafe { std::slice::from_raw_parts(tile(map[src as usize]), n) };
-                            output.scatter(start, values);
+                            let from = place(src, &outside, &map);
+                            // Already there if the plan wrote it in place.
+                            let there = output.typed::<T>().is_some_and(|values| {
+                                std::ptr::eq(from, unsafe { values.as_ptr().add(start) })
+                            });
+                            if !there {
+                                let values = unsafe { std::slice::from_raw_parts(from, n) };
+                                output.scatter(start, values);
+                            }
                         }
                     }
                 }
@@ -1954,21 +2154,97 @@ fn interpret<T: Real>(
     }
 }
 
-/// Retire an instruction's result: a constant, or the tensor just written into
-/// the spare tile, which becomes `dst`'s tile while `dst`'s old one becomes the
-/// spare.
+/// Which copies the tile interpreter can skip for one program over one set of
+/// operands. Both are decided per instruction, once, before any tile runs.
+struct Plan {
+    /// A load reads its input in place: the input is already of the program's
+    /// type, is read without a remap, and is not one updated in place (whose
+    /// memory an earlier tile's stores may have been written to).
+    alias: Vec<bool>,
+    /// A computed result is written straight into this output: the output is
+    /// of the program's type, the result is what a later store sends there, and
+    /// — for a tensor updated in place — nothing loads that tensor afterwards.
+    direct: Vec<Option<usize>>,
+}
+
+impl Plan {
+    fn new<T: Real>(
+        program: &Program<T>,
+        inputs: &[Slice<'_>],
+        outputs: &mut [SliceMut<'_>],
+    ) -> Self {
+        let code = &program.code;
+        let fresh_inputs = program.fresh_inputs();
+        let alias = code
+            .iter()
+            .map(|instr| match *instr {
+                Instr::Load { input, remap, .. } => {
+                    let slot = usize::from(input);
+                    remap == Remap::Identity
+                        && slot < fresh_inputs
+                        && inputs[slot].typed::<T>().is_some()
+                }
+                _ => false,
+            })
+            .collect();
+
+        let mut direct = vec![None; code.len()];
+        let mut taken = vec![false; outputs.len()];
+        for (store, instr) in code.iter().enumerate() {
+            let Instr::Store { src, output } = *instr else {
+                continue;
+            };
+            let output = usize::from(output);
+            // The instruction whose value the store reads.
+            let Some(source) = (0..store).rev().find(|&k| code[k].dst() == Some(src)) else {
+                continue;
+            };
+            let computed = matches!(
+                code[source],
+                Instr::Binary { .. } | Instr::Unary { .. } | Instr::Cmp { .. }
+            );
+            let reloaded = output < program.updated
+                && code[source..].iter().any(|instr| {
+                    matches!(*instr, Instr::Load { input, .. }
+                        if usize::from(input) == fresh_inputs + output)
+                });
+            if computed
+                && !reloaded
+                && !taken[output]
+                && direct[source].is_none()
+                && outputs[output].typed::<T>().is_some()
+            {
+                direct[source] = Some(output);
+                taken[output] = true;
+            }
+        }
+        Plan { alias, direct }
+    }
+}
+
+/// Retire an instruction's result: a constant (`Ok`), or a tensor (`Err`) —
+/// written either into the spare tile, which becomes `dst`'s tile while `dst`'s
+/// old one becomes the spare, or, when the plan sent it there, into an output,
+/// where `dst` then reads it.
 fn commit<T: Real>(
     dst: Reg,
-    result: Option<T>,
+    result: Result<T, Option<*const T>>,
     map: &mut [usize; REGISTERS],
     spare: &mut usize,
     constant: &mut [Option<T>; REGISTERS],
+    outside: &mut [Option<*const T>; REGISTERS],
 ) {
     let dst = dst as usize;
     match result {
-        Some(value) => constant[dst] = Some(value),
-        None => {
-            std::mem::swap(&mut map[dst], spare);
+        Ok(value) => {
+            constant[dst] = Some(value);
+            outside[dst] = None;
+        }
+        Err(written) => {
+            if written.is_none() {
+                std::mem::swap(&mut map[dst], spare);
+            }
+            outside[dst] = written;
             constant[dst] = None;
         }
     }

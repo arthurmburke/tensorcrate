@@ -100,7 +100,9 @@ impl<T: Copy + 'static, B: Backend> Matrix<T, B> {
         Matrix {
             rows: self.rows,
             cols: self.cols,
-            data: B2::store_matrix(B::matrix_slice(&self.data)),
+            data: B2::vector_into_matrix(super::backend::transfer::<T, B, B2>(
+                B::matrix_as_vector(&self.data),
+            )),
         }
     }
 

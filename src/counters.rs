@@ -42,7 +42,12 @@ pub struct Counts {
     pub bytes: u64,
     /// Result tensors allocated fresh, rather than written into an existing one.
     pub allocations: u64,
-    /// Metal command buffers committed.
+    /// Metal operations queued: one per kernel dispatch or GPU copy, whichever
+    /// command buffer it is batched into. This is what shows that work ran on
+    /// the GPU.
+    pub dispatches: u64,
+    /// Metal command buffers committed. Operations share them — see
+    /// [`dispatches`](Self::dispatches) for the operations themselves.
     pub command_buffers: u64,
     /// Times the CPU blocked on the GPU, whether to read a result or because
     /// the backlog of queued command buffers filled up.
@@ -57,6 +62,7 @@ impl std::ops::Sub for Counts {
             kernels: self.kernels - earlier.kernels,
             bytes: self.bytes - earlier.bytes,
             allocations: self.allocations - earlier.allocations,
+            dispatches: self.dispatches - earlier.dispatches,
             command_buffers: self.command_buffers - earlier.command_buffers,
             syncs: self.syncs - earlier.syncs,
         }
@@ -75,6 +81,7 @@ mod enabled {
                 kernels: 0,
                 bytes: 0,
                 allocations: 0,
+                dispatches: 0,
                 command_buffers: 0,
                 syncs: 0,
             })
@@ -120,6 +127,11 @@ mod enabled {
     }
 
     #[cfg_attr(not(all(feature = "metal", target_os = "macos")), allow(dead_code))]
+    pub(crate) fn dispatch() {
+        update(|counts| counts.dispatches += 1);
+    }
+
+    #[cfg_attr(not(all(feature = "metal", target_os = "macos")), allow(dead_code))]
     pub(crate) fn sync() {
         update(|counts| counts.syncs += 1);
     }
@@ -130,7 +142,7 @@ mod enabled {
     not(all(feature = "metal", target_os = "macos")),
     allow(unused_imports)
 )]
-pub(crate) use enabled::{command_buffer, kernel, sync};
+pub(crate) use enabled::{command_buffer, dispatch, kernel, sync};
 #[cfg(feature = "counters")]
 pub use enabled::{measure, reset, snapshot};
 
@@ -145,6 +157,10 @@ mod disabled {
 
     #[cfg_attr(not(all(feature = "metal", target_os = "macos")), allow(dead_code))]
     #[inline(always)]
+    pub(crate) fn dispatch() {}
+
+    #[cfg_attr(not(all(feature = "metal", target_os = "macos")), allow(dead_code))]
+    #[inline(always)]
     pub(crate) fn sync() {}
 }
 
@@ -153,7 +169,7 @@ mod disabled {
     not(all(feature = "metal", target_os = "macos")),
     allow(unused_imports)
 )]
-pub(crate) use disabled::{command_buffer, kernel, sync};
+pub(crate) use disabled::{command_buffer, dispatch, kernel, sync};
 
 /// Record one elementwise-shaped kernel: `inputs` operands of `len` `T`s read
 /// and one `len`-long result written into a fresh allocation.
