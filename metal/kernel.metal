@@ -476,6 +476,12 @@ kernel void transpose_tiled(
     }
 }
 
+// The shader builds with fast math, whose hyperbolics are formed from `exp`:
+// `tanh` becomes `inf / inf = NaN` once `exp(2x)` overflows (|x| > ~44), and
+// `sinh`/`cosh` reach `inf` near |x| = 89 where the true value is still finite.
+// The `precise::` forms saturate and overflow where the host's do, and the rest
+// of the shader keeps fast math.
+//
 // These variants must agree with `tensors::kernels::Analytic`, and each
 // derivative must match the corresponding `Dual` implementation.
 inline float analytic_value(AnalyticOp op, float x) {
@@ -490,9 +496,9 @@ inline float analytic_value(AnalyticOp op, float x) {
         case AnalyticOp::Arctan: return atan(x);
         case AnalyticOp::Exp:    return exp(x);
         case AnalyticOp::Ln:     return log(x);
-        case AnalyticOp::Sinh:   return sinh(x);
-        case AnalyticOp::Cosh:   return cosh(x);
-        case AnalyticOp::Tanh:   return tanh(x);
+        case AnalyticOp::Sinh:   return precise::sinh(x);
+        case AnalyticOp::Cosh:   return precise::cosh(x);
+        case AnalyticOp::Tanh:   return precise::tanh(x);
         case AnalyticOp::Sqrt:   return sqrt(x);
         default: return NAN;
     }
@@ -510,9 +516,9 @@ inline float analytic_derivative(AnalyticOp op, float x) {
         case AnalyticOp::Arctan: return 1.0f / (1.0f + x * x);
         case AnalyticOp::Exp:    return exp(x);
         case AnalyticOp::Ln:     return 1.0f / x;
-        case AnalyticOp::Sinh:   return cosh(x);
-        case AnalyticOp::Cosh:   return sinh(x);
-        case AnalyticOp::Tanh:   { float t = tanh(x); return 1.0f - t * t; }
+        case AnalyticOp::Sinh:   return precise::cosh(x);
+        case AnalyticOp::Cosh:   return precise::sinh(x);
+        case AnalyticOp::Tanh:   { float t = precise::tanh(x); return 1.0f - t * t; }
         case AnalyticOp::Sqrt:   return 0.5f * rsqrt(x);
         default: return NAN;
     }
