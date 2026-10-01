@@ -265,6 +265,47 @@ rejected), and reject complex (`i`) and dual (`d`) literals. `pow`, `det`, and `
 have resident Metal kernels; the result is converted back to Metal when it is a tensor. Use the
 regular tensor API for runtime-built shapes and autodiff tapes.
 
+### Fusion
+
+`math!` sees a whole block at once, and every tensor's shape at expansion time, so it fuses
+elementwise work into single kernels while it expands the block. No runtime graph is involved:
+
+```rust
+use tensorcrate::math;
+use tensorcrate::tensors::{Matrix, Metal};
+
+let out: Matrix<f32, Metal> = math! {
+    backend = Metal;
+    let x = [[1, 2], [3, 4]];
+    let w = [[0.5, -1], [2, 0.25]];
+    let h = max(x @ w + 1, 0);      // fused into the product's consumer
+    let a = h * 2 - 1;              // a and b: one kernel with two outputs
+    let b = exp(h) / 10;
+    sin(transpose(a @ b)) + 1       // the transpose becomes transposed loads
+};
+```
+
+- A chain of elementwise operations becomes one kernel: `+ − × ÷ %` between tensors or with a
+  scalar, `.*`, negation, the analytic functions, `min`, `max` and `clamp`. Scalars are computed
+  once, before the kernel, and passed to it as constants.
+- `transpose` inside such a chain is pushed down to the tensors it reads, which are then loaded in
+  transposed order instead of being transposed into a new tensor.
+- A `let` whose value is elementwise is never materialized when it is only read inside other fused
+  chains. If it is read once, it is inlined. If it is read several times, it is inlined only when it
+  is cheap: at most four operations and no transcendental functions.
+- Consecutive independent elementwise `let`s of the same shape are computed together by one
+  kernel that writes all of them.
+- On `Host` a fused chain becomes a single loop that LLVM vectorizes. It performs the same
+  operations in the same order as the unfused code, so the result is identical bit for bit. On
+  `Metal` it becomes one fused program for the bytecode shader. The macro allocates its registers
+  and splits any chain that would exceed the shader's limits, so a block that compiles always fits.
+
+Products, reductions, sorts, `pow`, and complex or dual values are not fused; they run as before,
+and the fused chains around them read their results. Fusion is on by default.
+`fuse = false;` turns it off for one block. `fused::with_mode(Mode::Unfused, || ...)` turns it off
+at runtime for every block on the current thread. Each block keeps its unfused form for that, which
+is also the reference the fused form is tested against.
+
 ## Automatic differentiation
 
 Reverse mode records an evaluation on a `Tape`. It is usually the right choice for training: one

@@ -29,6 +29,10 @@
 //! Metal's shaders are `f32`, so `backend = Metal;` with `dtype = f64;` is an
 //! error.
 //!
+//! Chains of elementwise tensor operations are fused into single kernels while
+//! the block expands — see [`fusion`]. A leading `fuse = false;` turns that off
+//! for the block.
+//!
 //! The input is parsed with `syn` as Rust syntax, which gives operator
 //! precedence, parentheses, grouping and array literals for free. The only
 //! extensions are literal suffixes: `2i` is imaginary and `2d` is the dual
@@ -37,13 +41,15 @@
 //! (ε is spelled `d`, not `e`: rustc's lexer treats any `e` after digits as the
 //! start of a float exponent, so `2e`/`2eps` cannot reach a macro at all.)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use proc_macro2::{Group, Ident, Literal, Punct, Spacing, Span, TokenStream, TokenTree};
 use quote::quote;
 use syn::parse::Parser;
 use syn::spanned::Spanned;
 use syn::{BinOp, Block, Expr, Lit, Pat, Stmt, UnOp};
+
+mod fusion;
 
 /// The static type of a `math!` expression.
 ///
@@ -185,8 +191,31 @@ impl Ty {
     }
 }
 
-/// Bindings introduced by `let` in the block, with their inferred types.
-type Env = HashMap<String, Ty>;
+/// What lowering knows at a point in the block.
+#[derive(Clone, Default)]
+struct Env {
+    /// Bindings introduced by `let` so far, with their inferred types.
+    types: HashMap<String, Ty>,
+    /// Whether elementwise operations are fused; see [`fusion`].
+    fuse: bool,
+    /// Elementwise bindings that are never materialized: fused lowering
+    /// substitutes their value wherever they are read.
+    inline: HashMap<String, Expr>,
+}
+
+impl Env {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn get(&self, name: &str) -> Option<&Ty> {
+        self.types.get(name)
+    }
+
+    fn insert(&mut self, name: String, ty: Ty) {
+        self.types.insert(name, ty);
+    }
+}
 
 #[proc_macro]
 pub fn math(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
@@ -285,7 +314,7 @@ fn marked_binary_operands<'a>(
 
 fn expand(input: TokenStream) -> syn::Result<TokenStream> {
     let mut stmts = Block::parse_within.parse2(input)?;
-    let backend = take_backend_directive(&mut stmts)?;
+    let (backend, fuse) = take_backend_directive(&mut stmts)?;
     let Some((last, leading)) = stmts.split_last() else {
         return Err(syn::Error::new(
             Span::call_site(),
@@ -301,21 +330,36 @@ fn expand(input: TokenStream) -> syn::Result<TokenStream> {
 
     let fallible = block_mentions_inverse(leading, result);
 
-    let mut env = Env::new();
-    let mut out = Vec::new();
-    for stmt in leading {
-        out.push(lower_let(stmt, &mut env, backend)?);
-    }
-
-    let ty = infer(result, &env)?;
-    validate_backend_type(ty, backend, result.span())?;
-    let body = lower(result, ty, &env, backend)?;
+    let (unfused, ty) = lower_block(leading, result, backend, None)?;
     let annotated = ty.rust_type(backend);
+
+    // The block once as written and once fused. Both are emitted when they
+    // differ, so `fused::Mode::Unfused` can still select the original at
+    // runtime — the exact reference fusion is checked against, and a way to
+    // rule fusion in or out when debugging.
+    let body = if fuse {
+        let inline = plan_inlining(leading, result, backend)?;
+        let (fused, _) = lower_block(leading, result, backend, Some(inline))?;
+        if fused.to_string() == unfused.to_string() {
+            unfused
+        } else {
+            quote! {
+                if ::tensorcrate::tensors::fused::mode()
+                    == ::tensorcrate::tensors::fused::Mode::Unfused
+                {
+                    #unfused
+                } else {
+                    #fused
+                }
+            }
+        }
+    } else {
+        unfused
+    };
 
     Ok(if fallible {
         quote! {
             (|| -> ::core::result::Result<#annotated, ::tensorcrate::errors::Error> {
-                #(#out)*
                 let __math_result: #annotated = #body;
                 ::core::result::Result::Ok(__math_result)
             })()
@@ -323,7 +367,6 @@ fn expand(input: TokenStream) -> syn::Result<TokenStream> {
     } else {
         quote! {
             {
-                #(#out)*
                 let __math_result: #annotated = #body;
                 __math_result
             }
@@ -331,11 +374,151 @@ fn expand(input: TokenStream) -> syn::Result<TokenStream> {
     })
 }
 
-/// Remove the optional leading `backend = Host;` / `backend = Metal;` and
-/// `dtype = f32;` / `dtype = f64;` directives, in either order.
-fn take_backend_directive(stmts: &mut Vec<Stmt>) -> syn::Result<BackendChoice> {
+/// Lower the bindings and the result as one block expression, fused when
+/// `inline` is given (naming the bindings to substitute rather than
+/// materialize).
+fn lower_block(
+    leading: &[Stmt],
+    result: &Expr,
+    backend: BackendChoice,
+    inline: Option<HashMap<String, Expr>>,
+) -> syn::Result<(TokenStream, Ty)> {
+    let mut env = Env {
+        fuse: inline.is_some(),
+        inline: inline.unwrap_or_default(),
+        ..Env::new()
+    };
+    let mut out = Vec::new();
+    let mut k = 0;
+    while k < leading.len() {
+        if env.fuse
+            && let Some((tokens, next)) = lower_horizontal(leading, k, &mut env, backend)?
+        {
+            out.push(tokens);
+            k = next;
+            continue;
+        }
+        out.push(lower_let(&leading[k], &mut env, backend)?);
+        k += 1;
+    }
+
+    let ty = infer(result, &env)?;
+    validate_backend_type(ty, backend, result.span())?;
+    let body = lower(result, ty, &env, backend)?;
+    Ok((quote!({ #(#out)* #body }), ty))
+}
+
+/// A `let` statement's name and value, when it is one `math!` accepts.
+fn binding(stmt: &Stmt) -> Option<(&Ident, &Expr)> {
+    let Stmt::Local(local) = stmt else {
+        return None;
+    };
+    let Pat::Ident(pat) = &local.pat else {
+        return None;
+    };
+    let init = local.init.as_ref()?;
+    if init.diverge.is_some() {
+        return None;
+    }
+    Some((&pat.ident, &init.expr))
+}
+
+/// Fuse the binding at `k` with the independent elementwise bindings of the
+/// same shape that follow it, if there are any, returning the one `let` that
+/// computes them all and the index of the first statement after them.
+fn lower_horizontal(
+    leading: &[Stmt],
+    k: usize,
+    env: &mut Env,
+    backend: BackendChoice,
+) -> syn::Result<Option<(TokenStream, usize)>> {
+    let Some((name, expr)) = binding(&leading[k]) else {
+        return Ok(None);
+    };
+    if env.inline.contains_key(&name.to_string()) {
+        return Ok(None);
+    }
+    let ty = infer(expr, env)?;
+    if !fusion::joins_horizontally(expr, ty, None, &HashSet::new(), env)? {
+        return Ok(None);
+    }
+
+    let mut scratch = env.clone();
+    let mut members = vec![(name.clone(), expr, ty)];
+    let mut bound: HashSet<String> = HashSet::from([name.to_string()]);
+    scratch.insert(name.to_string(), ty);
+    let mut end = k + 1;
+    let mut j = k + 1;
+    while j < leading.len() && members.len() < fusion::MAX_OUTPUTS {
+        let Some((other, value)) = binding(&leading[j]) else {
+            break;
+        };
+        let other_ty = infer(value, &scratch)?;
+        // Inlined bindings emit nothing, so they do not separate the group.
+        if scratch.inline.contains_key(&other.to_string()) {
+            scratch.insert(other.to_string(), other_ty);
+            j += 1;
+            continue;
+        }
+        if bound.contains(&other.to_string())
+            || !fusion::joins_horizontally(value, other_ty, Some(ty.shape), &bound, &scratch)?
+        {
+            break;
+        }
+        members.push((other.clone(), value, other_ty));
+        bound.insert(other.to_string());
+        scratch.insert(other.to_string(), other_ty);
+        j += 1;
+        end = j;
+    }
+    if members.len() < 2 {
+        return Ok(None);
+    }
+    let Some(tokens) = fusion::try_fuse_horizontally(&members, env, backend)? else {
+        return Ok(None);
+    };
+    // Bring the types of everything consumed — members and the inlined
+    // bindings among them — into scope.
+    for stmt in &leading[k..end] {
+        let (name, value) = binding(stmt).expect("only bindings were consumed");
+        let ty = infer(value, env)?;
+        env.insert(name.to_string(), ty);
+    }
+    Ok(Some((tokens, end)))
+}
+
+/// Type every binding, then decide which to inline; see
+/// [`fusion::plan_inlining`].
+fn plan_inlining(
+    leading: &[Stmt],
+    result: &Expr,
+    backend: BackendChoice,
+) -> syn::Result<HashMap<String, Expr>> {
+    let mut env = Env::new();
+    let mut envs = Vec::new();
+    let mut bindings = Vec::new();
+    for stmt in leading {
+        envs.push(env.clone());
+        let Some((name, value)) = binding(stmt) else {
+            // The unfused lowering has already reported it.
+            return Ok(HashMap::new());
+        };
+        let ty = infer(value, &env)?;
+        validate_backend_type(ty, backend, value.span())?;
+        env.insert(name.to_string(), ty);
+        bindings.push((name.to_string(), value));
+    }
+    envs.push(env);
+    fusion::plan_inlining(&bindings, result, &envs)
+}
+
+/// Remove the optional leading `backend = Host;` / `backend = Metal;`,
+/// `dtype = f32;` / `dtype = f64;` and `fuse = true;` / `fuse = false;`
+/// directives, in any order. Returns the backend and whether to fuse.
+fn take_backend_directive(stmts: &mut Vec<Stmt>) -> syn::Result<(BackendChoice, bool)> {
     let mut metal: Option<bool> = None;
     let mut dtype: Option<(bool, Span)> = None;
+    let mut fuse: Option<bool> = None;
     loop {
         let Some(Stmt::Expr(Expr::Assign(assign), Some(_))) = stmts.first() else {
             break;
@@ -345,6 +528,24 @@ fn take_backend_directive(stmts: &mut Vec<Stmt>) -> syn::Result<BackendChoice> {
         };
         let is_backend = left.path.is_ident("backend");
         let is_dtype = left.path.is_ident("dtype");
+        if left.path.is_ident("fuse") {
+            let Expr::Lit(syn::ExprLit {
+                lit: Lit::Bool(value),
+                ..
+            }) = &*assign.right
+            else {
+                return Err(syn::Error::new(
+                    assign.right.span(),
+                    "math! fuse must be `true` or `false`",
+                ));
+            };
+            if fuse.is_some() {
+                return Err(syn::Error::new(value.span(), "math! fuse is set twice"));
+            }
+            fuse = Some(value.value);
+            stmts.remove(0);
+            continue;
+        }
         if !is_backend && !is_dtype {
             break;
         }
@@ -381,15 +582,18 @@ fn take_backend_directive(stmts: &mut Vec<Stmt>) -> syn::Result<BackendChoice> {
         }
         stmts.remove(0);
     }
-    match (metal, dtype) {
-        (Some(true), Some((false, span))) => Err(syn::Error::new(
-            span,
-            "the Metal backend computes in f32; use `dtype = f32;` or the Host backend",
-        )),
-        (Some(true), _) => Ok(BackendChoice::Metal),
-        (_, Some((true, _))) => Ok(BackendChoice::HostF32),
-        _ => Ok(BackendChoice::Host),
-    }
+    let backend = match (metal, dtype) {
+        (Some(true), Some((false, span))) => {
+            return Err(syn::Error::new(
+                span,
+                "the Metal backend computes in f32; use `dtype = f32;` or the Host backend",
+            ));
+        }
+        (Some(true), _) => BackendChoice::Metal,
+        (_, Some((true, _))) => BackendChoice::HostF32,
+        _ => BackendChoice::Host,
+    };
+    Ok((backend, fuse.unwrap_or(true)))
 }
 
 fn validate_backend_type(ty: Ty, backend: BackendChoice, span: Span) -> syn::Result<()> {
@@ -453,8 +657,13 @@ fn lower_let(stmt: &Stmt, env: &mut Env, backend: BackendChoice) -> syn::Result<
 
     let ty = infer(&init.expr, env)?;
     validate_backend_type(ty, backend, init.expr.span())?;
-    let value = lower(&init.expr, ty, env, backend)?;
     let name = &pat.ident;
+    if env.inline.contains_key(&name.to_string()) {
+        // Never materialized: its consumers compute it inside their kernels.
+        env.insert(name.to_string(), ty);
+        return Ok(TokenStream::new());
+    }
+    let value = lower(&init.expr, ty, env, backend)?;
     let annotated = ty.rust_type(backend);
     env.insert(name.to_string(), ty);
     Ok(quote! { let #name: #annotated = #value; })
@@ -842,6 +1051,9 @@ const ANALYTIC: &[(&str, &str)] = &[
 
 /// Emit `expr` as Rust of type `target`, widening subexpressions as needed.
 fn lower(expr: &Expr, target: Ty, env: &Env, backend: BackendChoice) -> syn::Result<TokenStream> {
+    if let Some(fused) = fusion::try_fuse(expr, target, env, backend)? {
+        return Ok(fused);
+    }
     match expr {
         Expr::Lit(lit) => lower_literal(lit, target, backend),
         Expr::Array(arr) => {
@@ -872,6 +1084,11 @@ fn lower(expr: &Expr, target: Ty, env: &Env, backend: BackendChoice) -> syn::Res
         }
         Expr::Path(p) => {
             let name = path_name(p)?;
+            if let Some(inlined) = env.inline.get(&name) {
+                // Inlining only chooses bindings read inside fused groups, so
+                // this is a fallback rather than a path taken: recompute.
+                return lower(&inlined.clone(), target, env, backend);
+            }
             let ident = &p.path.segments[0].ident;
             let ty = env.get(&name).copied().unwrap_or(Ty::REAL);
             Ok(widen(quote!(#ident), ty, target, backend))
@@ -884,7 +1101,11 @@ fn lower(expr: &Expr, target: Ty, env: &Env, backend: BackendChoice) -> syn::Res
         Expr::Unary(u) => match u.op {
             UnOp::Neg(_) => {
                 let inner = lower(&u.expr, target, env, backend)?;
-                Ok(quote!(-(#inner)))
+                Ok(if target.is_tensor() {
+                    quote!(-&(#inner))
+                } else {
+                    quote!(-(#inner))
+                })
             }
             _ => Err(syn::Error::new(expr.span(), "unsupported unary operator")),
         },
@@ -1029,10 +1250,13 @@ fn lower_binary(
     // fail on a shape mismatch); a tensor and a scalar broadcast the scalar.
     let element = target.element();
     Ok(match (left_ty.is_tensor(), right_ty.is_tensor()) {
+        // By reference, so a bound tensor stays usable after the operation:
+        // `a + a`, or `a` read again on a later line. The by-value and
+        // by-reference operators run the same kernel.
         (true, true) => {
             let left = lower(&b.left, target, env, backend)?;
             let right = lower(&b.right, target, env, backend)?;
-            quote!((#left #op #right))
+            quote!((&(#left) #op &(#right)))
         }
         (true, false) => {
             let left = lower(&b.left, target, env, backend)?;
@@ -1067,7 +1291,7 @@ fn lower_elementwise_binary(
         (true, true) => {
             let left = lower(left, target, env, backend)?;
             let right = lower(right, target, env, backend)?;
-            quote!((#left * #right))
+            quote!((&(#left) * &(#right)))
         }
         (true, false) => {
             let left = lower(left, target, env, backend)?;
@@ -1305,7 +1529,6 @@ fn lower_min_max(
     })
 }
 
-
 /// Apply a scalar function, mapping over the elements when the value is a
 /// tensor.
 fn elementwise(function: TokenStream, value: TokenStream, target: Ty) -> TokenStream {
@@ -1433,6 +1656,100 @@ mod tests {
         assert!(
             expansion_error(quote! { sorted([1, 2], sideways) })
                 .contains("must be `ascending` or `descending`")
+        );
+    }
+
+    fn expansion(input: TokenStream) -> String {
+        expand(rewrite_custom_operators(input))
+            .expect("the macro input should expand")
+            .to_string()
+    }
+
+    #[test]
+    fn fusion_directives_are_validated() {
+        assert!(expansion_error(quote! { fuse = maybe; [1, 2] }).contains("`true` or `false`"));
+        assert!(
+            expansion_error(quote! { fuse = true; fuse = false; [1, 2] }).contains("set twice")
+        );
+    }
+
+    #[test]
+    fn a_chain_of_elementwise_operations_becomes_one_kernel() {
+        let host = expansion(quote! { let a = [1, 2]; sin(a * 2 + 1) - a });
+        assert!(host.contains("record_kernel"), "{host}");
+        // The unfused block is kept for `Mode::Unfused`.
+        assert!(host.contains("Mode :: Unfused"), "{host}");
+
+        let metal = expansion(quote! { backend = Metal; let a = [1, 2]; sin(a * 2 + 1) - a });
+        assert_eq!(
+            metal.matches("Program :: < f32 > :: new").count(),
+            1,
+            "{metal}"
+        );
+    }
+
+    #[test]
+    fn a_single_operation_is_left_alone() {
+        // One kernel either way, and the existing kernel is already vectorized.
+        let single = expansion(quote! { [1, 2] + [3, 4] });
+        assert!(!single.contains("record_kernel"), "{single}");
+        assert!(!single.contains("Mode :: Unfused"), "{single}");
+    }
+
+    #[test]
+    fn fusion_can_be_switched_off_per_block() {
+        let off = expansion(quote! { fuse = false; let a = [1, 2]; sin(a * 2 + 1) - a });
+        assert!(!off.contains("record_kernel"), "{off}");
+        assert!(!off.contains("Mode :: Unfused"), "{off}");
+    }
+
+    #[test]
+    fn single_use_elementwise_bindings_are_not_materialized() {
+        let fused = expansion(quote! { let a = [1, 2]; let b = a * 2; let c = b + 1; c - a });
+        let fused_half = fused.split("else").nth(1).expect("a fused branch");
+        assert!(!fused_half.contains("let b"), "{fused_half}");
+        assert!(!fused_half.contains("let c"), "{fused_half}");
+    }
+
+    #[test]
+    fn expensive_shared_bindings_are_materialized_once() {
+        let fused = expansion(quote! { let a = [1, 2]; let e = exp(a) * 3; e .* a + e });
+        let fused_half = fused.split("else").nth(1).expect("a fused branch");
+        assert!(fused_half.contains("let e"), "{fused_half}");
+        // ...but cheap ones are recomputed at each use.
+        let fused = expansion(quote! { let a = [1, 2]; let c = a * 3; c .* a + c });
+        let fused_half = fused.split("else").nth(1).expect("a fused branch");
+        assert!(!fused_half.contains("let c"), "{fused_half}");
+    }
+
+    #[test]
+    fn independent_bindings_fuse_horizontally() {
+        let fused = expansion(quote! {
+            backend = Metal;
+            let x = [[1, 2], [3, 4]];
+            let a = x * 2 + 1;
+            let b = exp(x) - 1;
+            a @ b
+        });
+        assert_eq!(
+            fused.matches("Program :: < f32 > :: new").count(),
+            1,
+            "{fused}"
+        );
+        assert!(fused.contains("let (a , b)"), "{fused}");
+    }
+
+    #[test]
+    fn programs_over_the_input_limit_are_split() {
+        // Twenty distinct inputs cannot be one Metal program.
+        let fused = expansion(quote! {
+            backend = Metal;
+            [1] + [2] + [3] + [4] + [5] + [6] + [7] + [8] + [9] + [10]
+                + [11] + [12] + [13] + [14] + [15] + [16] + [17] + [18] + [19] + [20]
+        });
+        assert!(
+            fused.matches("Program :: < f32 > :: new").count() >= 2,
+            "{fused}"
         );
     }
 
