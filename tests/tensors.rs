@@ -2,7 +2,7 @@
 
 use tensorcrate::errors::Error;
 use tensorcrate::numbers::{Complex, Dual};
-use tensorcrate::tensors::{BinaryOp, Matrix, MatrixOperand, Vector};
+use tensorcrate::tensors::{BinaryOp, Matrix, Vector, chained_matmul_cost};
 
 fn close(a: f64, b: f64) -> bool {
     (a - b).abs() < 1e-9
@@ -271,15 +271,11 @@ fn chained_matmul_restores_optimal_order_and_const_result_shape() {
     let a: Matrix<i64> = Matrix::from_rows([[1, 2, 3], [4, 5, 6]]);
     let b: Matrix<i64> = Matrix::from_rows([[1, 0], [0, 1], [1, 1]]);
     let c: Matrix<i64> = Matrix::from_rows([[1, 2, 3, 4], [5, 6, 7, 8]]);
-    let chain = [
-        MatrixOperand::from(&a),
-        MatrixOperand::from(&b),
-        MatrixOperand::from(&c),
-    ];
+    let chain = [&a, &b, &c];
 
     let product: Matrix<i64> = Matrix::chained_matmul(&chain).unwrap();
     assert_eq!(product, a.matmul(&b).matmul(&c));
-    assert_eq!(Matrix::<i64>::chained_matmul_cost(&chain), Ok(28));
+    assert_eq!(Matrix::chained_matmul_cost(&chain), Ok(28));
 }
 
 #[test]
@@ -287,12 +283,9 @@ fn hu_shing_cost_finds_the_classic_optimum() {
     let a = Matrix::<i64>::zeros(10, 20);
     let b = Matrix::<i64>::zeros(20, 5);
     let c = Matrix::<i64>::zeros(5, 30);
-    let chain = [
-        MatrixOperand::from(&a),
-        MatrixOperand::from(&b),
-        MatrixOperand::from(&c),
-    ];
-    assert_eq!(Matrix::<i64>::chained_matmul_cost(&chain), Ok(2500));
+    let chain = [&a, &b, &c];
+    assert_eq!(Matrix::chained_matmul_cost(&chain), Ok(2500));
+    assert_eq!(chained_matmul_cost(&[(10, 20), (20, 5), (5, 30)]), Ok(2500));
 }
 
 #[test]

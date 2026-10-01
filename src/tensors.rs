@@ -37,6 +37,7 @@
 //! [`Vector::to_backend`] and [`Matrix::to_backend`] move between the two; see
 //! the [`backend`] module for the details.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::fmt::{self, Display};
 use std::ops::{Add, Div, Index, Mul, Neg, Rem, Sub};
@@ -1882,49 +1883,23 @@ impl<T: Copy + 'static, B: Backend> Matrix<T, B> {
     }
 }
 
-/// A type-erased matrix used to assemble a heterogeneous matrix chain.
-/// Construct one with `MatrixOperand::from(&matrix)`.
+/// Multiply a chain of matrices in the optimal parenthesization.
 ///
-/// Rust slices cannot directly contain matrices whose shapes differ, because the
-/// values would have different sizes. This small owned adapter carries the
-/// shape alongside the elements so a chain can be held in one slice.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MatrixOperand<T> {
-    rows: usize,
-    cols: usize,
-    data: Vec<T>,
-}
-
-impl<T: Copy> From<&Matrix<T, Host>> for MatrixOperand<T> {
-    fn from(matrix: &Matrix<T, Host>) -> Self {
-        Self {
-            rows: matrix.rows,
-            cols: matrix.cols,
-            data: matrix.data.clone(),
-        }
-    }
-}
-
-impl<T> MatrixOperand<T> {
-    /// The `(rows, columns)` extents.
-    pub const fn shape(&self) -> (usize, usize) {
-        (self.rows, self.cols)
-    }
-}
-
-/// Multiply a heterogeneous chain in the optimal parenthesization.
-///
-/// The optimal order is found with the classic matrix-chain dynamic program; use
-/// [`chained_matmul_cost`] when only the optimal cost is needed, since that
-/// function uses the `O(n log n)` Hu–Shing solver.
+/// The matrices are borrowed and may have different shapes, as long as each
+/// one's column count is the next one's row count. The optimal order is found
+/// with the classic matrix-chain dynamic program, and each product is an
+/// ordinary [`Matrix::matmul`]; use [`chained_matmul_cost`] when only the
+/// optimal cost is needed, since that function uses the `O(n log n)` Hu–Shing
+/// solver.
 ///
 /// Returns [`Error::Shape`] when consecutive operands do not meet, and
 /// [`Error::InvalidArgument`] for a chain shorter than two matrices or one with
 /// a zero extent.
 pub fn chained_matmul<T: Coefficient>(
-    matrices: &[MatrixOperand<T>],
+    matrices: &[&Matrix<T, Host>],
 ) -> Result<Matrix<T, Host>, Error> {
-    let dims = validate_chain(matrices)?;
+    let shapes: Vec<_> = matrices.iter().map(|matrix| matrix.shape()).collect();
+    let dims = validate_chain(&shapes)?;
 
     let n = matrices.len();
     let mut costs = vec![vec![0u128; n]; n];
@@ -1948,54 +1923,55 @@ pub fn chained_matmul<T: Coefficient>(
         }
     }
 
-    fn evaluate<T: Coefficient>(
-        matrices: &[MatrixOperand<T>],
+    /// The product of `matrices[i..=j]`, borrowing a lone operand rather than
+    /// copying it.
+    fn evaluate<'m, T: Coefficient>(
+        matrices: &[&'m Matrix<T, Host>],
         splits: &[Vec<usize>],
         i: usize,
         j: usize,
-    ) -> MatrixOperand<T> {
+    ) -> Cow<'m, Matrix<T, Host>> {
         if i == j {
-            return matrices[i].clone();
+            return Cow::Borrowed(matrices[i]);
         }
         let k = splits[i][j];
         let left = evaluate(matrices, splits, i, k);
         let right = evaluate(matrices, splits, k + 1, j);
-        multiply_operands(&left, &right)
+        Cow::Owned(left.matmul(&right))
     }
 
-    let result = evaluate(matrices, &splits, 0, n - 1);
-    Ok(Matrix {
-        rows: result.rows,
-        cols: result.cols,
-        data: result.data,
-    })
+    Ok(evaluate(matrices, &splits, 0, n - 1).into_owned())
 }
 
-/// Minimum scalar-multiplication cost for a matrix chain, computed by the
-/// Hu–Shing `O(n log n)` optimal polygon-triangulation algorithm.
-pub fn chained_matmul_cost<T>(matrices: &[MatrixOperand<T>]) -> Result<u128, Error> {
-    let dims = validate_chain(matrices)?;
+/// Minimum scalar-multiplication cost for a chain of matrices with these
+/// `(rows, columns)` shapes, computed by the Hu–Shing `O(n log n)` optimal
+/// polygon-triangulation algorithm.
+///
+/// Fails exactly where [`chained_matmul`] would for the same shapes.
+pub fn chained_matmul_cost(shapes: &[(usize, usize)]) -> Result<u128, Error> {
+    let dims = validate_chain(shapes)?;
     Ok(hu_shing::optimal_cost(&dims.iter().map(|&d| d as i128).collect::<Vec<_>>()) as u128)
 }
 
-fn validate_chain<T>(matrices: &[MatrixOperand<T>]) -> Result<Vec<usize>, Error> {
-    if matrices.len() < 2 {
+/// The chain's boundary dimensions — the first row count, then every column
+/// count — once the shapes are known to meet.
+fn validate_chain(shapes: &[(usize, usize)]) -> Result<Vec<usize>, Error> {
+    if shapes.len() < 2 {
         return Err(Error::InvalidArgument(
             "expected at least 2 matrices to multiply".to_string(),
         ));
     }
-    let mut dims = Vec::with_capacity(matrices.len() + 1);
-    dims.push(matrices[0].rows);
-    for (i, matrix) in matrices.iter().enumerate() {
-        if i > 0 && matrix.rows != dims[i] {
+    let mut dims = Vec::with_capacity(shapes.len() + 1);
+    dims.push(shapes[0].0);
+    for (i, &(rows, cols)) in shapes.iter().enumerate() {
+        if i > 0 && rows != dims[i] {
             return Err(Error::shape(format!(
-                "chained_matmul dimension mismatch: matrix {} has {} columns but matrix {i} has {} rows",
+                "chained_matmul dimension mismatch: matrix {} has {} columns but matrix {i} has {rows} rows",
                 i - 1,
                 dims[i],
-                matrix.rows
             )));
         }
-        dims.push(matrix.cols);
+        dims.push(cols);
     }
     if dims.contains(&0) {
         return Err(Error::InvalidArgument(
@@ -2003,43 +1979,6 @@ fn validate_chain<T>(matrices: &[MatrixOperand<T>]) -> Result<Vec<usize>, Error>
         ));
     }
     Ok(dims)
-}
-
-fn multiply_operands<T: Coefficient>(
-    left: &MatrixOperand<T>,
-    right: &MatrixOperand<T>,
-) -> MatrixOperand<T> {
-    debug_assert_eq!(left.cols, right.rows);
-    let mut data = vec![T::zero(); left.rows * right.cols];
-    if crate::compact::matmul(
-        &left.data,
-        &right.data,
-        left.rows,
-        left.cols,
-        right.cols,
-        &mut data,
-        false,
-    ) {
-        return MatrixOperand {
-            rows: left.rows,
-            cols: right.cols,
-            data,
-        };
-    }
-    for i in 0..left.rows {
-        for j in 0..right.cols {
-            let mut sum = T::zero();
-            for k in 0..left.cols {
-                sum = sum + left.data[i * left.cols + k] * right.data[k * right.cols + j];
-            }
-            data[i * right.cols + j] = sum;
-        }
-    }
-    MatrixOperand {
-        rows: left.rows,
-        cols: right.cols,
-        data,
-    }
 }
 
 /// Hu–Shing's optimal weighted-polygon triangulation algorithm, restored from
@@ -2547,16 +2486,18 @@ impl<T> Index<(usize, usize)> for Matrix<T, Host> {
 }
 
 impl<T: Coefficient> Matrix<T, Host> {
-    /// Multiply a heterogeneous matrix chain in its optimal order.
-    ///
-    /// Convert each differently-shaped matrix with [`MatrixOperand::from`].
-    pub fn chained_matmul(matrices: &[MatrixOperand<T>]) -> Result<Self, Error> {
+    /// Multiply a chain of matrices, whatever their shapes, in its optimal
+    /// order. See [`chained_matmul`](crate::tensors::chained_matmul).
+    pub fn chained_matmul(matrices: &[&Self]) -> Result<Self, Error> {
         crate::tensors::chained_matmul(matrices)
     }
 
-    /// Return the optimal multiplication cost using the Hu–Shing algorithm.
-    pub fn chained_matmul_cost(matrices: &[MatrixOperand<T>]) -> Result<u128, Error> {
-        crate::tensors::chained_matmul_cost(matrices)
+    /// The optimal multiplication cost of a chain of these matrices, from
+    /// their shapes alone. See
+    /// [`chained_matmul_cost`](crate::tensors::chained_matmul_cost).
+    pub fn chained_matmul_cost(matrices: &[&Self]) -> Result<u128, Error> {
+        let shapes: Vec<_> = matrices.iter().map(|matrix| matrix.shape()).collect();
+        crate::tensors::chained_matmul_cost(&shapes)
     }
 
     /// A `rows × cols` matrix of zeros.
