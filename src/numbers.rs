@@ -5,7 +5,7 @@
 //! implemented for the primitive integers and floats, for [`Complex`], and for
 //! [`Dual`]. That closure is deliberate: it lets the extensions nest, so
 //! `Dual<Complex<f64>>` (a dual number with complex coefficients) and
-//! `Matrix<Dual<f64>, R, C>` both work.
+//! `Matrix<Dual<f64>>` both work.
 
 use std::fmt::{self, Display};
 use std::ops::{Add, Div, Mul, Neg, Rem, Sub};
@@ -18,7 +18,7 @@ pub use half::{bf16, f16};
 /// [`Complex`], and [`Dual`] all implement it.
 ///
 /// Because `Complex` and `Dual` are themselves coefficients, the extensions
-/// nest — `Dual<Complex<f64>>` and `Vector<Dual<f64>, N>` are ordinary types.
+/// nest — `Dual<Complex<f64>>` and `Vector<Dual<f64>>` are ordinary types.
 pub trait Coefficient: Num + Copy + 'static {
     /// Whether ordinary division belongs to a field-like coefficient domain.
     ///

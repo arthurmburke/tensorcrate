@@ -1,10 +1,8 @@
 //! Shapes that are not known until the program runs.
 //!
 //! Everything else in the suite happens to use sizes that are visible in the
-//! source, which a const-generic implementation would also accept. These tests
-//! are the ones that could not have been written before: each shape here comes
-//! from a value the compiler cannot see through, so nothing can be specialized
-//! or folded away at compile time.
+//! source. Here each shape comes from a value the compiler cannot see through,
+//! so nothing can be specialized or folded away at compile time.
 //!
 //! `black_box` is what guarantees that. Without it an optimizer is free to
 //! notice that `parse("7")` is `7` and the test would prove nothing about

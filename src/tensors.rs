@@ -300,10 +300,9 @@ pub(crate) mod simd_dispatch {
     //! [`crate::simd`]. The size gates are deliberately small: CPU SIMD has
     //! almost no fixed cost.
     //!
-    //! Every entry point takes flat slices and runtime extents, which is what
-    //! the kernels underneath wanted all along — the shapes used to be const
-    //! parameters threaded down from the tensor types purely to be read back out
-    //! as numbers here.
+    //! Every entry point takes flat slices and runtime extents, and writes into
+    //! storage the caller owns, so a dispatched operation allocates nothing
+    //! beyond its result.
 
     use std::any::TypeId;
 
@@ -362,11 +361,6 @@ pub(crate) mod simd_dispatch {
     }
 
     /// Writes `a op b` into `out`, returning whether the SIMD path ran.
-    ///
-    /// `out` is the caller's own storage. The earlier shape returned a `Vec`,
-    /// which cost two allocations — one for the kernel's scratch buffer and a
-    /// second for the `collect` that converted it back to `T` — plus a copy at
-    /// the call site.
     pub fn elementwise<T: Coefficient>(a: &[T], b: &[T], op: BinaryOp, out: &mut [T]) -> bool {
         if a.len() < MIN_ELEMENTS || op == BinaryOp::Rem {
             return false;
@@ -636,10 +630,8 @@ pub(crate) mod simd_dispatch {
     /// Writes `a·b` into `out`, returning whether the SIMD path ran.
     ///
     /// `out` is the caller's final storage, so the product lands in its
-    /// destination directly. The earlier shape of this function returned an
-    /// owned `Matrix` built from a `vec![0.0; R * C]` scratch buffer, which cost
-    /// an allocation plus a second element-by-element pass to copy out — at
-    /// `R = K = C = 8` that overhead was roughly twice the arithmetic itself.
+    /// destination directly: a scratch buffer and a copy out would cost about
+    /// as much as the arithmetic itself for small products.
     pub fn matmul<T: Coefficient>(
         a: &[T],
         b: &[T],
@@ -1622,9 +1614,8 @@ fn mixed_radix_fft<T: Float + Coefficient>(data: &mut [Complex<T>], inverse: boo
 
     // Two allocations for the whole transform: one workspace and the root
     // table. The recursion below borrows slices of these rather than allocating
-    // per node — the earlier shape allocated a subsequence per residue plus an
-    // output at every node of the tree, which for `n = 1000` (2³·5³, roughly
-    // 1250 nodes) meant thousands of allocations per call.
+    // per node, which for `n = 1000` (2³·5³, roughly 1250 nodes) would mean
+    // thousands of allocations per call.
     let unit = roots_of_unity(n, direction);
     let mut workspace = vec![zero; n];
     transform(data, &mut workspace, &unit, 1);
@@ -1705,10 +1696,10 @@ fn transform<T: Float + Coefficient>(
 ///
 /// The transform only ever needs these `n` angles, because the exponent is
 /// periodic modulo `n`. Computing them once and indexing by the reduced
-/// exponent replaces the quadratic number of `cos`/`sin` calls the direct and
-/// mixed-radix paths used to make — and is more accurate besides, since the
-/// angle handed to `cos` stays inside one period instead of growing to
-/// `2π·(n−1)²/n` and losing precision to argument reduction.
+/// exponent avoids a quadratic number of `cos`/`sin` calls — and is more
+/// accurate besides, since the angle handed to `cos` stays inside one period
+/// instead of growing to `2π·(n−1)²/n` and losing precision to argument
+/// reduction.
 fn roots_of_unity<T: Float + Coefficient>(n: usize, direction: T) -> Vec<Complex<T>> {
     let tau = cast::<T>(std::f64::consts::TAU);
     (0..n)
@@ -1981,9 +1972,8 @@ fn validate_chain(shapes: &[(usize, usize)]) -> Result<Vec<usize>, Error> {
     Ok(dims)
 }
 
-/// Hu–Shing's optimal weighted-polygon triangulation algorithm, restored from
-/// the original tensor implementation. A matrix chain's boundary dimensions
-/// are the polygon weights.
+/// Hu–Shing's optimal weighted-polygon triangulation algorithm. A matrix
+/// chain's boundary dimensions are the polygon weights.
 mod hu_shing {
     use std::cmp::Ordering;
     use std::collections::BinaryHeap;
