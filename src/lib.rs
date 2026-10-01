@@ -44,6 +44,7 @@ pub mod projections;
 pub mod simd;
 pub mod statistics;
 pub mod tensors;
+mod vmath;
 
 /// Support for the code `math!` expands to. Not part of the public API: the
 /// names here may change with the macro.

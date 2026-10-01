@@ -616,6 +616,13 @@ The scalar types `Dual<T>` and `Complex<T>`, the `math!` macro (`dtype = f32;`) 
   CPU matrix products widen once and use Accelerate's SGEMM. A sum of 10,000 `f16` ones is 10,000
   rather than the 2,048 a 16-bit running total stops at.
 
+The elementary functions of `f32`, `f16` and `bf16` (`sin`, `exp`, `ln`, `tanh` and the rest of
+`Analytic`) are tensorcrate's own on the host rather than the platform `libm`'s. They are written
+so that LLVM vectorizes a whole tensor, which makes them two to six times faster, and they are
+within one ulp of the correctly rounded result for `exp`, `ln`, `sin` and `cos`, two for most of
+the rest and three for `tan`. The unfused kernels, fused programs, `math!` and the scalar `numbers`
+traits all use them, so those paths still agree bit for bit. `f64` keeps `libm`.
+
 ```rust
 use tensorcrate::numbers::f16;
 use tensorcrate::tensors::Vector;

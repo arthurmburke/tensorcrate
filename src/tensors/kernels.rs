@@ -326,7 +326,14 @@ impl Analytic {
     ];
 
     /// `f(x)`.
+    ///
+    /// For `f32`, and for `f16` and `bf16`, which compute in it, the functions
+    /// are the host's own vectorizable ones (`vmath`), so this is bit for bit
+    /// what every host kernel, fused or not, computes.
     pub fn value<T: Real>(self, x: T) -> T {
+        if let Some(y) = crate::vmath::compact_value(self, x) {
+            return y;
+        }
         match self {
             Analytic::Sin => x.sin(),
             Analytic::Cos => x.cos(),
@@ -349,29 +356,29 @@ impl Analytic {
     pub fn derivative<T: Real>(self, x: T) -> T {
         let one = T::one();
         match self {
-            Analytic::Sin => x.cos(),
-            Analytic::Cos => -x.sin(),
+            Analytic::Sin => Analytic::Cos.value(x),
+            Analytic::Cos => -Analytic::Sin.value(x),
             Analytic::Tan => {
-                let cos = x.cos();
+                let cos = Analytic::Cos.value(x);
                 (cos * cos).recip()
             }
             Analytic::Sec => {
-                let cos = x.cos();
-                x.sin() / (cos * cos)
+                let cos = Analytic::Cos.value(x);
+                Analytic::Sin.value(x) / (cos * cos)
             }
             Analytic::Csc => {
-                let sin = x.sin();
-                -x.cos() / (sin * sin)
+                let sin = Analytic::Sin.value(x);
+                -Analytic::Cos.value(x) / (sin * sin)
             }
             Analytic::Arcsin => (one - x * x).sqrt().recip(),
             Analytic::Arccos => -(one - x * x).sqrt().recip(),
             Analytic::Arctan => (one + x * x).recip(),
-            Analytic::Exp => x.exp(),
+            Analytic::Exp => Analytic::Exp.value(x),
             Analytic::Ln => x.recip(),
-            Analytic::Sinh => x.cosh(),
-            Analytic::Cosh => x.sinh(),
+            Analytic::Sinh => Analytic::Cosh.value(x),
+            Analytic::Cosh => Analytic::Sinh.value(x),
             Analytic::Tanh => {
-                let tanh = x.tanh();
+                let tanh = Analytic::Tanh.value(x);
                 one - tanh * tanh
             }
             Analytic::Sqrt => ((one + one) * x.sqrt()).recip(),
@@ -1065,7 +1072,9 @@ impl<T: Real> Kernels<T> for Host {
                 return Vector::new(out);
             }
         }
-        a.map(|&x| f.value(x))
+        let mut out = vec![T::zero(); a.len()];
+        crate::vmath::unary_slice(f, a.data(), &mut out);
+        Vector::new(out)
     }
 
     fn vector_power(a: &Vector<T, Self>, b: &Vector<T, Self>) -> Vector<T, Self> {
@@ -1099,7 +1108,9 @@ impl<T: Real> Kernels<T> for Host {
             .zip(tangent.data())
             .map(|(&x, &d)| f.derivative(x) * d)
             .collect::<Vec<_>>();
-        (value.map(|&x| f.value(x)), Vector::new(derivatives))
+        let mut values = vec![T::zero(); value.len()];
+        crate::vmath::unary_slice(f, value.data(), &mut values);
+        (Vector::new(values), Vector::new(derivatives))
     }
 
     fn dot(a: &Vector<T, Self>, b: &Vector<T, Self>) -> T {
@@ -1192,7 +1203,9 @@ impl<T: Real> Kernels<T> for Host {
                 return Matrix::from_flat(a.rows(), a.cols(), out);
             }
         }
-        a.map(|&x| f.value(x))
+        let mut out = vec![T::zero(); a.rows() * a.cols()];
+        crate::vmath::unary_slice(f, a.data(), &mut out);
+        Matrix::from_flat(a.rows(), a.cols(), out)
     }
 
     fn matrix_power(a: &Matrix<T, Self>, b: &Matrix<T, Self>) -> Matrix<T, Self> {
@@ -1227,8 +1240,10 @@ impl<T: Real> Kernels<T> for Host {
             .zip(tangent.data())
             .map(|(&x, &d)| f.derivative(x) * d)
             .collect::<Vec<_>>();
+        let mut values = vec![T::zero(); rows * cols];
+        crate::vmath::unary_slice(f, value.data(), &mut values);
         (
-            value.map(|&x| f.value(x)),
+            Matrix::from_flat(rows, cols, values),
             Matrix::from_flat(rows, cols, derivatives),
         )
     }

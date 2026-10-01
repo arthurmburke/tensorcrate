@@ -1966,8 +1966,8 @@ mod kernel {
     }
 
     /// `sqrt` is correctly rounded in hardware, so its vector form is exact; the
-    /// other functions use the scalar definitions, which the unfused kernels use
-    /// too.
+    /// other functions are the vectorized `vmath` ones, which the unfused
+    /// kernels use too.
     pub fn unary<T: Real>(values: &[T], op: Analytic, out: &mut [T]) {
         if op == Analytic::Sqrt && crate::compact::sqrt(values, out) {
             return;
@@ -1981,9 +1981,7 @@ mod kernel {
                 return crate::simd::f64k::sqrt(values, out);
             }
         }
-        for (out, &x) in out.iter_mut().zip(values) {
-            *out = op.value(x);
-        }
+        crate::vmath::unary_slice(op, values, out);
     }
 }
 

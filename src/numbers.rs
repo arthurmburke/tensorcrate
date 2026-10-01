@@ -1138,7 +1138,8 @@ impl<T: Display + PartialOrd + Zero> Display for Complex<T> {
 // ---- the analytic ops for every number type ---------------------------------
 //
 // Floats keep their precision (`Output = Self`); integers widen to `f64`, since
-// a transcendental of an integer is not an integer.
+// a transcendental of an integer is not an integer. The functions themselves
+// come from `vmath`, so an `f32` here is exactly what the tensor kernels give.
 
 /// Implement a unary analytic op for every float and every integer type. The
 /// op is written once as an expression over a bound value `$x`.
@@ -1171,19 +1172,19 @@ macro_rules! unary_number_impls {
     )+};
 }
 
-unary_number_impls!(Sin, sin, x, x.sin());
-unary_number_impls!(Cos, cos, x, x.cos());
-unary_number_impls!(Tan, tan, x, x.tan());
-unary_number_impls!(Csc, csc, x, x.sin().recip());
-unary_number_impls!(Sec, sec, x, x.cos().recip());
-unary_number_impls!(Arcsin, arcsin, x, x.asin());
-unary_number_impls!(Arccos, arccos, x, x.acos());
-unary_number_impls!(Arctan, arctan, x, x.atan());
-unary_number_impls!(Exp, exp, x, x.exp());
-unary_number_impls!(Ln, ln, x, x.ln());
-unary_number_impls!(Sinh, sinh, x, x.sinh());
-unary_number_impls!(Cosh, cosh, x, x.cosh());
-unary_number_impls!(Tanh, tanh, x, x.tanh());
+unary_number_impls!(Sin, sin, x, crate::vmath::Elementary::sin(x));
+unary_number_impls!(Cos, cos, x, crate::vmath::Elementary::cos(x));
+unary_number_impls!(Tan, tan, x, crate::vmath::Elementary::tan(x));
+unary_number_impls!(Csc, csc, x, crate::vmath::Elementary::sin(x).recip());
+unary_number_impls!(Sec, sec, x, crate::vmath::Elementary::cos(x).recip());
+unary_number_impls!(Arcsin, arcsin, x, crate::vmath::Elementary::asin(x));
+unary_number_impls!(Arccos, arccos, x, crate::vmath::Elementary::acos(x));
+unary_number_impls!(Arctan, arctan, x, crate::vmath::Elementary::atan(x));
+unary_number_impls!(Exp, exp, x, crate::vmath::Elementary::exp(x));
+unary_number_impls!(Ln, ln, x, crate::vmath::Elementary::ln(x));
+unary_number_impls!(Sinh, sinh, x, crate::vmath::Elementary::sinh(x));
+unary_number_impls!(Cosh, cosh, x, crate::vmath::Elementary::cosh(x));
+unary_number_impls!(Tanh, tanh, x, crate::vmath::Elementary::tanh(x));
 unary_number_impls!(Sqrt, sqrt, x, x.sqrt());
 unary_number_impls!(Recip, recip, x, x.recip());
 
