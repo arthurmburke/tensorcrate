@@ -584,6 +584,51 @@ Run the backend comparison on macOS with:
 cargo run --release --example metal_backend
 ```
 
+### Fused elementwise programs
+
+A chain of elementwise operations normally runs one kernel per operation, each
+reading its operands from memory and writing a fresh result. `tensors::fused`
+compiles such a chain into a register program that runs as **one** kernel on
+either backend. Intermediates stay in registers, and tensors can be updated in
+place:
+
+```rust
+use tensorcrate::tensors::fused::{Builder, DType};
+use tensorcrate::tensors::{Analytic, Vector};
+
+// y = sqrt(a·b + 1), in one pass.
+let mut b = Builder::new();
+let (x, w) = (b.input(DType::F32), b.input(DType::F32));
+let product = b.mul(x, w);
+let shifted = b.shift(product, 1.0);
+let root = b.unary(Analytic::Sqrt, shifted);
+b.output(root, DType::F32);
+let program = b.build().unwrap();
+
+let y = program.run_vectors(&[&Vector::new([3.0f32, 0.0]), &Vector::new([1.0f32, 5.0])]);
+assert_eq!(y[0].as_slice(), [2.0, 1.0]);
+```
+
+- On `Host`, a program runs as a tile interpreter over the existing SIMD kernels, and the result
+  is identical, bit for bit, to running the same operations unfused. On `Metal`, a single
+  bytecode shader interprets the program per thread. Like the other shaders it uses fast math, so
+  it agrees with the host within tolerance rather than exactly.
+- Loads can read a transposed matrix or broadcast a row or column vector without materializing it.
+  Each input and output can be stored as `f32`, `f16` or `bf16`; arithmetic is always `f32`.
+- The optimizers use fused programs. An `Adam` step is one kernel that updates the parameters and
+  both moments in place, where it used to be fourteen kernels and eleven temporary tensors.
+- For debugging: `println!("{program}")` prints a disassembly, `program.trace(...)` returns every
+  intermediate, and `fused::with_mode(Mode::Unfused, || ...)` turns fusion off on the current
+  thread, so a suspected fusion problem can be confirmed or ruled out without changing the code.
+
+The `counters` feature counts the kernels, bytes moved and allocations on the current thread
+(`tensorcrate::counters`). The `fusion_baseline` example uses it to compare training steps with
+and without fusion:
+
+```console
+cargo run --release --features counters --example fusion_baseline
+```
+
 ## Saving trained tensors
 
 Host tensors can be written to a compact, versioned binary format and loaded with shape and type
@@ -614,6 +659,7 @@ cargo run --release --example loss_choice
 cargo run --release --example optimizers
 cargo run --release --example simd_bench
 cargo run --release --example metal_backend  # macOS
+cargo run --release --features counters --example fusion_baseline
 
 cargo test
 cargo fmt --check

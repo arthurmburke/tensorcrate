@@ -10,10 +10,8 @@
 //! The full kernel set operates on `f32`; M5 TensorOps matrix products also use
 //! compact `f16` and `bf16` storage. A chain of operations over `Metal`-backed
 //! tensors therefore stays resident: no operand is uploaded and no result is
-//! downloaded until you ask for one. The [`Host`] backend's automatic offload
-//! (the `MIN_*` thresholds in [`crate::metal`]) cannot do that — it has to copy
-//! both operands in and the result back out on every single call, which is why
-//! its thresholds are so high.
+//! downloaded until you ask for one. The [`Host`] backend never moves work to
+//! the GPU on its own; choosing a backend is the only thing that does.
 //!
 //! Move between backends explicitly with
 //! [`Vector::to_backend`](super::Vector::to_backend) and

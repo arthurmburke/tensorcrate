@@ -154,10 +154,18 @@ fn unfused_parameter<P: Parameter>(
                         BinaryOp::Rem => a % b,
                     }),
                     // The two forms `scale` and `shift` are exactly.
-                    (Value::Tensor(a), Value::Scalar(b), BinaryOp::Mul) => Value::Tensor(a.scale(*b)),
-                    (Value::Scalar(a), Value::Tensor(b), BinaryOp::Mul) => Value::Tensor(b.scale(*a)),
-                    (Value::Tensor(a), Value::Scalar(b), BinaryOp::Add) => Value::Tensor(a.shift(*b)),
-                    (Value::Scalar(a), Value::Tensor(b), BinaryOp::Add) => Value::Tensor(b.shift(*a)),
+                    (Value::Tensor(a), Value::Scalar(b), BinaryOp::Mul) => {
+                        Value::Tensor(a.scale(*b))
+                    }
+                    (Value::Scalar(a), Value::Tensor(b), BinaryOp::Mul) => {
+                        Value::Tensor(b.scale(*a))
+                    }
+                    (Value::Tensor(a), Value::Scalar(b), BinaryOp::Add) => {
+                        Value::Tensor(a.shift(*b))
+                    }
+                    (Value::Scalar(a), Value::Tensor(b), BinaryOp::Add) => {
+                        Value::Tensor(b.shift(*a))
+                    }
                     (a, b, op) => {
                         let (a, b) = (tensor(a), tensor(b));
                         Value::Tensor(match op {
@@ -206,7 +214,10 @@ fn run_fused<B: Kernels, T: Fusable<B>>(
     inputs: &[&T],
     updated: &mut [&mut T],
 ) -> Vec<Output<B>> {
-    let inputs: Vec<&dyn Fusable<B>> = inputs.iter().map(|&input| input as &dyn Fusable<B>).collect();
+    let inputs: Vec<&dyn Fusable<B>> = inputs
+        .iter()
+        .map(|&input| input as &dyn Fusable<B>)
+        .collect();
     let mut updated: Vec<&mut dyn Fusable<B>> = updated
         .iter_mut()
         .map(|target| &mut **target as &mut dyn Fusable<B>)
@@ -867,7 +878,11 @@ mod tests {
         b.output(thirds, DType::F32);
         let program = b.build().unwrap();
 
-        let g = Vector::new((0..100).map(|i| (i as f32 * 0.37).sin()).collect::<Vec<_>>());
+        let g = Vector::new(
+            (0..100)
+                .map(|i| (i as f32 * 0.37).sin())
+                .collect::<Vec<_>>(),
+        );
         let start = Vector::new((0..100).map(|i| i as f32 * 0.01).collect::<Vec<_>>());
         let moment = Vector::new(vec![0.5f32; 100]);
 

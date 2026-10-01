@@ -284,12 +284,12 @@ mod accelerate_tests {
 
 #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub(crate) mod simd_dispatch {
-    //! CPU SIMD tier: sits between `metal_dispatch` and the generic scalar
+    //! CPU SIMD tier, above the generic scalar
     //! loops. Each entry point downcasts the generic element type to a concrete
     //! float via `TypeId` (returning `None` — i.e. defer to scalar — for every
     //! other type), then calls the architecture-specific kernels in
     //! [`crate::simd`]. The size gates are deliberately small: CPU SIMD has
-    //! almost no fixed cost, so it wins far below the Metal thresholds.
+    //! almost no fixed cost.
     //!
     //! Every entry point takes flat slices and runtime extents, which is what
     //! the kernels underneath wanted all along — the shapes used to be const

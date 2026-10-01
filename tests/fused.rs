@@ -223,7 +223,12 @@ fn rules_match_their_references<P: Parameter>(
     };
     let mut expected = start.duplicate();
     rule.update(&mut fresh, &gradients[0]);
-    reference::adam((0.001, 0.9, 0.999, 1e-8), &mut state, &mut expected, &gradients[0]);
+    reference::adam(
+        (0.001, 0.9, 0.999, 1e-8),
+        &mut state,
+        &mut expected,
+        &gradients[0],
+    );
     same(&fresh, &expected, "adam after reset");
 }
 
@@ -315,7 +320,11 @@ fn random_program(rng: &mut Lcg, inputs: usize, outputs: usize, metal: bool) -> 
     }
 }
 
-fn run_on<B: Kernels>(program: &Program, shape: (usize, usize), inputs: &[Vector<f32>]) -> Vec<Vec<f32>> {
+fn run_on<B: Kernels>(
+    program: &Program,
+    shape: (usize, usize),
+    inputs: &[Vector<f32>],
+) -> Vec<Vec<f32>> {
     let inputs: Vec<Vector<f32, B>> = inputs.iter().map(|v| v.to_backend::<B>()).collect();
     let refs: Vec<&dyn Fusable<B>> = inputs.iter().map(|v| v as &dyn Fusable<B>).collect();
     program
@@ -338,9 +347,15 @@ fn random_programs_agree_with_their_unfused_evaluation_bit_for_bit() {
             .collect();
 
         let fused = run_on::<Host>(&program, (1, len), &values);
-        let unfused = fused::with_mode(Mode::Unfused, || run_on::<Host>(&program, (1, len), &values));
+        let unfused = fused::with_mode(Mode::Unfused, || {
+            run_on::<Host>(&program, (1, len), &values)
+        });
         for (k, (f, u)) in fused.iter().zip(&unfused).enumerate() {
-            assert_bits_eq(f, u, &format!("case {case}, output {k}, len {len}\n{program}"));
+            assert_bits_eq(
+                f,
+                u,
+                &format!("case {case}, output {k}, len {len}\n{program}"),
+            );
         }
     }
 }
@@ -367,19 +382,24 @@ fn remapped_loads_read_transposed_and_broadcast_operands() {
     let expected: Vec<f32> = (0..3)
         .flat_map(|r| {
             let (a, bt, row, col) = (&a, &bt, &row, &col);
-            (0..4).map(move |c| {
-                a.as_slice()[r * 4 + c] + bt.as_slice()[c * 3 + r] * row[c] - col[r]
-            })
+            (0..4)
+                .map(move |c| a.as_slice()[r * 4 + c] + bt.as_slice()[c * 3 + r] * row[c] - col[r])
         })
         .collect();
 
     let inputs: [&dyn Fusable<Host>; 4] = [&a, &bt, &row, &col];
-    let fused = program.run((3, 4), &inputs, &mut []).remove(0).into_matrix::<f32>();
+    let fused = program
+        .run((3, 4), &inputs, &mut [])
+        .remove(0)
+        .into_matrix::<f32>();
     assert_eq!(fused.shape(), (3, 4));
     assert_bits_eq(fused.as_slice(), &expected, "remapped");
 
     let unfused = fused::with_mode(Mode::Unfused, || {
-        program.run((3, 4), &inputs, &mut []).remove(0).into_matrix::<f32>()
+        program
+            .run((3, 4), &inputs, &mut [])
+            .remove(0)
+            .into_matrix::<f32>()
     });
     assert_bits_eq(unfused.as_slice(), &expected, "remapped, unfused");
 }
@@ -402,9 +422,15 @@ fn remaps_survive_tile_boundaries() {
     let row = Vector::new(rng.vector(cols, -1.0, 1.0));
     let col = Vector::new(rng.vector(rows, -1.0, 1.0));
     let inputs: [&dyn Fusable<Host>; 3] = [&t, &row, &col];
-    let fused = program.run((rows, cols), &inputs, &mut []).remove(0).into_vector::<f32>();
+    let fused = program
+        .run((rows, cols), &inputs, &mut [])
+        .remove(0)
+        .into_vector::<f32>();
     let unfused = fused::with_mode(Mode::Unfused, || {
-        program.run((rows, cols), &inputs, &mut []).remove(0).into_vector::<f32>()
+        program
+            .run((rows, cols), &inputs, &mut [])
+            .remove(0)
+            .into_vector::<f32>()
     });
     assert_bits_eq(fused.as_slice(), unfused.as_slice(), "tall remap");
 }
@@ -447,14 +473,23 @@ fn compact_types_widen_on_load_and_narrow_on_store() {
     let program = b.build().unwrap();
 
     let mut rng = Lcg(3);
-    let a: Vec<f16> = rng.vector(100, -50.0, 50.0).into_iter().map(f16::from_f32).collect();
-    let c: Vec<bf16> = rng.vector(100, -50.0, 50.0).into_iter().map(bf16::from_f32).collect();
+    let a: Vec<f16> = rng
+        .vector(100, -50.0, 50.0)
+        .into_iter()
+        .map(f16::from_f32)
+        .collect();
+    let c: Vec<bf16> = rng
+        .vector(100, -50.0, 50.0)
+        .into_iter()
+        .map(bf16::from_f32)
+        .collect();
     let av = Vector::new(a.clone());
     let cv = Vector::new(c.clone());
     let inputs: [&dyn Fusable<Host>; 2] = [&av, &cv];
 
     for mode in [Mode::Fused, Mode::Unfused] {
-        let mut outputs = fused::with_mode(mode, || program.run((1, 100), &inputs, &mut [])).into_iter();
+        let mut outputs =
+            fused::with_mode(mode, || program.run((1, 100), &inputs, &mut [])).into_iter();
         let wide = outputs.next().unwrap().into_vector::<f32>();
         let half = outputs.next().unwrap().into_vector::<f16>();
         let brain = outputs.next().unwrap().into_vector::<bf16>();
@@ -549,14 +584,24 @@ fn malformed_programs_are_rejected() {
         ProgramError::Undefined { at: 0, reg: 0 },
     );
     check(
-        vec![Load { dst: 0, input: 1, remap: Remap::Identity }, Store { src: 0, output: 0 }],
+        vec![
+            Load {
+                dst: 0,
+                input: 1,
+                remap: Remap::Identity,
+            },
+            Store { src: 0, output: 0 },
+        ],
         vec![f],
         vec![f],
         0,
         ProgramError::BadInput { at: 0 },
     );
     check(
-        vec![Const { dst: 16, value: 1.0 }],
+        vec![Const {
+            dst: 16,
+            value: 1.0,
+        }],
         vec![],
         vec![f],
         0,
@@ -582,7 +627,14 @@ fn malformed_programs_are_rejected() {
     );
     // An in-place tensor read through a remap would race other threads.
     check(
-        vec![Load { dst: 0, input: 0, remap: Remap::Transpose }, Store { src: 0, output: 0 }],
+        vec![
+            Load {
+                dst: 0,
+                input: 0,
+                remap: Remap::Transpose,
+            },
+            Store { src: 0, output: 0 },
+        ],
         vec![f],
         vec![f],
         1,
@@ -593,7 +645,11 @@ fn malformed_programs_are_rejected() {
         vec![
             Const { dst: 0, value: 1.0 },
             Store { src: 0, output: 0 },
-            Load { dst: 1, input: 0, remap: Remap::Identity },
+            Load {
+                dst: 1,
+                input: 0,
+                remap: Remap::Identity,
+            },
         ],
         vec![f],
         vec![f],
@@ -717,7 +773,9 @@ fn metal_programs_agree_with_the_host_within_tolerance() {
             .collect();
         let host = run_on::<Host>(&program, (1, len), &values);
         let metal = run_on::<Metal>(&program, (1, len), &values);
-        let unfused = fused::with_mode(Mode::Unfused, || run_on::<Metal>(&program, (1, len), &values));
+        let unfused = fused::with_mode(Mode::Unfused, || {
+            run_on::<Metal>(&program, (1, len), &values)
+        });
         for (k, ((m, u), h)) in metal.iter().zip(&unfused).zip(&host).enumerate() {
             for (i, ((&m, &u), &h)) in m.iter().zip(u).zip(h).enumerate() {
                 // Fast-math shaders already differ from the host in places —
@@ -772,8 +830,16 @@ fn metal_remaps_in_place_updates_and_compact_types() {
     let program = b.build().unwrap();
 
     let t = Matrix::from_flat(cols, rows, rng.vector(rows * cols, -1.0, 1.0));
-    let row: Vec<bf16> = rng.vector(cols, -1.0, 1.0).into_iter().map(bf16::from_f32).collect();
-    let col: Vec<f16> = rng.vector(rows, -1.0, 1.0).into_iter().map(f16::from_f32).collect();
+    let row: Vec<bf16> = rng
+        .vector(cols, -1.0, 1.0)
+        .into_iter()
+        .map(bf16::from_f32)
+        .collect();
+    let col: Vec<f16> = rng
+        .vector(rows, -1.0, 1.0)
+        .into_iter()
+        .map(f16::from_f32)
+        .collect();
     let acc = Matrix::from_flat(rows, cols, rng.vector(rows * cols, -1.0, 1.0));
 
     // Host.
@@ -800,10 +866,22 @@ fn metal_remaps_in_place_updates_and_compact_types() {
     let widenb = |v: &[bf16]| v.iter().map(|x| x.to_f32()).collect::<Vec<_>>();
     // Narrowing can turn a last-bit difference into a one-step difference in
     // the compact type, so compare at the compact type's own precision.
-    for (m, h) in widen16(metal_half.as_slice()).iter().zip(widen16(host_half.as_slice())) {
-        assert!((m - h).abs() <= 1e-3 * (1.0 + h.abs()), "f16: {m} against {h}");
+    for (m, h) in widen16(metal_half.as_slice())
+        .iter()
+        .zip(widen16(host_half.as_slice()))
+    {
+        assert!(
+            (m - h).abs() <= 1e-3 * (1.0 + h.abs()),
+            "f16: {m} against {h}"
+        );
     }
-    for (m, h) in widenb(metal_brain.as_slice()).iter().zip(widenb(host_brain.as_slice())) {
-        assert!((m - h).abs() <= 8e-3 * (1.0 + h.abs()), "bf16: {m} against {h}");
+    for (m, h) in widenb(metal_brain.as_slice())
+        .iter()
+        .zip(widenb(host_brain.as_slice()))
+    {
+        assert!(
+            (m - h).abs() <= 8e-3 * (1.0 + h.abs()),
+            "bf16: {m} against {h}"
+        );
     }
 }

@@ -195,7 +195,12 @@ pub enum Instr {
     /// `dst ← op(a)`.
     Unary { dst: Reg, op: Analytic, a: Reg },
     /// `dst ← op(a, b)`, including the `1.0`/`0.0` predicates.
-    Cmp { dst: Reg, op: Compare, a: Reg, b: Reg },
+    Cmp {
+        dst: Reg,
+        op: Compare,
+        a: Reg,
+        b: Reg,
+    },
     /// `output[i] ← src`, narrowed to the output's storage type.
     Store { src: Reg, output: u8 },
 }
@@ -234,22 +239,39 @@ pub enum ProgramError {
     /// More registers are live at once than [`REGISTERS`].
     TooManyRegisters,
     /// Instruction `at` names a register outside [`REGISTERS`].
-    BadRegister { at: usize },
+    BadRegister {
+        at: usize,
+    },
     /// Instruction `at` reads a register nothing has written.
-    Undefined { at: usize, reg: Reg },
+    Undefined {
+        at: usize,
+        reg: Reg,
+    },
     /// Instruction `at` loads an input slot the program does not declare.
-    BadInput { at: usize },
+    BadInput {
+        at: usize,
+    },
     /// Instruction `at` stores to an output slot the program does not declare.
-    BadOutput { at: usize },
+    BadOutput {
+        at: usize,
+    },
     /// An output is never stored, or stored twice.
-    OutputNotStoredOnce { output: u8 },
+    OutputNotStoredOnce {
+        output: u8,
+    },
     /// An in-place tensor is read through a remap, which would read elements
     /// other threads may already have overwritten.
-    RemappedUpdate { at: usize },
+    RemappedUpdate {
+        at: usize,
+    },
     /// An in-place tensor is read after its new value was stored.
-    LoadAfterStore { at: usize },
+    LoadAfterStore {
+        at: usize,
+    },
     /// An in-place tensor's input and output storage types differ.
-    UpdateTypeMismatch { slot: usize },
+    UpdateTypeMismatch {
+        slot: usize,
+    },
     /// More in-place tensors than inputs or outputs.
     BadUpdateCount,
     /// A program with no outputs does nothing.
@@ -269,7 +291,9 @@ impl fmt::Display for ProgramError {
             ProgramError::TooManyRegisters => {
                 write!(f, "more than {REGISTERS} values are live at once")
             }
-            ProgramError::BadRegister { at } => write!(f, "instruction {at}: register out of range"),
+            ProgramError::BadRegister { at } => {
+                write!(f, "instruction {at}: register out of range")
+            }
             ProgramError::Undefined { at, reg } => {
                 write!(f, "instruction {at}: r{reg} is read before it is written")
             }
@@ -279,13 +303,22 @@ impl fmt::Display for ProgramError {
                 write!(f, "output {output} must be stored exactly once")
             }
             ProgramError::RemappedUpdate { at } => {
-                write!(f, "instruction {at}: an in-place tensor can only be loaded unremapped")
+                write!(
+                    f,
+                    "instruction {at}: an in-place tensor can only be loaded unremapped"
+                )
             }
             ProgramError::LoadAfterStore { at } => {
-                write!(f, "instruction {at}: an in-place tensor is loaded after it is stored")
+                write!(
+                    f,
+                    "instruction {at}: an in-place tensor is loaded after it is stored"
+                )
             }
             ProgramError::UpdateTypeMismatch { slot } => {
-                write!(f, "in-place tensor {slot} is read and written as different types")
+                write!(
+                    f,
+                    "in-place tensor {slot} is read and written as different types"
+                )
             }
             ProgramError::BadUpdateCount => {
                 write!(f, "more in-place tensors than inputs or outputs")
@@ -553,7 +586,8 @@ impl Program {
     #[track_caller]
     fn check_input(&self, slot: usize, dtype: DType, len: usize, shape: (usize, usize)) {
         assert_eq!(
-            dtype, self.inputs[slot],
+            dtype,
+            self.inputs[slot],
             "fused program: input {slot} is {} but the program reads {}",
             dtype.name(),
             self.inputs[slot].name()
@@ -564,12 +598,10 @@ impl Program {
             {
                 let expected = remap.input_len(shape);
                 assert_eq!(
-                    len,
-                    expected,
+                    len, expected,
                     "fused program: input {slot} holds {len} elements, but a {}×{} space \
                      read through {remap:?} needs {expected}",
-                    shape.0,
-                    shape.1
+                    shape.0, shape.1
                 );
             }
         }
@@ -1186,11 +1218,7 @@ impl<B: Backend> Output<B> {
         let len = self.shape.0 * self.shape.1;
         match T::unwrap::<B>(self.data) {
             Some(storage) => Vector::from_storage(len, storage),
-            None => panic!(
-                "fused output is {}, not {}",
-                dtype.name(),
-                T::DTYPE.name()
-            ),
+            None => panic!("fused output is {}, not {}", dtype.name(), T::DTYPE.name()),
         }
     }
 
@@ -1281,9 +1309,7 @@ fn step<'r, B: Kernels>(
                 .expect("programs are validated")
         };
         match *instr {
-            Instr::Load { input, remap, .. } => {
-                Register::Tensor(load(usize::from(input), remap))
-            }
+            Instr::Load { input, remap, .. } => Register::Tensor(load(usize::from(input), remap)),
             Instr::Const { value, .. } => Register::Scalar(value),
             Instr::Binary { op, a, b, .. } => match (get(a), get(b)) {
                 (Register::Scalar(a), Register::Scalar(b)) => {
@@ -1679,7 +1705,9 @@ fn interpret(
                                 (None, Some(b)) => {
                                     kernel::compare_scalar(view(a), b, op, false, out)
                                 }
-                                (Some(a), None) => kernel::compare_scalar(view(b), a, op, true, out),
+                                (Some(a), None) => {
+                                    kernel::compare_scalar(view(b), a, op, true, out)
+                                }
                                 _ => kernel::compare(view(a), view(b), op, out),
                             }
                             None
@@ -1743,7 +1771,13 @@ mod kernel {
         }
     }
 
-    pub fn broadcast(values: &[f32], scalar: f32, op: BinaryOp, scalar_left: bool, out: &mut [f32]) {
+    pub fn broadcast(
+        values: &[f32],
+        scalar: f32,
+        op: BinaryOp,
+        scalar_left: bool,
+        out: &mut [f32],
+    ) {
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         if op != BinaryOp::Rem {
             return f32k::broadcast(values, scalar, op, scalar_left, out);

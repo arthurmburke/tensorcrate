@@ -1,11 +1,11 @@
 //! Architecture-specific SIMD kernels for the CPU math paths.
 //!
-//! These are the *middle tier* between the naive generic scalar loops in
-//! [`tensors`](crate::tensors) and the Metal GPU path. Metal only pays off once
-//! a problem is large enough to amortize command-buffer setup (see the
-//! `MIN_*` thresholds in `tensors`); below those sizes — which is most real
-//! matmuls and every short FFT — the generic path runs one scalar multiply at a
-//! time. These kernels vectorize that gap.
+//! These are the fast path for `f32` and `f64` on the [`Host`] backend, above
+//! the naive generic scalar loops in [`tensors`](crate::tensors), which run one
+//! scalar operation at a time and remain the definition for every other element
+//! type. The Metal GPU path is reached only by choosing the `Metal` backend.
+//!
+//! [`Host`]: crate::tensors::Host
 //!
 //! On `aarch64`, NEON is part of the architecture baseline. On `x86_64`, the
 //! implementation selects AVX2+FMA at runtime and retains an SSE2 baseline for

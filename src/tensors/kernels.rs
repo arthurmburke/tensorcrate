@@ -1222,7 +1222,10 @@ impl Kernels for Host {
     }
 
     fn matmul(a: &Matrix<f32, Self>, b: &Matrix<f32, Self>) -> Matrix<f32, Self> {
-        counters::kernel((a.rows() * a.cols() + b.rows() * b.cols() + a.rows() * b.cols()) * 4, 1);
+        counters::kernel(
+            (a.rows() * a.cols() + b.rows() * b.cols() + a.rows() * b.cols()) * 4,
+            1,
+        );
         a.matmul(b)
     }
 
@@ -1231,7 +1234,10 @@ impl Kernels for Host {
         b: &Matrix<f32, Self>,
         addend: Matrix<f32, Self>,
     ) -> Matrix<f32, Self> {
-        counters::kernel((a.rows() * a.cols() + b.rows() * b.cols() + 2 * a.rows() * b.cols()) * 4, 0);
+        counters::kernel(
+            (a.rows() * a.cols() + b.rows() * b.cols() + 2 * a.rows() * b.cols()) * 4,
+            0,
+        );
         a.matmul_add(b, addend)
     }
 
@@ -1245,7 +1251,14 @@ impl Kernels for Host {
         window: &Matrix<f32, Self>,
         flip: bool,
     ) -> Matrix<f32, Self> {
-        counters::kernel((input.rows() * input.cols() + window.rows() * window.cols() + correlation_shape(input.shape(), window.shape()).0 * correlation_shape(input.shape(), window.shape()).1) * 4, 1);
+        counters::kernel(
+            (input.rows() * input.cols()
+                + window.rows() * window.cols()
+                + correlation_shape(input.shape(), window.shape()).0
+                    * correlation_shape(input.shape(), window.shape()).1)
+                * 4,
+            1,
+        );
         let cols = input.cols();
         let (window_rows, window_cols) = window.shape();
         let (out_rows, out_cols) = correlation_shape(input.shape(), window.shape());
@@ -1299,7 +1312,13 @@ impl Kernels for Host {
         window: &Matrix<f32, Self>,
         forward_flip: bool,
     ) -> Matrix<f32, Self> {
-        counters::kernel((adjoint.rows() * adjoint.cols() + window.rows() * window.cols() + (adjoint.rows() + window.rows() - 1) * (adjoint.cols() + window.cols() - 1)) * 4, 1);
+        counters::kernel(
+            (adjoint.rows() * adjoint.cols()
+                + window.rows() * window.cols()
+                + (adjoint.rows() + window.rows() - 1) * (adjoint.cols() + window.cols() - 1))
+                * 4,
+            1,
+        );
         // X̄[p][q] = Σᵤᵥ Ȳ[p−u][q−v]·K[u][v], with the taps reversed when the
         // forward pass reversed them. Out-of-range adjoint indices are the zeros
         // a full correlation pads with.
@@ -1337,7 +1356,12 @@ impl Kernels for Host {
     }
 
     fn pad(input: &Matrix<f32, Self>, pad_rows: usize, pad_cols: usize) -> Matrix<f32, Self> {
-        counters::kernel((input.rows() * input.cols() + (input.rows() + 2 * pad_rows) * (input.cols() + 2 * pad_cols)) * 4, 1);
+        counters::kernel(
+            (input.rows() * input.cols()
+                + (input.rows() + 2 * pad_rows) * (input.cols() + 2 * pad_cols))
+                * 4,
+            1,
+        );
         let (rows, cols) = input.shape();
         let (padded_rows, padded_cols) = (rows + 2 * pad_rows, cols + 2 * pad_cols);
         let values = input.data();
@@ -1373,7 +1397,10 @@ impl Kernels for Host {
         a: &Matrix<f32, Self>,
         axis: Axis,
     ) -> (Vector<f32, Self>, Vector<f32, Self>) {
-        counters::kernel((2 * a.rows() * a.cols() + 2 * axis.extent(a.shape())) * 4, 2);
+        counters::kernel(
+            (2 * a.rows() * a.cols() + 2 * axis.extent(a.shape())) * 4,
+            2,
+        );
         let moments = a.moments_axis(axis);
         (moments.means, moments.sum_squared_deviations)
     }
@@ -1412,7 +1439,10 @@ impl Kernels for Host {
         first: &Vector<f32, Self>,
         second: &Vector<f32, Self>,
     ) -> Matrix<f32, Self> {
-        counters::kernel((2 * a.rows() * a.cols() + 2 * axis.extent(a.shape())) * 4, 1);
+        counters::kernel(
+            (2 * a.rows() * a.cols() + 2 * axis.extent(a.shape())) * 4,
+            1,
+        );
         a.distribution_axis(axis, statistic, &axis_distributions(family, first, second))
     }
 
@@ -1692,7 +1722,10 @@ mod gpu {
         }
 
         fn matmul(a: &Matrix<f32, Self>, b: &Matrix<f32, Self>) -> Matrix<f32, Self> {
-            counters::kernel((a.rows() * a.cols() + b.rows() * b.cols() + a.rows() * b.cols()) * 4, 1);
+            counters::kernel(
+                (a.rows() * a.cols() + b.rows() * b.cols() + a.rows() * b.cols()) * 4,
+                1,
+            );
             a.matmul(b)
         }
 
@@ -1701,7 +1734,10 @@ mod gpu {
             b: &Matrix<f32, Self>,
             addend: Matrix<f32, Self>,
         ) -> Matrix<f32, Self> {
-            counters::kernel((a.rows() * a.cols() + b.rows() * b.cols() + 2 * a.rows() * b.cols()) * 4, 0);
+            counters::kernel(
+                (a.rows() * a.cols() + b.rows() * b.cols() + 2 * a.rows() * b.cols()) * 4,
+                0,
+            );
             a.matmul_add(b, addend)
         }
 
@@ -1715,7 +1751,14 @@ mod gpu {
             window: &Matrix<f32, Self>,
             flip: bool,
         ) -> Matrix<f32, Self> {
-            counters::kernel((input.rows() * input.cols() + window.rows() * window.cols() + correlation_shape(input.shape(), window.shape()).0 * correlation_shape(input.shape(), window.shape()).1) * 4, 1);
+            counters::kernel(
+                (input.rows() * input.cols()
+                    + window.rows() * window.cols()
+                    + correlation_shape(input.shape(), window.shape()).0
+                        * correlation_shape(input.shape(), window.shape()).1)
+                    * 4,
+                1,
+            );
             let (rows, cols) = input.shape();
             let (window_rows, window_cols) = window.shape();
             let (out_rows, out_cols) = correlation_shape(input.shape(), window.shape());
@@ -1761,7 +1804,13 @@ mod gpu {
             window: &Matrix<f32, Self>,
             forward_flip: bool,
         ) -> Matrix<f32, Self> {
-            counters::kernel((adjoint.rows() * adjoint.cols() + window.rows() * window.cols() + (adjoint.rows() + window.rows() - 1) * (adjoint.cols() + window.cols() - 1)) * 4, 1);
+            counters::kernel(
+                (adjoint.rows() * adjoint.cols()
+                    + window.rows() * window.cols()
+                    + (adjoint.rows() + window.rows() - 1) * (adjoint.cols() + window.cols() - 1))
+                    * 4,
+                1,
+            );
             let (out_rows, out_cols) = adjoint.shape();
             let (window_rows, window_cols) = window.shape();
             let (rows, cols) = (out_rows + window_rows - 1, out_cols + window_cols - 1);
@@ -1792,7 +1841,12 @@ mod gpu {
         }
 
         fn pad(input: &Matrix<f32, Self>, pad_rows: usize, pad_cols: usize) -> Matrix<f32, Self> {
-            counters::kernel((input.rows() * input.cols() + (input.rows() + 2 * pad_rows) * (input.cols() + 2 * pad_cols)) * 4, 1);
+            counters::kernel(
+                (input.rows() * input.cols()
+                    + (input.rows() + 2 * pad_rows) * (input.cols() + 2 * pad_cols))
+                    * 4,
+                1,
+            );
             let (rows, cols) = input.shape();
             let (padded_rows, padded_cols) = (rows + 2 * pad_rows, cols + 2 * pad_cols);
             match input.storage().pad(rows, cols, pad_rows, pad_cols) {
@@ -1817,7 +1871,10 @@ mod gpu {
             a: &Matrix<f32, Self>,
             axis: Axis,
         ) -> (Vector<f32, Self>, Vector<f32, Self>) {
-            counters::kernel((2 * a.rows() * a.cols() + 2 * axis.extent(a.shape())) * 4, 2);
+            counters::kernel(
+                (2 * a.rows() * a.cols() + 2 * axis.extent(a.shape())) * 4,
+                2,
+            );
             let (rows, cols) = a.shape();
             let extent = axis.extent((rows, cols));
             // An empty fold has no mean, and the shader has no thread to write
@@ -1885,7 +1942,10 @@ mod gpu {
             first: &Vector<f32, Self>,
             second: &Vector<f32, Self>,
         ) -> Matrix<f32, Self> {
-            counters::kernel((2 * a.rows() * a.cols() + 2 * axis.extent(a.shape())) * 4, 1);
+            counters::kernel(
+                (2 * a.rows() * a.cols() + 2 * axis.extent(a.shape())) * 4,
+                1,
+            );
             let (rows, cols) = a.shape();
             let resident = a.storage().axis_distribution(
                 first.storage(),

@@ -1,10 +1,10 @@
 //! GPU-accelerated tensor kernels via Apple Metal.
 //!
-//! Compiled only with the `metal` feature on macOS. It offloads large `f32`
-//! matrix/vector products, elementwise and broadcast operations, and radix-2
-//! FFTs to the GPU. M5 GPUs additionally use Metal 4 TensorOps for `f32`, `f16`,
-//! and `bf16` matrix products. `f64`, matrix inversion, and non-radix-2 FFT
-//! leaves stay on the CPU path.
+//! Compiled only with the `metal` feature on macOS. It runs `f32` matrix and
+//! vector products, elementwise, broadcast, reduction and analytic operations,
+//! fused elementwise programs, and radix-2 FFTs on the GPU. M5 GPUs additionally
+//! use Metal 4 TensorOps for `f32`, `f16`, and `bf16` matrix products. `f64`,
+//! matrix inversion, and non-radix-2 FFTs stay on the CPU.
 //!
 //! Every entry point returns `Option`: if no Metal device is available or an
 //! operation cannot be encoded, the caller falls back to the CPU kernel. A
@@ -14,13 +14,8 @@
 //! Input/output buffers are recycled through a small per-thread pool so
 //! repeated calls avoid re-allocating GPU memory.
 //!
-//! The tensor API on its default `Host` backend offloads above fixed size
-//! thresholds: 32,768 multiply-accumulates for products, 4,096 values for
-//! elementwise and broadcast work, and 1,024 values for radix-2 FFTs. Because
-//! those tensors live in host memory, each such call has to upload its operands
-//! and download its result.
-//!
-//! To keep a *sequence* of operations on the GPU, put the tensors on the
+//! The `Host` backend never comes here: its tensors stay on the CPU whatever
+//! their size. To run on the GPU, put the tensors on the
 //! [`Metal`](crate::tensors::Metal) backend, which stores their elements in
 //! `MTLStorageModeShared` memory and passes the allocations from kernel to
 //! kernel. [`MetalBuffer`] is that storage, usable directly when the
