@@ -49,18 +49,28 @@
 
 use std::sync::Arc;
 
-use crate::tensors::fused::{Builder, DType, Fusable, Instr, Output, Program, Remap};
+use num_traits::Float;
+
+use crate::numbers::Real;
+use crate::tensors::fused::{Builder, Element, Fusable, Instr, Output, Program, Remap};
 use crate::tensors::tape::Adjoint;
 use crate::tensors::{Analytic, BinaryOp, Host, Kernels, Matrix, ScalarVar, Tape, Var, Vector};
 
 /// A tensor an optimizer can carry: the elementwise algebra the update rules
 /// need, plus the ability to put itself on a tape.
 ///
-/// Implemented for `f32`, [`Vector`] and [`Matrix`], so a rule is written once
-/// and applies to any of them — on either backend, without leaving it.
+/// Implemented for scalars, [`Vector`] and [`Matrix`] of any element type —
+/// `f32`, `f64`, [`f16`](crate::numbers::f16) or [`bf16`](crate::numbers::bf16) —
+/// so a rule is written once and applies to any of them, on either backend,
+/// without leaving it. (Metal computes in `f32`, `f16` and `bf16`, so those are
+/// the element types of a resident parameter.)
 pub trait Parameter: Sized + 'static {
+    /// The element type: what the hyperparameters, the loss and the arithmetic
+    /// of a step are made of.
+    type Elem: Element;
+
     /// Where this parameter's elements live.
-    type Backend: Kernels;
+    type Backend: Kernels<Self::Elem>;
 
     /// A tensor of *this* parameter's shape, all zeros — the starting point for
     /// the moment buffers the adaptive rules keep. With runtime dimensions the
@@ -76,10 +86,10 @@ pub trait Parameter: Sized + 'static {
     fn divide(&self, other: &Self) -> Self;
 
     /// Multiply every element by a constant.
-    fn scale(&self, factor: f32) -> Self;
+    fn scale(&self, factor: Self::Elem) -> Self;
 
     /// Add a constant to every element.
-    fn shift(&self, offset: f32) -> Self;
+    fn shift(&self, offset: Self::Elem) -> Self;
 
     /// Elementwise square root, for the adaptive rules' denominators.
     fn sqrt(&self) -> Self;
@@ -92,27 +102,31 @@ pub trait Parameter: Sized + 'static {
 
     /// Run a fused elementwise [`Program`] over tensors of this parameter's
     /// shape: `inputs` are read, `updated` are overwritten in place, and the
-    /// program's fresh outputs are returned. Every slot is `f32` and read
-    /// unremapped.
+    /// program's fresh outputs are returned. Every slot is read unremapped, and
+    /// the program computes in [`Self::Elem`](Parameter::Elem).
     ///
     /// This is how the rules below take a whole update in one kernel. The
     /// provided implementation is for parameter types of your own: it runs the
     /// program one operation at a time through the methods above, so it
     /// supports exactly the operations they spell — `+ − × ÷`, `sqrt`, and
     /// constants — and panics on anything else.
-    fn fused(program: &Program, inputs: &[&Self], updated: &mut [&mut Self]) -> Vec<Self> {
+    fn fused(
+        program: &Program<Self::Elem>,
+        inputs: &[&Self],
+        updated: &mut [&mut Self],
+    ) -> Vec<Self> {
         unfused_parameter(program, inputs, updated)
     }
 }
 
 /// [`Parameter::fused`] through the trait's own elementwise methods.
 fn unfused_parameter<P: Parameter>(
-    program: &Program,
+    program: &Program<P::Elem>,
     inputs: &[&P],
     updated: &mut [&mut P],
 ) -> Vec<P> {
-    enum Value<P> {
-        Scalar(f32),
+    enum Value<P, T> {
+        Scalar(T),
         Tensor(P),
     }
     // Any operand fixes the shape a constant has to be filled out to.
@@ -121,14 +135,14 @@ fn unfused_parameter<P: Parameter>(
         .map(|p| p.zeros_like())
         .or_else(|| updated.first().map(|p| p.zeros_like()))
         .expect("a parameter program has at least one tensor operand");
-    let fill = |value: f32| like.shift(value);
-    let tensor = |value: &Value<P>| match value {
+    let fill = |value: P::Elem| like.shift(value);
+    let tensor = |value: &Value<P, P::Elem>| match value {
         Value::Scalar(value) => fill(*value),
         Value::Tensor(tensor) => tensor.duplicate(),
     };
 
     let fresh = program.fresh_inputs();
-    let mut registers: Vec<Option<Value<P>>> = (0..16).map(|_| None).collect();
+    let mut registers: Vec<Option<Value<P, P::Elem>>> = (0..16).map(|_| None).collect();
     let mut outputs: Vec<Option<P>> = (0..program.outputs().len()).map(|_| None).collect();
     for instr in program.code() {
         let get = |reg: u8| registers[usize::from(reg)].as_ref().expect("validated");
@@ -147,11 +161,11 @@ fn unfused_parameter<P: Parameter>(
             Instr::Binary { dst, op, a, b } => {
                 let value = match (get(a), get(b), op) {
                     (Value::Scalar(a), Value::Scalar(b), _) => Value::Scalar(match op {
-                        BinaryOp::Add => a + b,
-                        BinaryOp::Sub => a - b,
-                        BinaryOp::Mul => a * b,
-                        BinaryOp::Div => a / b,
-                        BinaryOp::Rem => a % b,
+                        BinaryOp::Add => *a + *b,
+                        BinaryOp::Sub => *a - *b,
+                        BinaryOp::Mul => *a * *b,
+                        BinaryOp::Div => *a / *b,
+                        BinaryOp::Rem => *a % *b,
                     }),
                     // The two forms `scale` and `shift` are exactly.
                     (Value::Tensor(a), Value::Scalar(b), BinaryOp::Mul) => {
@@ -208,8 +222,8 @@ fn unfused_parameter<P: Parameter>(
 }
 
 /// Run `program` over same-shaped tensors, which is every parameter program.
-fn run_fused<B: Kernels, T: Fusable<B>>(
-    program: &Program,
+fn run_fused<E: Element, B: Kernels<E>, T: Fusable<B>>(
+    program: &Program<E>,
     shape: (usize, usize),
     inputs: &[&T],
     updated: &mut [&mut T],
@@ -228,11 +242,12 @@ fn run_fused<B: Kernels, T: Fusable<B>>(
 /// A scalar parameter — a learned temperature, or a log-variance. It carries no
 /// storage of its own, so its tape is the host one; a scalar living inside a
 /// resident graph is a job for [`Tape`] directly rather than for [`minimize`].
-impl Parameter for f32 {
+impl<T: Element> Parameter for T {
+    type Elem = T;
     type Backend = Host;
 
     fn zeros_like(&self) -> Self {
-        0.0
+        T::zero()
     }
 
     fn duplicate(&self) -> Self {
@@ -240,43 +255,43 @@ impl Parameter for f32 {
     }
 
     fn add(&self, other: &Self) -> Self {
-        self + other
+        *self + *other
     }
 
     fn subtract(&self, other: &Self) -> Self {
-        self - other
+        *self - *other
     }
 
     fn multiply(&self, other: &Self) -> Self {
-        self * other
+        *self * *other
     }
 
     fn divide(&self, other: &Self) -> Self {
-        self / other
+        *self / *other
     }
 
-    fn scale(&self, factor: f32) -> Self {
-        self * factor
+    fn scale(&self, factor: T) -> Self {
+        *self * factor
     }
 
-    fn shift(&self, offset: f32) -> Self {
-        self + offset
+    fn shift(&self, offset: T) -> Self {
+        *self + offset
     }
 
     fn sqrt(&self) -> Self {
-        f32::sqrt(*self)
+        Float::sqrt(*self)
     }
 
     fn record<'t>(&self, tape: &'t Tape<Host>) -> Var<'t, Self, Host> {
         tape.scalar(*self)
     }
 
-    fn fused(program: &Program, inputs: &[&Self], updated: &mut [&mut Self]) -> Vec<Self> {
-        let inputs: Vec<Vector<f32>> = inputs.iter().map(|&&x| Vector::new([x])).collect();
-        let mut targets: Vec<Vector<f32>> = updated.iter().map(|x| Vector::new([**x])).collect();
+    fn fused(program: &Program<T>, inputs: &[&Self], updated: &mut [&mut Self]) -> Vec<Self> {
+        let inputs: Vec<Vector<T>> = inputs.iter().map(|&&x| Vector::new([x])).collect();
+        let mut targets: Vec<Vector<T>> = updated.iter().map(|x| Vector::new([**x])).collect();
         let outputs = {
-            let inputs: Vec<&Vector<f32>> = inputs.iter().collect();
-            let mut targets: Vec<&mut Vector<f32>> = targets.iter_mut().collect();
+            let inputs: Vec<&Vector<T>> = inputs.iter().collect();
+            let mut targets: Vec<&mut Vector<T>> = targets.iter_mut().collect();
             run_fused(program, (1, 1), &inputs, &mut targets)
         };
         for (target, value) in updated.iter_mut().zip(&targets) {
@@ -284,16 +299,17 @@ impl Parameter for f32 {
         }
         outputs
             .into_iter()
-            .map(|output| output.into_vector::<f32>().as_slice()[0])
+            .map(|output| output.into_vector::<T>().as_slice()[0])
             .collect()
     }
 }
 
-impl<B: Kernels> Parameter for Vector<f32, B> {
+impl<T: Element, B: Kernels<T>> Parameter for Vector<T, B> {
+    type Elem = T;
     type Backend = B;
 
     fn zeros_like(&self) -> Self {
-        Vector::filled(self.len(), 0.0)
+        Vector::filled(self.len(), T::zero())
     }
 
     fn duplicate(&self) -> Self {
@@ -316,11 +332,11 @@ impl<B: Kernels> Parameter for Vector<f32, B> {
         B::vector_elementwise(self, other, BinaryOp::Div)
     }
 
-    fn scale(&self, factor: f32) -> Self {
+    fn scale(&self, factor: T) -> Self {
         B::vector_broadcast(self, factor, BinaryOp::Mul, false)
     }
 
-    fn shift(&self, offset: f32) -> Self {
+    fn shift(&self, offset: T) -> Self {
         B::vector_broadcast(self, offset, BinaryOp::Add, false)
     }
 
@@ -332,7 +348,7 @@ impl<B: Kernels> Parameter for Vector<f32, B> {
         tape.vector(self.to_backend::<B>())
     }
 
-    fn fused(program: &Program, inputs: &[&Self], updated: &mut [&mut Self]) -> Vec<Self> {
+    fn fused(program: &Program<T>, inputs: &[&Self], updated: &mut [&mut Self]) -> Vec<Self> {
         let len = inputs
             .first()
             .map(|v| v.len())
@@ -345,12 +361,13 @@ impl<B: Kernels> Parameter for Vector<f32, B> {
     }
 }
 
-impl<B: Kernels> Parameter for Matrix<f32, B> {
+impl<T: Element, B: Kernels<T>> Parameter for Matrix<T, B> {
+    type Elem = T;
     type Backend = B;
 
     fn zeros_like(&self) -> Self {
         let (rows, cols) = self.shape();
-        Matrix::filled(rows, cols, 0.0)
+        Matrix::filled(rows, cols, T::zero())
     }
 
     fn duplicate(&self) -> Self {
@@ -373,11 +390,11 @@ impl<B: Kernels> Parameter for Matrix<f32, B> {
         B::matrix_elementwise(self, other, BinaryOp::Div)
     }
 
-    fn scale(&self, factor: f32) -> Self {
+    fn scale(&self, factor: T) -> Self {
         B::matrix_broadcast(self, factor, BinaryOp::Mul, false)
     }
 
-    fn shift(&self, offset: f32) -> Self {
+    fn shift(&self, offset: T) -> Self {
         B::matrix_broadcast(self, offset, BinaryOp::Add, false)
     }
 
@@ -389,7 +406,7 @@ impl<B: Kernels> Parameter for Matrix<f32, B> {
         tape.matrix(self.to_backend::<B>())
     }
 
-    fn fused(program: &Program, inputs: &[&Self], updated: &mut [&mut Self]) -> Vec<Self> {
+    fn fused(program: &Program<T>, inputs: &[&Self], updated: &mut [&mut Self]) -> Vec<Self> {
         let shape = inputs
             .first()
             .map(|m| m.shape())
@@ -421,21 +438,22 @@ pub trait Rule<P> {
 /// The step size is the whole algorithm, and it has to respect the curvature:
 /// descent diverges above `2/λmax` of the loss's Hessian.
 #[derive(Copy, Clone, Debug)]
-pub struct Sgd {
-    pub rate: f32,
+pub struct Sgd<T = f32> {
+    pub rate: T,
 }
 
-impl Sgd {
-    pub fn new(rate: f32) -> Self {
+impl<T> Sgd<T> {
+    pub fn new(rate: T) -> Self {
         Sgd { rate }
     }
 }
 
-impl<P: Parameter> Rule<P> for Sgd {
+impl<P: Parameter> Rule<P> for Sgd<P::Elem> {
     fn update(&mut self, parameters: &mut P, gradient: &P) {
+        let dtype = <P::Elem as Element>::DTYPE;
         let mut b = Builder::new();
-        let g = b.input(DType::F32);
-        let p = b.update(DType::F32);
+        let g = b.input(dtype);
+        let p = b.update(dtype);
         let step = b.scale(g, self.rate);
         let p = b.sub(p, step);
         b.set(0, p);
@@ -456,16 +474,16 @@ impl<P: Parameter> Rule<P> for Sgd {
 /// rate·(g + μv)`, applying the momentum term where the parameters are about to
 /// be rather than where they are.
 #[derive(Clone, Debug)]
-pub struct Momentum<P> {
-    pub rate: f32,
-    pub momentum: f32,
+pub struct Momentum<P: Parameter> {
+    pub rate: P::Elem,
+    pub momentum: P::Elem,
     pub nesterov: bool,
     velocity: Option<P>,
 }
 
-impl<P> Momentum<P> {
+impl<P: Parameter> Momentum<P> {
     /// Classical momentum; `0.9` is the usual coefficient.
-    pub fn new(rate: f32, momentum: f32) -> Self {
+    pub fn new(rate: P::Elem, momentum: P::Elem) -> Self {
         Momentum {
             rate,
             momentum,
@@ -475,7 +493,7 @@ impl<P> Momentum<P> {
     }
 
     /// The look-ahead variant.
-    pub fn nesterov(rate: f32, momentum: f32) -> Self {
+    pub fn nesterov(rate: P::Elem, momentum: P::Elem) -> Self {
         Momentum {
             rate,
             momentum,
@@ -488,12 +506,13 @@ impl<P> Momentum<P> {
 impl<P: Parameter> Rule<P> for Momentum<P> {
     /// One fused kernel: the velocity and parameters are updated in place.
     fn update(&mut self, parameters: &mut P, gradient: &P) {
+        let dtype = <P::Elem as Element>::DTYPE;
         let mut b = Builder::new();
-        let g = b.input(DType::F32);
-        let p = b.update(DType::F32);
+        let g = b.input(dtype);
+        let p = b.update(dtype);
         let resumed = self.velocity.is_some();
         let velocity = if resumed {
-            let previous = b.update(DType::F32);
+            let previous = b.update(dtype);
             let decayed = b.scale(previous, self.momentum);
             b.add(decayed, g)
         } else {
@@ -511,7 +530,7 @@ impl<P: Parameter> Rule<P> for Momentum<P> {
         if resumed {
             b.set(1, velocity);
         } else {
-            b.output(velocity, DType::F32);
+            b.output(velocity, dtype);
         }
         let program = b.build().expect("the rule's program is valid");
 
@@ -536,17 +555,17 @@ impl<P: Parameter> Rule<P> for Momentum<P> {
 /// Rarely-moved parameters keep a large effective step. The denominator only
 /// grows, so the steps only shrink — which is why [`RmsProp`] exists.
 #[derive(Clone, Debug)]
-pub struct AdaGrad<P> {
-    pub rate: f32,
-    pub epsilon: f32,
+pub struct AdaGrad<P: Parameter> {
+    pub rate: P::Elem,
+    pub epsilon: P::Elem,
     total: Option<P>,
 }
 
-impl<P> AdaGrad<P> {
-    pub fn new(rate: f32) -> Self {
+impl<P: Parameter> AdaGrad<P> {
+    pub fn new(rate: P::Elem) -> Self {
         AdaGrad {
             rate,
-            epsilon: 1e-8,
+            epsilon: <P::Elem as Real>::from_f64(1e-8),
             total: None,
         }
     }
@@ -555,13 +574,14 @@ impl<P> AdaGrad<P> {
 impl<P: Parameter> Rule<P> for AdaGrad<P> {
     /// One fused kernel, updating the parameters and the running total in place.
     fn update(&mut self, parameters: &mut P, gradient: &P) {
+        let dtype = <P::Elem as Element>::DTYPE;
         let mut b = Builder::new();
-        let g = b.input(DType::F32);
-        let p = b.update(DType::F32);
+        let g = b.input(dtype);
+        let p = b.update(dtype);
         let resumed = self.total.is_some();
         let squared = b.mul(g, g);
         let total = if resumed {
-            let previous = b.update(DType::F32);
+            let previous = b.update(dtype);
             b.add(previous, squared)
         } else {
             squared
@@ -571,7 +591,7 @@ impl<P: Parameter> Rule<P> for AdaGrad<P> {
         if resumed {
             b.set(1, total);
         } else {
-            b.output(total, DType::F32);
+            b.output(total, dtype);
         }
         let program = b.build().expect("the rule's program is valid");
 
@@ -594,19 +614,19 @@ impl<P: Parameter> Rule<P> for AdaGrad<P> {
 /// The exponential average keeps the denominator from growing without bound, so
 /// the effective step size adapts instead of decaying to nothing.
 #[derive(Clone, Debug)]
-pub struct RmsProp<P> {
-    pub rate: f32,
-    pub decay: f32,
-    pub epsilon: f32,
+pub struct RmsProp<P: Parameter> {
+    pub rate: P::Elem,
+    pub decay: P::Elem,
+    pub epsilon: P::Elem,
     mean_square: Option<P>,
 }
 
-impl<P> RmsProp<P> {
-    pub fn new(rate: f32) -> Self {
+impl<P: Parameter> RmsProp<P> {
+    pub fn new(rate: P::Elem) -> Self {
         RmsProp {
             rate,
-            decay: 0.9,
-            epsilon: 1e-8,
+            decay: <P::Elem as Real>::from_f64(0.9),
+            epsilon: <P::Elem as Real>::from_f64(1e-8),
             mean_square: None,
         }
     }
@@ -615,14 +635,15 @@ impl<P> RmsProp<P> {
 impl<P: Parameter> Rule<P> for RmsProp<P> {
     /// One fused kernel, updating the parameters and the mean square in place.
     fn update(&mut self, parameters: &mut P, gradient: &P) {
+        let dtype = <P::Elem as Element>::DTYPE;
         let mut b = Builder::new();
-        let g = b.input(DType::F32);
-        let p = b.update(DType::F32);
+        let g = b.input(dtype);
+        let p = b.update(dtype);
         let resumed = self.mean_square.is_some();
         let squared = b.mul(g, g);
-        let squared = b.scale(squared, 1.0 - self.decay);
+        let squared = b.scale(squared, <P::Elem as num_traits::One>::one() - self.decay);
         let mean_square = if resumed {
-            let previous = b.update(DType::F32);
+            let previous = b.update(dtype);
             let decayed = b.scale(previous, self.decay);
             b.add(decayed, squared)
         } else {
@@ -633,7 +654,7 @@ impl<P: Parameter> Rule<P> for RmsProp<P> {
         if resumed {
             b.set(1, mean_square);
         } else {
-            b.output(mean_square, DType::F32);
+            b.output(mean_square, dtype);
         }
         let program = b.build().expect("the rule's program is valid");
 
@@ -656,24 +677,24 @@ impl<P: Parameter> Rule<P> for RmsProp<P> {
 /// `m ← β₁m + (1−β₁)g`, `v ← β₂v + (1−β₂)g⊙g`, and after correcting both for
 /// their zero initialization, `p ← p − rate·m̂/(√v̂ + ε)`.
 #[derive(Clone, Debug)]
-pub struct Adam<P> {
-    pub rate: f32,
-    pub first_decay: f32,
-    pub second_decay: f32,
-    pub epsilon: f32,
+pub struct Adam<P: Parameter> {
+    pub rate: P::Elem,
+    pub first_decay: P::Elem,
+    pub second_decay: P::Elem,
+    pub epsilon: P::Elem,
     first: Option<P>,
     second: Option<P>,
     steps: u32,
 }
 
-impl<P> Adam<P> {
+impl<P: Parameter> Adam<P> {
     /// The usual coefficients: `β₁ = 0.9`, `β₂ = 0.999`, `ε = 1e-8`.
-    pub fn new(rate: f32) -> Self {
+    pub fn new(rate: P::Elem) -> Self {
         Adam {
             rate,
-            first_decay: 0.9,
-            second_decay: 0.999,
-            epsilon: 1e-8,
+            first_decay: <P::Elem as Real>::from_f64(0.9),
+            second_decay: <P::Elem as Real>::from_f64(0.999),
+            epsilon: <P::Elem as Real>::from_f64(1e-8),
             first: None,
             second: None,
             steps: 0,
@@ -688,16 +709,18 @@ impl<P: Parameter> Rule<P> for Adam<P> {
     fn update(&mut self, parameters: &mut P, gradient: &P) {
         self.steps += 1;
 
+        let dtype = <P::Elem as Element>::DTYPE;
+        let one = <P::Elem as num_traits::One>::one();
         let mut b = Builder::new();
-        let g = b.input(DType::F32);
-        let p = b.update(DType::F32);
+        let g = b.input(dtype);
+        let p = b.update(dtype);
         let resumed = self.first.is_some() && self.second.is_some();
 
-        let fresh_first = b.scale(g, 1.0 - self.first_decay);
+        let fresh_first = b.scale(g, one - self.first_decay);
         let squared = b.mul(g, g);
-        let fresh_second = b.scale(squared, 1.0 - self.second_decay);
+        let fresh_second = b.scale(squared, one - self.second_decay);
         let (first, second) = if resumed {
-            let (m, v) = (b.update(DType::F32), b.update(DType::F32));
+            let (m, v) = (b.update(dtype), b.update(dtype));
             let m = b.scale(m, self.first_decay);
             let v = b.scale(v, self.second_decay);
             (b.add(m, fresh_first), b.add(v, fresh_second))
@@ -707,8 +730,8 @@ impl<P: Parameter> Rule<P> for Adam<P> {
 
         // Both moments start at zero, so early estimates are biased toward it;
         // dividing by `1 − βᵗ` undoes exactly that.
-        let first_correction = 1.0 - self.first_decay.powi(self.steps as i32);
-        let second_correction = 1.0 - self.second_decay.powi(self.steps as i32);
+        let first_correction = one - self.first_decay.powi(self.steps as i32);
+        let second_correction = one - self.second_decay.powi(self.steps as i32);
         let corrected_first = b.scale(first, first_correction.recip());
         let corrected_second = b.scale(second, second_correction.recip());
 
@@ -722,8 +745,8 @@ impl<P: Parameter> Rule<P> for Adam<P> {
             b.set(1, first);
             b.set(2, second);
         } else {
-            b.output(first, DType::F32);
-            b.output(second, DType::F32);
+            b.output(first, dtype);
+            b.output(second, dtype);
         }
         let program = b.build().expect("the rule's program is valid");
 
@@ -747,13 +770,13 @@ impl<P: Parameter> Rule<P> for Adam<P> {
 }
 
 /// `p − rate · g / (√s + ε)`, the step the adaptive rules share.
-fn descend(
-    b: &mut Builder,
+fn descend<T: Real>(
+    b: &mut Builder<T>,
     p: crate::tensors::fused::Value,
     g: crate::tensors::fused::Value,
     scale: crate::tensors::fused::Value,
-    epsilon: f32,
-    rate: f32,
+    epsilon: T,
+    rate: T,
 ) -> crate::tensors::fused::Value {
     let root = b.unary(Analytic::Sqrt, scale);
     let denominator = b.shift(root, epsilon);
@@ -835,13 +858,13 @@ pub fn minimize<P, R>(
     parameters: &mut P,
     rule: &mut R,
     steps: usize,
-    objective: impl for<'t> Fn(&Var<'t, P, P::Backend>, usize) -> ScalarVar<'t, P::Backend>,
-) -> f32
+    objective: impl for<'t> Fn(&Var<'t, P, P::Backend>, usize) -> ScalarVar<'t, P::Backend, P::Elem>,
+) -> P::Elem
 where
     P: Parameter + Adjoint<P::Backend>,
     R: Rule<P>,
 {
-    let mut last = f32::NAN;
+    let mut last = <P::Elem as Float>::nan();
     for step in 0..steps {
         let tape = Tape::<P::Backend>::new();
         let recorded = parameters.record(&tape);
@@ -856,6 +879,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tensors::fused::DType;
 
     /// The provided [`Parameter::fused`], for parameter types without a
     /// program runner, has to give the same answers as the real one.
@@ -865,7 +889,7 @@ mod tests {
         let g = b.input(DType::F32);
         let p = b.update(DType::F32);
         let m = b.update(DType::F32);
-        let decayed = b.scale(m, 0.9);
+        let decayed = b.scale(m, 0.9f32);
         let m = b.add(decayed, g);
         let root = b.unary(Analytic::Sqrt, m);
         let lifted = b.shift(root, 1e-3);

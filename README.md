@@ -21,6 +21,8 @@ API to use for model training, dynamic data, and GPU execution.
 - Projected gradient descent for box, norm-ball, simplex, or custom constraints.
 - Means, variances, and normal or inverse-Gaussian distribution functions, whole-tensor or by axis.
 - A generic host backend, Accelerate and SIMD CPU paths, and resident Apple Metal storage.
+- Generic element types: autodiff, optimizers, statistics, projections and fused programs run in
+  `f32`, `f64`, `f16` or `bf16`, with `f32` the default.
 - Saving and loading host tensors without an external serialization framework.
 
 ## Requirements and installation
@@ -110,7 +112,7 @@ expanded code.
 
 ### Literals and types
 
-- Unsuffixed numbers are `f64`.
+- Unsuffixed numbers are `f64`, or `f32` in a block that starts with `dtype = f32;`.
 - `2i` means the imaginary value `2i`.
 - `1d` means the dual infinitesimal `1ε`; `d` is used because Rust reserves `e` in numeric
   exponents.
@@ -244,8 +246,22 @@ let values: Vector<f32, Metal> = math! {
 };
 ```
 
-Metal blocks use `f32` because the shaders are 32-bit and reject complex (`i`) and dual (`d`)
-literals. `pow`, `det`, and `inv` currently make an explicit Host round trip because they do not
+Host blocks compute in `f64` unless a `dtype = f32;` directive says otherwise; it may come before or
+after a backend directive, and changes only the coefficient type, so complex and dual values become
+`Complex<f32>` and `Dual<f32>`:
+
+```rust
+use tensorcrate::math;
+use tensorcrate::tensors::{Host, Matrix};
+
+let product: Matrix<f32, Host> = math! {
+    dtype = f32;
+    [[1, 2], [3, 4]] @ [[0, 1], [1, 0]]
+};
+```
+
+Metal blocks use `f32` because the shaders are 32-bit (so `dtype = f64;` with `backend = Metal;` is
+rejected), and reject complex (`i`) and dual (`d`) literals. `pow`, `det`, and `inv` currently make an explicit Host round trip because they do not
 have resident Metal kernels; the result is converted back to Metal when it is a tensor. Use the
 regular tensor API for runtime-built shapes and autodiff tapes.
 
@@ -412,8 +428,8 @@ assert_eq!(spread.len(), 4);                                // one per column
 ```
 
 `Axis` names what is *folded*, not what survives: `Axis::Rows` folds each row and leaves one value
-per row. Every variance and standard deviation takes a `Correction` — `Population` divides by `n`,
-`Sample` by `n − 1` — because neither is a safe default. `moments()` and `moments_axis()` return
+per row. Every variance and standard deviation takes a `Correction` - `Population` divides by `n`,
+`Sample` by `n − 1`, because neither is a safe default. `moments()` and `moments_axis()` return
 the count, mean, and summed squared deviations together, so asking for a mean and both variances
 costs one traversal rather than three.
 
@@ -435,7 +451,7 @@ assert_eq!(probabilities.data()[1], 0.5);
 assert_eq!(probabilities.ppf(&standard).data()[2].round(), 1.0);
 ```
 
-`Distribution::InverseGaussian { mean, shape }` is the Wald distribution — the first-passage time
+`Distribution::InverseGaussian { mean, shape }` is the Wald distribution, the first-passage time
 of a drifting Brownian motion. It lives on the positive reals and is right-skewed, which makes it
 the counterpart to the normal for durations and latencies.
 
@@ -464,8 +480,8 @@ assert!((recovered[(1, 4)] - 5000.0).abs() < 1e-6);
 ```
 
 The methods above are inherent on `Host` tensors of any float element type. On `Metal`, and in code
-generic over the backend, the same operations come from the `Statistics` and `AxisStatistics`
-traits:
+generic over the backend or the element type (`T: Real, B: Kernels<T>`), the same operations come
+from the `Statistics` and `AxisStatistics` traits:
 
 ```rust
 use tensorcrate::statistics::{Axis, AxisStatistics, Correction, Distribution, Statistics};
@@ -484,7 +500,7 @@ assert!(ranked.is_device_resident());
 
 A few things worth knowing about the numbers:
 
-- Variances are computed in two passes — mean first, then squared deviations from it — rather than
+- Variances are computed in two passes: mean first, then squared deviations from it, rather than
   through the one-pass `E[x²] − E[x]²` identity, which loses every significant digit when the mean
   is large relative to the spread.
 - A column-wise fold accumulates a whole row of partial sums at a time, so it reads the matrix in
@@ -493,7 +509,7 @@ A few things worth knowing about the numbers:
   `f32` tensor gets results correct to the last `f32` bit. The Metal shaders evaluate in `f32`
   throughout, so the two backends agree to about `1e-6` relative rather than exactly. Moments agree
   far more closely, differing only in summation order.
-- `statistics::special` exposes the scalar functions underneath — `erf`, `erfc`, `ln_erfc`,
+- `statistics::special` exposes the scalar functions underneath: `erf`, `erfc`, `ln_erfc`,
   `erf_inv`, and each family's density, distribution function, and quantile.
 
 ## Compute backends
@@ -505,8 +521,8 @@ A tensor's second type parameter selects where its values live:
 | Host, scalar | `Vector<T, Host>` / `Matrix<T, Host>` | Maximum portability and all supported element types |
 | Host with `simd` | Same host types | Faster `f32`/`f64` CPU operations on AArch64 and x86-64 |
 | Host on macOS | Same host types | Accelerate SGEMM/DGEMM for dispatched `f32`/`f64` products |
-| Apple Metal | `Vector<f32, Metal>` / `Matrix<f32, Metal>` | Long `f32` operation chains that should remain GPU-resident |
-| M5 Metal 4 | `Matrix<f16, Metal>` / `Matrix<bf16, Metal>` | Compact TensorOps matrix products |
+| Apple Metal | `Vector<T, Metal>` / `Matrix<T, Metal>` for `f32`, `f16`, `bf16` | Long operation chains that should remain GPU-resident |
+| M5 Metal 4 | Same Metal types | TensorOps matrix products for all three types |
 
 `Host` is the default, so `Vector<f32>` means `Vector<f32, Host>`. With the `simd` feature, host
 operations select NEON on AArch64 or AVX2/FMA with an SSE2 fallback on x86-64. Small tensors and
@@ -514,6 +530,63 @@ unsupported operations use the ordinary scalar implementation automatically. SIM
 tier of `Host`, not a separate storage type. On macOS, Host `f32` and `f64` matrix products at the
 existing 512 multiply-accumulate dispatch threshold use Accelerate SGEMM or DGEMM before the SIMD
 path is considered.
+
+### Element types
+
+The backend-generic layers are written once over any `Real` element type, `f32`, `f64`, `f16` or
+`bf16`, through `Kernels<T>`. `Host` implements it for all four; `Metal` implements it for `f32`,
+`f16` and `bf16`, with every shader compiled once per type. `T` defaults to `f32`, so `B: Kernels`, `Tape<B>`, `DualVector<B>`,
+`Program` and `Sgd` keep meaning what they did, and choosing another type is a matter of what you
+put in the tensors:
+
+```rust
+use tensorcrate::numbers::Real;
+use tensorcrate::optim::{Adam, minimize};
+use tensorcrate::tensors::{Kernels, Ordered, Vector};
+
+// Generic over the element as well as the backend.
+fn relu<T: Real, B: Kernels<T>>(v: &Vector<T, B>) -> Vector<T, B> {
+    v.max_scalar(T::zero())
+}
+assert_eq!(relu(&Vector::new([-1.0f64, 2.0])).data(), [0.0, 2.0]);
+
+// An `f64` parameter makes the whole step `f64`: the tape, the gradient, Adam's moments and its
+// hyperparameters.
+let target = Vector::new([0.1f64, 0.2]);
+let mut parameters = Vector::<f64>::zeros(2);
+let loss = minimize(&mut parameters, &mut Adam::new(0.05), 2000, |x, _| {
+    let offset = x - &x.tape().vector(target.clone());
+    offset.dot(&offset)
+});
+assert!(loss < 1e-12);
+```
+
+The scalar types `Dual<T>` and `Complex<T>`, the `math!` macro (`dtype = f32;`) and saved tensors
+(`f16` and `bf16` included) follow the same element types.
+
+`f16` and `bf16` are computed in, not only stored. Two rules hold on both backends:
+
+- Elementwise operations round to the 16-bit type every time. On the GPU they are `half` and
+  `bfloat` shader arithmetic. On AArch64 CPUs, `f16` uses the native FP16 vector instructions
+  (`FADD v.8h`, `FSQRT`, `FMAXNM`, ...); `bf16` widens to `f32` exactly, computes, and rounds once
+  with `BFCVTN` (M2 and later), which is the correctly rounded `bf16` result.
+- Accumulations run in `f32` and round once: sums, dot and matrix products, prefix sums, moments
+  and correlations. Dot products use the widening `FMLAL` and `BFMLALB`/`BFMLALT` instructions, and
+  CPU matrix products widen once and use Accelerate's SGEMM. A sum of 10,000 `f16` ones is 10,000
+  rather than the 2,048 a 16-bit running total stops at.
+
+```rust
+use tensorcrate::numbers::f16;
+use tensorcrate::tensors::Vector;
+
+let ones = Vector::new(vec![f16::ONE; 10_000]);
+assert_eq!(ones.sum(), f16::from_f32(10_000.0));
+
+// Each addition rounds to f16: 2048 + 1 is 2048.
+let big = Vector::new(vec![f16::from_f32(2048.0); 4]);
+let one = Vector::new(vec![f16::ONE; 4]);
+assert_eq!((&(&big + &one) - &big).data(), [f16::ZERO; 4]);
+```
 
 ### Apple Metal
 
@@ -541,8 +614,9 @@ Important backend details:
   the existing tiled `f32` kernel. Fused `matmul_add` also retains the tiled path.
 - Metal `f16` and `bf16` storage uses the Rust [`half`](https://crates.io/crates/half) crate, whose
   two-byte values map directly to Metal `half` and `bfloat` buffers.
-- The full Metal operation set is available for `f32`. Compact types currently provide storage,
-  FP32 conversion, and matrix multiplication.
+- The full Metal operation set is available for `f32`, `f16` and `bf16`: every shader is compiled
+  once per type, and `Kernels<T>` is implemented for each, so autodiff, optimizers, statistics and
+  fused programs stay resident in 16-bit precision too.
 - Operands in one operation must use the same backend.
 - `to_backend` is the explicit transfer boundary; avoid moving back and forth inside a hot loop.
 - Optimizers, projections, forward autodiff, and reverse autodiff are generic over `Host` and
@@ -551,9 +625,8 @@ Important backend details:
   device is available, the Metal backend falls back to CPU storage and preserves the same answers.
 - Metal objects are thread-affine and are not `Send`.
 
-Use `matmul` for same-format `f16`/`bf16` cooperative accumulation and compact output, or
-`matmul_f32` when the product should accumulate and remain in FP32. Same-format accumulation saves
-register and output bandwidth but loses precision more quickly as the inner dimension grows:
+Use `matmul` for a compact result, accumulated in FP32 and rounded once per element, or
+`matmul_f32` when the product should stay in FP32:
 
 ```rust
 use tensorcrate::numbers::{bf16, f16};
@@ -614,7 +687,10 @@ assert_eq!(y[0].as_slice(), [2.0, 1.0]);
   bytecode shader interprets the program per thread. Like the other shaders it uses fast math, so
   it agrees with the host within tolerance rather than exactly.
 - Loads can read a transposed matrix or broadcast a row or column vector without materializing it.
-  Each input and output can be stored as `f32`, `f16` or `bf16`; arithmetic is always `f32`.
+  Each input and output can be stored as `f32`, `f16`, `bf16` or `f64`, independently of the
+  arithmetic, which runs in the program's element type: `Program<T>` and `Builder<T>` default to
+  `f32`, and `Builder::<f16>::new()` builds one that computes in `f16`. The Metal shader is
+  compiled for `f32`, `f16` and `bf16` arithmetic; `f64` programs run on the host.
 - The optimizers use fused programs. An `Adam` step is one kernel that updates the parameters and
   both moments in place, where it used to be fourteen kernels and eleven temporary tensors.
 - For debugging: `println!("{program}")` prints a disassembly, `program.trace(...)` returns every

@@ -24,8 +24,16 @@
 //! to [`Host`] — the `Vec` just described. On macOS with the `metal` feature,
 //! tensors can instead be placed on the [`Metal`] backend, whose elements live
 //! in GPU-shared memory so a chain of operations runs without copying between
-//! CPU and GPU pools. The full operation set is available for `f32`; `f16` and
-//! `bf16` provide compact storage and M5 TensorOps matrix products.
+//! CPU and GPU pools. The full GPU operation set is available for `f32`, `f16`
+//! and `bf16`, each with its own compiled kernels. On the host every element
+//! type works, and the layers built on [`Kernels`] — automatic
+//! differentiation, optimizers, statistics, fused programs — are generic over
+//! the floating-point ones (`f32`, `f64`, `f16`, `bf16`), with `f32` the default.
+//!
+//! `f16` and `bf16` are computed in, not just stored: an elementwise operation
+//! rounds to the 16-bit type every time, while sums, dot and matrix products,
+//! prefix sums and moments accumulate in `f32` and round once. That holds on
+//! both backends.
 //! [`Vector::to_backend`] and [`Matrix::to_backend`] move between the two; see
 //! the [`backend`] module for the details.
 
@@ -36,7 +44,7 @@ use std::ops::{Add, Div, Index, Mul, Neg, Rem, Sub};
 use num_traits::{Float, NumCast};
 
 use crate::errors::Error;
-use crate::numbers::{Coefficient, Complex};
+use crate::numbers::{Coefficient, Complex, Real};
 
 pub mod analytic;
 pub mod backend;
@@ -363,6 +371,11 @@ pub(crate) mod simd_dispatch {
             return false;
         }
         debug_assert!(b.len() == a.len() && out.len() == a.len());
+        // The compact floats have kernels of their own: native FP16 lanes, and
+        // BF16 through `f32` with one rounding.
+        if crate::compact::elementwise(a, b, op, out) {
+            return true;
+        }
         unsafe {
             if let (Some(a), Some(b), Some(out)) = (
                 as_slice::<T, f32>(a),
@@ -397,6 +410,9 @@ pub(crate) mod simd_dispatch {
             return false;
         }
         debug_assert_eq!(out.len(), values.len());
+        if crate::compact::broadcast(values, scalar, op, scalar_left, out) {
+            return true;
+        }
         unsafe {
             if let (Some(v), Some(s), Some(out)) = (
                 as_slice::<T, f32>(values),
@@ -425,6 +441,9 @@ pub(crate) mod simd_dispatch {
             return false;
         }
         debug_assert!(b.len() == a.len() && out.len() == a.len());
+        if crate::compact::compare(a, b, op, out) {
+            return true;
+        }
         unsafe {
             if let (Some(a), Some(b), Some(out)) = (
                 as_slice::<T, f32>(a),
@@ -459,6 +478,9 @@ pub(crate) mod simd_dispatch {
             return false;
         }
         debug_assert_eq!(out.len(), values.len());
+        if crate::compact::compare_scalar(values, scalar, op, scalar_left, out) {
+            return true;
+        }
         unsafe {
             if let (Some(v), Some(s), Some(out)) = (
                 as_slice::<T, f32>(values),
@@ -487,6 +509,9 @@ pub(crate) mod simd_dispatch {
             return false;
         }
         debug_assert_eq!(out.len(), values.len());
+        if crate::compact::clamp(values, low, high, out) {
+            return true;
+        }
         unsafe {
             if let (Some(v), Some(low), Some(high), Some(out)) = (
                 as_slice::<T, f32>(values),
@@ -945,11 +970,11 @@ impl<T: Copy + 'static, B: Backend> Vector<T, B> {
     }
 }
 
-impl<B: Backend> Vector<f32, B> {
+impl<T: Real, B: Backend> Vector<T, B> {
     /// An arithmetic progression: `start`, `start + step`, `start + 2·step`, …
-    pub fn ramp(len: usize, start: f32, step: f32) -> Self {
+    pub fn ramp(len: usize, start: T, step: T) -> Self {
         let values = (0..len)
-            .map(|index| start + step * index as f32)
+            .map(|index| start + step * T::from_f64(index as f64))
             .collect::<Vec<_>>();
         Vector {
             len,
@@ -1004,6 +1029,30 @@ impl<T> Vector<T, Host> {
         Vector {
             len: self.len,
             data: self.data.iter().map(f).collect(),
+        }
+    }
+
+    /// Combine two vectors element by element with `f`, producing a vector of
+    /// the new element type.
+    ///
+    /// # Panics
+    ///
+    /// If the two lengths differ.
+    #[track_caller]
+    pub fn zip_map<U, V>(
+        &self,
+        other: &Vector<U, Host>,
+        f: impl Fn(&T, &U) -> V,
+    ) -> Vector<V, Host> {
+        assert_same_len(self.len, other.len, "zip_map");
+        Vector {
+            len: self.len,
+            data: self
+                .data
+                .iter()
+                .zip(&other.data)
+                .map(|(a, b)| f(a, b))
+                .collect(),
         }
     }
 }
@@ -1084,6 +1133,10 @@ impl<T: Coefficient> Vector<T, Host> {
     #[track_caller]
     pub fn dot(&self, other: &Vector<T, Host>) -> T {
         assert_same_len(self.len, other.len, "dot");
+        // `f16` and `bf16` accumulate in `f32` and round once.
+        if let Some(output) = crate::compact::dot(&self.data, &other.data) {
+            return output;
+        }
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         if let Some(output) = simd_dispatch::dot(&self.data, &other.data) {
             return output;
@@ -1105,6 +1158,10 @@ impl<T: Coefficient> Vector<T, Host> {
         assert_inner((1, self.len), m.shape(), "vecmat");
         let (rows, cols) = (m.rows, m.cols);
         let mut out = vec![T::zero(); cols];
+
+        if crate::compact::matmul(&self.data, &m.data, 1, rows, cols, &mut out, false) {
+            return Vector::new(out);
+        }
 
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         if simd_dispatch::vecmat(&self.data, &m.data, rows, cols, &mut out) {
@@ -1220,7 +1277,12 @@ impl<T> Vector<T, Host> {
 
 impl<T: Coefficient> Vector<T, Host> {
     /// The sum of every element; `0` for an empty vector.
+    ///
+    /// `f16` and `bf16` sum in `f32` and round once.
     pub fn sum(&self) -> T {
+        if let Some(total) = crate::compact::reduce(&self.data, Reduce::Sum) {
+            return total;
+        }
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         if let Some(total) = simd_dispatch::reduce(&self.data, Reduce::Sum) {
             return total;
@@ -1240,7 +1302,13 @@ impl<T: Coefficient> Vector<T, Host> {
     /// [`Kernels::vector_prefix_sum`](crate::tensors::Kernels::vector_prefix_sum),
     /// where `log n` sweeps beat the serial chain because there are thousands of
     /// threads to spend on it.
+    ///
+    /// `f16` and `bf16` keep the running total in `f32`, rounding each output
+    /// once.
     pub fn prefix_sum(&self) -> Self {
+        if let Some(out) = crate::compact::prefix_sum(&self.data) {
+            return Vector::new(out);
+        }
         let mut running = T::zero();
         let mut out = Vec::with_capacity(self.len);
         for &value in &self.data {
@@ -1367,7 +1435,7 @@ impl<T: Coefficient + PartialOrd> Vector<T, Host> {
     }
 }
 
-impl Vector<f32, Host> {
+impl<T: Real> Vector<T, Host> {
     /// Elementwise comparison with another vector.
     ///
     /// The same operation the [`Metal`] backend runs as one dispatch, so code
@@ -1381,7 +1449,7 @@ impl Vector<f32, Host> {
         assert_same_len(self.len, other.len, "compare");
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         {
-            let mut out = vec![0.0; self.len];
+            let mut out = vec![T::zero(); self.len];
             if simd_dispatch::compare(&self.data, &other.data, op, &mut out) {
                 return Vector::new(out);
             }
@@ -1397,10 +1465,10 @@ impl Vector<f32, Host> {
 
     /// Elementwise comparison against a scalar; `scalar_left` puts the scalar on
     /// the left, which matters for every op but `Min` and `Max`.
-    pub fn compare_scalar(&self, scalar: f32, op: Compare, scalar_left: bool) -> Self {
+    pub fn compare_scalar(&self, scalar: T, op: Compare, scalar_left: bool) -> Self {
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         {
-            let mut out = vec![0.0; self.len];
+            let mut out = vec![T::zero(); self.len];
             if simd_dispatch::compare_scalar(&self.data, scalar, op, scalar_left, &mut out) {
                 return Vector::new(out);
             }
@@ -1416,7 +1484,10 @@ impl Vector<f32, Host> {
 
     /// Fold the whole vector to one value. An empty vector gives
     /// [`op.identity()`](Reduce::identity).
-    pub fn reduce(&self, op: Reduce) -> f32 {
+    pub fn reduce(&self, op: Reduce) -> T {
+        if let Some(total) = crate::compact::reduce(&self.data, op) {
+            return total;
+        }
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         if let Some(total) = simd_dispatch::reduce(&self.data, op) {
             return total;
@@ -1940,6 +2011,21 @@ fn multiply_operands<T: Coefficient>(
 ) -> MatrixOperand<T> {
     debug_assert_eq!(left.cols, right.rows);
     let mut data = vec![T::zero(); left.rows * right.cols];
+    if crate::compact::matmul(
+        &left.data,
+        &right.data,
+        left.rows,
+        left.cols,
+        right.cols,
+        &mut data,
+        false,
+    ) {
+        return MatrixOperand {
+            rows: left.rows,
+            cols: right.cols,
+            data,
+        };
+    }
     for i in 0..left.rows {
         for j in 0..right.cols {
             let mut sum = T::zero();
@@ -2418,6 +2504,31 @@ impl<T> Matrix<T, Host> {
             data: self.data.iter().map(f).collect(),
         }
     }
+
+    /// Combine two matrices element by element with `f`, producing a matrix of
+    /// the new element type.
+    ///
+    /// # Panics
+    ///
+    /// If the two shapes differ.
+    #[track_caller]
+    pub fn zip_map<U, V>(
+        &self,
+        other: &Matrix<U, Host>,
+        f: impl Fn(&T, &U) -> V,
+    ) -> Matrix<V, Host> {
+        assert_same_shape(self.shape(), other.shape(), "zip_map");
+        Matrix {
+            rows: self.rows,
+            cols: self.cols,
+            data: self
+                .data
+                .iter()
+                .zip(&other.data)
+                .map(|(a, b)| f(a, b))
+                .collect(),
+        }
+    }
 }
 
 impl<T> Index<(usize, usize)> for Matrix<T, Host> {
@@ -2520,6 +2631,11 @@ impl<T: Coefficient> Matrix<T, Host> {
         let (rows, inner, cols) = (self.rows, self.cols, other.cols);
         let mut out = vec![T::zero(); rows * cols];
 
+        // `f16` and `bf16` widen once, multiply in `f32`, and round once.
+        if crate::compact::matmul(&self.data, &other.data, rows, inner, cols, &mut out, false) {
+            return Matrix::from_flat(rows, cols, out);
+        }
+
         #[cfg(target_os = "macos")]
         if accelerate_dispatch::matmul(&self.data, &other.data, rows, inner, cols, &mut out, false)
         {
@@ -2557,6 +2673,11 @@ impl<T: Coefficient> Matrix<T, Host> {
         assert_same_shape(addend.shape(), (self.rows, other.cols), "matmul_add addend");
         let (rows, inner, cols) = (self.rows, self.cols, other.cols);
         let mut output = addend;
+
+        if crate::compact::matmul(&self.data, &other.data, rows, inner, cols, &mut output.data, true)
+        {
+            return output;
+        }
 
         #[cfg(target_os = "macos")]
         if accelerate_dispatch::matmul(
@@ -2598,6 +2719,10 @@ impl<T: Coefficient> Matrix<T, Host> {
         let (rows, cols) = (self.rows, self.cols);
         let mut out = vec![T::zero(); rows];
 
+        if crate::compact::matmul(&self.data, &v.data, rows, cols, 1, &mut out, false) {
+            return Vector::new(out);
+        }
+
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         if simd_dispatch::matvec(&self.data, &v.data, rows, cols, &mut out) {
             return Vector::new(out);
@@ -2628,6 +2753,10 @@ impl<T: Coefficient> Matrix<T, Host> {
         assert_same_len(addend.len, self.rows, "matvec_add addend");
         let (rows, cols) = (self.rows, self.cols);
         let mut output = addend;
+
+        if crate::compact::matmul(&self.data, &v.data, rows, cols, 1, &mut output.data, true) {
+            return output;
+        }
 
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         if simd_dispatch::matvec_add(&self.data, &v.data, rows, cols, &mut output.data) {
@@ -2874,7 +3003,7 @@ impl<T: Coefficient + PartialOrd> Matrix<T, Host> {
     }
 }
 
-impl Matrix<f32, Host> {
+impl<T: Real> Matrix<T, Host> {
     /// Elementwise comparison with another matrix.
     ///
     /// # Panics
@@ -2885,7 +3014,7 @@ impl Matrix<f32, Host> {
         assert_same_shape(self.shape(), other.shape(), "compare");
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         {
-            let mut out = vec![0.0; self.data.len()];
+            let mut out = vec![T::zero(); self.data.len()];
             if simd_dispatch::compare(&self.data, &other.data, op, &mut out) {
                 return Matrix::from_flat(self.rows, self.cols, out);
             }
@@ -2900,10 +3029,10 @@ impl Matrix<f32, Host> {
     }
 
     /// Elementwise comparison against a scalar.
-    pub fn compare_scalar(&self, scalar: f32, op: Compare, scalar_left: bool) -> Self {
+    pub fn compare_scalar(&self, scalar: T, op: Compare, scalar_left: bool) -> Self {
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         {
-            let mut out = vec![0.0; self.data.len()];
+            let mut out = vec![T::zero(); self.data.len()];
             if simd_dispatch::compare_scalar(&self.data, scalar, op, scalar_left, &mut out) {
                 return Matrix::from_flat(self.rows, self.cols, out);
             }

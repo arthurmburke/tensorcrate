@@ -7,8 +7,11 @@
 //!
 //! The [`Metal`] backend (macOS, `metal` feature) instead keeps elements in
 //! `MTLStorageModeShared` memory, which the GPU kernels read and write in place.
-//! The full kernel set operates on `f32`; M5 TensorOps matrix products also use
-//! compact `f16` and `bf16` storage. A chain of operations over `Metal`-backed
+//! The full kernel set is compiled for `f32`, `f16` and `bf16` — the
+//! [`MetalElement`](crate::metal::MetalElement) types — so
+//! [`Kernels<T>`](super::Kernels) is implemented for `Metal` at each of them,
+//! where `Host` implements it for every float type (`f64` included). M5 GPUs
+//! run all three types' matrix products on TensorOps. A chain of operations over `Metal`-backed
 //! tensors therefore stays resident: no operand is uploaded and no result is
 //! downloaded until you ask for one. The [`Host`] backend never moves work to
 //! the GPU on its own; choosing a backend is the only thing that does.
@@ -105,35 +108,43 @@ pub trait Backend: sealed::Sealed + Sized + 'static {
 
     /// Build a matrix from vectors stacked along the vertical axis (the vectors
     /// are rows), each of length `len`.
-    fn vstack(vectors: &[Self::Vector<f32>], len: usize) -> Self::Matrix<f32>;
+    fn vstack<T: Copy + 'static>(vectors: &[Self::Vector<T>], len: usize) -> Self::Matrix<T>;
 
     /// Build a matrix from vectors stacked along the horizontal axis (the
     /// vectors are columns), each of length `len`.
-    fn hstack(vectors: &[Self::Vector<f32>], len: usize) -> Self::Matrix<f32>;
+    fn hstack<T: Copy + 'static>(vectors: &[Self::Vector<T>], len: usize) -> Self::Matrix<T>;
 
     /// Build a matrix by placing two `rows`-tall matrices side by side.
-    fn concat(
-        a: &Self::Matrix<f32>,
-        b: &Self::Matrix<f32>,
+    fn concat<T: Copy + 'static>(
+        a: &Self::Matrix<T>,
+        b: &Self::Matrix<T>,
         rows: usize,
         left_cols: usize,
         right_cols: usize,
-    ) -> Self::Matrix<f32>;
+    ) -> Self::Matrix<T>;
 
     /// Build a matrix by placing two `cols`-wide matrices one above the other.
-    fn stack(
-        a: &Self::Matrix<f32>,
-        b: &Self::Matrix<f32>,
+    fn stack<T: Copy + 'static>(
+        a: &Self::Matrix<T>,
+        b: &Self::Matrix<T>,
         top_rows: usize,
         bottom_rows: usize,
         cols: usize,
-    ) -> Self::Matrix<f32>;
+    ) -> Self::Matrix<T>;
 
     /// Build a matrix by placing several `rows × cols` matrices side by side.
-    fn hmerge(matrices: &[Self::Matrix<f32>], rows: usize, cols: usize) -> Self::Matrix<f32>;
+    fn hmerge<T: Copy + 'static>(
+        matrices: &[Self::Matrix<T>],
+        rows: usize,
+        cols: usize,
+    ) -> Self::Matrix<T>;
 
     /// Build a matrix by stacking several `rows × cols` matrices vertically.
-    fn vmerge(matrices: &[Self::Matrix<f32>], rows: usize, cols: usize) -> Self::Matrix<f32>;
+    fn vmerge<T: Copy + 'static>(
+        matrices: &[Self::Matrix<T>],
+        rows: usize,
+        cols: usize,
+    ) -> Self::Matrix<T>;
 }
 
 mod sealed {
@@ -194,7 +205,7 @@ impl Backend for Host {
         matrix
     }
 
-    fn vstack(vectors: &[Vec<f32>], len: usize) -> Vec<f32> {
+    fn vstack<T: Copy + 'static>(vectors: &[Vec<T>], len: usize) -> Vec<T> {
         let mut values = Vec::with_capacity(vectors.len() * len);
         for vector in vectors {
             debug_assert_eq!(vector.len(), len);
@@ -203,25 +214,24 @@ impl Backend for Host {
         values
     }
 
-    fn hstack(vectors: &[Vec<f32>], len: usize) -> Vec<f32> {
-        let cols = vectors.len();
-        let mut values = vec![0.0; len * cols];
-        for (col, vector) in vectors.iter().enumerate() {
-            debug_assert_eq!(vector.len(), len);
-            for (row, value) in vector.iter().enumerate() {
-                values[row * cols + col] = *value;
+    fn hstack<T: Copy + 'static>(vectors: &[Vec<T>], len: usize) -> Vec<T> {
+        let mut values = Vec::with_capacity(len * vectors.len());
+        for row in 0..len {
+            for vector in vectors {
+                debug_assert_eq!(vector.len(), len);
+                values.push(vector[row]);
             }
         }
         values
     }
 
-    fn concat(
-        a: &Vec<f32>,
-        b: &Vec<f32>,
+    fn concat<T: Copy + 'static>(
+        a: &Vec<T>,
+        b: &Vec<T>,
         rows: usize,
         left_cols: usize,
         right_cols: usize,
-    ) -> Vec<f32> {
+    ) -> Vec<T> {
         let mut values = Vec::with_capacity(rows * (left_cols + right_cols));
         for row in 0..rows {
             values.extend_from_slice(&a[row * left_cols..(row + 1) * left_cols]);
@@ -230,20 +240,20 @@ impl Backend for Host {
         values
     }
 
-    fn stack(
-        a: &Vec<f32>,
-        b: &Vec<f32>,
+    fn stack<T: Copy + 'static>(
+        a: &Vec<T>,
+        b: &Vec<T>,
         top_rows: usize,
         bottom_rows: usize,
         cols: usize,
-    ) -> Vec<f32> {
+    ) -> Vec<T> {
         let mut values = Vec::with_capacity((top_rows + bottom_rows) * cols);
         values.extend_from_slice(a);
         values.extend_from_slice(b);
         values
     }
 
-    fn hmerge(matrices: &[Vec<f32>], rows: usize, cols: usize) -> Vec<f32> {
+    fn hmerge<T: Copy + 'static>(matrices: &[Vec<T>], rows: usize, cols: usize) -> Vec<T> {
         let mut values = Vec::with_capacity(rows * cols * matrices.len());
         for row in 0..rows {
             for matrix in matrices {
@@ -253,7 +263,7 @@ impl Backend for Host {
         values
     }
 
-    fn vmerge(matrices: &[Vec<f32>], rows: usize, cols: usize) -> Vec<f32> {
+    fn vmerge<T: Copy + 'static>(matrices: &[Vec<T>], rows: usize, cols: usize) -> Vec<T> {
         let mut values = Vec::with_capacity(rows * cols * matrices.len());
         for matrix in matrices {
             values.extend_from_slice(matrix);
@@ -267,20 +277,45 @@ pub use gpu::{Metal, MetalStorage};
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod gpu {
+    use std::any::TypeId;
     use std::fmt;
 
     use half::{bf16, f16};
 
     use super::{Backend, sealed};
-    use crate::metal::MetalBuffer;
+    use crate::metal::{MetalBuffer, MetalElement};
+
+    /// `Some($body)` with `$E` naming the [`MetalElement`] that `$T` is — the
+    /// typed kernels then run — or `None` for any other element type. `$body`
+    /// produces an `Option<MetalStorage<$E>>`, which comes back as `$T`.
+    macro_rules! resident {
+        ($T:ty, $E:ident => $body:expr) => {
+            'resident: {
+                if same::<$T, f32>() {
+                    type $E = f32;
+                    break 'resident ($body).map(cast_owned::<$E, $T>);
+                }
+                if same::<$T, f16>() {
+                    type $E = f16;
+                    break 'resident ($body).map(cast_owned::<$E, $T>);
+                }
+                if same::<$T, bf16>() {
+                    type $E = bf16;
+                    break 'resident ($body).map(cast_owned::<$E, $T>);
+                }
+                None
+            }
+        };
+    }
     use crate::tensors::{Analytic, Axis, BinaryOp, Compare, Family, Reduce, SortOrder, Statistic};
 
     /// A backend that keeps elements in GPU-shared memory, so the Metal kernels
     /// read and write them in place.
     ///
-    /// `f32` has the complete Metal operation set. `f16` and `bf16` use the
-    /// crate's re-exported [`half`](https://docs.rs/half) types for compact M5
-    /// TensorOps products.
+    /// `f32`, `f16` and `bf16` — the [`MetalElement`] types — each have the
+    /// complete Metal operation set, with every kernel compiled for that type.
+    /// The 16-bit types are the crate's re-exported
+    /// [`half`](https://docs.rs/half) types.
     ///
     /// Metal objects are thread-affine, so these tensors are not `Send`. They do
     /// clone (into a fresh allocation with the same values) and compare by
@@ -338,8 +373,13 @@ mod gpu {
             matrix
         }
 
-        fn vstack(vectors: &[MetalStorage], len: usize) -> MetalStorage {
-            if let Some(storage) = MetalStorage::vstack(vectors, len) {
+        // The resident kernels exist for every `MetalElement`; any other
+        // element type takes the host path over the shared memory, which gives
+        // the same values.
+        fn vstack<T: Copy + 'static>(vectors: &[MetalStorage<T>], len: usize) -> MetalStorage<T> {
+            if let Some(storage) =
+                resident!(T, E => MetalStorage::<E>::vstack(cast_slice(vectors), len))
+            {
                 return storage;
             }
             let mut values = Vec::with_capacity(vectors.len() * len);
@@ -349,28 +389,34 @@ mod gpu {
             MetalStorage::from_slice(&values)
         }
 
-        fn hstack(vectors: &[MetalStorage], len: usize) -> MetalStorage {
-            if let Some(storage) = MetalStorage::hstack(vectors, len) {
+        fn hstack<T: Copy + 'static>(vectors: &[MetalStorage<T>], len: usize) -> MetalStorage<T> {
+            if let Some(storage) =
+                resident!(T, E => MetalStorage::<E>::hstack(cast_slice(vectors), len))
+            {
                 return storage;
             }
-            let cols = vectors.len();
-            let mut values = vec![0.0; len * cols];
-            for (col, vector) in vectors.iter().enumerate() {
-                for (row, value) in vector.as_slice().iter().enumerate() {
-                    values[row * cols + col] = *value;
+            let mut values = Vec::with_capacity(len * vectors.len());
+            for row in 0..len {
+                for vector in vectors {
+                    values.push(vector.as_slice()[row]);
                 }
             }
             MetalStorage::from_slice(&values)
         }
 
-        fn concat(
-            a: &MetalStorage,
-            b: &MetalStorage,
+        fn concat<T: Copy + 'static>(
+            a: &MetalStorage<T>,
+            b: &MetalStorage<T>,
             rows: usize,
             left_cols: usize,
             right_cols: usize,
-        ) -> MetalStorage {
-            if let Some(storage) = a.concat(b, rows, left_cols, right_cols) {
+        ) -> MetalStorage<T> {
+            if let Some(storage) = resident!(T, E => cast_ref::<T, E>(a).concat(
+                cast_ref(b),
+                rows,
+                left_cols,
+                right_cols
+            )) {
                 return storage;
             }
             let (left, right) = (a.as_slice(), b.as_slice());
@@ -382,14 +428,19 @@ mod gpu {
             MetalStorage::from_slice(&values)
         }
 
-        fn stack(
-            a: &MetalStorage,
-            b: &MetalStorage,
+        fn stack<T: Copy + 'static>(
+            a: &MetalStorage<T>,
+            b: &MetalStorage<T>,
             top_rows: usize,
             bottom_rows: usize,
             cols: usize,
-        ) -> MetalStorage {
-            if let Some(storage) = a.stack(b, top_rows, bottom_rows, cols) {
+        ) -> MetalStorage<T> {
+            if let Some(storage) = resident!(T, E => cast_ref::<T, E>(a).stack(
+                cast_ref(b),
+                top_rows,
+                bottom_rows,
+                cols
+            )) {
                 return storage;
             }
             let mut values = Vec::with_capacity((top_rows + bottom_rows) * cols);
@@ -398,8 +449,14 @@ mod gpu {
             MetalStorage::from_slice(&values)
         }
 
-        fn hmerge(matrices: &[MetalStorage], rows: usize, cols: usize) -> MetalStorage {
-            if let Some(storage) = MetalStorage::hmerge(matrices, rows, cols) {
+        fn hmerge<T: Copy + 'static>(
+            matrices: &[MetalStorage<T>],
+            rows: usize,
+            cols: usize,
+        ) -> MetalStorage<T> {
+            if let Some(storage) =
+                resident!(T, E => MetalStorage::<E>::hmerge(cast_slice(matrices), rows, cols))
+            {
                 return storage;
             }
             let mut values = Vec::with_capacity(rows * cols * matrices.len());
@@ -411,8 +468,14 @@ mod gpu {
             MetalStorage::from_slice(&values)
         }
 
-        fn vmerge(matrices: &[MetalStorage], rows: usize, cols: usize) -> MetalStorage {
-            if let Some(storage) = MetalStorage::vmerge(matrices, rows, cols) {
+        fn vmerge<T: Copy + 'static>(
+            matrices: &[MetalStorage<T>],
+            rows: usize,
+            cols: usize,
+        ) -> MetalStorage<T> {
+            if let Some(storage) =
+                resident!(T, E => MetalStorage::<E>::vmerge(cast_slice(matrices), rows, cols))
+            {
                 return storage;
             }
             let mut values = Vec::with_capacity(rows * cols * matrices.len());
@@ -421,6 +484,38 @@ mod gpu {
             }
             MetalStorage::from_slice(&values)
         }
+    }
+
+    /// Whether `T` and `U` are the same type.
+    fn same<T: 'static, U: 'static>() -> bool {
+        TypeId::of::<T>() == TypeId::of::<U>()
+    }
+
+    /// `storage` as the [`MetalElement`] it is; only called once [`resident!`]
+    /// has established that `T` is `U`.
+    fn cast_ref<T: 'static, U: 'static>(storage: &MetalStorage<T>) -> &MetalStorage<U> {
+        assert!(same::<T, U>());
+        // SAFETY: `T` and `U` are one type, so the two storage types are too.
+        unsafe { &*(storage as *const MetalStorage<T>).cast::<MetalStorage<U>>() }
+    }
+
+    /// The slice form of [`cast_ref`].
+    fn cast_slice<T: 'static, U: 'static>(storage: &[MetalStorage<T>]) -> &[MetalStorage<U>] {
+        assert!(same::<T, U>());
+        // SAFETY: as in `cast_ref`; a slice of one type is a slice of the other.
+        unsafe {
+            std::slice::from_raw_parts(storage.as_ptr().cast::<MetalStorage<U>>(), storage.len())
+        }
+    }
+
+    /// The owned form of [`cast_ref`], handing a typed result back as the
+    /// caller's `U`.
+    fn cast_owned<T: 'static, U: 'static>(storage: MetalStorage<T>) -> MetalStorage<U> {
+        assert!(same::<T, U>());
+        let storage = std::mem::ManuallyDrop::new(storage);
+        // SAFETY: `T` is `U`, so this is the same type; the original is not
+        // dropped, so ownership moves rather than duplicates.
+        unsafe { std::ptr::read((&*storage as *const MetalStorage<T>).cast::<MetalStorage<U>>()) }
     }
 
     /// The allocation behind a [`Metal`]-backed tensor.
@@ -502,7 +597,10 @@ mod gpu {
         }
     }
 
-    impl MetalStorage<f32> {
+    /// The resident operations, for every element type the kernels are compiled
+    /// for. Scalars and results are in `T`; the folds that end on the CPU
+    /// return their unrounded `f32` accumulator.
+    impl<T: MetalElement> MetalStorage<T> {
         fn vstack(inputs: &[Self], vector_len: usize) -> Option<Self> {
             let buffers = inputs
                 .iter()
@@ -598,7 +696,7 @@ mod gpu {
         /// [`elementwise`](Self::elementwise).
         pub(crate) fn broadcast(
             &self,
-            scalar: f32,
+            scalar: T,
             op: BinaryOp,
             scalar_left: bool,
         ) -> Option<Self> {
@@ -625,7 +723,7 @@ mod gpu {
             a.matmul_accumulate(b, target, m, k, n)
         }
 
-        /// Analytic function applied to a value/tangent pair, in one dispatch;
+        /// Analytic function applied to a value/tangent pair, in one dispatch.
         pub(crate) fn unary_dual(&self, tangent: &Self, op: Analytic) -> Option<(Self, Self)> {
             let (value, tangent) = self.device()?.unary_dual(tangent.device()?, op)?;
             Some((
@@ -681,7 +779,7 @@ mod gpu {
         /// Elementwise comparison against a scalar.
         pub(crate) fn compare_scalar(
             &self,
-            scalar: f32,
+            scalar: T,
             op: Compare,
             scalar_left: bool,
         ) -> Option<Self> {
@@ -690,12 +788,13 @@ mod gpu {
         }
 
         /// Elementwise clamp to `[low, high]`.
-        pub(crate) fn clamp(&self, low: f32, high: f32) -> Option<Self> {
+        pub(crate) fn clamp(&self, low: T, high: T) -> Option<Self> {
             Some(Self(Residency::Device(self.device()?.clamp(low, high)?)))
         }
 
         /// Whole-buffer fold. The result is a number rather than an allocation,
         /// so unlike its neighbours this one ends on the CPU by construction.
+        /// It is the `f32` accumulator, unrounded.
         pub(crate) fn reduce(&self, op: Reduce) -> Option<f32> {
             self.device()?.reduce(op)
         }
@@ -712,16 +811,18 @@ mod gpu {
 
         /// Elementwise `self^rhs`.
         pub(crate) fn power(&self, rhs: &Self) -> Option<Self> {
-            Some(Self(Residency::Device(self.device()?.power(rhs.device()?)?)))
+            Some(Self(Residency::Device(
+                self.device()?.power(rhs.device()?)?,
+            )))
         }
 
         /// Elementwise power with one operand fixed.
-        pub(crate) fn power_scalar(&self, scalar: f32, scalar_left: bool) -> Option<Self> {
+        pub(crate) fn power_scalar(&self, scalar: T, scalar_left: bool) -> Option<Self> {
             let output = self.device()?.power_scalar(scalar, scalar_left)?;
             Some(Self(Residency::Device(output)))
         }
 
-        /// Analytic function applied elementwise; `op` is an
+        /// Analytic function applied elementwise.
         pub(crate) fn unary(&self, op: Analytic) -> Option<Self> {
             Some(Self(Residency::Device(self.device()?.unary(op)?)))
         }
@@ -785,17 +886,6 @@ mod gpu {
     macro_rules! low_precision_storage {
         ($ty:ty) => {
             impl MetalStorage<$ty> {
-                pub(crate) fn matmul(
-                    &self,
-                    rhs: &Self,
-                    m: usize,
-                    k: usize,
-                    n: usize,
-                ) -> Option<Self> {
-                    let product = self.device()?.matmul(rhs.device()?, m, k, n)?;
-                    Some(Self(Residency::Device(product)))
-                }
-
                 pub(crate) fn matmul_f32(
                     &self,
                     rhs: &Self,

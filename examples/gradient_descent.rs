@@ -12,7 +12,7 @@
 //! The shape of the loop is the part worth copying: build a *fresh* tape each
 //! step, record the current parameters as leaves, evaluate the loss, propagate,
 //! then step the parameters outside the tape. A tape is a recording of one
-//! evaluation — reusing it across steps would append every step's nodes to the
+//! evaluation. Reusing it across steps would append every step's nodes to the
 //! same graph and grow without bound.
 
 use tensorcrate::tensors::{Matrix, Tape, Vector};
@@ -37,7 +37,7 @@ fn main() {
     //
     // L(x) = ‖A·x − y‖²/n, whose gradient is (2/n)Aᵀ(A·x − y). Reverse mode
     // never needs that formula written down. Averaging over the samples is what
-    // keeps a step size of this order stable — the raw sum has n times the
+    // keeps a step size of this order stable. The raw sum has n times the
     // curvature, and gradient descent diverges above 2/λmax.
     println!("least squares: fitting {FEATURES} parameters to {SAMPLES} samples");
     let mut x = Vector::<f32>::zeros(FEATURES);
@@ -130,11 +130,11 @@ fn main() {
     multi_output_regression();
 }
 
-/// Learning a *matrix* of parameters — and a bias vector alongside it.
+/// Learning a *matrix* of parameters and a bias vector alongside it.
 ///
 /// `Y = W·X + b·1ᵀ` over a batch: `W` is `OUT × IN`, `b` is `OUT`, and both come
 /// out of the same single backward pass. Recording a matrix parameter is the only
-/// change from the vector case — `tape.matrix` instead of `tape.vector`, and
+/// change from the vector case `tape.matrix` instead of `tape.vector`, and
 /// `grad()` hands back the same shape it was given.
 fn multi_output_regression() {
     const IN: usize = 4;
@@ -144,7 +144,7 @@ fn multi_output_regression() {
     // A batch of inputs, one sample per column. These have to be genuinely
     // independent across rows: smooth functions of a single parameter look fine
     // but leave the design nearly collinear, and then many (W, b) pairs fit the
-    // data equally well — the loss falls while the parameters wander.
+    // data equally well the loss falls while the parameters wander.
     let mut state = 0x2545_F491_4F6C_DD1Du64;
     let mut next = move || {
         state ^= state << 13;

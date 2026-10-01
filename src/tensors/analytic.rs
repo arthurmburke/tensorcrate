@@ -7,15 +7,17 @@
 //!
 //! * **Inherent methods on host tensors** — [`Vector<T, Host>`] and
 //!   [`Matrix<T, Host>`] get `sin`, `exp`, … for every element type that
-//!   implements the matching scalar trait. `f64` and `f32` stay themselves and
-//!   integers widen to `f64`, exactly as they do on their own; the
+//!   implements the matching scalar trait. The floats — `f64`, `f32` and the
+//!   compact `f16` and `bf16`, which evaluate in `f32` and round once — stay
+//!   themselves and integers widen to `f64`, exactly as they do on their own; the
 //!   [`Complex`](crate::numbers::Complex) and [`Dual`](crate::numbers::Dual)
 //!   definitions carry over too, so the `ε` part of a dual tensor comes back
 //!   holding the derivative, elementwise.
 //!
 //! * **Inherent methods on resident tensors** — the same names on
-//!   `Vector<f32, Metal>` and `Matrix<f32, Metal>`, each running the GPU unary
-//!   kernel and leaving the result in GPU-shared memory.
+//!   `Vector<T, Metal>` and `Matrix<T, Metal>` for `f32`, `f16` and `bf16`,
+//!   each running that type's GPU unary kernel and leaving the result in
+//!   GPU-shared memory.
 //!
 //! * **[`Transcendental`]** — the same operations once more, for code that is
 //!   generic over the backend. This is to the unary kernels what
@@ -51,14 +53,17 @@
 //! [`Matrix<T, Host>`]: Matrix
 
 use crate::numbers::{
-    Arccos, Arcsin, Arctan, Cos, Cosh, Csc, Exp, Ln, Power, Sec, Sin, Sinh, Sqrt, Tan, Tanh,
+    Arccos, Arcsin, Arctan, Cos, Cosh, Csc, Exp, Ln, Power, Real, Sec, Sin, Sinh, Sqrt, Tan, Tanh,
+    bf16, f16,
 };
+#[cfg(all(feature = "metal", target_os = "macos"))]
+use crate::metal::MetalElement;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use crate::tensors::Metal;
 use crate::tensors::kernels::{Analytic, Kernels};
 use crate::tensors::{Host, Matrix, Vector, assert_same_len, assert_same_shape};
 
-impl Vector<f32, Host> {
+impl<T: Real> Vector<T, Host> {
     /// Apply an analytic function to every element.
     ///
     /// The named methods — [`sin`](Vector::sin), [`exp`](Vector::exp), … — are
@@ -78,7 +83,7 @@ impl Vector<f32, Host> {
     }
 }
 
-impl Matrix<f32, Host> {
+impl<T: Real> Matrix<T, Host> {
     /// Apply an analytic function to every element; see [`Vector::analytic`].
     pub fn analytic(&self, f: Analytic) -> Self {
         self.map(|&x| f.value(x))
@@ -104,21 +109,25 @@ macro_rules! elementwise_analytic {
         /// so backend-generic code goes through here:
         ///
         /// ```
+        /// use tensorcrate::numbers::Real;
         /// use tensorcrate::tensors::{Kernels, Transcendental, Vector};
         ///
-        /// fn squash<B: Kernels>(v: &Vector<f32, B>) -> Vector<f32, B> {
+        /// // Any element type the backend computes in: `f32` and `f64` on the
+        /// // host, `f32` on Metal.
+        /// fn squash<T: Real, B: Kernels<T>>(v: &Vector<T, B>) -> Vector<T, B> {
         ///     v.tanh()
         /// }
         ///
         /// assert_eq!(squash(&Vector::new([0.0f32])).data(), [0.0]);
+        /// assert_eq!(squash(&Vector::new([0.0f64])).data(), [0.0]);
         /// ```
         ///
         /// On a concrete backend the inherent method wins method resolution and
         /// this trait is never consulted; both run the same kernel, so which one
         /// resolved is not observable. The inherent host methods also cover
-        /// element types this trait cannot — `Vector<f64, Host>::exp` is real,
-        /// while the 32-bit shaders mean the backend-generic surface is `f32`
-        /// only.
+        /// element types this trait cannot — `Vector<i32, Host>::exp` widens to
+        /// `f64` — while `Metal` implements the trait for the types its kernels
+        /// are compiled for: `f32`, `f16` and `bf16`.
         ///
         /// Every named method is [`analytic`](Transcendental::analytic) with the
         /// function fixed, so implementing that one implements them all.
@@ -126,11 +135,14 @@ macro_rules! elementwise_analytic {
         /// [`Vector<f32, Host>`]: Vector
         /// [`Vector<f32, Metal>`]: Vector
         pub trait Transcendental: Sized {
+            /// The element type the functions are evaluated in.
+            type Elem: Real;
+
             /// Apply `f` to every element.
             fn analytic(&self, f: Analytic) -> Self;
 
             /// Raise every element to `exponent`.
-            fn pow(&self, exponent: f32) -> Self;
+            fn pow(&self, exponent: Self::Elem) -> Self;
 
             /// Raise every element to the matching element of `exponents`.
             ///
@@ -185,7 +197,7 @@ macro_rules! elementwise_analytic {
             // ---- resident tensors: the GPU unary kernel ----
 
             #[cfg(all(feature = "metal", target_os = "macos"))]
-            impl Vector<f32, Metal> {
+            impl<T: MetalElement> Vector<T, Metal> {
                 #[doc = concat!("Elementwise `", stringify!($method), "`, on the GPU.")]
                 pub fn $method(&self) -> Self {
                     self.analytic(Analytic::$Trait)
@@ -193,7 +205,7 @@ macro_rules! elementwise_analytic {
             }
 
             #[cfg(all(feature = "metal", target_os = "macos"))]
-            impl Matrix<f32, Metal> {
+            impl<T: MetalElement> Matrix<T, Metal> {
                 #[doc = concat!("Elementwise `", stringify!($method), "`, on the GPU.")]
                 pub fn $method(&self) -> Self {
                     self.analytic(Analytic::$Trait)
@@ -201,8 +213,8 @@ macro_rules! elementwise_analytic {
             }
 
             #[cfg(all(feature = "metal", target_os = "macos"))]
-            impl $Trait for &Vector<f32, Metal> {
-                type Output = Vector<f32, Metal>;
+            impl<T: MetalElement> $Trait for &Vector<T, Metal> {
+                type Output = Vector<T, Metal>;
 
                 fn $method(self) -> Self::Output {
                     self.analytic(Analytic::$Trait)
@@ -210,8 +222,8 @@ macro_rules! elementwise_analytic {
             }
 
             #[cfg(all(feature = "metal", target_os = "macos"))]
-            impl $Trait for &Matrix<f32, Metal> {
-                type Output = Matrix<f32, Metal>;
+            impl<T: MetalElement> $Trait for &Matrix<T, Metal> {
+                type Output = Matrix<T, Metal>;
 
                 fn $method(self) -> Self::Output {
                     self.analytic(Analytic::$Trait)
@@ -238,11 +250,9 @@ elementwise_analytic!(
     sqrt => Sqrt,
 );
 
-
 // ---- powers ------------------------------------------------------------------
 
 impl<T: Power + Copy + 'static> Vector<T, Host> {
-
     /// Raise every element to `exponent`.
     ///
     /// ```
@@ -284,13 +294,16 @@ impl<T: Power + Copy + 'static> Vector<T, Host> {
 }
 
 impl<T: Power + Copy + 'static> Matrix<T, Host> {
-
     /// Raise every element to `exponent`; see [`Vector::pow`].
     pub fn pow(&self, exponent: T) -> Matrix<<T as Power>::Output, Host>
     where
         <T as Power>::Output: 'static,
     {
-        Matrix::from_flat(self.rows(), self.cols(), power_scalar(self.data(), exponent))
+        Matrix::from_flat(
+            self.rows(),
+            self.cols(),
+            power_scalar(self.data(), exponent),
+        )
     }
 
     /// Raise every element to the matching element of `exponents`.
@@ -425,7 +438,13 @@ fn same<T: 'static, U: 'static>() -> bool {
 /// [`same`].
 unsafe fn retype<T, U>(values: Vec<T>) -> Vec<U> {
     let mut values = std::mem::ManuallyDrop::new(values);
-    unsafe { Vec::from_raw_parts(values.as_mut_ptr().cast::<U>(), values.len(), values.capacity()) }
+    unsafe {
+        Vec::from_raw_parts(
+            values.as_mut_ptr().cast::<U>(),
+            values.len(),
+            values.capacity(),
+        )
+    }
 }
 
 /// `basesᵢ^exponentsᵢ` over two equal-length buffers.
@@ -504,18 +523,19 @@ macro_rules! scalar_base_power {
     )+};
 }
 
-scalar_base_power!(f32, f64);
+scalar_base_power!(f32, f64, f16, bf16);
 
 // ---- resident tensors: the GPU power kernels ----
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod resident {
     use super::{Matrix, Metal, Power, Vector, assert_same_len, assert_same_shape};
+    use crate::metal::MetalElement;
     use crate::tensors::Host;
 
-    impl Vector<f32, Metal> {
+    impl<T: MetalElement> Vector<T, Metal> {
         /// Raise every element to `exponent`, on the GPU.
-        pub fn pow(&self, exponent: f32) -> Self {
+        pub fn pow(&self, exponent: T) -> Self {
             self.power_scalar(exponent, false)
         }
 
@@ -538,13 +558,13 @@ mod resident {
 
         /// Elementwise power with one operand fixed; `scalar_left` selects
         /// `scalar^x` over `x^scalar`.
-        pub(crate) fn power_scalar(&self, scalar: f32, scalar_left: bool) -> Self {
+        pub(crate) fn power_scalar(&self, scalar: T, scalar_left: bool) -> Self {
             match self.storage().power_scalar(scalar, scalar_left) {
                 Some(data) => Vector::from_storage(self.len(), data),
                 None => {
                     let host = self.to_backend::<Host>();
                     if scalar_left {
-                        scalar.power(&host).to_backend()
+                        host.map(|&exponent| scalar.power(exponent)).to_backend()
                     } else {
                         host.pow(scalar).to_backend()
                     }
@@ -553,9 +573,9 @@ mod resident {
         }
     }
 
-    impl Matrix<f32, Metal> {
+    impl<T: MetalElement> Matrix<T, Metal> {
         /// Raise every element to `exponent`, on the GPU.
-        pub fn pow(&self, exponent: f32) -> Self {
+        pub fn pow(&self, exponent: T) -> Self {
             self.power_scalar(exponent, false)
         }
 
@@ -577,14 +597,14 @@ mod resident {
             }
         }
 
-        pub(crate) fn power_scalar(&self, scalar: f32, scalar_left: bool) -> Self {
+        pub(crate) fn power_scalar(&self, scalar: T, scalar_left: bool) -> Self {
             let (rows, cols) = self.shape();
             match self.storage().power_scalar(scalar, scalar_left) {
                 Some(data) => Matrix::from_storage(rows, cols, data),
                 None => {
                     let host = self.to_backend::<Host>();
                     if scalar_left {
-                        scalar.power(&host).to_backend()
+                        host.map(|&exponent| scalar.power(exponent)).to_backend()
                     } else {
                         host.pow(scalar).to_backend()
                     }
@@ -593,63 +613,65 @@ mod resident {
         }
     }
 
-    impl Power<f32> for &Vector<f32, Metal> {
-        type Output = Vector<f32, Metal>;
+    impl<T: MetalElement> Power<T> for &Vector<T, Metal> {
+        type Output = Vector<T, Metal>;
 
-        fn power(self, exponent: f32) -> Self::Output {
+        fn power(self, exponent: T) -> Self::Output {
             self.pow(exponent)
         }
     }
 
-    impl Power<f32> for &Matrix<f32, Metal> {
-        type Output = Matrix<f32, Metal>;
+    impl<T: MetalElement> Power<T> for &Matrix<T, Metal> {
+        type Output = Matrix<T, Metal>;
 
-        fn power(self, exponent: f32) -> Self::Output {
+        fn power(self, exponent: T) -> Self::Output {
             self.pow(exponent)
         }
     }
 
-    impl Power<&Vector<f32, Metal>> for &Vector<f32, Metal> {
-        type Output = Vector<f32, Metal>;
+    impl<T: MetalElement> Power<&Vector<T, Metal>> for &Vector<T, Metal> {
+        type Output = Vector<T, Metal>;
 
         #[track_caller]
-        fn power(self, exponents: &Vector<f32, Metal>) -> Self::Output {
+        fn power(self, exponents: &Vector<T, Metal>) -> Self::Output {
             self.pow_elementwise(exponents)
         }
     }
 
-    impl Power<&Matrix<f32, Metal>> for &Matrix<f32, Metal> {
-        type Output = Matrix<f32, Metal>;
+    impl<T: MetalElement> Power<&Matrix<T, Metal>> for &Matrix<T, Metal> {
+        type Output = Matrix<T, Metal>;
 
         #[track_caller]
-        fn power(self, exponents: &Matrix<f32, Metal>) -> Self::Output {
+        fn power(self, exponents: &Matrix<T, Metal>) -> Self::Output {
             self.pow_elementwise(exponents)
         }
     }
 
-    impl Power<&Vector<f32, Metal>> for f32 {
-        type Output = Vector<f32, Metal>;
+    impl<T: MetalElement> Power<&Vector<T, Metal>> for T {
+        type Output = Vector<T, Metal>;
 
-        fn power(self, exponents: &Vector<f32, Metal>) -> Self::Output {
+        fn power(self, exponents: &Vector<T, Metal>) -> Self::Output {
             exponents.power_scalar(self, true)
         }
     }
 
-    impl Power<&Matrix<f32, Metal>> for f32 {
-        type Output = Matrix<f32, Metal>;
+    impl<T: MetalElement> Power<&Matrix<T, Metal>> for T {
+        type Output = Matrix<T, Metal>;
 
-        fn power(self, exponents: &Matrix<f32, Metal>) -> Self::Output {
+        fn power(self, exponents: &Matrix<T, Metal>) -> Self::Output {
             exponents.power_scalar(self, true)
         }
     }
 }
 
-impl<B: Kernels> Transcendental for Vector<f32, B> {
+impl<T: Real, B: Kernels<T>> Transcendental for Vector<T, B> {
+    type Elem = T;
+
     fn analytic(&self, f: Analytic) -> Self {
         B::vector_unary(self, f)
     }
 
-    fn pow(&self, exponent: f32) -> Self {
+    fn pow(&self, exponent: T) -> Self {
         B::vector_power_scalar(self, exponent, false)
     }
 
@@ -658,12 +680,14 @@ impl<B: Kernels> Transcendental for Vector<f32, B> {
     }
 }
 
-impl<B: Kernels> Transcendental for Matrix<f32, B> {
+impl<T: Real, B: Kernels<T>> Transcendental for Matrix<T, B> {
+    type Elem = T;
+
     fn analytic(&self, f: Analytic) -> Self {
         B::matrix_unary(self, f)
     }
 
-    fn pow(&self, exponent: f32) -> Self {
+    fn pow(&self, exponent: T) -> Self {
         B::matrix_power_scalar(self, exponent, false)
     }
 

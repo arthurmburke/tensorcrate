@@ -4,6 +4,19 @@ using namespace metal;
 #define TILE 16
 #define REDUCE_GROUP 256
 
+// Every typed kernel below is a template over its element type, instantiated
+// once per type the `Metal` backend computes in. The host picks the pipeline by
+// appending the suffix: `elementwise_f16`, `reduce_partial_bf16`, …
+//
+// Arithmetic runs in the element type itself — `half` and `bfloat` operators
+// round every result to that type, exactly as the host's `f16`/`bf16` do. The
+// one exception is accumulation: sums, products, convolutions and moments fold
+// in `float` and round once at the end, so a long reduction keeps `float`'s
+// precision instead of losing it to a 16-bit running total. MSL's math library
+// has no `bfloat` overloads, so `bfloat` transcendentals evaluate in `float`
+// and round once, as the host's do.
+#define FOR_EACH_ELEMENT(M) M(float, f32) M(half, f16) M(bfloat, bf16)
+
 enum class BinaryOp : ushort {
     Add = 0,
     Sub = 1,
@@ -70,10 +83,11 @@ enum class StatisticOp : ushort {
     Ppf = 2
 };
 
+template <typename T>
 kernel void matmul_tiled(
-    device const float* A [[buffer(0)]],
-    device const float* B [[buffer(1)]],
-    device float* C       [[buffer(2)]],
+    device const T* A [[buffer(0)]],
+    device const T* B [[buffer(1)]],
+    device T* C       [[buffer(2)]],
     constant uint& M      [[buffer(3)]],
     constant uint& K      [[buffer(4)]],
     constant uint& N      [[buffer(5)]],
@@ -92,8 +106,10 @@ kernel void matmul_tiled(
     for (uint t = 0; t < tiles; t++) {
         uint a_col = t * TILE + tid.x;
         uint b_row = t * TILE + tid.y;
-        Asub[tid.y][tid.x] = (row < M && a_col < K) ? A[row * K + a_col] : 0.0f;
-        Bsub[tid.y][tid.x] = (b_row < K && col < N) ? B[b_row * N + col] : 0.0f;
+        // Staged in `float`: the products of two 16-bit values are exact there,
+        // and the running sum is the accumulator.
+        Asub[tid.y][tid.x] = (row < M && a_col < K) ? float(A[row * K + a_col]) : 0.0f;
+        Bsub[tid.y][tid.x] = (b_row < K && col < N) ? float(B[b_row * N + col]) : 0.0f;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (uint p = 0; p < TILE; p++) {
@@ -106,119 +122,179 @@ kernel void matmul_tiled(
         // `accumulate` adds into C instead of overwriting it, which is what the
         // forward-mode tangent `A'B + AB'` and reverse-mode gradient
         // accumulation both want — one dispatch instead of a separate add.
-        C[row * N + col] = accumulate ? C[row * N + col] + acc : acc;
+        C[row * N + col] = T(accumulate ? float(C[row * N + col]) + acc : acc);
     }
 }
 
+#define INSTANTIATE_MATMUL(T, S)                                               \
+template [[host_name("matmul_tiled_" #S)]] kernel void matmul_tiled<T>(        \
+    device const T*, device const T*, device T*, constant uint&,               \
+    constant uint&, constant uint&, constant uint&, uint2, uint2);
+FOR_EACH_ELEMENT(INSTANTIATE_MATMUL)
+
+// `+ - * /` in the element type. There is no remainder kernel; the host keeps
+// `BinaryOp::Rem` for itself.
+template <typename T>
+inline T binary_values(BinaryOp op, T a, T b) {
+    switch (op) {
+        case BinaryOp::Add: return a + b;
+        case BinaryOp::Sub: return a - b;
+        case BinaryOp::Mul: return a * b;
+        default: return a / b;
+    }
+}
+
+template <typename T>
 kernel void elementwise(
-    device const float* A [[buffer(0)]],
-    device const float* B [[buffer(1)]],
-    device float* C       [[buffer(2)]],
+    device const T* A [[buffer(0)]],
+    device const T* B [[buffer(1)]],
+    device T* C       [[buffer(2)]],
     constant BinaryOp& op [[buffer(3)]],
     uint i [[thread_position_in_grid]])
 {
-    float a = A[i];
-    float b = B[i];
-    switch (op) {
-        case BinaryOp::Add: C[i] = a + b; break;
-        case BinaryOp::Sub: C[i] = a - b; break;
-        case BinaryOp::Mul: C[i] = a * b; break;
-        default: C[i] = a / b; break;
-    }
+    C[i] = binary_values(op, A[i], B[i]);
 }
+
+#define INSTANTIATE_ELEMENTWISE(T, S)                                          \
+template [[host_name("elementwise_" #S)]] kernel void elementwise<T>(          \
+    device const T*, device const T*, device T*, constant BinaryOp&, uint);
+FOR_EACH_ELEMENT(INSTANTIATE_ELEMENTWISE)
 
 // Elementwise `a^b`. Kept out of `elementwise` above rather than added to
 // `BinaryOp`, because that enum's contract is that every variant is an operator
 // defined for every `Coefficient` — and a power is not: raising an integer to an
 // integer leaves the integers. The host side has the same split for the same
 // reason.
+template <typename T>
 kernel void power(
-    device const float* A [[buffer(0)]],
-    device const float* B [[buffer(1)]],
-    device float* C       [[buffer(2)]],
+    device const T* A [[buffer(0)]],
+    device const T* B [[buffer(1)]],
+    device T* C       [[buffer(2)]],
     uint i [[thread_position_in_grid]])
 {
-    C[i] = pow(A[i], B[i]);
+    C[i] = T(pow(A[i], B[i]));
 }
+
+#define INSTANTIATE_POWER(T, S)                                                \
+template [[host_name("power_" #S)]] kernel void power<T>(                      \
+    device const T*, device const T*, device T*, uint);
+FOR_EACH_ELEMENT(INSTANTIATE_POWER)
 
 // The same with one operand held fixed: `scalar_left` selects `scalar^A[i]`
 // over `A[i]^scalar`.
+//
+// Scalars arrive as `float` for every element type: the host only ever passes a
+// value of the element type, which `float` holds exactly, so `T(scalar)` is that
+// value again.
+template <typename T>
 kernel void power_scalar(
-    device const float* A      [[buffer(0)]],
-    device float* C            [[buffer(1)]],
+    device const T* A          [[buffer(0)]],
+    device T* C                [[buffer(1)]],
     constant float& scalar     [[buffer(2)]],
     constant uint& scalar_left [[buffer(3)]],
     uint i [[thread_position_in_grid]])
 {
-    float a = scalar_left ? scalar : A[i];
-    float b = scalar_left ? A[i] : scalar;
-    C[i] = pow(a, b);
+    T s = T(scalar);
+    T a = scalar_left ? s : A[i];
+    T b = scalar_left ? A[i] : s;
+    C[i] = T(pow(a, b));
 }
 
+#define INSTANTIATE_POWER_SCALAR(T, S)                                         \
+template [[host_name("power_scalar_" #S)]] kernel void power_scalar<T>(        \
+    device const T*, device T*, constant float&, constant uint&, uint);
+FOR_EACH_ELEMENT(INSTANTIATE_POWER_SCALAR)
+
+template <typename T>
 kernel void broadcast(
-    device const float* A [[buffer(0)]],
-    device float* C       [[buffer(1)]],
+    device const T* A      [[buffer(0)]],
+    device T* C            [[buffer(1)]],
     constant float& scalar [[buffer(2)]],
     constant BinaryOp& op  [[buffer(3)]],
     constant uint& scalar_left [[buffer(4)]],
     uint i [[thread_position_in_grid]])
 {
-    float a = scalar_left ? scalar : A[i];
-    float b = scalar_left ? A[i] : scalar;
+    T s = T(scalar);
+    C[i] = scalar_left ? binary_values(op, s, A[i]) : binary_values(op, A[i], s);
+}
+
+#define INSTANTIATE_BROADCAST(T, S)                                            \
+template [[host_name("broadcast_" #S)]] kernel void broadcast<T>(              \
+    device const T*, device T*, constant float&, constant BinaryOp&,           \
+    constant uint&, uint);
+FOR_EACH_ELEMENT(INSTANTIATE_BROADCAST)
+
+// `fmin`/`fmax` in the element type. MSL returns `float` for `bfloat` operands,
+// which the conversion rounds straight back — exactly, since the result is one
+// of the two operands.
+template <typename T> inline T element_min(T a, T b) { return T(fmin(a, b)); }
+template <typename T> inline T element_max(T a, T b) { return T(fmax(a, b)); }
+
+template <typename T>
+inline T compare_values(CompareOp op, T a, T b) {
     switch (op) {
-        case BinaryOp::Add: C[i] = a + b; break;
-        case BinaryOp::Sub: C[i] = a - b; break;
-        case BinaryOp::Mul: C[i] = a * b; break;
-        default: C[i] = a / b; break;
+        case CompareOp::Min: return element_min(a, b);
+        case CompareOp::Max: return element_max(a, b);
+        case CompareOp::MaxShare: return a > b ? T(1.0f) : (a < b ? T(0.0f) : T(0.5f));
+        case CompareOp::Less: return a < b ? T(1.0f) : T(0.0f);
+        case CompareOp::LessEqual: return a <= b ? T(1.0f) : T(0.0f);
+        case CompareOp::Greater: return a > b ? T(1.0f) : T(0.0f);
+        default: return a >= b ? T(1.0f) : T(0.0f);
     }
 }
 
-inline float compare_values(CompareOp op, float a, float b) {
-    switch (op) {
-        case CompareOp::Min: return fmin(a, b);
-        case CompareOp::Max: return fmax(a, b);
-        case CompareOp::MaxShare: return a > b ? 1.0f : (a < b ? 0.0f : 0.5f);
-        case CompareOp::Less: return a < b ? 1.0f : 0.0f;
-        case CompareOp::LessEqual: return a <= b ? 1.0f : 0.0f;
-        case CompareOp::Greater: return a > b ? 1.0f : 0.0f;
-        default: return a >= b ? 1.0f : 0.0f;
-    }
-}
-
+template <typename T>
 kernel void compare(
-    device const float* A  [[buffer(0)]],
-    device const float* B  [[buffer(1)]],
-    device float* C        [[buffer(2)]],
+    device const T* A      [[buffer(0)]],
+    device const T* B      [[buffer(1)]],
+    device T* C            [[buffer(2)]],
     constant CompareOp& op [[buffer(3)]],
     uint i [[thread_position_in_grid]])
 {
     C[i] = compare_values(op, A[i], B[i]);
 }
 
+#define INSTANTIATE_COMPARE(T, S)                                              \
+template [[host_name("compare_" #S)]] kernel void compare<T>(                  \
+    device const T*, device const T*, device T*, constant CompareOp&, uint);
+FOR_EACH_ELEMENT(INSTANTIATE_COMPARE)
+
+template <typename T>
 kernel void compare_scalar(
-    device const float* A      [[buffer(0)]],
-    device float* C            [[buffer(1)]],
+    device const T* A          [[buffer(0)]],
+    device T* C                [[buffer(1)]],
     constant float& scalar     [[buffer(2)]],
     constant CompareOp& op     [[buffer(3)]],
     constant uint& scalar_left [[buffer(4)]],
     uint i [[thread_position_in_grid]])
 {
-    float a = scalar_left ? scalar : A[i];
-    float b = scalar_left ? A[i] : scalar;
-    C[i] = compare_values(op, a, b);
+    T s = T(scalar);
+    C[i] = scalar_left ? compare_values(op, s, A[i]) : compare_values(op, A[i], s);
 }
+
+#define INSTANTIATE_COMPARE_SCALAR(T, S)                                       \
+template [[host_name("compare_scalar_" #S)]] kernel void compare_scalar<T>(    \
+    device const T*, device T*, constant float&, constant CompareOp&,          \
+    constant uint&, uint);
+FOR_EACH_ELEMENT(INSTANTIATE_COMPARE_SCALAR)
 
 // `fmin`/`fmax` rather than the `clamp` builtin, whose behaviour on a NaN input
 // is unspecified: this pair is `x.max(low).min(high)`, the CPU definition.
+template <typename T>
 kernel void clamp_values(
-    device const float* A  [[buffer(0)]],
-    device float* C        [[buffer(1)]],
+    device const T* A      [[buffer(0)]],
+    device T* C            [[buffer(1)]],
     constant float& low    [[buffer(2)]],
     constant float& high   [[buffer(3)]],
     uint i [[thread_position_in_grid]])
 {
-    C[i] = fmin(fmax(A[i], low), high);
+    C[i] = element_min(element_max(A[i], T(low)), T(high));
 }
+
+#define INSTANTIATE_CLAMP(T, S)                                                \
+template [[host_name("clamp_values_" #S)]] kernel void clamp_values<T>(        \
+    device const T*, device T*, constant float&, constant float&, uint);
+FOR_EACH_ELEMENT(INSTANTIATE_CLAMP)
 
 inline float reduce_values(ReduceOp op, float a, float b) {
     switch (op) {
@@ -243,8 +319,13 @@ inline float reduce_identity(ReduceOp op) {
 //
 // Dispatched as whole threadgroups (never `dispatchThreads`): every thread in a
 // group must reach the barriers, and a ragged final group would not.
+//
+// The fold is always in `float`. The first round reads the tensor's own element
+// type; every later round reads the `float` partials, through the `_f32`
+// instance.
+template <typename T>
 kernel void reduce_partial(
-    device const float* input  [[buffer(0)]],
+    device const T* input      [[buffer(0)]],
     device float* partials     [[buffer(1)]],
     constant uint& count       [[buffer(2)]],
     constant ReduceOp& op      [[buffer(3)]],
@@ -254,7 +335,7 @@ kernel void reduce_partial(
     uint width [[threads_per_threadgroup]])
 {
     threadgroup float scratch[REDUCE_GROUP];
-    scratch[tid] = gid < count ? input[gid] : reduce_identity(op);
+    scratch[tid] = gid < count ? float(input[gid]) : reduce_identity(op);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint stride = width / 2; stride > 0; stride >>= 1) {
@@ -268,6 +349,40 @@ kernel void reduce_partial(
     }
 }
 
+#define INSTANTIATE_REDUCE(T, S)                                               \
+template [[host_name("reduce_partial_" #S)]] kernel void reduce_partial<T>(    \
+    device const T*, device float*, constant uint&, constant ReduceOp&,        \
+    uint, uint, uint, uint);
+FOR_EACH_ELEMENT(INSTANTIATE_REDUCE)
+
+// Conversions into and out of the `float` accumulator, for the operations that
+// need a whole `float` buffer: the prefix sum scans in `float` and rounds each
+// running total once on the way back.
+template <typename T>
+kernel void widen(
+    device const T* input [[buffer(0)]],
+    device float* output  [[buffer(1)]],
+    uint i [[thread_position_in_grid]])
+{
+    output[i] = float(input[i]);
+}
+
+template <typename T>
+kernel void narrow(
+    device const float* input [[buffer(0)]],
+    device T* output          [[buffer(1)]],
+    uint i [[thread_position_in_grid]])
+{
+    output[i] = T(input[i]);
+}
+
+#define INSTANTIATE_CONVERT(T, S)                                              \
+template [[host_name("widen_" #S)]] kernel void widen<T>(                      \
+    device const T*, device float*, uint);                                     \
+template [[host_name("narrow_" #S)]] kernel void narrow<T>(                    \
+    device const float*, device T*, uint);
+FOR_EACH_ELEMENT(INSTANTIATE_CONVERT)
+
 // One sweep of an inclusive Hillis–Steele scan, from `input` into `output`. The
 // host runs it for offsets 1, 2, 4, … and swaps the buffers between sweeps: the
 // pass cannot be done in place, since a thread reading `i - offset` would race
@@ -275,6 +390,9 @@ kernel void reduce_partial(
 //
 // `log n` sweeps of `n` adds is more arithmetic than the serial `n`, which is
 // the trade a scan makes to have any parallelism at all.
+//
+// `float` only: a 16-bit tensor is widened first and narrowed after, so the
+// running totals carry `float` precision.
 kernel void scan_step(
     device const float* input [[buffer(0)]],
     device float* output      [[buffer(1)]],
@@ -294,25 +412,39 @@ inline uint sort_key(float value) {
     return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
 
+// The same key for the 16-bit types, whose sign bit is bit 15.
+inline ushort sort_key_16(ushort bits) {
+    return (bits & 0x8000u) ? ushort(~bits) : ushort(bits | 0x8000u);
+}
+inline ushort sort_key(half value) { return sort_key_16(as_type<ushort>(value)); }
+inline ushort sort_key(bfloat value) { return sort_key_16(as_type<ushort>(value)); }
+
 // Copy into a power-of-two buffer, filling the tail with a value that sorts to
 // the end so the padding trims cleanly afterwards.
+template <typename T>
 kernel void sort_prepare(
-    device const float* input [[buffer(0)]],
-    device float* output      [[buffer(1)]],
+    device const T* input     [[buffer(0)]],
+    device T* output          [[buffer(1)]],
     constant uint& count      [[buffer(2)]],
-    constant float& padding   [[buffer(3)]],
+    constant T& padding       [[buffer(3)]],
     uint i [[thread_position_in_grid]])
 {
     output[i] = i < count ? input[i] : padding;
 }
+
+#define INSTANTIATE_SORT_PREPARE(T, S)                                         \
+template [[host_name("sort_prepare_" #S)]] kernel void sort_prepare<T>(        \
+    device const T*, device T*, constant uint&, constant T&, uint);
+FOR_EACH_ELEMENT(INSTANTIATE_SORT_PREPARE)
 
 // One compare-exchange stage of a bitonic sort. `block` is the width of the
 // bitonic sequence being merged and `stride` the distance between partners;
 // within a block the direction alternates, which is what builds the next
 // sequence up. Only the lower index of each pair does the work, so the stage's
 // writes are disjoint and need no synchronization beyond the dispatch boundary.
+template <typename T>
 kernel void bitonic_stage(
-    device float* values   [[buffer(0)]],
+    device T* values       [[buffer(0)]],
     constant uint& block   [[buffer(1)]],
     constant uint& stride  [[buffer(2)]],
     constant uint& ascending [[buffer(3)]],
@@ -322,21 +454,27 @@ kernel void bitonic_stage(
     if (partner <= i) return;
 
     bool up = ((i & block) == 0) == (ascending != 0);
-    float a = values[i];
-    float b = values[partner];
+    T a = values[i];
+    T b = values[partner];
     if ((sort_key(a) > sort_key(b)) == up) {
         values[i] = b;
         values[partner] = a;
     }
 }
 
+#define INSTANTIATE_BITONIC(T, S)                                              \
+template [[host_name("bitonic_stage_" #S)]] kernel void bitonic_stage<T>(      \
+    device T*, constant uint&, constant uint&, constant uint&, uint);
+FOR_EACH_ELEMENT(INSTANTIATE_BITONIC)
+
 // Valid cross-correlation: every output element is the window of `input` under
 // `weights`, summed. `flip` reverses the window, which turns cross-correlation
 // into convolution proper — and is what the input-side gradient needs.
+template <typename T>
 kernel void correlate(
-    device const float* input   [[buffer(0)]],
-    device const float* weights [[buffer(1)]],
-    device float* output        [[buffer(2)]],
+    device const T* input       [[buffer(0)]],
+    device const T* weights     [[buffer(1)]],
+    device T* output            [[buffer(2)]],
     constant uint& rows         [[buffer(3)]],
     constant uint& cols         [[buffer(4)]],
     constant uint& window_rows  [[buffer(5)]],
@@ -353,18 +491,25 @@ kernel void correlate(
         for (uint wc = 0; wc < window_cols; wc++) {
             uint tap_row = flip ? window_rows - 1 - wr : wr;
             uint tap_col = flip ? window_cols - 1 - wc : wc;
-            acc += input[(gid.y + wr) * cols + (gid.x + wc)]
-                 * weights[tap_row * window_cols + tap_col];
+            acc += float(input[(gid.y + wr) * cols + (gid.x + wc)])
+                 * float(weights[tap_row * window_cols + tap_col]);
         }
     }
-    output[gid.y * out_cols + gid.x] = acc;
+    output[gid.y * out_cols + gid.x] = T(acc);
 }
+
+#define INSTANTIATE_CORRELATE(T, S)                                            \
+template [[host_name("correlate_" #S)]] kernel void correlate<T>(              \
+    device const T*, device const T*, device T*, constant uint&,               \
+    constant uint&, constant uint&, constant uint&, constant uint&, uint2);
+FOR_EACH_ELEMENT(INSTANTIATE_CORRELATE)
 
 // Reverse both axes. The kernel-side gradient of a convolution is the flip of
 // the correlation's, so this is what lets both conventions differentiate.
+template <typename T>
 kernel void flip_both(
-    device const float* input [[buffer(0)]],
-    device float* output      [[buffer(1)]],
+    device const T* input     [[buffer(0)]],
+    device T* output          [[buffer(1)]],
     constant uint& rows       [[buffer(2)]],
     constant uint& cols       [[buffer(3)]],
     uint2 gid [[thread_position_in_grid]])
@@ -373,11 +518,17 @@ kernel void flip_both(
     output[gid.y * cols + gid.x] = input[(rows - 1 - gid.y) * cols + (cols - 1 - gid.x)];
 }
 
+#define INSTANTIATE_FLIP(T, S)                                                 \
+template [[host_name("flip_both_" #S)]] kernel void flip_both<T>(              \
+    device const T*, device T*, constant uint&, constant uint&, uint2);
+FOR_EACH_ELEMENT(INSTANTIATE_FLIP)
+
 // Surround a matrix with zeros. The input-side gradient of a valid correlation
 // is a full one, and padding is how a full correlation is spelled.
+template <typename T>
 kernel void pad_zeros(
-    device const float* input [[buffer(0)]],
-    device float* output      [[buffer(1)]],
+    device const T* input     [[buffer(0)]],
+    device T* output          [[buffer(1)]],
     constant uint& rows       [[buffer(2)]],
     constant uint& cols       [[buffer(3)]],
     constant uint& pad_rows   [[buffer(4)]],
@@ -391,14 +542,21 @@ kernel void pad_zeros(
     bool inside = gid.y >= pad_rows && gid.y < pad_rows + rows
                && gid.x >= pad_cols && gid.x < pad_cols + cols;
     output[gid.y * out_cols + gid.x] =
-        inside ? input[(gid.y - pad_rows) * cols + (gid.x - pad_cols)] : 0.0f;
+        inside ? input[(gid.y - pad_rows) * cols + (gid.x - pad_cols)] : T(0.0f);
 }
+
+#define INSTANTIATE_PAD(T, S)                                                  \
+template [[host_name("pad_zeros_" #S)]] kernel void pad_zeros<T>(              \
+    device const T*, device T*, constant uint&, constant uint&,                \
+    constant uint&, constant uint&, uint2);
+FOR_EACH_ELEMENT(INSTANTIATE_PAD)
 
 // Copy one input vector into a row or column of a row-major output matrix.
 // `output_stride == 1` writes a contiguous row; otherwise it scatters a column.
+template <typename T>
 kernel void stack_vector(
-    device const float* input [[buffer(0)]],
-    device float* output      [[buffer(1)]],
+    device const T* input     [[buffer(0)]],
+    device T* output          [[buffer(1)]],
     constant uint& count      [[buffer(2)]],
     constant uint& offset     [[buffer(3)]],
     constant uint& output_stride [[buffer(4)]],
@@ -409,12 +567,19 @@ kernel void stack_vector(
     }
 }
 
+#define INSTANTIATE_STACK(T, S)                                                \
+template [[host_name("stack_vector_" #S)]] kernel void stack_vector<T>(        \
+    device const T*, device T*, constant uint&, constant uint&,                \
+    constant uint&, uint);
+FOR_EACH_ELEMENT(INSTANTIATE_STACK)
+
 // Concatenate two row-major matrices with the same row count. Each thread
 // writes one output element; both input reads and output writes are coalesced.
+template <typename T>
 kernel void concat_horizontal(
-    device const float* left  [[buffer(0)]],
-    device const float* right [[buffer(1)]],
-    device float* output      [[buffer(2)]],
+    device const T* left      [[buffer(0)]],
+    device const T* right     [[buffer(1)]],
+    device T* output          [[buffer(2)]],
     constant uint& rows       [[buffer(3)]],
     constant uint& left_cols  [[buffer(4)]],
     constant uint& right_cols [[buffer(5)]],
@@ -430,11 +595,18 @@ kernel void concat_horizontal(
         : right[row * right_cols + col - left_cols];
 }
 
+#define INSTANTIATE_CONCAT(T, S)                                               \
+template [[host_name("concat_horizontal_" #S)]] kernel void concat_horizontal<T>( \
+    device const T*, device const T*, device T*, constant uint&,               \
+    constant uint&, constant uint&, uint2);
+FOR_EACH_ELEMENT(INSTANTIATE_CONCAT)
+
 // Place one matrix into a horizontal block of a wider row-major matrix. The
 // encoder dispatches this once per input matrix in the same command buffer.
+template <typename T>
 kernel void merge_horizontal(
-    device const float* input [[buffer(0)]],
-    device float* output      [[buffer(1)]],
+    device const T* input     [[buffer(0)]],
+    device T* output          [[buffer(1)]],
     constant uint& rows       [[buffer(2)]],
     constant uint& input_cols [[buffer(3)]],
     constant uint& output_cols [[buffer(4)]],
@@ -449,18 +621,25 @@ kernel void merge_horizontal(
     }
 }
 
+#define INSTANTIATE_MERGE(T, S)                                                \
+template [[host_name("merge_horizontal_" #S)]] kernel void merge_horizontal<T>( \
+    device const T*, device T*, constant uint&, constant uint&,                \
+    constant uint&, constant uint&, uint2);
+FOR_EACH_ELEMENT(INSTANTIATE_MERGE)
+
 // Transpose through a padded threadgroup tile. Adjacent threads read adjacent
 // input values and write adjacent output values; the extra column avoids bank
 // conflicts when the tile is read in the opposite direction.
+template <typename T>
 kernel void transpose_tiled(
-    device const float* input [[buffer(0)]],
-    device float* output      [[buffer(1)]],
+    device const T* input     [[buffer(0)]],
+    device T* output          [[buffer(1)]],
     constant uint& rows       [[buffer(2)]],
     constant uint& cols       [[buffer(3)]],
     uint2 tid [[thread_position_in_threadgroup]],
     uint2 group [[threadgroup_position_in_grid]])
 {
-    threadgroup float tile[TILE][TILE + 1];
+    threadgroup T tile[TILE][TILE + 1];
 
     uint input_col = group.x * TILE + tid.x;
     uint input_row = group.y * TILE + tid.y;
@@ -476,71 +655,99 @@ kernel void transpose_tiled(
     }
 }
 
+#define INSTANTIATE_TRANSPOSE(T, S)                                            \
+template [[host_name("transpose_tiled_" #S)]] kernel void transpose_tiled<T>(  \
+    device const T*, device T*, constant uint&, constant uint&, uint2, uint2);
+FOR_EACH_ELEMENT(INSTANTIATE_TRANSPOSE)
+
 // These variants must agree with `tensors::kernels::Analytic`, and each
 // derivative must match the corresponding `Dual` implementation.
-inline float analytic_value(AnalyticOp op, float x) {
+//
+// Each function is evaluated in the element type and every intermediate rounds
+// to it, in the order the host's `Analytic::value` and `derivative` use, so a
+// `half` derivative is built from `half` operations exactly as the CPU's `f16`
+// one is. `T(...)` around a library call is the identity for `float` and
+// `half`, and the single rounding of a `float` result for `bfloat`.
+template <typename T>
+inline T analytic_value(AnalyticOp op, T x) {
+    const T one = T(1.0f);
     switch (op) {
-        case AnalyticOp::Sin:    return sin(x);
-        case AnalyticOp::Cos:    return cos(x);
-        case AnalyticOp::Tan:    return tan(x);
-        case AnalyticOp::Sec:    return 1.0f / cos(x);
-        case AnalyticOp::Csc:    return 1.0f / sin(x);
-        case AnalyticOp::Arcsin: return asin(x);
-        case AnalyticOp::Arccos: return acos(x);
-        case AnalyticOp::Arctan: return atan(x);
-        case AnalyticOp::Exp:    return exp(x);
-        case AnalyticOp::Ln:     return log(x);
-        case AnalyticOp::Sinh:   return sinh(x);
-        case AnalyticOp::Cosh:   return cosh(x);
-        case AnalyticOp::Tanh:   return tanh(x);
-        case AnalyticOp::Sqrt:   return sqrt(x);
-        default: return NAN;
+        case AnalyticOp::Sin:    return T(sin(x));
+        case AnalyticOp::Cos:    return T(cos(x));
+        case AnalyticOp::Tan:    return T(tan(x));
+        case AnalyticOp::Sec:    return one / T(cos(x));
+        case AnalyticOp::Csc:    return one / T(sin(x));
+        case AnalyticOp::Arcsin: return T(asin(x));
+        case AnalyticOp::Arccos: return T(acos(x));
+        case AnalyticOp::Arctan: return T(atan(x));
+        case AnalyticOp::Exp:    return T(exp(x));
+        case AnalyticOp::Ln:     return T(log(x));
+        case AnalyticOp::Sinh:   return T(sinh(x));
+        case AnalyticOp::Cosh:   return T(cosh(x));
+        case AnalyticOp::Tanh:   return T(tanh(x));
+        case AnalyticOp::Sqrt:   return T(sqrt(x));
+        default: return T(NAN);
     }
 }
 
-inline float analytic_derivative(AnalyticOp op, float x) {
+template <typename T>
+inline T analytic_derivative(AnalyticOp op, T x) {
+    const T one = T(1.0f);
     switch (op) {
-        case AnalyticOp::Sin:    return cos(x);
-        case AnalyticOp::Cos:    return -sin(x);
-        case AnalyticOp::Tan:    { float c = cos(x); return 1.0f / (c * c); }
-        case AnalyticOp::Sec:    { float c = cos(x); return sin(x) / (c * c); }
-        case AnalyticOp::Csc:    { float s = sin(x); return -cos(x) / (s * s); }
-        case AnalyticOp::Arcsin: return 1.0f / sqrt(1.0f - x * x);
-        case AnalyticOp::Arccos: return -1.0f / sqrt(1.0f - x * x);
-        case AnalyticOp::Arctan: return 1.0f / (1.0f + x * x);
-        case AnalyticOp::Exp:    return exp(x);
-        case AnalyticOp::Ln:     return 1.0f / x;
-        case AnalyticOp::Sinh:   return cosh(x);
-        case AnalyticOp::Cosh:   return sinh(x);
-        case AnalyticOp::Tanh:   { float t = tanh(x); return 1.0f - t * t; }
-        case AnalyticOp::Sqrt:   return 0.5f * rsqrt(x);
-        default: return NAN;
+        case AnalyticOp::Sin:    return T(cos(x));
+        case AnalyticOp::Cos:    return -T(sin(x));
+        case AnalyticOp::Tan:    { T c = T(cos(x)); return one / (c * c); }
+        case AnalyticOp::Sec:    { T c = T(cos(x)); return T(sin(x)) / (c * c); }
+        case AnalyticOp::Csc:    { T s = T(sin(x)); return -T(cos(x)) / (s * s); }
+        case AnalyticOp::Arcsin: return one / T(sqrt(one - x * x));
+        case AnalyticOp::Arccos: return -(one / T(sqrt(one - x * x)));
+        case AnalyticOp::Arctan: return one / (one + x * x);
+        case AnalyticOp::Exp:    return T(exp(x));
+        case AnalyticOp::Ln:     return one / x;
+        case AnalyticOp::Sinh:   return T(cosh(x));
+        case AnalyticOp::Cosh:   return T(sinh(x));
+        case AnalyticOp::Tanh:   { T t = T(tanh(x)); return one - t * t; }
+        case AnalyticOp::Sqrt:   return one / ((one + one) * T(sqrt(x)));
+        default: return T(NAN);
     }
 }
 
+template <typename T>
 kernel void unary(
-    device const float* A [[buffer(0)]],
-    device float* C       [[buffer(1)]],
+    device const T* A [[buffer(0)]],
+    device T* C       [[buffer(1)]],
     constant AnalyticOp& op [[buffer(2)]],
     uint i [[thread_position_in_grid]])
 {
     C[i] = analytic_value(op, A[i]);
 }
 
+#define INSTANTIATE_UNARY(T, S)                                                \
+template [[host_name("unary_" #S)]] kernel void unary<T>(                      \
+    device const T*, device T*, constant AnalyticOp&, uint);
+FOR_EACH_ELEMENT(INSTANTIATE_UNARY)
+
 // Forward-mode AD: `f(v + d·ε) = f(v) + f'(v)·d·ε`. Both parts come out of one
 // dispatch, which also reads `v` only once.
+template <typename T>
 kernel void unary_dual(
-    device const float* value    [[buffer(0)]],
-    device const float* tangent  [[buffer(1)]],
-    device float* out_value      [[buffer(2)]],
-    device float* out_tangent    [[buffer(3)]],
+    device const T* value        [[buffer(0)]],
+    device const T* tangent      [[buffer(1)]],
+    device T* out_value          [[buffer(2)]],
+    device T* out_tangent        [[buffer(3)]],
     constant AnalyticOp& op      [[buffer(4)]],
     uint i [[thread_position_in_grid]])
 {
-    float v = value[i];
+    T v = value[i];
     out_value[i] = analytic_value(op, v);
     out_tangent[i] = analytic_derivative(op, v) * tangent[i];
 }
+
+#define INSTANTIATE_UNARY_DUAL(T, S)                                           \
+template [[host_name("unary_dual_" #S)]] kernel void unary_dual<T>(            \
+    device const T*, device const T*, device T*, device T*,                    \
+    constant AnalyticOp&, uint);
+FOR_EACH_ELEMENT(INSTANTIATE_UNARY_DUAL)
 
 kernel void fft_bit_reverse(
     device const float2* input [[buffer(0)]],
@@ -599,8 +806,9 @@ kernel void fft_stage(
 //
 // Dispatched as whole threadgroups, for the reason `reduce_partial` is: every
 // thread has to reach the barriers.
+template <typename T>
 kernel void deviation_partial(
-    device const float* input [[buffer(0)]],
+    device const T* input     [[buffer(0)]],
     device float* partials    [[buffer(1)]],
     constant uint& count      [[buffer(2)]],
     constant float& mean      [[buffer(3)]],
@@ -610,7 +818,9 @@ kernel void deviation_partial(
     uint width [[threads_per_threadgroup]])
 {
     threadgroup float scratch[REDUCE_GROUP];
-    float deviation = gid < count ? input[gid] - mean : 0.0f;
+    // The mean is the unrounded `float` one, so the deviations are measured
+    // from the true centre rather than its 16-bit neighbour.
+    float deviation = gid < count ? float(input[gid]) - mean : 0.0f;
     scratch[tid] = deviation * deviation;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -625,6 +835,12 @@ kernel void deviation_partial(
     }
 }
 
+#define INSTANTIATE_DEVIATION(T, S)                                            \
+template [[host_name("deviation_partial_" #S)]] kernel void deviation_partial<T>( \
+    device const T*, device float*, constant uint&, constant float&,           \
+    uint, uint, uint, uint);
+FOR_EACH_ELEMENT(INSTANTIATE_DEVIATION)
+
 // One thread per row or per column, each taking both passes over its own slice.
 //
 // A thread per output rather than a threadgroup per output: the slices are
@@ -633,10 +849,14 @@ kernel void deviation_partial(
 // they are strided per thread but *adjacent threads read adjacent elements*,
 // which is the coalesced pattern — the two axes trade which of the two
 // localities they get, and neither is the pathological case.
+//
+// Both passes accumulate in `float`; the mean and the deviation sum round to
+// the element type once, when they are written.
+template <typename T>
 kernel void axis_moments(
-    device const float* input  [[buffer(0)]],
-    device float* means        [[buffer(1)]],
-    device float* deviations   [[buffer(2)]],
+    device const T* input      [[buffer(0)]],
+    device T* means            [[buffer(1)]],
+    device T* deviations       [[buffer(2)]],
     constant uint& rows        [[buffer(3)]],
     constant uint& cols        [[buffer(4)]],
     constant AxisOp& axis      [[buffer(5)]],
@@ -649,19 +869,25 @@ kernel void axis_moments(
 
     float total = 0.0f;
     for (uint k = 0; k < count; ++k) {
-        total += input[base + k * stride];
+        total += float(input[base + k * stride]);
     }
     float mean = total / float(count);
 
     float deviation = 0.0f;
     for (uint k = 0; k < count; ++k) {
-        float d = input[base + k * stride] - mean;
+        float d = float(input[base + k * stride]) - mean;
         deviation += d * d;
     }
 
-    means[i] = mean;
-    deviations[i] = deviation;
+    means[i] = T(mean);
+    deviations[i] = T(deviation);
 }
+
+#define INSTANTIATE_AXIS_MOMENTS(T, S)                                         \
+template [[host_name("axis_moments_" #S)]] kernel void axis_moments<T>(        \
+    device const T*, device T*, device T*, constant uint&, constant uint&,     \
+    constant AxisOp&, uint);
+FOR_EACH_ELEMENT(INSTANTIATE_AXIS_MOMENTS)
 
 // These must agree with `statistics::special`, which is the same mathematics in
 // double precision. They do not agree bit for bit and are not meant to: the
@@ -873,26 +1099,38 @@ inline float distribution_value(
 }
 
 // One distribution over the whole tensor.
+//
+// The special functions are `float` polynomials; a 16-bit element widens
+// exactly on the way in and the result rounds once on the way out, which is
+// also what the host does from `f64`.
+template <typename T>
 kernel void distribution(
-    device const float* input     [[buffer(0)]],
-    device float* output          [[buffer(1)]],
+    device const T* input         [[buffer(0)]],
+    device T* output              [[buffer(1)]],
     constant FamilyOp& family     [[buffer(2)]],
     constant StatisticOp& stat    [[buffer(3)]],
     constant float& first         [[buffer(4)]],
     constant float& second        [[buffer(5)]],
     uint i [[thread_position_in_grid]])
 {
-    output[i] = distribution_value(family, stat, input[i], first, second);
+    output[i] = T(distribution_value(family, stat, float(input[i]), first, second));
 }
+
+#define INSTANTIATE_DISTRIBUTION(T, S)                                         \
+template [[host_name("distribution_" #S)]] kernel void distribution<T>(        \
+    device const T*, device T*, constant FamilyOp&, constant StatisticOp&,     \
+    constant float&, constant float&, uint);
+FOR_EACH_ELEMENT(INSTANTIATE_DISTRIBUTION)
 
 // One distribution per row or per column: the parameter pair is looked up by
 // the element's position along the axis, which is what turns a per-row fit into
 // a single dispatch rather than one per row.
+template <typename T>
 kernel void axis_distribution(
-    device const float* input     [[buffer(0)]],
-    device float* output          [[buffer(1)]],
-    device const float* first     [[buffer(2)]],
-    device const float* second    [[buffer(3)]],
+    device const T* input         [[buffer(0)]],
+    device T* output              [[buffer(1)]],
+    device const T* first         [[buffer(2)]],
+    device const T* second        [[buffer(3)]],
     constant uint& cols           [[buffer(4)]],
     constant AxisOp& axis         [[buffer(5)]],
     constant FamilyOp& family     [[buffer(6)]],
@@ -900,13 +1138,22 @@ kernel void axis_distribution(
     uint i [[thread_position_in_grid]])
 {
     uint along = axis == AxisOp::Rows ? i / cols : i % cols;
-    output[i] = distribution_value(family, stat, input[i], first[along], second[along]);
+    output[i] = T(distribution_value(
+        family, stat, float(input[i]), float(first[along]), float(second[along])));
 }
+
+#define INSTANTIATE_AXIS_DISTRIBUTION(T, S)                                    \
+template [[host_name("axis_distribution_" #S)]] kernel void axis_distribution<T>( \
+    device const T*, device T*, device const T*, device const T*,              \
+    constant uint&, constant AxisOp&, constant FamilyOp&, constant StatisticOp&, uint);
+FOR_EACH_ELEMENT(INSTANTIATE_AXIS_DISTRIBUTION)
 
 // ---- fused elementwise programs ----------------------------------------------
 //
 // One thread runs a whole register program for one element; see
-// `tensors::fused`. Every thread runs the same instructions in the same order,
+// `tensors::fused`. The registers hold the program's element type — the `T` of
+// `Program<T>` — so a `Program<f16>` computes in `half`, and loads and stores
+// convert between that and each operand's storage type. Every thread runs the same instructions in the same order,
 // so the `switch` on each opcode never diverges within a SIMD group, and the
 // intermediates stay in the `r` array rather than going back to memory.
 
@@ -971,20 +1218,13 @@ inline uint fused_remap(ushort remap, uint i, uint rows, uint cols) {
     }
 }
 
-inline float fused_binary(BinaryOp op, float a, float b) {
-    switch (op) {
-        case BinaryOp::Add: return a + b;
-        case BinaryOp::Sub: return a - b;
-        case BinaryOp::Mul: return a * b;
-        default: return a / b;
-    }
-}
 
 // Sixteen input and eight output slots, plus the program and its shape: 26 of
 // Metal's 31 buffer arguments. Unused slots are bound to a used buffer, which is
 // never touched because no instruction names them. A tensor updated in place is
 // bound to both an input and an output slot; the program reads it before it
 // stores it, and each thread touches only its own element.
+template <typename T>
 kernel void fused_elementwise(
     constant FusedInstr* code   [[buffer(0)]],
     constant FusedShape& shape  [[buffer(1)]],
@@ -1020,20 +1260,23 @@ kernel void fused_elementwise(
     };
     device uchar* outputs[8] = { out0, out1, out2, out3, out4, out5, out6, out7 };
 
-    float r[FUSED_REGISTERS];
+    T r[FUSED_REGISTERS];
     for (uint pc = 0; pc < shape.count; pc++) {
         FusedInstr instr = code[pc];
         switch (instr.kind) {
             case 0:
-                r[instr.dst] = fused_load(
+                // Every storage type widens to `float` exactly, so this is one
+                // rounding, to `T`.
+                r[instr.dst] = T(fused_load(
                     inputs[instr.a], instr.b,
-                    fused_remap(instr.op, i, shape.rows, shape.cols));
+                    fused_remap(instr.op, i, shape.rows, shape.cols)));
                 break;
             case 1:
-                r[instr.dst] = instr.value;
+                // A `Program<T>` constant is a `T`, which `float` holds exactly.
+                r[instr.dst] = T(instr.value);
                 break;
             case 2:
-                r[instr.dst] = fused_binary(BinaryOp(instr.op), r[instr.a], r[instr.b]);
+                r[instr.dst] = binary_values(BinaryOp(instr.op), r[instr.a], r[instr.b]);
                 break;
             case 3:
                 r[instr.dst] = analytic_value(AnalyticOp(instr.op), r[instr.a]);
@@ -1042,8 +1285,21 @@ kernel void fused_elementwise(
                 r[instr.dst] = compare_values(CompareOp(instr.op), r[instr.a], r[instr.b]);
                 break;
             default:
-                fused_store(outputs[instr.aux], instr.b, i, r[instr.a]);
+                fused_store(outputs[instr.aux], instr.b, i, float(r[instr.a]));
                 break;
         }
     }
 }
+
+#define INSTANTIATE_FUSED(T, S)                                                \
+template [[host_name("fused_elementwise_" #S)]] kernel void fused_elementwise<T>( \
+    constant FusedInstr*, constant FusedShape&,                                \
+    device const uchar*, device const uchar*, device const uchar*,             \
+    device const uchar*, device const uchar*, device const uchar*,             \
+    device const uchar*, device const uchar*, device const uchar*,             \
+    device const uchar*, device const uchar*, device const uchar*,             \
+    device const uchar*, device const uchar*, device const uchar*,             \
+    device const uchar*,                                                       \
+    device uchar*, device uchar*, device uchar*, device uchar*,                \
+    device uchar*, device uchar*, device uchar*, device uchar*, uint);
+FOR_EACH_ELEMENT(INSTANTIATE_FUSED)

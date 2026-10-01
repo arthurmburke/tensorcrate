@@ -265,7 +265,7 @@ fn jacobian_columns_are_the_seeded_tangents() {
     // f(x) = A·(x ⊙ x), so J = 2·A·diag(x).
     let a = matrix(3, 4);
     let at = vector(4);
-    let computed = jacobian::<Host>(&at, |x| DualMatrix::constant(a.clone()).matvec(&(x * x)));
+    let computed = jacobian::<Host, f32>(&at, |x| DualMatrix::constant(a.clone()).matvec(&(x * x)));
 
     for row in 0..3 {
         for col in 0..4 {

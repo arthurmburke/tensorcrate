@@ -6,8 +6,7 @@
 //! cargo run --release --example simd_bench --no-default-features --features simd
 //! ```
 //!
-//! These are wall-clock microbenchmarks, not statistically rigorous — they exist
-//! to show the kernels are pulling their weight, and where the crossover lands.
+//! These are wall-clock microbenchmarks, not statistically rigorous.
 //!
 //! Every timed closure passes its operands through [`std::hint::black_box`]. That
 //! is load-bearing rather than decorative: the sweep calls kernels whose lengths
@@ -198,8 +197,7 @@ fn main() {
     //
     // What a caller actually pays. Above `MIN_MATMUL_OPS` (512 ops, i.e. N ≥ 8)
     // `Matrix::matmul` takes the SIMD path, which currently heap-allocates an
-    // `R*C` output buffer and then copies it out element by element — costs the
-    // kernel sweep above does not see.
+    // `R*C` output buffer and then copies it out element by element.
 
     println!("Matrix::matmul end-to-end (N×N×N)");
     println!(

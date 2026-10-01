@@ -40,8 +40,8 @@
 //!
 //! # Exactness
 //!
-//! A program performs, for every element, exactly the `f32` operations the
-//! unfused chain would, in the same order. On the [`Host`] backend its result is
+//! A program performs, for every element, exactly the operations — in the
+//! program's own element type — the unfused chain would, in the same order. On the [`Host`] backend its result is
 //! therefore identical to the unfused one bit for bit — [`Mode::Unfused`]
 //! exists to check that, and the tests do. (The one gap is the sign of a zero
 //! from `Min`/`Max` when `−0.0` meets `+0.0`, which the unfused kernels do not
@@ -64,10 +64,16 @@
 //!
 //! # Storage types
 //!
-//! Every input and output has its own [`DType`]. Loads widen to `f32`, stores
-//! narrow from it, and all arithmetic is `f32`; `f16` and `bf16` only change
-//! how many bytes cross memory.
+//! Every input and output has its own [`DType`], independent of the type the
+//! arithmetic runs in. A [`Program<T>`] computes in `T` — `f32` by default, or
+//! `f64`, `f16`, `bf16` — loads convert to `T` and stores convert from it, so
+//! the compact storage types only change how many bytes cross memory, and `f64`
+//! storage and arithmetic give a program the same precision as the unfused
+//! `f64` kernels. The Metal shader is compiled for `f32`, `f16` and `bf16`
+//! arithmetic, so a `Program<f16>` runs in `half` registers on the GPU; a
+//! program in `f64`, or over `f64` storage, runs on the host.
 
+use std::any::TypeId;
 use std::cell::Cell;
 use std::fmt;
 
@@ -75,6 +81,7 @@ use half::{bf16, f16};
 
 use super::{Analytic, Backend, BinaryOp, Compare, Host, Kernels, Matrix, Vector};
 use crate::counters;
+use crate::numbers::Real;
 
 /// Registers a program may use. Metal keeps them in a per-thread array, so this
 /// is also a bound on the shader's register pressure.
@@ -96,22 +103,26 @@ pub const MAX_INSTRUCTIONS: usize = 256;
 /// A register index, below [`REGISTERS`].
 pub type Reg = u8;
 
-/// How an input or output is stored. Arithmetic is always `f32`.
+/// How an input or output is stored. Arithmetic is a separate matter: it runs
+/// in the program's own element type, `T` in [`Program<T>`].
 ///
 /// The representation is part of the Metal shader ABI: keep the discriminants
-/// stable and only append.
+/// stable and only append. The shaders have no `f64`, so a program that touches
+/// [`F64`](DType::F64) storage runs on the host.
 #[repr(u16)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DType {
     F32 = 0,
     F16 = 1,
     Bf16 = 2,
+    F64 = 3,
 }
 
 impl DType {
     /// Bytes per stored element.
     pub fn size(self) -> usize {
         match self {
+            DType::F64 => 8,
             DType::F32 => 4,
             DType::F16 | DType::Bf16 => 2,
         }
@@ -122,6 +133,7 @@ impl DType {
             DType::F32 => "f32",
             DType::F16 => "f16",
             DType::Bf16 => "bf16",
+            DType::F64 => "f64",
         }
     }
 }
@@ -179,12 +191,14 @@ impl Remap {
 
 /// One step of a program. Every operation code is one of the existing kernel
 /// enums, so an instruction means exactly what the matching kernel does.
+///
+/// `T` is the type the program computes in; it defaults to `f32`.
 #[derive(Copy, Clone, Debug, PartialEq)]
-pub enum Instr {
-    /// `dst ← input[remap(i)]`, widened to `f32`.
+pub enum Instr<T = f32> {
+    /// `dst ← input[remap(i)]`, converted from the input's storage type to `T`.
     Load { dst: Reg, input: u8, remap: Remap },
     /// `dst ← value`, the same for every element.
-    Const { dst: Reg, value: f32 },
+    Const { dst: Reg, value: T },
     /// `dst ← a op b`.
     Binary {
         dst: Reg,
@@ -201,11 +215,11 @@ pub enum Instr {
         a: Reg,
         b: Reg,
     },
-    /// `output[i] ← src`, narrowed to the output's storage type.
+    /// `output[i] ← src`, converted to the output's storage type.
     Store { src: Reg, output: u8 },
 }
 
-impl Instr {
+impl<T> Instr<T> {
     /// The register written, if any.
     fn dst(&self) -> Option<Reg> {
         match *self {
@@ -337,22 +351,27 @@ impl std::error::Error for ProgramError {}
 /// place: they are outputs `0..updated` as well, followed by any fresh outputs.
 /// That is how an optimizer step overwrites its parameters and moments rather
 /// than allocating new ones.
+///
+/// `T` is the element type the arithmetic runs in. The storage types of the
+/// inputs and outputs are independent of it — see [`DType`] — so a program can
+/// compute in `f64` over `f32` data, or in `f32` over `f16` data. It defaults to
+/// `f32`, which is also all the Metal backend computes in.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Program {
-    code: Vec<Instr>,
+pub struct Program<T = f32> {
+    code: Vec<Instr<T>>,
     inputs: Vec<DType>,
     outputs: Vec<DType>,
     updated: usize,
     registers: usize,
 }
 
-impl Program {
+impl<T: Real> Program<T> {
     /// Check a hand-written program.
     ///
     /// `inputs` and `outputs` give each slot's storage type; the last `updated`
     /// inputs and the first `updated` outputs are the same in-place tensors.
     pub fn new(
-        code: Vec<Instr>,
+        code: Vec<Instr<T>>,
         inputs: Vec<DType>,
         outputs: Vec<DType>,
         updated: usize,
@@ -439,7 +458,7 @@ impl Program {
     }
 
     /// The instructions.
-    pub fn code(&self) -> &[Instr] {
+    pub fn code(&self) -> &[Instr<T>] {
         &self.code
     }
 
@@ -493,7 +512,7 @@ impl Program {
     /// If the counts, storage types or lengths disagree with the program and
     /// its remaps.
     #[track_caller]
-    pub fn run<B: Kernels>(
+    pub fn run<B: Kernels<T>>(
         &self,
         shape: (usize, usize),
         inputs: &[&dyn Fusable<B>],
@@ -536,10 +555,14 @@ impl Program {
             .collect()
     }
 
-    /// [`run`](Self::run) for the common case: `f32` vectors of one length,
-    /// nothing updated in place, every output `f32`.
+    /// [`run`](Self::run) for the common case: vectors of one length, all of the
+    /// program's own element type, nothing updated in place, every output of
+    /// that type too.
     #[track_caller]
-    pub fn run_vectors<B: Kernels>(&self, inputs: &[&Vector<f32, B>]) -> Vec<Vector<f32, B>> {
+    pub fn run_vectors<B: Kernels<T>>(&self, inputs: &[&Vector<T, B>]) -> Vec<Vector<T, B>>
+    where
+        T: Element,
+    {
         let len = inputs.first().map_or(0, |input| input.len());
         let inputs: Vec<&dyn Fusable<B>> = inputs.iter().map(|&v| v as &dyn Fusable<B>).collect();
         self.run((1, len), &inputs, &mut [])
@@ -553,13 +576,13 @@ impl Program {
     ///
     /// `inputs` covers every input slot, in-place tensors included; nothing is
     /// written. Step `k` of the result holds the value instruction `k` produced
-    /// (as `f32`, before any narrowing), or `None` for a store.
+    /// (as `T`, before any narrowing), or `None` for a store.
     #[track_caller]
-    pub fn trace<B: Kernels>(
+    pub fn trace<B: Kernels<T>>(
         &self,
         shape: (usize, usize),
         inputs: &[&dyn Fusable<B>],
-    ) -> Vec<Option<Matrix<f32, B>>> {
+    ) -> Vec<Option<Matrix<T, B>>> {
         assert_eq!(
             inputs.len(),
             self.inputs.len(),
@@ -571,11 +594,11 @@ impl Program {
         for (slot, source) in sources.iter().enumerate() {
             self.check_input(slot, source.dtype(), source.len, shape);
         }
-        let mut registers: Vec<Option<Register<B>>> = (0..REGISTERS).map(|_| None).collect();
+        let mut registers: Vec<Option<Register<B, T>>> = (0..REGISTERS).map(|_| None).collect();
         self.code
             .iter()
             .map(|instr| {
-                step::<B>(instr, &mut registers, |slot, remap| {
+                step::<B, T>(instr, &mut registers, |slot, remap| {
                     load_unfused(&sources[slot], shape, remap)
                 })
                 .map(|value| value.materialize(shape))
@@ -638,7 +661,7 @@ impl Program {
                     a: 0,
                     b: 0,
                     aux: 0,
-                    value,
+                    value: value.into_f64() as f32,
                 },
                 Instr::Binary { dst, op, a, b } => Encoded {
                     kind: 2,
@@ -684,15 +707,18 @@ impl Program {
     /// no remainder, matching the unfused kernels.
     #[cfg_attr(not(all(feature = "metal", target_os = "macos")), allow(dead_code))]
     pub(crate) fn runs_on_metal(&self) -> bool {
-        !self.code.iter().any(|instr| {
-            matches!(
-                instr,
-                Instr::Binary {
-                    op: BinaryOp::Rem,
-                    ..
-                }
-            )
-        })
+        // The shaders have no `f64` storage and no remainder.
+        !self.inputs.contains(&DType::F64)
+            && !self.outputs.contains(&DType::F64)
+            && !self.code.iter().any(|instr| {
+                matches!(
+                    instr,
+                    Instr::Binary {
+                        op: BinaryOp::Rem,
+                        ..
+                    }
+                )
+            })
     }
 }
 
@@ -719,7 +745,7 @@ pub(crate) struct Encoded {
     pub value: f32,
 }
 
-impl fmt::Display for Program {
+impl<T: Real + fmt::Debug> fmt::Display for Program<T> {
     /// A disassembly: one instruction per line.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let types = |types: &[DType]| {
@@ -763,9 +789,9 @@ impl fmt::Display for Program {
 pub struct Value(usize);
 
 #[derive(Copy, Clone, Debug)]
-enum Node {
+enum Node<T> {
     Load(u8, Remap),
-    Const(f32),
+    Const(T),
     Binary(BinaryOp, Value, Value),
     Unary(Analytic, Value),
     Cmp(Compare, Value, Value),
@@ -778,21 +804,36 @@ enum Node {
 /// given its new one with [`set`](Self::set) — and fresh outputs with
 /// [`output`](Self::output). The operations are emitted in the order they were
 /// built; loads of the same slot and remap are shared.
-#[derive(Clone, Debug, Default)]
-pub struct Builder {
-    nodes: Vec<Node>,
+///
+/// `T` is the element type the program will compute in, and is normally inferred
+/// from the first constant or the tensors the program runs over.
+#[derive(Clone, Debug)]
+pub struct Builder<T = f32> {
+    nodes: Vec<Node<T>>,
     inputs: Vec<DType>,
     updates: Vec<(DType, Option<Value>)>,
     outputs: Vec<(DType, Value)>,
     loads: Vec<((u8, Remap), Value)>,
 }
 
-impl Builder {
+impl<T: Real> Default for Builder<T> {
+    fn default() -> Self {
+        Builder {
+            nodes: Vec::new(),
+            inputs: Vec::new(),
+            updates: Vec::new(),
+            outputs: Vec::new(),
+            loads: Vec::new(),
+        }
+    }
+}
+
+impl<T: Real> Builder<T> {
     pub fn new() -> Self {
         Self::default()
     }
 
-    fn push(&mut self, node: Node) -> Value {
+    fn push(&mut self, node: Node<T>) -> Value {
         self.nodes.push(node);
         Value(self.nodes.len() - 1)
     }
@@ -842,7 +883,7 @@ impl Builder {
         value
     }
 
-    pub fn constant(&mut self, value: f32) -> Value {
+    pub fn constant(&mut self, value: T) -> Value {
         self.push(Node::Const(value))
     }
 
@@ -867,13 +908,13 @@ impl Builder {
     }
 
     /// `a · factor`, the fused form of a scalar broadcast.
-    pub fn scale(&mut self, a: Value, factor: f32) -> Value {
+    pub fn scale(&mut self, a: Value, factor: T) -> Value {
         let factor = self.constant(factor);
         self.mul(a, factor)
     }
 
     /// `a + offset`.
-    pub fn shift(&mut self, a: Value, offset: f32) -> Value {
+    pub fn shift(&mut self, a: Value, offset: T) -> Value {
         let offset = self.constant(offset);
         self.add(a, offset)
     }
@@ -890,7 +931,7 @@ impl Builder {
     ///
     /// A register is freed after the last instruction that reads its value, so
     /// a long chain needs only as many registers as it has values live at once.
-    pub fn build(self) -> Result<Program, ProgramError> {
+    pub fn build(self) -> Result<Program<T>, ProgramError> {
         let fresh_inputs = self.inputs.len();
         let slot_of = |slot: u8| -> u8 {
             if usize::from(slot) >= MAX_INPUTS {
@@ -1007,12 +1048,13 @@ impl Builder {
 mod sealed {
     pub trait Sealed {}
     impl Sealed for f32 {}
+    impl Sealed for f64 {}
     impl Sealed for half::f16 {}
     impl Sealed for half::bf16 {}
 }
 
-/// An element type a program can load and store.
-pub trait Element: Copy + 'static + sealed::Sealed {
+/// An element type a program can load and store: the four [`Real`] types.
+pub trait Element: Real + sealed::Sealed {
     const DTYPE: DType;
 
     #[doc(hidden)]
@@ -1051,6 +1093,7 @@ macro_rules! element {
 element!(f32, F32);
 element!(f16, F16);
 element!(bf16, Bf16);
+element!(f64, F64);
 
 /// Borrowed storage of one of the [`DType`]s.
 #[doc(hidden)]
@@ -1058,6 +1101,7 @@ pub enum SourceData<'a, B: Backend> {
     F32(&'a B::Vector<f32>),
     F16(&'a B::Vector<f16>),
     Bf16(&'a B::Vector<bf16>),
+    F64(&'a B::Vector<f64>),
 }
 
 /// Mutably borrowed storage of one of the [`DType`]s.
@@ -1066,6 +1110,7 @@ pub enum SinkData<'a, B: Backend> {
     F32(&'a mut B::Vector<f32>),
     F16(&'a mut B::Vector<f16>),
     Bf16(&'a mut B::Vector<bf16>),
+    F64(&'a mut B::Vector<f64>),
 }
 
 /// Owned storage of one of the [`DType`]s, as a program allocates it.
@@ -1074,6 +1119,7 @@ pub enum Fresh<B: Backend> {
     F32(B::Vector<f32>),
     F16(B::Vector<f16>),
     Bf16(B::Vector<bf16>),
+    F64(B::Vector<f64>),
 }
 
 /// A program input: storage and its length.
@@ -1096,6 +1142,7 @@ impl<B: Backend> Source<'_, B> {
             SourceData::F32(_) => DType::F32,
             SourceData::F16(_) => DType::F16,
             SourceData::Bf16(_) => DType::Bf16,
+            SourceData::F64(_) => DType::F64,
         }
     }
 
@@ -1104,6 +1151,7 @@ impl<B: Backend> Source<'_, B> {
             SourceData::F32(storage) => Slice::F32(B::vector_slice(storage)),
             SourceData::F16(storage) => Slice::F16(B::vector_slice(storage)),
             SourceData::Bf16(storage) => Slice::Bf16(B::vector_slice(storage)),
+            SourceData::F64(storage) => Slice::F64(B::vector_slice(storage)),
         }
     }
 }
@@ -1114,6 +1162,7 @@ impl<B: Backend> Sink<'_, B> {
             SinkData::F32(_) => DType::F32,
             SinkData::F16(_) => DType::F16,
             SinkData::Bf16(_) => DType::Bf16,
+            SinkData::F64(_) => DType::F64,
         }
     }
 
@@ -1122,6 +1171,7 @@ impl<B: Backend> Sink<'_, B> {
             SinkData::F32(storage) => SliceMut::F32(B::vector_slice_mut(storage)),
             SinkData::F16(storage) => SliceMut::F16(B::vector_slice_mut(storage)),
             SinkData::Bf16(storage) => SliceMut::Bf16(B::vector_slice_mut(storage)),
+            SinkData::F64(storage) => SliceMut::F64(B::vector_slice_mut(storage)),
         }
     }
 
@@ -1130,6 +1180,7 @@ impl<B: Backend> Sink<'_, B> {
             SinkData::F32(storage) => SourceData::F32(&**storage),
             SinkData::F16(storage) => SourceData::F16(&**storage),
             SinkData::Bf16(storage) => SourceData::Bf16(&**storage),
+            SinkData::F64(storage) => SourceData::F64(&**storage),
         };
         Source {
             data,
@@ -1143,6 +1194,7 @@ impl<B: Backend> Sink<'_, B> {
             (SinkData::F32(storage), Fresh::F32(value)) => **storage = value,
             (SinkData::F16(storage), Fresh::F16(value)) => **storage = value,
             (SinkData::Bf16(storage), Fresh::Bf16(value)) => **storage = value,
+            (SinkData::F64(storage), Fresh::F64(value)) => **storage = value,
             _ => unreachable!("in-place types are checked against the program"),
         }
     }
@@ -1204,6 +1256,7 @@ impl<B: Backend> Output<B> {
             Fresh::F32(_) => DType::F32,
             Fresh::F16(_) => DType::F16,
             Fresh::Bf16(_) => DType::Bf16,
+            Fresh::F64(_) => DType::F64,
         }
     }
 
@@ -1277,14 +1330,14 @@ pub fn with_mode<R>(mode: Mode, f: impl FnOnce() -> R) -> R {
 /// A register's contents in unfused evaluation. Constants stay scalars so that
 /// an operation with one becomes the scalar broadcast kernel, which is what the
 /// unfused code called.
-enum Register<B: Backend> {
-    Scalar(f32),
-    Tensor(Matrix<f32, B>),
+enum Register<B: Backend, T: Real> {
+    Scalar(T),
+    Tensor(Matrix<T, B>),
 }
 
-impl<B: Kernels> Register<B> {
+impl<B: Kernels<T>, T: Real> Register<B, T> {
     /// The value as a tensor of its own, filling a constant out to the shape.
-    fn materialize(&self, (rows, cols): (usize, usize)) -> Matrix<f32, B> {
+    fn materialize(&self, (rows, cols): (usize, usize)) -> Matrix<T, B> {
         match self {
             Register::Scalar(value) => Matrix::filled(rows, cols, *value),
             Register::Tensor(tensor) => tensor.to_backend::<B>(),
@@ -1297,11 +1350,11 @@ impl<B: Kernels> Register<B> {
 /// `load` reads an input slot through a remap. A store changes no register and
 /// is left to the caller; everything else writes its destination, whose new
 /// value is returned.
-fn step<'r, B: Kernels>(
-    instr: &Instr,
-    registers: &'r mut [Option<Register<B>>],
-    load: impl FnOnce(usize, Remap) -> Matrix<f32, B>,
-) -> Option<&'r Register<B>> {
+fn step<'r, B: Kernels<T>, T: Real>(
+    instr: &Instr<T>,
+    registers: &'r mut [Option<Register<B, T>>],
+    load: impl FnOnce(usize, Remap) -> Matrix<T, B>,
+) -> Option<&'r Register<B, T>> {
     let value = {
         let get = |reg: Reg| {
             registers[usize::from(reg)]
@@ -1349,36 +1402,31 @@ fn step<'r, B: Kernels>(
     registers[dst].as_ref()
 }
 
-/// A load as unfused kernels: widen if needed, then materialize the remap —
+/// A load as unfused kernels: convert if needed, then materialize the remap —
 /// a transpose kernel, or a stack of copies for a broadcast.
-fn load_unfused<B: Kernels>(
+fn load_unfused<B: Kernels<T>, T: Real>(
     source: &Source<'_, B>,
     (rows, cols): (usize, usize),
     remap: Remap,
-) -> Matrix<f32, B> {
+) -> Matrix<T, B> {
     let (stored_rows, stored_cols) = match remap {
         Remap::Identity => (rows, cols),
         Remap::Transpose => (cols, rows),
         Remap::Row => (1, cols),
         Remap::Column => (rows, 1),
     };
-    let tensor = match source.data {
-        SourceData::F32(storage) => {
-            Matrix::build(stored_rows, stored_cols, B::vector_slice(storage))
-        }
-        _ => Matrix::build(stored_rows, stored_cols, &source.slice().widen()),
-    };
+    let tensor = Matrix::build(stored_rows, stored_cols, &source.slice().widen::<T>());
     match remap {
         Remap::Identity => tensor,
         Remap::Transpose => B::transpose(&tensor),
         Remap::Row => {
-            let copies: Vec<B::Vector<f32>> = (0..rows)
+            let copies: Vec<B::Vector<T>> = (0..rows)
                 .map(|_| B::store_vector(tensor.as_slice()))
                 .collect();
             Matrix::from_storage(rows, cols, B::vstack(&copies, cols))
         }
         Remap::Column => {
-            let copies: Vec<B::Vector<f32>> = (0..cols)
+            let copies: Vec<B::Vector<T>> = (0..cols)
                 .map(|_| B::store_vector(tensor.as_slice()))
                 .collect();
             Matrix::from_storage(rows, cols, B::hstack(&copies, rows))
@@ -1386,7 +1434,7 @@ fn load_unfused<B: Kernels>(
     }
 }
 
-fn scalar_binary(op: BinaryOp, a: f32, b: f32) -> f32 {
+fn scalar_binary<T: Real>(op: BinaryOp, a: T, b: T) -> T {
     match op {
         BinaryOp::Add => a + b,
         BinaryOp::Sub => a - b,
@@ -1396,35 +1444,27 @@ fn scalar_binary(op: BinaryOp, a: f32, b: f32) -> f32 {
     }
 }
 
-/// Narrow an `f32` tensor to an output's storage type.
-fn narrow<B: Kernels>(tensor: Matrix<f32, B>, dtype: DType) -> Fresh<B> {
+/// Convert a `T` tensor to an output's storage type.
+fn narrow<B: Kernels<T>, T: Real>(tensor: Matrix<T, B>, dtype: DType) -> Fresh<B> {
     let storage = B::matrix_into_flattened(tensor.into_storage());
+    let values = B::vector_slice(&storage);
     match dtype {
-        DType::F32 => Fresh::F32(storage),
-        DType::F16 => Fresh::F16(B::vector_from_vec(
-            B::vector_slice(&storage)
-                .iter()
-                .map(|&x| f16::from_f32(x))
-                .collect(),
-        )),
-        DType::Bf16 => Fresh::Bf16(B::vector_from_vec(
-            B::vector_slice(&storage)
-                .iter()
-                .map(|&x| bf16::from_f32(x))
-                .collect(),
-        )),
+        DType::F32 => Fresh::F32(B::vector_from_vec(convert(values))),
+        DType::F16 => Fresh::F16(B::vector_from_vec(convert(values))),
+        DType::Bf16 => Fresh::Bf16(B::vector_from_vec(convert(values))),
+        DType::F64 => Fresh::F64(B::vector_from_vec(convert(values))),
     }
 }
 
 /// Run a program as one existing kernel per instruction.
-fn unfused<B: Kernels>(
-    program: &Program,
+fn unfused<B: Kernels<T>, T: Real>(
+    program: &Program<T>,
     shape: (usize, usize),
     inputs: &[Source<'_, B>],
     updated: &mut [Sink<'_, B>],
 ) -> Vec<Fresh<B>> {
     let fresh_inputs = program.fresh_inputs();
-    let mut registers: Vec<Option<Register<B>>> = (0..REGISTERS).map(|_| None).collect();
+    let mut registers: Vec<Option<Register<B, T>>> = (0..REGISTERS).map(|_| None).collect();
     let mut stored: Vec<Option<Fresh<B>>> = (0..program.outputs.len()).map(|_| None).collect();
     for instr in &program.code {
         if let Instr::Store { src, output } = *instr {
@@ -1436,7 +1476,7 @@ fn unfused<B: Kernels>(
             stored[output] = Some(narrow(value, program.outputs[output]));
             continue;
         }
-        step::<B>(instr, &mut registers, |slot, remap| {
+        step::<B, T>(instr, &mut registers, |slot, remap| {
             if slot < fresh_inputs {
                 load_unfused(&inputs[slot], shape, remap)
             } else {
@@ -1452,6 +1492,50 @@ fn unfused<B: Kernels>(
     stored.collect()
 }
 
+// ---- element conversion ---------------------------------------------------------
+
+/// `values` as `U`s: a copy when the types are the same, and otherwise one
+/// rounding per element, through the exact `f64` widening.
+fn convert<T: Real, U: Real>(values: &[T]) -> Vec<U> {
+    match same::<T, U>(values) {
+        Some(values) => values.to_vec(),
+        None => values.iter().map(|&x| U::from_f64(x.into_f64())).collect(),
+    }
+}
+
+/// Convert `values` into `out`, element for element.
+fn convert_into<T: Real, U: Real>(values: &[T], out: &mut [U]) {
+    match same::<T, U>(values) {
+        Some(values) => out.copy_from_slice(values),
+        None => {
+            for (out, &x) in out.iter_mut().zip(values) {
+                *out = U::from_f64(x.into_f64());
+            }
+        }
+    }
+}
+
+/// `&[T]` as `&[U]` when they are the same type. A no-op conversion is the
+/// common case — `f32` data under `f32` arithmetic — and this is what keeps it
+/// a `memcpy`.
+fn same<T: 'static, U: 'static>(values: &[T]) -> Option<&[U]> {
+    // SAFETY: equal `TypeId`s mean one type, so the layouts are identical.
+    (TypeId::of::<T>() == TypeId::of::<U>())
+        .then(|| unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<U>(), values.len()) })
+}
+
+/// The mutable form of [`same`].
+#[cfg_attr(
+    not(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64"))),
+    allow(dead_code)
+)]
+fn same_mut<T: 'static, U: 'static>(values: &mut [T]) -> Option<&mut [U]> {
+    // SAFETY: as in `same`.
+    (TypeId::of::<T>() == TypeId::of::<U>()).then(|| unsafe {
+        std::slice::from_raw_parts_mut(values.as_mut_ptr().cast::<U>(), values.len())
+    })
+}
+
 // ---- the host tile interpreter ------------------------------------------------
 
 /// Elements per tile. Sixteen registers of this many `f32`s plus a spare fill
@@ -1464,6 +1548,7 @@ pub enum Slice<'a> {
     F32(&'a [f32]),
     F16(&'a [f16]),
     Bf16(&'a [bf16]),
+    F64(&'a [f64]),
 }
 
 /// A typed output slice.
@@ -1472,42 +1557,38 @@ pub enum SliceMut<'a> {
     F32(&'a mut [f32]),
     F16(&'a mut [f16]),
     Bf16(&'a mut [bf16]),
+    F64(&'a mut [f64]),
 }
 
 impl Slice<'_> {
-    fn widen(&self) -> Vec<f32> {
+    fn widen<T: Real>(&self) -> Vec<T> {
         match self {
-            Slice::F32(values) => values.to_vec(),
-            Slice::F16(values) => values.iter().map(|x| x.to_f32()).collect(),
-            Slice::Bf16(values) => values.iter().map(|x| x.to_f32()).collect(),
+            Slice::F32(values) => convert(values),
+            Slice::F16(values) => convert(values),
+            Slice::Bf16(values) => convert(values),
+            Slice::F64(values) => convert(values),
         }
     }
 
     #[inline]
-    fn get(&self, index: usize) -> f32 {
+    fn get<T: Real>(&self, index: usize) -> T {
         match self {
-            Slice::F32(values) => values[index],
-            Slice::F16(values) => values[index].to_f32(),
-            Slice::Bf16(values) => values[index].to_f32(),
+            Slice::F32(values) => T::from_f64(f64::from(values[index])),
+            Slice::F16(values) => T::from_f64(values[index].to_f64()),
+            Slice::Bf16(values) => T::from_f64(values[index].to_f64()),
+            Slice::F64(values) => T::from_f64(values[index]),
         }
     }
 
-    /// Widen `len` elements from `start`, read through `remap`, into `out`.
-    fn gather(&self, start: usize, shape: (usize, usize), remap: Remap, out: &mut [f32]) {
+    /// Convert `out.len()` elements from `start`, read through `remap`, into `out`.
+    fn gather<T: Real>(&self, start: usize, shape: (usize, usize), remap: Remap, out: &mut [T]) {
         if remap == Remap::Identity {
             let end = start + out.len();
             match self {
-                Slice::F32(values) => out.copy_from_slice(&values[start..end]),
-                Slice::F16(values) => {
-                    for (out, x) in out.iter_mut().zip(&values[start..end]) {
-                        *out = x.to_f32();
-                    }
-                }
-                Slice::Bf16(values) => {
-                    for (out, x) in out.iter_mut().zip(&values[start..end]) {
-                        *out = x.to_f32();
-                    }
-                }
+                Slice::F32(values) => convert_into(&values[start..end], out),
+                Slice::F16(values) => convert_into(&values[start..end], out),
+                Slice::Bf16(values) => convert_into(&values[start..end], out),
+                Slice::F64(values) => convert_into(&values[start..end], out),
             }
             return;
         }
@@ -1523,45 +1604,41 @@ impl SliceMut<'_> {
             SliceMut::F32(values) => Slice::F32(values),
             SliceMut::F16(values) => Slice::F16(values),
             SliceMut::Bf16(values) => Slice::Bf16(values),
+            SliceMut::F64(values) => Slice::F64(values),
         }
     }
 
-    /// Narrow `values` into this output from `start`.
-    fn scatter(&mut self, start: usize, values: &[f32]) {
+    /// Convert `values` into this output from `start`.
+    fn scatter<T: Real>(&mut self, start: usize, values: &[T]) {
         let end = start + values.len();
         match self {
-            SliceMut::F32(out) => out[start..end].copy_from_slice(values),
-            SliceMut::F16(out) => {
-                for (out, &x) in out[start..end].iter_mut().zip(values) {
-                    *out = f16::from_f32(x);
-                }
-            }
-            SliceMut::Bf16(out) => {
-                for (out, &x) in out[start..end].iter_mut().zip(values) {
-                    *out = bf16::from_f32(x);
-                }
-            }
+            SliceMut::F32(out) => convert_into(values, &mut out[start..end]),
+            SliceMut::F16(out) => convert_into(values, &mut out[start..end]),
+            SliceMut::Bf16(out) => convert_into(values, &mut out[start..end]),
+            SliceMut::F64(out) => convert_into(values, &mut out[start..end]),
         }
     }
 
-    fn fill(&mut self, start: usize, len: usize, value: f32) {
+    fn fill<T: Real>(&mut self, start: usize, len: usize, value: T) {
         let end = start + len;
         match self {
-            SliceMut::F32(out) => out[start..end].fill(value),
-            SliceMut::F16(out) => out[start..end].fill(f16::from_f32(value)),
-            SliceMut::Bf16(out) => out[start..end].fill(bf16::from_f32(value)),
+            SliceMut::F32(out) => out[start..end].fill(f32::from_f64(value.into_f64())),
+            SliceMut::F16(out) => out[start..end].fill(f16::from_f64(value.into_f64())),
+            SliceMut::Bf16(out) => out[start..end].fill(bf16::from_f64(value.into_f64())),
+            SliceMut::F64(out) => out[start..end].fill(value.into_f64()),
         }
     }
 }
 
 /// Allocate a program's fresh outputs.
-fn allocate(program: &Program, len: usize) -> Vec<Owned> {
+fn allocate<T>(program: &Program<T>, len: usize) -> Vec<Owned> {
     program.outputs[program.updated..]
         .iter()
         .map(|dtype| match dtype {
             DType::F32 => Owned::F32(vec![0.0; len]),
             DType::F16 => Owned::F16(vec![f16::ZERO; len]),
             DType::Bf16 => Owned::Bf16(vec![bf16::ZERO; len]),
+            DType::F64 => Owned::F64(vec![0.0; len]),
         })
         .collect()
 }
@@ -1570,6 +1647,7 @@ enum Owned {
     F32(Vec<f32>),
     F16(Vec<f16>),
     Bf16(Vec<bf16>),
+    F64(Vec<f64>),
 }
 
 impl Owned {
@@ -1578,6 +1656,7 @@ impl Owned {
             Owned::F32(values) => SliceMut::F32(values),
             Owned::F16(values) => SliceMut::F16(values),
             Owned::Bf16(values) => SliceMut::Bf16(values),
+            Owned::F64(values) => SliceMut::F64(values),
         }
     }
 
@@ -1586,6 +1665,7 @@ impl Owned {
             Owned::F32(values) => Fresh::F32(B::vector_from_vec(values)),
             Owned::F16(values) => Fresh::F16(B::vector_from_vec(values)),
             Owned::Bf16(values) => Fresh::Bf16(B::vector_from_vec(values)),
+            Owned::F64(values) => Fresh::F64(B::vector_from_vec(values)),
         }
     }
 }
@@ -1593,8 +1673,8 @@ impl Owned {
 /// Run a program on the CPU, over whatever backend's storage, reading it in
 /// place. This is the [`Host`] implementation and the fallback for a Metal
 /// tensor that is not device-resident.
-pub(crate) fn interpret_on<B: Backend>(
-    program: &Program,
+pub(crate) fn interpret_on<B: Backend, T: Real>(
+    program: &Program<T>,
     shape: (usize, usize),
     inputs: &[Source<'_, B>],
     updated: &mut [Sink<'_, B>],
@@ -1621,8 +1701,8 @@ pub(crate) fn interpret_on<B: Backend>(
 ///
 /// `outputs` holds the in-place tensors first; loads of the last
 /// `program.updated()` input slots read them.
-fn interpret(
-    program: &Program,
+fn interpret<T: Real>(
+    program: &Program<T>,
     shape: (usize, usize),
     inputs: &[Slice<'_>],
     outputs: &mut [SliceMut<'_>],
@@ -1632,11 +1712,11 @@ fn interpret(
     // One physical tile per register, plus a spare that receives each result
     // so an instruction may overwrite one of its own operands.
     let physical = program.registers + 1;
-    let mut scratch = vec![0.0f32; physical * TILE.min(len.max(1))];
+    let mut scratch = vec![T::zero(); physical * TILE.min(len.max(1))];
     let tile_len = TILE.min(len.max(1));
     let mut map: [usize; REGISTERS] = std::array::from_fn(|reg| reg.min(physical - 1));
     let mut spare = physical - 1;
-    let mut constant: [Option<f32>; REGISTERS] = [None; REGISTERS];
+    let mut constant: [Option<T>; REGISTERS] = [None; REGISTERS];
 
     let mut start = 0;
     while start < len {
@@ -1735,12 +1815,12 @@ fn interpret(
 /// Retire an instruction's result: a constant, or the tensor just written into
 /// the spare tile, which becomes `dst`'s tile while `dst`'s old one becomes the
 /// spare.
-fn commit(
+fn commit<T: Real>(
     dst: Reg,
-    result: Option<f32>,
+    result: Option<T>,
     map: &mut [usize; REGISTERS],
     spare: &mut usize,
-    constant: &mut [Option<f32>; REGISTERS],
+    constant: &mut [Option<T>; REGISTERS],
 ) {
     let dst = dst as usize;
     match result {
@@ -1752,35 +1832,67 @@ fn commit(
     }
 }
 
-/// The per-tile kernels: the SIMD tier where the build has one, and otherwise
-/// the scalar definitions the SIMD kernels are tested against.
+/// The per-tile kernels: the SIMD tier where the build has one for the element
+/// type, and otherwise the scalar definitions the SIMD kernels are tested
+/// against.
 mod kernel {
     use super::super::{Analytic, BinaryOp, Compare};
-    use super::scalar_binary;
-
+    use super::{Real, scalar_binary};
     #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
-    use crate::simd::f32k;
+    use super::{same, same_mut};
 
-    pub fn elementwise(a: &[f32], b: &[f32], op: BinaryOp, out: &mut [f32]) {
+    pub fn elementwise<T: Real>(a: &[T], b: &[T], op: BinaryOp, out: &mut [T]) {
+        if crate::compact::elementwise(a, b, op, out) {
+            return;
+        }
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         if op != BinaryOp::Rem {
-            return f32k::elementwise(a, b, op, out);
+            if let (Some(a), Some(b), Some(out)) = (
+                same::<T, f32>(a),
+                same::<T, f32>(b),
+                same_mut::<T, f32>(out),
+            ) {
+                return crate::simd::f32k::elementwise(a, b, op, out);
+            }
+            if let (Some(a), Some(b), Some(out)) = (
+                same::<T, f64>(a),
+                same::<T, f64>(b),
+                same_mut::<T, f64>(out),
+            ) {
+                return crate::simd::f64k::elementwise(a, b, op, out);
+            }
         }
         for ((out, &a), &b) in out.iter_mut().zip(a).zip(b) {
             *out = scalar_binary(op, a, b);
         }
     }
 
-    pub fn broadcast(
-        values: &[f32],
-        scalar: f32,
+    pub fn broadcast<T: Real>(
+        values: &[T],
+        scalar: T,
         op: BinaryOp,
         scalar_left: bool,
-        out: &mut [f32],
+        out: &mut [T],
     ) {
+        if crate::compact::broadcast(values, scalar, op, scalar_left, out) {
+            return;
+        }
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         if op != BinaryOp::Rem {
-            return f32k::broadcast(values, scalar, op, scalar_left, out);
+            if let (Some(values), Some(scalar), Some(out)) = (
+                same::<T, f32>(values),
+                same::<T, f32>(std::slice::from_ref(&scalar)),
+                same_mut::<T, f32>(out),
+            ) {
+                return crate::simd::f32k::broadcast(values, scalar[0], op, scalar_left, out);
+            }
+            if let (Some(values), Some(scalar), Some(out)) = (
+                same::<T, f64>(values),
+                same::<T, f64>(std::slice::from_ref(&scalar)),
+                same_mut::<T, f64>(out),
+            ) {
+                return crate::simd::f64k::broadcast(values, scalar[0], op, scalar_left, out);
+            }
         }
         for (out, &x) in out.iter_mut().zip(values) {
             *out = if scalar_left {
@@ -1791,25 +1903,59 @@ mod kernel {
         }
     }
 
-    pub fn compare(a: &[f32], b: &[f32], op: Compare, out: &mut [f32]) {
+    pub fn compare<T: Real>(a: &[T], b: &[T], op: Compare, out: &mut [T]) {
+        if crate::compact::compare(a, b, op, out) {
+            return;
+        }
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
-        return f32k::compare(a, b, op, out);
-        #[allow(unreachable_code)]
+        {
+            if let (Some(a), Some(b), Some(out)) = (
+                same::<T, f32>(a),
+                same::<T, f32>(b),
+                same_mut::<T, f32>(out),
+            ) {
+                return crate::simd::f32k::compare(a, b, op, out);
+            }
+            if let (Some(a), Some(b), Some(out)) = (
+                same::<T, f64>(a),
+                same::<T, f64>(b),
+                same_mut::<T, f64>(out),
+            ) {
+                return crate::simd::f64k::compare(a, b, op, out);
+            }
+        }
         for ((out, &a), &b) in out.iter_mut().zip(a).zip(b) {
             *out = op.value(a, b);
         }
     }
 
-    pub fn compare_scalar(
-        values: &[f32],
-        scalar: f32,
+    pub fn compare_scalar<T: Real>(
+        values: &[T],
+        scalar: T,
         op: Compare,
         scalar_left: bool,
-        out: &mut [f32],
+        out: &mut [T],
     ) {
+        if crate::compact::compare_scalar(values, scalar, op, scalar_left, out) {
+            return;
+        }
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
-        return f32k::compare_scalar(values, scalar, op, scalar_left, out);
-        #[allow(unreachable_code)]
+        {
+            if let (Some(values), Some(scalar), Some(out)) = (
+                same::<T, f32>(values),
+                same::<T, f32>(std::slice::from_ref(&scalar)),
+                same_mut::<T, f32>(out),
+            ) {
+                return crate::simd::f32k::compare_scalar(values, scalar[0], op, scalar_left, out);
+            }
+            if let (Some(values), Some(scalar), Some(out)) = (
+                same::<T, f64>(values),
+                same::<T, f64>(std::slice::from_ref(&scalar)),
+                same_mut::<T, f64>(out),
+            ) {
+                return crate::simd::f64k::compare_scalar(values, scalar[0], op, scalar_left, out);
+            }
+        }
         for (out, &x) in out.iter_mut().zip(values) {
             *out = if scalar_left {
                 op.value(scalar, x)
@@ -1822,10 +1968,18 @@ mod kernel {
     /// `sqrt` is correctly rounded in hardware, so its vector form is exact; the
     /// other functions use the scalar definitions, which the unfused kernels use
     /// too.
-    pub fn unary(values: &[f32], op: Analytic, out: &mut [f32]) {
+    pub fn unary<T: Real>(values: &[T], op: Analytic, out: &mut [T]) {
+        if op == Analytic::Sqrt && crate::compact::sqrt(values, out) {
+            return;
+        }
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         if op == Analytic::Sqrt {
-            return f32k::sqrt(values, out);
+            if let (Some(values), Some(out)) = (same::<T, f32>(values), same_mut::<T, f32>(out)) {
+                return crate::simd::f32k::sqrt(values, out);
+            }
+            if let (Some(values), Some(out)) = (same::<T, f64>(values), same_mut::<T, f64>(out)) {
+                return crate::simd::f64k::sqrt(values, out);
+            }
         }
         for (out, &x) in out.iter_mut().zip(values) {
             *out = op.value(x);
@@ -1834,8 +1988,8 @@ mod kernel {
 }
 
 /// The [`Host`] entry point for [`Kernels::fused`].
-pub(crate) fn host(
-    program: &Program,
+pub(crate) fn host<T: Real>(
+    program: &Program<T>,
     shape: (usize, usize),
     inputs: &[Source<'_, Host>],
     updated: &mut [Sink<'_, Host>],
@@ -1848,9 +2002,13 @@ pub(crate) fn host(
 /// every instruction has a shader implementation, and otherwise the host
 /// interpreter over the shared memory — the same fallback every Metal kernel
 /// has.
+///
+/// The shader is compiled once per [`MetalElement`](crate::metal::MetalElement)
+/// and the program's own `T` picks the instance, so a `Program<f16>` runs in
+/// `half` registers on the GPU just as it runs in `f16` tiles on the host.
 #[cfg(all(feature = "metal", target_os = "macos"))]
-pub(crate) fn metal(
-    program: &Program,
+pub(crate) fn metal<T: crate::metal::MetalElement>(
+    program: &Program<T>,
     shape: (usize, usize),
     inputs: &[Source<'_, super::Metal>],
     updated: &mut [Sink<'_, super::Metal>],
@@ -1860,8 +2018,8 @@ pub(crate) fn metal(
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
-fn resident(
-    program: &Program,
+fn resident<T: crate::metal::MetalElement>(
+    program: &Program<T>,
     shape: (usize, usize),
     inputs: &[Source<'_, super::Metal>],
     updated: &[Sink<'_, super::Metal>],
@@ -1886,6 +2044,7 @@ fn resident(
             SourceData::F32(storage) => raw(storage)?,
             SourceData::F16(storage) => raw(storage)?,
             SourceData::Bf16(storage) => raw(storage)?,
+            SourceData::F64(_) => return None,
         });
     }
     let mut written = Vec::with_capacity(program.outputs.len());
@@ -1894,6 +2053,7 @@ fn resident(
             SinkData::F32(storage) => raw(storage)?,
             SinkData::F16(storage) => raw(storage)?,
             SinkData::Bf16(storage) => raw(storage)?,
+            SinkData::F64(_) => return None,
         };
         read.push(buffer);
         written.push(buffer);
@@ -1910,6 +2070,7 @@ fn resident(
             DType::F32 => Allocation::F32(MetalBuffer::allocate(len)?),
             DType::F16 => Allocation::F16(MetalBuffer::allocate(len)?),
             DType::Bf16 => Allocation::Bf16(MetalBuffer::allocate(len)?),
+            DType::F64 => return None,
         });
     }
     written.extend(fresh.iter().map(|allocation| match allocation {
@@ -1918,7 +2079,7 @@ fn resident(
         Allocation::Bf16(buffer) => buffer.raw(),
     }));
 
-    crate::metal::fused_elementwise(&program.encode(), shape, &read, &written)?;
+    crate::metal::fused_elementwise::<T>(&program.encode(), shape, &read, &written)?;
     Some(
         fresh
             .into_iter()

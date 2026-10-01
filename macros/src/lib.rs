@@ -21,9 +21,13 @@
 //! elementwise. Analytic functions such as `sin(A)` and `cos(v)` map
 //! elementwise over matrices and vectors.
 //!
-//! Tensors use the host backend by default. A leading `backend = Metal;`
-//! directive selects resident `f32` Metal tensors instead; `backend = Host;`
-//! is the explicit spelling of the default.
+//! Tensors use the host backend by default, with `f64` coefficients. A leading
+//! `backend = Metal;` directive selects resident `f32` Metal tensors instead;
+//! `backend = Host;` is the explicit spelling of the default. A leading
+//! `dtype = f32;` (or `dtype = f64;`) chooses the coefficient type, so a host
+//! block can compute in `f32` too. The directives may come in either order;
+//! Metal's shaders are `f32`, so `backend = Metal;` with `dtype = f64;` is an
+//! error.
 //!
 //! The input is parsed with `syn` as Rust syntax, which gives operator
 //! precedence, parentheses, grouping and array literals for free. The only
@@ -44,7 +48,7 @@ use syn::{BinOp, Block, Expr, Lit, Pat, Stmt, UnOp};
 /// The static type of a `math!` expression.
 ///
 /// The extensions are independent axes rather than rival choices: a value may be
-/// complex, dual, or both — a dual number whose coefficients are complex — and
+/// complex, dual, or both (a dual number whose coefficients are complex) and
 /// any of those may be the element type of a tensor. Combining two types is just
 /// the union of their axes.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
@@ -66,27 +70,40 @@ struct Ty {
 
 /// Where tensor literals and operations emitted by a block live.
 ///
-/// Host preserves the macro's original `f64` algebra. Metal shaders are
-/// `f32`, so selecting Metal also selects `f32` coefficients.
+/// Host preserves the macro's original `f64` algebra unless a `dtype = f32;`
+/// directive asks for `f32` (`HostF32`). Metal shaders are `f32`, so selecting
+/// Metal also selects `f32` coefficients.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 enum BackendChoice {
     #[default]
     Host,
+    HostF32,
     Metal,
 }
 
 impl BackendChoice {
+    fn is_metal(self) -> bool {
+        self == BackendChoice::Metal
+    }
+
+    /// Whether coefficients are `f32` rather than `f64`.
+    fn is_single(self) -> bool {
+        self != BackendChoice::Host
+    }
+
     fn coefficient_type(self) -> TokenStream {
-        match self {
-            BackendChoice::Host => quote!(f64),
-            BackendChoice::Metal => quote!(f32),
+        if self.is_single() {
+            quote!(f32)
+        } else {
+            quote!(f64)
         }
     }
 
     fn tensor_backend_type(self) -> TokenStream {
-        match self {
-            BackendChoice::Host => quote!(::tensorcrate::tensors::Host),
-            BackendChoice::Metal => quote!(::tensorcrate::tensors::Metal),
+        if self.is_metal() {
+            quote!(::tensorcrate::tensors::Metal)
+        } else {
+            quote!(::tensorcrate::tensors::Host)
         }
     }
 }
@@ -108,7 +125,7 @@ impl Ty {
         shape: Shape::Scalar,
     };
 
-    /// This type's element type — itself, with the tensor axis dropped.
+    /// This type's element type.
     fn element(self) -> Ty {
         Ty {
             shape: Shape::Scalar,
@@ -143,9 +160,7 @@ impl Ty {
         match self.shape {
             Shape::Scalar => element,
             // The dimensions are runtime values now, so they are not part of
-            // the type. The macro still *knows* them — that is what selects the
-            // right product below and rejects a mismatched literal at expansion
-            // time — they simply have nowhere to go in the emitted type.
+            // the type. The macro still *knows* them.
             Shape::Vector(_) => quote!(::tensorcrate::tensors::Vector<#element, #storage>),
             Shape::Matrix(_, _) => quote!(::tensorcrate::tensors::Matrix<#element, #storage>),
         }
@@ -316,39 +331,69 @@ fn expand(input: TokenStream) -> syn::Result<TokenStream> {
     })
 }
 
-/// Remove an optional leading `backend = Host;` / `backend = Metal;` directive.
+/// Remove the optional leading `backend = Host;` / `backend = Metal;` and
+/// `dtype = f32;` / `dtype = f64;` directives, in either order.
 fn take_backend_directive(stmts: &mut Vec<Stmt>) -> syn::Result<BackendChoice> {
-    let Some(Stmt::Expr(Expr::Assign(assign), Some(_))) = stmts.first() else {
-        return Ok(BackendChoice::Host);
-    };
-    let Expr::Path(left) = &*assign.left else {
-        return Ok(BackendChoice::Host);
-    };
-    if !left.path.is_ident("backend") {
-        return Ok(BackendChoice::Host);
+    let mut metal: Option<bool> = None;
+    let mut dtype: Option<(bool, Span)> = None;
+    loop {
+        let Some(Stmt::Expr(Expr::Assign(assign), Some(_))) = stmts.first() else {
+            break;
+        };
+        let Expr::Path(left) = &*assign.left else {
+            break;
+        };
+        let is_backend = left.path.is_ident("backend");
+        let is_dtype = left.path.is_ident("dtype");
+        if !is_backend && !is_dtype {
+            break;
+        }
+        let message = if is_backend {
+            "math! backend must be `Host` or `Metal`"
+        } else {
+            "math! dtype must be `f32` or `f64`"
+        };
+        let Expr::Path(right) = &*assign.right else {
+            return Err(syn::Error::new(assign.right.span(), message));
+        };
+        if is_backend {
+            if metal.is_some() {
+                return Err(syn::Error::new(right.span(), "math! backend is set twice"));
+            }
+            metal = Some(if right.path.is_ident("Host") {
+                false
+            } else if right.path.is_ident("Metal") {
+                true
+            } else {
+                return Err(syn::Error::new(right.span(), message));
+            });
+        } else {
+            if dtype.is_some() {
+                return Err(syn::Error::new(right.span(), "math! dtype is set twice"));
+            }
+            dtype = Some(if right.path.is_ident("f32") {
+                (true, right.span())
+            } else if right.path.is_ident("f64") {
+                (false, right.span())
+            } else {
+                return Err(syn::Error::new(right.span(), message));
+            });
+        }
+        stmts.remove(0);
     }
-    let Expr::Path(right) = &*assign.right else {
-        return Err(syn::Error::new(
-            assign.right.span(),
-            "math! backend must be `Host` or `Metal`",
-        ));
-    };
-    let backend = if right.path.is_ident("Host") {
-        BackendChoice::Host
-    } else if right.path.is_ident("Metal") {
-        BackendChoice::Metal
-    } else {
-        return Err(syn::Error::new(
-            right.span(),
-            "math! backend must be `Host` or `Metal`",
-        ));
-    };
-    stmts.remove(0);
-    Ok(backend)
+    match (metal, dtype) {
+        (Some(true), Some((false, span))) => Err(syn::Error::new(
+            span,
+            "the Metal backend computes in f32; use `dtype = f32;` or the Host backend",
+        )),
+        (Some(true), _) => Ok(BackendChoice::Metal),
+        (_, Some((true, _))) => Ok(BackendChoice::HostF32),
+        _ => Ok(BackendChoice::Host),
+    }
 }
 
 fn validate_backend_type(ty: Ty, backend: BackendChoice, span: Span) -> syn::Result<()> {
-    if backend == BackendChoice::Metal && (ty.complex || ty.dual) {
+    if backend.is_metal() && (ty.complex || ty.dual) {
         return Err(syn::Error::new(
             span,
             "the Metal backend supports real f32 values only (no `i` or `d` literals)",
@@ -819,7 +864,7 @@ fn lower(expr: &Expr, target: Ty, env: &Env, backend: BackendChoice) -> syn::Res
                 quote!(::tensorcrate::tensors::Vector::<#element_type, ::tensorcrate::tensors::Host>::new([#(#values),*]))
             };
             Ok(match backend {
-                BackendChoice::Host => host,
+                BackendChoice::Host | BackendChoice::HostF32 => host,
                 BackendChoice::Metal => {
                     quote!((#host).to_backend::<::tensorcrate::tensors::Metal>())
                 }
@@ -863,7 +908,7 @@ fn lower_literal(
         .map_err(|_| syn::Error::new(lit.span(), "invalid numeric literal"))?;
     let value = match backend {
         BackendChoice::Host => Literal::f64_suffixed(value),
-        BackendChoice::Metal => Literal::f32_suffixed(value as f32),
+        BackendChoice::HostF32 | BackendChoice::Metal => Literal::f32_suffixed(value as f32),
     };
 
     // Build the coefficient first: `2i` is `0 + 2i`, anything else is purely
@@ -1087,10 +1132,10 @@ fn lower_call(
             let value = tensor_arg(0, env)?;
             let descending = args.get(1).map_or(Ok(false), |order| sort_order(order))?;
             Ok(match backend {
-                BackendChoice::Host if descending => {
+                BackendChoice::Host | BackendChoice::HostF32 if descending => {
                     quote!((#value).sorted_by(|__a, __b| __b.total_cmp(__a)))
                 }
-                BackendChoice::Host => {
+                BackendChoice::Host | BackendChoice::HostF32 => {
                     quote!((#value).sorted_by(|__a, __b| __a.total_cmp(__b)))
                 }
                 BackendChoice::Metal if descending => quote!((#value).sorted(
@@ -1162,7 +1207,7 @@ fn lower_call(
         ("inv", 1) => {
             let a = tensor_arg(0, env)?;
             Ok(match backend {
-                BackendChoice::Host => quote!((#a).inverse()?),
+                BackendChoice::Host | BackendChoice::HostF32 => quote!((#a).inverse()?),
                 BackendChoice::Metal => quote!((#a)
                     .to_backend::<::tensorcrate::tensors::Host>()
                     .inverse()?
@@ -1172,7 +1217,7 @@ fn lower_call(
         ("det", 1) => {
             let a = tensor_arg(0, env)?;
             Ok(match backend {
-                BackendChoice::Host => quote!((#a).determinant()),
+                BackendChoice::Host | BackendChoice::HostF32 => quote!((#a).determinant()),
                 BackendChoice::Metal => quote!((#a)
                     .to_backend::<::tensorcrate::tensors::Host>()
                     .determinant()),
@@ -1275,7 +1320,7 @@ fn elementwise(function: TokenStream, value: TokenStream, target: Ty) -> TokenSt
 fn zero_of(complex: bool, backend: BackendChoice) -> TokenStream {
     let zero = match backend {
         BackendChoice::Host => quote!(0f64),
-        BackendChoice::Metal => quote!(0f32),
+        BackendChoice::HostF32 | BackendChoice::Metal => quote!(0f32),
     };
     if complex {
         quote!(::tensorcrate::numbers::Complex::constant(#zero))
@@ -1288,7 +1333,7 @@ fn zero_of(complex: bool, backend: BackendChoice) -> TokenStream {
 ///
 /// The axes are handled in order: lift the coefficients to complex, then wrap in
 /// a dual. A tensor is widened by mapping the same conversion over its elements.
-/// Narrowing never happens — `infer` already unified to the wider type.
+/// Narrowing never happens.
 fn widen(value: TokenStream, from: Ty, to: Ty, backend: BackendChoice) -> TokenStream {
     if from.is_tensor() {
         // The element conversion, expressed on a bound element.
@@ -1297,7 +1342,9 @@ fn widen(value: TokenStream, from: Ty, to: Ty, backend: BackendChoice) -> TokenS
             value
         } else {
             match backend {
-                BackendChoice::Host => quote!((#value).map(|&__x| #converted)),
+                BackendChoice::Host | BackendChoice::HostF32 => {
+                    quote!((#value).map(|&__x| #converted))
+                }
                 BackendChoice::Metal => unreachable!("Metal values cannot require widening"),
             }
         };
@@ -1360,6 +1407,20 @@ mod tests {
         assert!(
             expansion_error(quote! { backend = Metal; [1 + 1i] })
                 .contains("Metal backend supports real f32 values only")
+        );
+    }
+
+    #[test]
+    fn dtype_directives_are_validated() {
+        assert!(expansion_error(quote! { dtype = f16; [1, 2] }).contains("dtype must be `f32`"));
+        assert!(
+            expansion_error(quote! { backend = Metal; dtype = f64; [1, 2] })
+                .contains("Metal backend computes in f32")
+        );
+        assert!(expansion_error(quote! { dtype = f32; dtype = f64; [1, 2] }).contains("set twice"));
+        assert!(
+            expansion_error(quote! { backend = Host; backend = Host; [1, 2] })
+                .contains("set twice")
         );
     }
 

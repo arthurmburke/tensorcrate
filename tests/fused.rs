@@ -63,11 +63,11 @@ const LENGTHS: [usize; 9] = [0, 1, 3, 15, 16, 17, 1023, 1025, 3001];
 mod reference {
     use tensorcrate::optim::Parameter;
 
-    pub fn sgd<P: Parameter>(rate: f32, p: &mut P, g: &P) {
+    pub fn sgd<P: Parameter<Elem = f32>>(rate: f32, p: &mut P, g: &P) {
         *p = p.subtract(&g.scale(rate));
     }
 
-    pub fn momentum<P: Parameter>(
+    pub fn momentum<P: Parameter<Elem = f32>>(
         rate: f32,
         mu: f32,
         nesterov: bool,
@@ -88,7 +88,13 @@ mod reference {
         *velocity = Some(v);
     }
 
-    pub fn adagrad<P: Parameter>(rate: f32, eps: f32, total: &mut Option<P>, p: &mut P, g: &P) {
+    pub fn adagrad<P: Parameter<Elem = f32>>(
+        rate: f32,
+        eps: f32,
+        total: &mut Option<P>,
+        p: &mut P,
+        g: &P,
+    ) {
         let squared = g.multiply(g);
         let t = match total.take() {
             Some(previous) => previous.add(&squared),
@@ -99,7 +105,7 @@ mod reference {
         *total = Some(t);
     }
 
-    pub fn rmsprop<P: Parameter>(
+    pub fn rmsprop<P: Parameter<Elem = f32>>(
         rate: f32,
         decay: f32,
         eps: f32,
@@ -123,7 +129,7 @@ mod reference {
         pub steps: u32,
     }
 
-    pub fn adam<P: Parameter>(
+    pub fn adam<P: Parameter<Elem = f32>>(
         (rate, b1, b2, eps): (f32, f32, f32, f32),
         state: &mut Adam<P>,
         p: &mut P,
@@ -152,7 +158,7 @@ mod reference {
 
 /// Drive every rule and its reference side by side for several steps, with a
 /// fresh gradient each step, and demand identical bits after each one.
-fn rules_match_their_references<P: Parameter>(
+fn rules_match_their_references<P: Parameter<Elem = f32>>(
     start: &P,
     gradients: &[P],
     bits: impl Fn(&P) -> Vec<f32>,
@@ -363,7 +369,7 @@ fn random_programs_agree_with_their_unfused_evaluation_bit_for_bit() {
 #[test]
 fn remapped_loads_read_transposed_and_broadcast_operands() {
     // out[r][c] = a[r][c] + bᵀ[r][c] · row[c] − col[r], over a 3×4 space.
-    let mut b = Builder::new();
+    let mut b = Builder::<f32>::new();
     let a = b.input(DType::F32);
     let t = b.input_remapped(DType::F32, Remap::Transpose);
     let row = b.input_remapped(DType::F32, Remap::Row);
@@ -409,7 +415,7 @@ fn remaps_survive_tile_boundaries() {
     // A tall space, so tiles start mid-row, with every remap in one program.
     let mut rng = Lcg(5);
     let (rows, cols) = (300, 7);
-    let mut b = Builder::new();
+    let mut b = Builder::<f32>::new();
     let t = b.input_remapped(DType::F32, Remap::Transpose);
     let row = b.input_remapped(DType::F32, Remap::Row);
     let col = b.input_remapped(DType::F32, Remap::Column);
@@ -463,7 +469,7 @@ fn in_place_tensors_are_read_then_overwritten() {
 
 #[test]
 fn compact_types_widen_on_load_and_narrow_on_store() {
-    let mut b = Builder::new();
+    let mut b = Builder::<f32>::new();
     let h = b.input(DType::F16);
     let bf = b.input(DType::Bf16);
     let sum = b.add(h, bf);
@@ -697,7 +703,7 @@ fn the_builder_reuses_registers_once_values_die() {
 #[test]
 #[should_panic(expected = "needs 4")]
 fn a_short_input_is_caught_before_running() {
-    let mut b = Builder::new();
+    let mut b = Builder::<f32>::new();
     let x = b.input(DType::F32);
     b.output(x, DType::F32);
     let program = b.build().unwrap();
@@ -816,7 +822,7 @@ fn metal_remaps_in_place_updates_and_compact_types() {
     let mut rng = Lcg(8);
     let (rows, cols) = (33, 70);
 
-    let mut b = Builder::new();
+    let mut b = Builder::<f32>::new();
     let t = b.input_remapped(DType::F32, Remap::Transpose);
     let row = b.input_remapped(DType::Bf16, Remap::Row);
     let col = b.input_remapped(DType::F16, Remap::Column);

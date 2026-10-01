@@ -7,7 +7,7 @@
 //! another that has no idea how big it is.
 //!
 //! The element type needs protection that a shape no longer does, and is the
-//! harder half. The numeric tower in [`numbers`](crate::numbers) has ten leaf
+//! harder half. The numeric tower in [`numbers`](crate::numbers) has twelve leaf
 //! types and lets [`Complex`] and [`Dual`] nest without limit, and it
 //! deliberately carries no runtime type tag. Nothing in four `f32` distinguishes
 //! them from four `i32` once they reach a file, so the format records an element
@@ -67,7 +67,7 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 use crate::errors::Error;
-use crate::numbers::{Coefficient, Complex, Dual};
+use crate::numbers::{Coefficient, Complex, Dual, bf16, f16};
 use crate::tensors::{Host, Matrix, Vector};
 
 const MAGIC: [u8; 4] = *b"TCR1";
@@ -123,7 +123,7 @@ macro_rules! primitive_storable {
 primitive_storable! {
     i8 => 0x01, u8 => 0x02, i16 => 0x03, u16 => 0x04,
     i32 => 0x05, u32 => 0x06, i64 => 0x07, u64 => 0x08,
-    f32 => 0x10, f64 => 0x11,
+    f32 => 0x10, f64 => 0x11, f16 => 0x12, bf16 => 0x13,
 }
 
 impl<T: Storable> Storable for Complex<T> {
@@ -191,6 +191,8 @@ fn describe(tag: &[u8]) -> String {
             0x08 => "u64".to_string(),
             0x10 => "f32".to_string(),
             0x11 => "f64".to_string(),
+            0x12 => "f16".to_string(),
+            0x13 => "bf16".to_string(),
             TAG_COMPLEX => format!("Complex<{}>", walk(tag, at)),
             TAG_DUAL => format!("Dual<{}>", walk(tag, at)),
             other => format!("<unknown tag 0x{other:02x}>"),

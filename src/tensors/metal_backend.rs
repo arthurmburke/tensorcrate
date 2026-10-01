@@ -22,10 +22,14 @@
 //! dispatch is encoded.
 //!
 //! Operations with no GPU kernel at all — such as [`Matrix::determinant`] and
-//! [`Matrix::inverse`] — are not implemented for this backend. The complete
-//! operation set is `f32`; `f16` and `bf16` expose conversion plus same-format
-//! and widened matrix products. Reach other operations through
-//! [`to_backend::<Host>()`](Matrix::to_backend).
+//! [`Matrix::inverse`] — are not implemented for this backend. Reach them
+//! through [`to_backend::<Host>()`](Matrix::to_backend).
+//!
+//! Everything here is defined for every [`MetalElement`] — `f32`, `f16` and
+//! `bf16` — and runs that type's own kernels: a `Vector<f16, Metal>` adds in
+//! `half`. Sums, products and moments accumulate in `f32` and round to the
+//! element type once. `f16` and `bf16` also convert to and from `f32`, and
+//! have a matrix product with an `f32` result.
 //!
 //! [`Matrix::determinant`]: super::Matrix::determinant
 //! [`Matrix::inverse`]: super::Matrix::inverse
@@ -41,6 +45,7 @@ use super::{
     Analytic, Backend, BinaryOp, Compare, Host, Kernels, Matrix, Metal, Reduce, SortOrder, Vector,
     assert_inner, assert_ordered_bounds, assert_same_len, assert_same_shape,
 };
+use crate::metal::MetalElement;
 
 macro_rules! low_precision_tensors {
     ($ty:ty) => {
@@ -65,10 +70,6 @@ macro_rules! low_precision_tensors {
                     .map(f32::from)
                     .collect::<Vec<_>>();
                 Vector::build(&converted)
-            }
-
-            pub fn is_device_resident(&self) -> bool {
-                self.storage().is_device_resident()
             }
         }
 
@@ -95,26 +96,6 @@ macro_rules! low_precision_tensors {
                 Matrix::build(self.rows(), self.cols(), &converted)
             }
 
-            pub fn is_device_resident(&self) -> bool {
-                self.storage().is_device_resident()
-            }
-
-            /// TensorOps product with same-format cooperative accumulation and
-            /// compact output storage. On non-M5 GPUs, the operation
-            /// transparently falls back through Host arithmetic.
-            #[track_caller]
-            pub fn matmul(&self, other: &Self) -> Self {
-                assert_inner(self.shape(), other.shape(), "matmul");
-                let (rows, inner, cols) = (self.rows(), self.cols(), other.cols());
-                match self.storage().matmul(other.storage(), rows, inner, cols) {
-                    Some(data) => Matrix::from_storage(rows, cols, data),
-                    None => self
-                        .to_backend::<Host>()
-                        .matmul(&other.to_backend::<Host>())
-                        .to_backend(),
-                }
-            }
-
             /// TensorOps product with widened FP32 accumulation and output.
             #[track_caller]
             pub fn matmul_f32(&self, other: &Self) -> Matrix<f32, Metal> {
@@ -139,7 +120,7 @@ macro_rules! low_precision_tensors {
 low_precision_tensors!(f16);
 low_precision_tensors!(bf16);
 
-impl Vector<f32, Metal> {
+impl<T: MetalElement> Vector<T, Metal> {
     /// Whether the elements really are in GPU-shared memory.
     ///
     /// `false` means the process has no Metal device, so this vector fell back
@@ -153,13 +134,14 @@ impl Vector<f32, Metal> {
     /// The reduction runs on the CPU, reading both shared allocations in place —
     /// shared storage is ordinary cached memory from the CPU's side, so this
     /// still copies nothing. The GPU alternative available here, a `1×N` by
-    /// `N×1` matmul, would run the whole sum on a single thread.
+    /// `N×1` matmul, would run the whole sum on a single thread. The sum
+    /// accumulates in `f32` and rounds to `T` once.
     ///
     /// # Panics
     ///
     /// If the two lengths differ.
     #[track_caller]
-    pub fn dot(&self, other: &Self) -> f32 {
+    pub fn dot(&self, other: &Self) -> T {
         assert_same_len(self.len(), other.len(), "dot");
         reduce_dot(self.as_slice(), other.as_slice())
     }
@@ -170,7 +152,7 @@ impl Vector<f32, Metal> {
     ///
     /// If this vector's length is not the matrix's row count.
     #[track_caller]
-    pub fn vecmat(&self, m: &Matrix<f32, Metal>) -> Vector<f32, Metal> {
+    pub fn vecmat(&self, m: &Matrix<T, Metal>) -> Vector<T, Metal> {
         assert_inner((1, self.len()), m.shape(), "vecmat");
         let (rows, cols) = m.shape();
         match self.storage().matmul(m.storage(), 1, rows, cols) {
@@ -185,8 +167,8 @@ impl Vector<f32, Metal> {
     /// Apply an analytic function elementwise, on the GPU.
     ///
     /// The host tensor of the same name maps the scalar trait from
-    /// [`crate::numbers`] over its elements; those go through `Float`, which the
-    /// 32-bit shaders cannot, so resident tensors run the unary kernel instead.
+    /// [`crate::numbers`] over its elements; resident tensors run the unary
+    /// kernel compiled for their element type instead.
     /// Both spellings — this and the named methods in
     /// [`analytic`](crate::tensors::analytic) — are the same operation.
     pub fn analytic(&self, f: Analytic) -> Self {
@@ -210,7 +192,7 @@ impl Vector<f32, Metal> {
     }
 
     /// Elementwise comparison against a scalar, on the GPU.
-    pub fn compare_scalar(&self, scalar: f32, op: Compare, scalar_left: bool) -> Self {
+    pub fn compare_scalar(&self, scalar: T, op: Compare, scalar_left: bool) -> Self {
         match self.storage().compare_scalar(scalar, op, scalar_left) {
             Some(data) => Vector::from_storage(self.len(), data),
             None => {
@@ -241,13 +223,13 @@ impl Vector<f32, Metal> {
     }
 
     /// The lesser of each element and `scalar`, on the GPU.
-    pub fn min_scalar(&self, scalar: f32) -> Self {
+    pub fn min_scalar(&self, scalar: T) -> Self {
         self.compare_scalar(scalar, Compare::Min, false)
     }
 
     /// The greater of each element and `scalar`, on the GPU — `max_scalar(0.0)`
     /// is a relu.
-    pub fn max_scalar(&self, scalar: f32) -> Self {
+    pub fn max_scalar(&self, scalar: T) -> Self {
         self.compare_scalar(scalar, Compare::Max, false)
     }
 
@@ -257,7 +239,7 @@ impl Vector<f32, Metal> {
     ///
     /// If `low > high`.
     #[track_caller]
-    pub fn clamp(&self, low: f32, high: f32) -> Self {
+    pub fn clamp(&self, low: T, high: T) -> Self {
         assert_ordered_bounds(&low, &high);
         match self.storage().clamp(low, high) {
             Some(data) => Vector::from_storage(self.len(), data),
@@ -271,25 +253,26 @@ impl Vector<f32, Metal> {
     /// The answer is a number rather than a tensor, so this necessarily comes
     /// back to the CPU: it is a synchronization point, unlike the operations
     /// that leave their result resident.
-    pub fn reduce(&self, op: Reduce) -> f32 {
+    pub fn reduce(&self, op: Reduce) -> T {
         match self.storage().reduce(op) {
-            Some(value) => value,
+            // The fold ran in `f32`; this is its one rounding to `T`.
+            Some(value) => T::from_f64(f64::from(value)),
             None => Host::vector_reduce(&self.to_backend::<Host>(), op),
         }
     }
 
     /// The sum of every element.
-    pub fn sum(&self) -> f32 {
+    pub fn sum(&self) -> T {
         self.reduce(Reduce::Sum)
     }
 
     /// The smallest element, or `None` when there are none.
-    pub fn minimum(&self) -> Option<f32> {
+    pub fn minimum(&self) -> Option<T> {
         (!self.is_empty()).then(|| self.reduce(Reduce::Min))
     }
 
     /// The largest element, or `None` when there are none.
-    pub fn maximum(&self) -> Option<f32> {
+    pub fn maximum(&self) -> Option<T> {
         (!self.is_empty()).then(|| self.reduce(Reduce::Max))
     }
 
@@ -308,7 +291,7 @@ impl Vector<f32, Metal> {
     /// Sort in [`SortOrder`]'s total order, staying resident.
     ///
     /// A bitonic sort over integer sort keys, so the result matches a host
-    /// [`f32::total_cmp`] sort exactly, NaNs included.
+    /// total-order sort exactly, NaNs included.
     pub fn sorted(&self, order: SortOrder) -> Self {
         match self.storage().sort(order) {
             Some(data) => Vector::from_storage(self.len(), data),
@@ -322,20 +305,20 @@ impl Vector<f32, Metal> {
     /// leaves the device: the elements are read out of shared memory, sorted on
     /// the CPU, and stored back. [`sorted`](Self::sorted) is the resident
     /// version, and covers everything a total order can express.
-    pub fn sorted_by(&self, compare: impl FnMut(&f32, &f32) -> Ordering) -> Self {
+    pub fn sorted_by(&self, compare: impl FnMut(&T, &T) -> Ordering) -> Self {
         let mut values = self.to_vec();
         values.sort_by(compare);
         Vector::new(values).to_backend()
     }
 
     /// Multiply every element by `scalar`, on the GPU.
-    pub fn scale(&self, scalar: f32) -> Self {
+    pub fn scale(&self, scalar: T) -> Self {
         self.broadcast_right(scalar, BinaryOp::Mul)
     }
 
     /// Implementation hook used by `math!` for tensor/scalar broadcasting.
     #[doc(hidden)]
-    pub fn broadcast_right(&self, scalar: f32, op: BinaryOp) -> Self {
+    pub fn broadcast_right(&self, scalar: T, op: BinaryOp) -> Self {
         match self.storage().broadcast(scalar, op, false) {
             Some(data) => Vector::from_storage(self.len(), data),
             None => self
@@ -347,7 +330,7 @@ impl Vector<f32, Metal> {
 
     /// Implementation hook used by `math!` for scalar/tensor broadcasting.
     #[doc(hidden)]
-    pub fn broadcast_left(&self, scalar: f32, op: BinaryOp) -> Self {
+    pub fn broadcast_left(&self, scalar: T, op: BinaryOp) -> Self {
         match self.storage().broadcast(scalar, op, true) {
             Some(data) => Vector::from_storage(self.len(), data),
             None => self
@@ -358,7 +341,7 @@ impl Vector<f32, Metal> {
     }
 }
 
-impl Matrix<f32, Metal> {
+impl<T: MetalElement> Matrix<T, Metal> {
     /// Whether the elements really are in GPU-shared memory; see
     /// [`Vector::is_device_resident`].
     pub fn is_device_resident(&self) -> bool {
@@ -372,7 +355,7 @@ impl Matrix<f32, Metal> {
     ///
     /// If this matrix's column count is not the other's row count.
     #[track_caller]
-    pub fn matmul(&self, other: &Matrix<f32, Metal>) -> Matrix<f32, Metal> {
+    pub fn matmul(&self, other: &Matrix<T, Metal>) -> Matrix<T, Metal> {
         assert_inner(self.shape(), other.shape(), "matmul");
         let (rows, inner, cols) = (self.rows(), self.cols(), other.cols());
         match self.storage().matmul(other.storage(), rows, inner, cols) {
@@ -398,7 +381,7 @@ impl Matrix<f32, Metal> {
         let mut power = power.to_i32().expect("expected a valid integer");
 
         // Requires a single memcpy of memory on the host to metal.
-        let mut result = Matrix::<f32, Host>::identity(r).to_backend::<Metal>();
+        let mut result = Matrix::<T, Host>::identity(r).to_backend::<Metal>();
         let mut base = self.clone();
 
         while power > 0 {
@@ -424,9 +407,9 @@ impl Matrix<f32, Metal> {
     #[track_caller]
     pub fn matmul_add(
         &self,
-        other: &Matrix<f32, Metal>,
-        mut addend: Matrix<f32, Metal>,
-    ) -> Matrix<f32, Metal> {
+        other: &Matrix<T, Metal>,
+        mut addend: Matrix<T, Metal>,
+    ) -> Matrix<T, Metal> {
         assert_inner(self.shape(), other.shape(), "matmul_add");
         assert_same_shape(
             addend.shape(),
@@ -452,7 +435,7 @@ impl Matrix<f32, Metal> {
     ///
     /// If the vector's length is not this matrix's column count.
     #[track_caller]
-    pub fn matvec(&self, v: &Vector<f32, Metal>) -> Vector<f32, Metal> {
+    pub fn matvec(&self, v: &Vector<T, Metal>) -> Vector<T, Metal> {
         assert_inner(self.shape(), (v.len(), 1), "matvec");
         let (rows, cols) = self.shape();
         match self.storage().matmul(v.storage(), rows, cols, 1) {
@@ -475,9 +458,9 @@ impl Matrix<f32, Metal> {
     #[track_caller]
     pub fn matvec_add(
         &self,
-        v: &Vector<f32, Metal>,
-        mut addend: Vector<f32, Metal>,
-    ) -> Vector<f32, Metal> {
+        v: &Vector<T, Metal>,
+        mut addend: Vector<T, Metal>,
+    ) -> Vector<T, Metal> {
         assert_inner(self.shape(), (v.len(), 1), "matvec_add");
         assert_same_len(addend.len(), self.rows(), "matvec_add addend");
         let (rows, cols) = self.shape();
@@ -494,7 +477,7 @@ impl Matrix<f32, Metal> {
     }
 
     /// Transpose: an `R×C` matrix becomes `C×R`.
-    pub fn transpose(&self) -> Matrix<f32, Metal> {
+    pub fn transpose(&self) -> Matrix<T, Metal> {
         let (rows, cols) = self.shape();
         match self.storage().transpose(rows, cols) {
             Some(data) => Matrix::from_storage(cols, rows, data),
@@ -527,7 +510,7 @@ impl Matrix<f32, Metal> {
     }
 
     /// Elementwise comparison against a scalar, on the GPU.
-    pub fn compare_scalar(&self, scalar: f32, op: Compare, scalar_left: bool) -> Self {
+    pub fn compare_scalar(&self, scalar: T, op: Compare, scalar_left: bool) -> Self {
         let (rows, cols) = self.shape();
         match self.storage().compare_scalar(scalar, op, scalar_left) {
             Some(data) => Matrix::from_storage(rows, cols, data),
@@ -559,12 +542,12 @@ impl Matrix<f32, Metal> {
     }
 
     /// The lesser of each element and `scalar`.
-    pub fn min_scalar(&self, scalar: f32) -> Self {
+    pub fn min_scalar(&self, scalar: T) -> Self {
         self.compare_scalar(scalar, Compare::Min, false)
     }
 
     /// The greater of each element and `scalar`.
-    pub fn max_scalar(&self, scalar: f32) -> Self {
+    pub fn max_scalar(&self, scalar: T) -> Self {
         self.compare_scalar(scalar, Compare::Max, false)
     }
 
@@ -574,7 +557,7 @@ impl Matrix<f32, Metal> {
     ///
     /// If `low > high`.
     #[track_caller]
-    pub fn clamp(&self, low: f32, high: f32) -> Self {
+    pub fn clamp(&self, low: T, high: T) -> Self {
         assert_ordered_bounds(&low, &high);
         let (rows, cols) = self.shape();
         match self.storage().clamp(low, high) {
@@ -584,13 +567,13 @@ impl Matrix<f32, Metal> {
     }
 
     /// Multiply every element by `scalar`, on the GPU.
-    pub fn scale(&self, scalar: f32) -> Self {
+    pub fn scale(&self, scalar: T) -> Self {
         self.broadcast_right(scalar, BinaryOp::Mul)
     }
 
     /// Implementation hook used by `math!` for tensor/scalar broadcasting.
     #[doc(hidden)]
-    pub fn broadcast_right(&self, scalar: f32, op: BinaryOp) -> Self {
+    pub fn broadcast_right(&self, scalar: T, op: BinaryOp) -> Self {
         let (rows, cols) = self.shape();
         match self.storage().broadcast(scalar, op, false) {
             Some(data) => Matrix::from_storage(rows, cols, data),
@@ -603,7 +586,7 @@ impl Matrix<f32, Metal> {
 
     /// Implementation hook used by `math!` for scalar/tensor broadcasting.
     #[doc(hidden)]
-    pub fn broadcast_left(&self, scalar: f32, op: BinaryOp) -> Self {
+    pub fn broadcast_left(&self, scalar: T, op: BinaryOp) -> Self {
         let (rows, cols) = self.shape();
         match self.storage().broadcast(scalar, op, true) {
             Some(data) => Matrix::from_storage(rows, cols, data),
@@ -615,25 +598,39 @@ impl Matrix<f32, Metal> {
     }
 }
 
-/// Sum of products over two CPU-readable slices, vectorized where possible.
-fn reduce_dot(a: &[f32], b: &[f32]) -> f32 {
+/// Sum of products over two CPU-readable slices, vectorized where possible,
+/// accumulated in `f32` and rounded to `T` once.
+fn reduce_dot<T: MetalElement>(a: &[T], b: &[T]) -> T {
+    if let Some(total) = crate::compact::dot(a, b) {
+        return total;
+    }
     #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        crate::simd::f32k::dot(a, b)
+    if let (Some(a), Some(b)) = (as_f32(a), as_f32(b)) {
+        return T::from_f64(f64::from(crate::simd::f32k::dot(a, b)));
     }
-    #[cfg(not(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64"))))]
-    {
-        a.iter().zip(b).map(|(x, y)| x * y).sum()
-    }
+    let total: f32 = a
+        .iter()
+        .zip(b)
+        .map(|(&x, &y)| x.into_f64() as f32 * y.into_f64() as f32)
+        .sum();
+    T::from_f64(f64::from(total))
+}
+
+/// `values` as `f32`s, when that is what they are.
+#[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
+fn as_f32<T: 'static>(values: &[T]) -> Option<&[f32]> {
+    // SAFETY: equal `TypeId`s mean one type, so the layouts are identical.
+    (std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>())
+        .then(|| unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<f32>(), values.len()) })
 }
 
 /// Elementwise `op` over two resident vectors, in shared memory.
 #[track_caller]
-pub(super) fn vector_elementwise(
-    a: &Vector<f32, Metal>,
-    b: &Vector<f32, Metal>,
+pub(super) fn vector_elementwise<T: MetalElement>(
+    a: &Vector<T, Metal>,
+    b: &Vector<T, Metal>,
     op: BinaryOp,
-) -> Vector<f32, Metal> {
+) -> Vector<T, Metal> {
     assert_same_len(a.len(), b.len(), op.name());
     match a.storage().elementwise(b.storage(), op) {
         Some(data) => Vector::from_storage(a.len(), data),
@@ -644,11 +641,11 @@ pub(super) fn vector_elementwise(
 
 /// Elementwise `op` over two resident matrices, in shared memory.
 #[track_caller]
-pub(super) fn matrix_elementwise(
-    a: &Matrix<f32, Metal>,
-    b: &Matrix<f32, Metal>,
+pub(super) fn matrix_elementwise<T: MetalElement>(
+    a: &Matrix<T, Metal>,
+    b: &Matrix<T, Metal>,
     op: BinaryOp,
-) -> Matrix<f32, Metal> {
+) -> Matrix<T, Metal> {
     assert_same_shape(a.shape(), b.shape(), op.name());
     let (rows, cols) = a.shape();
     match a.storage().elementwise(b.storage(), op) {
@@ -664,7 +661,7 @@ pub(super) fn matrix_elementwise(
 /// what most code wants: `&a * &b` leaves both operands usable.
 macro_rules! resident_operator {
     ($Type:ident, $Trait:ident, $method:ident, $op:expr, $apply:ident) => {
-        impl $Trait for $Type<f32, Metal> {
+        impl<T: MetalElement> $Trait for $Type<T, Metal> {
             type Output = Self;
             #[track_caller]
             fn $method(self, rhs: Self) -> Self::Output {
@@ -672,10 +669,10 @@ macro_rules! resident_operator {
             }
         }
 
-        impl $Trait<&$Type<f32, Metal>> for &$Type<f32, Metal> {
-            type Output = $Type<f32, Metal>;
+        impl<T: MetalElement> $Trait<&$Type<T, Metal>> for &$Type<T, Metal> {
+            type Output = $Type<T, Metal>;
             #[track_caller]
-            fn $method(self, rhs: &$Type<f32, Metal>) -> Self::Output {
+            fn $method(self, rhs: &$Type<T, Metal>) -> Self::Output {
                 $apply(self, rhs, $op)
             }
         }
@@ -693,37 +690,37 @@ resident_operator!(Matrix, Mul, mul, BinaryOp::Mul, matrix_elementwise);
 resident_operator!(Matrix, Div, div, BinaryOp::Div, matrix_elementwise);
 resident_operator!(Matrix, Rem, rem, BinaryOp::Rem, matrix_elementwise);
 
-impl Neg for Vector<f32, Metal> {
+impl<T: MetalElement> Neg for Vector<T, Metal> {
     type Output = Self;
     fn neg(self) -> Self {
-        self.broadcast_right(-1.0, BinaryOp::Mul)
+        self.broadcast_right(-T::one(), BinaryOp::Mul)
     }
 }
 
-impl Neg for &Vector<f32, Metal> {
-    type Output = Vector<f32, Metal>;
+impl<T: MetalElement> Neg for &Vector<T, Metal> {
+    type Output = Vector<T, Metal>;
     fn neg(self) -> Self::Output {
-        self.broadcast_right(-1.0, BinaryOp::Mul)
+        self.broadcast_right(-T::one(), BinaryOp::Mul)
     }
 }
 
-impl Neg for Matrix<f32, Metal> {
+impl<T: MetalElement> Neg for Matrix<T, Metal> {
     type Output = Self;
     fn neg(self) -> Self {
-        self.broadcast_right(-1.0, BinaryOp::Mul)
+        self.broadcast_right(-T::one(), BinaryOp::Mul)
     }
 }
 
-impl Neg for &Matrix<f32, Metal> {
-    type Output = Matrix<f32, Metal>;
+impl<T: MetalElement> Neg for &Matrix<T, Metal> {
+    type Output = Matrix<T, Metal>;
     fn neg(self) -> Self::Output {
-        self.broadcast_right(-1.0, BinaryOp::Mul)
+        self.broadcast_right(-T::one(), BinaryOp::Mul)
     }
 }
 
 // The same formatting as the host-backed tensors, so a backend switch does not
 // change what a printed tensor looks like.
-impl Display for Vector<f32, Metal> {
+impl<T: MetalElement> Display for Vector<T, Metal> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "[")?;
         for x in self.as_slice() {
@@ -733,7 +730,7 @@ impl Display for Vector<f32, Metal> {
     }
 }
 
-impl Display for Matrix<f32, Metal> {
+impl<T: MetalElement> Display for Matrix<T, Metal> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let values = self.as_slice();
         let (rows, cols) = self.shape();

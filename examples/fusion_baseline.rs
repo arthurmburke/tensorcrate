@@ -1,4 +1,4 @@
-//! What one training step costs, in kernels, bytes and allocations — with and
+//! What one training step costs, in kernels, bytes and allocations, with and
 //! without fusion, on each backend.
 //!
 //! ```text
@@ -8,7 +8,7 @@
 //! Three workloads, the ones the fusion plan baselines:
 //!
 //! 1. an Adam update of a 1M-element parameter tensor;
-//! 2. one softmax cross-entropy step — forward, backward and an Adam update —
+//! 2. one softmax cross-entropy step: forward, backward and an Adam update —
 //!    for a linear classifier;
 //! 3. one step of a two-layer MLP, every weight and bias updated by Adam.
 //!

@@ -155,9 +155,9 @@ mod disabled {
 )]
 pub(crate) use disabled::{command_buffer, kernel, sync};
 
-/// Record one elementwise-shaped kernel: `inputs` operands of `len` `f32`s read
+/// Record one elementwise-shaped kernel: `inputs` operands of `len` `T`s read
 /// and one `len`-long result written into a fresh allocation.
 #[inline(always)]
-pub(crate) fn elementwise(len: usize, inputs: usize) {
-    kernel((inputs + 1) * len * size_of::<f32>(), 1);
+pub(crate) fn elementwise_of<T>(len: usize, inputs: usize) {
+    kernel((inputs + 1) * len * size_of::<T>(), 1);
 }
