@@ -1,0 +1,1111 @@
+//! Static kernel fusion for `math!`.
+//!
+//! A `math!` block is a whole program the macro can see at once, with every
+//! tensor's shape known at expansion time, so the fusion decisions that a lazy
+//! backend would make at runtime can be made here instead, for free.
+//!
+//! # What fuses
+//!
+//! An *elementwise* operation is one whose result element `(i, j)` depends only
+//! on element `(i, j)` of its real tensor operands: `+ − × ÷ %` between tensors
+//! or with a scalar, `.*`, negation, the analytic functions, `min`, `max` and
+//! `clamp`. A tree of them is a *group*, and a group becomes one kernel.
+//! Whatever feeds a group and is not elementwise — a literal, a product, a
+//! bound tensor — is a *leaf*, materialized as usual and read by the kernel.
+//! Scalar subexpressions are evaluated once, before the kernel, and enter it as
+//! constants.
+//!
+//! `transpose` is an index remap rather than arithmetic, and inside a group it
+//! is pushed down to the leaves (`(A + B)ᵀ = Aᵀ + Bᵀ`), where it becomes a
+//! transposed load. A transpose of a transpose cancels on the way.
+//!
+//! # Bindings
+//!
+//! A `let` whose value is elementwise is *inlined* into its consumers — never
+//! materialized — when every use is itself inside a group and either there is
+//! one use, or the value is cheap enough to recompute at each use (at most
+//! [`CHEAP_OPERATIONS`] operations and no transcendental functions: memory
+//! traffic costs more than a few additions, but not more than a `tan`).
+//! Anything else is materialized once.
+//!
+//! Consecutive materialized bindings that are each elementwise, have the same
+//! shape and do not depend on one another are fused *horizontally*: one kernel
+//! computes them all, reading the inputs they share only once.
+//!
+//! # Code generation
+//!
+//! On the host a group becomes one closure over the element index, which LLVM
+//! vectorizes; it performs exactly the operations the unfused kernels would, in
+//! the same order, so its results are identical bit for bit. On Metal a group
+//! becomes a register [`Program`](tensorcrate::tensors::fused::Program) for the
+//! fused bytecode shader. The macro allocates its registers itself and splits a
+//! group that would exceed the shader's register or input limits, so those
+//! limits are met by construction rather than checked at runtime.
+
+use std::collections::{HashMap, HashSet};
+
+use proc_macro2::{Ident, Literal, Span, TokenStream};
+use quote::{format_ident, quote};
+use syn::{BinOp, Expr, UnOp};
+
+use crate::{
+    ANALYTIC, BackendChoice, Env, Shape, Ty, call_name, elementwise_mul_operands, infer, lower,
+    matmul_operands, path_name,
+};
+
+/// Operations a value may take and still be recomputed at every use rather
+/// than materialized.
+const CHEAP_OPERATIONS: usize = 4;
+
+/// The fused shader's limits; see `tensors::fused`.
+const REGISTERS: usize = 16;
+const MAX_INPUTS: usize = 16;
+pub(crate) const MAX_OUTPUTS: usize = 8;
+const MAX_INSTRUCTIONS: usize = 256;
+
+// ---- recognizing elementwise operations ----------------------------------------
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Arith {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+}
+
+/// One elementwise operation, with its operands.
+enum Kind<'a> {
+    /// Parentheses or an invisible group: no operation at all.
+    Pass(&'a Expr),
+    Binary(Arith, &'a Expr, &'a Expr),
+    Neg(&'a Expr),
+    Unary(&'static str, &'a Expr),
+    /// `max` when true.
+    MinMax(bool, &'a Expr, &'a Expr),
+    Clamp(&'a Expr, &'a Expr, &'a Expr),
+    Transpose(&'a Expr),
+}
+
+fn is_real_tensor(ty: Ty) -> bool {
+    ty.is_tensor() && !ty.complex && !ty.dual
+}
+
+/// `expr` as an elementwise operation, if it is one: a real tensor result built
+/// by one of the operations a group can hold.
+fn kind<'a>(expr: &'a Expr, env: &Env) -> syn::Result<Option<Kind<'a>>> {
+    let ty = infer(expr, env)?;
+    if !is_real_tensor(ty) {
+        return Ok(None);
+    }
+    Ok(match expr {
+        Expr::Paren(p) => Some(Kind::Pass(&p.expr)),
+        Expr::Group(g) => Some(Kind::Pass(&g.expr)),
+        Expr::Unary(u) if matches!(u.op, UnOp::Neg(_)) => Some(Kind::Neg(&u.expr)),
+        Expr::Binary(b) => {
+            if matmul_operands(expr).is_some() {
+                None
+            } else if let Some((left, right)) = elementwise_mul_operands(expr) {
+                Some(Kind::Binary(Arith::Mul, left, right))
+            } else {
+                let arith = match b.op {
+                    BinOp::Add(_) => Arith::Add,
+                    BinOp::Sub(_) => Arith::Sub,
+                    // A product of two vectors is a dot product, which is not
+                    // elementwise — but then the result is a scalar, which the
+                    // tensor check above has already turned away.
+                    BinOp::Mul(_) => Arith::Mul,
+                    BinOp::Div(_) => Arith::Div,
+                    BinOp::Rem(_) => Arith::Rem,
+                    _ => return Ok(None),
+                };
+                Some(Kind::Binary(arith, &b.left, &b.right))
+            }
+        }
+        Expr::Call(call) => {
+            let name = call_name(call)?;
+            let args: Vec<&Expr> = call.args.iter().collect();
+            match (name.as_str(), args.len()) {
+                ("min", 2) => Some(Kind::MinMax(false, args[0], args[1])),
+                ("max", 2) => Some(Kind::MinMax(true, args[0], args[1])),
+                ("clamp", 3) => Some(Kind::Clamp(args[0], args[1], args[2])),
+                ("transpose", 1) => Some(Kind::Transpose(args[0])),
+                (_, 1) => ANALYTIC
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .map(|(n, _)| Kind::Unary(n, args[0])),
+                _ => None,
+            }
+        }
+        _ => None,
+    })
+}
+
+/// The operands of an elementwise operation, in order.
+fn operands<'a>(kind: &Kind<'a>) -> Vec<&'a Expr> {
+    match *kind {
+        Kind::Pass(e) | Kind::Neg(e) | Kind::Unary(_, e) | Kind::Transpose(e) => vec![e],
+        Kind::Binary(_, a, b) | Kind::MinMax(_, a, b) => vec![a, b],
+        Kind::Clamp(v, low, high) => vec![v, low, high],
+    }
+}
+
+/// How many operations fusing `expr` would save a kernel for, looking through
+/// inlined bindings, and whether any of them is transcendental.
+fn weigh(expr: &Expr, env: &Env) -> syn::Result<(usize, bool)> {
+    if let Expr::Path(p) = expr
+        && let Ok(name) = path_name(p)
+        && let Some(inlined) = env.inline.get(&name)
+    {
+        return weigh(&inlined.clone(), env);
+    }
+    let Some(kind) = kind(expr, env)? else {
+        return Ok((0, false));
+    };
+    let (mut count, mut expensive) = match kind {
+        Kind::Pass(_) => (0, false),
+        Kind::Unary(..) => (1, true),
+        _ => (1, false),
+    };
+    for operand in operands(&kind) {
+        let (c, e) = weigh(operand, env)?;
+        count += c;
+        expensive |= e;
+    }
+    Ok((count, expensive))
+}
+
+// ---- deciding what to inline ------------------------------------------------------
+
+/// Every identifier `expr` reads, function names aside.
+pub(crate) fn names(expr: &Expr, out: &mut HashSet<String>) {
+    match expr {
+        Expr::Path(p) => {
+            if let Some(ident) = p.path.get_ident() {
+                out.insert(ident.to_string());
+            }
+        }
+        Expr::Paren(p) => names(&p.expr, out),
+        Expr::Group(g) => names(&g.expr, out),
+        Expr::Unary(u) => names(&u.expr, out),
+        Expr::Binary(b) => {
+            names(&b.left, out);
+            names(&b.right, out);
+        }
+        Expr::Call(c) => c.args.iter().for_each(|a| names(a, out)),
+        Expr::Array(a) => a.elems.iter().for_each(|e| names(e, out)),
+        _ => {}
+    }
+}
+
+/// Record each use of a binding in `expr`, and whether it sits directly inside
+/// an elementwise operation — the only place inlining can put it.
+fn uses(
+    expr: &Expr,
+    env: &Env,
+    in_group: bool,
+    out: &mut HashMap<String, Vec<bool>>,
+) -> syn::Result<()> {
+    if let Expr::Path(p) = expr {
+        if let Some(ident) = p.path.get_ident() {
+            out.entry(ident.to_string()).or_default().push(in_group);
+        }
+        return Ok(());
+    }
+    // A product's operands are read whole, never elementwise. (`@` is spelled
+    // `a / marker / b` underneath, so this must come before the `/` below
+    // mistakes the inner half for a division.)
+    if let Some((left, right)) = matmul_operands(expr) {
+        uses(left, env, false, out)?;
+        return uses(right, env, false, out);
+    }
+    if let Some(kind) = kind(expr, env)? {
+        // A real-tensor operand of an elementwise operation can be inlined into
+        // it; a scalar operand only ever becomes a constant.
+        let inside = match kind {
+            Kind::Pass(_) => in_group,
+            _ => true,
+        };
+        for operand in operands(&kind) {
+            let tensor = is_real_tensor(infer(operand, env)?);
+            uses(operand, env, inside && tensor, out)?;
+        }
+        return Ok(());
+    }
+    match expr {
+        Expr::Paren(p) => uses(&p.expr, env, false, out),
+        Expr::Group(g) => uses(&g.expr, env, false, out),
+        Expr::Unary(u) => uses(&u.expr, env, false, out),
+        Expr::Binary(b) => {
+            uses(&b.left, env, false, out)?;
+            uses(&b.right, env, false, out)
+        }
+        Expr::Call(c) => c.args.iter().try_for_each(|a| uses(a, env, false, out)),
+        Expr::Array(a) => a.elems.iter().try_for_each(|e| uses(e, env, false, out)),
+        _ => Ok(()),
+    }
+}
+
+/// Decide which bindings fused lowering substitutes into their consumers.
+///
+/// `bindings` are the block's `let`s in order and `result` its final
+/// expression; `envs[k]` is the environment binding `k` was typed in, and
+/// `envs[bindings.len()]` the one the result is typed in.
+pub(crate) fn plan_inlining(
+    bindings: &[(String, &Expr)],
+    result: &Expr,
+    envs: &[Env],
+) -> syn::Result<HashMap<String, Expr>> {
+    let mut inline: HashMap<String, Expr> = HashMap::new();
+    for (k, (name, init)) in bindings.iter().enumerate() {
+        let env = &envs[k];
+        let Some(root) = kind(init, env)? else {
+            continue;
+        };
+        if matches!(root, Kind::Pass(_)) && weigh(init, env)?.0 == 0 {
+            continue;
+        }
+        // Substitution moves the expression to its uses, so nothing it reads
+        // may be rebound in between — and it must be the only binding of its
+        // own name, or uses would be ambiguous.
+        let mut read = HashSet::new();
+        names(init, &mut read);
+        let later = &bindings[k + 1..];
+        if later
+            .iter()
+            .any(|(other, _)| other == name || read.contains(other))
+        {
+            continue;
+        }
+
+        let mut found: HashMap<String, Vec<bool>> = HashMap::new();
+        for (j, (_, other)) in later.iter().enumerate() {
+            uses(other, &envs[k + 1 + j], false, &mut found)?;
+        }
+        uses(result, &envs[bindings.len()], false, &mut found)?;
+        let Some(sites) = found.get(name) else {
+            continue; // unused: keep it as written
+        };
+        if !sites.iter().all(|&in_group| in_group) {
+            continue;
+        }
+        let mut weighing = env.clone();
+        weighing.inline.clone_from(&inline);
+        let (operations, expensive) = weigh(init, &weighing)?;
+        if sites.len() == 1 || (operations <= CHEAP_OPERATIONS && !expensive) {
+            inline.insert(name.clone(), (*init).clone());
+        }
+    }
+    Ok(inline)
+}
+
+// ---- groups --------------------------------------------------------------------------
+
+/// A group's elementwise tree, over indices into its leaves and scalars.
+#[derive(Clone, Debug)]
+enum Node {
+    Leaf(usize),
+    Scalar(usize),
+    Binary(Arith, Box<Node>, Box<Node>),
+    Neg(Box<Node>),
+    Unary(&'static str, Box<Node>),
+    MinMax(bool, Box<Node>, Box<Node>),
+    /// The value and the scalar indices of its bounds.
+    Clamp(Box<Node>, usize, usize),
+}
+
+impl Node {
+    fn size(&self) -> usize {
+        1 + self.children().iter().map(|c| c.size()).sum::<usize>()
+    }
+
+    fn children(&self) -> Vec<&Node> {
+        match self {
+            Node::Leaf(_) | Node::Scalar(_) => vec![],
+            Node::Neg(a) | Node::Unary(_, a) | Node::Clamp(a, ..) => vec![a],
+            Node::Binary(_, a, b) | Node::MinMax(_, a, b) => vec![a, b],
+        }
+    }
+
+    fn children_mut(&mut self) -> Vec<&mut Node> {
+        match self {
+            Node::Leaf(_) | Node::Scalar(_) => vec![],
+            Node::Neg(a) | Node::Unary(_, a) | Node::Clamp(a, ..) => vec![a],
+            Node::Binary(_, a, b) | Node::MinMax(_, a, b) => vec![a, b],
+        }
+    }
+
+    fn leaves(&self, out: &mut Vec<usize>) {
+        if let Node::Leaf(i) = self
+            && !out.contains(i)
+        {
+            out.push(*i);
+        }
+        for child in self.children() {
+            child.leaves(out);
+        }
+    }
+}
+
+/// A tensor read by a group: lowered once, before any kernel.
+struct Leaf {
+    /// The identifier bound to a reference to it.
+    ident: Ident,
+    /// What it is bound to, or `None` for a temporary a split produced.
+    value: Option<TokenStream>,
+    /// Read transposed: the leaf is stored `cols × rows`.
+    transposed: bool,
+    /// Its dedup key: the lowered tokens and the orientation.
+    key: String,
+}
+
+/// Several groups' worth of shared state: every leaf and scalar is lowered once
+/// and may be read by any of the kernels emitted at one site.
+struct Site<'e> {
+    env: &'e Env,
+    backend: BackendChoice,
+    leaves: Vec<Leaf>,
+    scalars: Vec<TokenStream>,
+    /// `clamp` bounds that must be checked before the kernel runs.
+    bounds: Vec<(usize, usize)>,
+}
+
+impl<'e> Site<'e> {
+    fn new(env: &'e Env, backend: BackendChoice) -> Self {
+        Site {
+            env,
+            backend,
+            leaves: Vec::new(),
+            scalars: Vec::new(),
+            bounds: Vec::new(),
+        }
+    }
+
+    fn scalar(&mut self, expr: &Expr) -> syn::Result<Node> {
+        let value = lower(expr, Ty::REAL, self.env, self.backend)?;
+        self.scalars.push(value);
+        Ok(Node::Scalar(self.scalars.len() - 1))
+    }
+
+    fn leaf(&mut self, expr: &Expr, transposed: bool) -> syn::Result<Node> {
+        let ty = infer(expr, self.env)?;
+        let value = lower(expr, ty, self.env, self.backend)?;
+        let key = format!("{transposed}:{value}");
+        if let Some(i) = self.leaves.iter().position(|leaf| leaf.key == key) {
+            return Ok(Node::Leaf(i));
+        }
+        let ident = format_ident!("__fused_in{}", self.leaves.len());
+        self.leaves.push(Leaf {
+            ident,
+            value: Some(value),
+            transposed,
+            key,
+        });
+        Ok(Node::Leaf(self.leaves.len() - 1))
+    }
+
+    /// Build the elementwise tree for `expr`, whose elements are read in
+    /// transposed order when `transposed` is set.
+    fn collect(&mut self, expr: &Expr, transposed: bool) -> syn::Result<Node> {
+        let ty = infer(expr, self.env)?;
+        if !ty.is_tensor() {
+            return self.scalar(expr);
+        }
+        if let Expr::Path(p) = expr
+            && let Ok(name) = path_name(p)
+            && let Some(inlined) = self.env.inline.get(&name)
+        {
+            return self.collect(&inlined.clone(), transposed);
+        }
+        let Some(kind) = kind(expr, self.env)? else {
+            return self.leaf(expr, transposed);
+        };
+        Ok(match kind {
+            Kind::Pass(inner) => self.collect(inner, transposed)?,
+            Kind::Transpose(inner) => self.collect(inner, !transposed)?,
+            Kind::Binary(op, a, b) => Node::Binary(
+                op,
+                Box::new(self.collect(a, transposed)?),
+                Box::new(self.collect(b, transposed)?),
+            ),
+            Kind::Neg(a) => Node::Neg(Box::new(self.collect(a, transposed)?)),
+            Kind::Unary(name, a) => Node::Unary(name, Box::new(self.collect(a, transposed)?)),
+            Kind::MinMax(max, a, b) => Node::MinMax(
+                max,
+                Box::new(self.collect(a, transposed)?),
+                Box::new(self.collect(b, transposed)?),
+            ),
+            Kind::Clamp(value, low, high) => {
+                let value = self.collect(value, transposed)?;
+                let (Node::Scalar(low), Node::Scalar(high)) =
+                    (self.scalar(low)?, self.scalar(high)?)
+                else {
+                    unreachable!("scalars collect as scalars")
+                };
+                self.bounds.push((low, high));
+                Node::Clamp(Box::new(value), low, high)
+            }
+        })
+    }
+
+    fn element_type(&self) -> TokenStream {
+        self.backend.coefficient_type()
+    }
+}
+
+/// The result of one group: its tree and the shape it is computed over.
+struct Root {
+    node: Node,
+    shape: Shape,
+}
+
+/// Whether `expr` should be lowered as a fused group: an elementwise operation
+/// on real tensors that saves at least one kernel.
+fn worth_fusing(expr: &Expr, target: Ty, env: &Env) -> syn::Result<bool> {
+    if !env.fuse || !is_real_tensor(target) || infer(expr, env)? != target {
+        return Ok(false);
+    }
+    if kind(expr, env)?.is_none() {
+        return Ok(false);
+    }
+    Ok(weigh(expr, env)?.0 >= 2)
+}
+
+/// Lower `expr` as one fused kernel, or `None` to lower it as written.
+pub(crate) fn try_fuse(
+    expr: &Expr,
+    target: Ty,
+    env: &Env,
+    backend: BackendChoice,
+) -> syn::Result<Option<TokenStream>> {
+    if !worth_fusing(expr, target, env)? {
+        return Ok(None);
+    }
+    let mut site = Site::new(env, backend);
+    let node = site.collect(expr, false)?;
+    let roots = vec![Root {
+        node,
+        shape: target.shape,
+    }];
+    Ok(Some(emit(site, roots)?))
+}
+
+/// Lower several bindings as one horizontally fused kernel, or `None` when they
+/// do not form one. Each binding is `(name, value, type)`; the result binds the
+/// names in one `let`.
+pub(crate) fn try_fuse_horizontally(
+    bindings: &[(Ident, &Expr, Ty)],
+    env: &Env,
+    backend: BackendChoice,
+) -> syn::Result<Option<TokenStream>> {
+    if bindings.len() < 2 {
+        return Ok(None);
+    }
+    let mut site = Site::new(env, backend);
+    let mut roots = Vec::new();
+    for (_, expr, ty) in bindings {
+        roots.push(Root {
+            node: site.collect(expr, false)?,
+            shape: ty.shape,
+        });
+    }
+    if backend.is_metal() {
+        let nodes: Vec<&Node> = roots.iter().map(|root| &root.node).collect();
+        if allocate(&nodes).is_err() {
+            // Splitting would only trade this kernel for several; leave the
+            // bindings to fuse one by one.
+            return Ok(None);
+        }
+    }
+    let names = bindings.iter().map(|(name, ..)| name);
+    let types = bindings.iter().map(|(_, _, ty)| ty.rust_type(backend));
+    let value = emit(site, roots)?;
+    Ok(Some(quote! { let (#(#names),*): (#(#types),*) = #value; }))
+}
+
+/// Whether binding `expr` may join a horizontal group of `shape`: an
+/// elementwise operation over that shape that reads none of `earlier`.
+pub(crate) fn joins_horizontally(
+    expr: &Expr,
+    ty: Ty,
+    shape: Option<Shape>,
+    earlier: &HashSet<String>,
+    env: &Env,
+) -> syn::Result<bool> {
+    if !env.fuse || !is_real_tensor(ty) || shape.is_some_and(|shape| shape != ty.shape) {
+        return Ok(false);
+    }
+    if kind(expr, env)?.is_none() || weigh(expr, env)?.0 == 0 {
+        return Ok(false);
+    }
+    let mut read = HashSet::new();
+    expanded_names(expr, env, &mut read);
+    Ok(read.is_disjoint(earlier))
+}
+
+/// The names `expr` reads once inlined bindings are substituted.
+fn expanded_names(expr: &Expr, env: &Env, out: &mut HashSet<String>) {
+    let mut direct = HashSet::new();
+    names(expr, &mut direct);
+    for name in direct {
+        if let Some(inlined) = env.inline.get(&name) {
+            expanded_names(&inlined.clone(), env, out);
+        }
+        out.insert(name);
+    }
+}
+
+// ---- emission ---------------------------------------------------------------------
+
+fn extent(shape: Shape) -> (usize, usize) {
+    match shape {
+        Shape::Vector(n) => (1, n),
+        Shape::Matrix(r, c) => (r, c),
+        Shape::Scalar => unreachable!("groups are tensors"),
+    }
+}
+
+/// Bind every leaf and scalar, check `clamp` bounds, then run the kernels.
+fn emit(mut site: Site<'_>, roots: Vec<Root>) -> syn::Result<TokenStream> {
+    let kernels = match site.backend {
+        BackendChoice::Metal => emit_metal(&mut site, roots)?,
+        BackendChoice::Host | BackendChoice::HostF32 => emit_host(&site, &roots),
+    };
+    let bind_leaves = site.leaves.iter().filter_map(|leaf| {
+        let ident = &leaf.ident;
+        leaf.value
+            .as_ref()
+            .map(|value| quote!(let #ident = &(#value);))
+    });
+    let element = site.element_type();
+    let bind_scalars = site.scalars.iter().enumerate().map(|(i, value)| {
+        let ident = format_ident!("__fused_k{i}");
+        quote!(let #ident: #element = #value;)
+    });
+    let checks = site.bounds.iter().map(|(low, high)| {
+        let (low, high) = (
+            format_ident!("__fused_k{low}"),
+            format_ident!("__fused_k{high}"),
+        );
+        quote!(::tensorcrate::__private::assert_clamp_bounds(&#low, &#high);)
+    });
+    Ok(quote! {{
+        #(#bind_leaves)*
+        #(#bind_scalars)*
+        #(#checks)*
+        #kernels
+    }})
+}
+
+/// The host form: one loop over the elements computing every root, which is
+/// the same arithmetic as the unfused kernels in the same order.
+fn emit_host(site: &Site<'_>, roots: &[Root]) -> TokenStream {
+    let element = site.element_type();
+    let (rows, cols) = extent(roots[0].shape);
+    let len = rows * cols;
+
+    let mut read = Vec::new();
+    for root in roots {
+        root.node.leaves(&mut read);
+    }
+    read.sort_unstable();
+    let slices = read.iter().map(|&i| {
+        let (ident, slice) = (&site.leaves[i].ident, format_ident!("__fused_s{i}"));
+        quote!(let #slice: &[#element] = &#ident.as_slice()[..#len];)
+    });
+    let loads = read.iter().map(|&i| {
+        let (slice, value) = (format_ident!("__fused_s{i}"), format_ident!("__fused_x{i}"));
+        if site.leaves[i].transposed {
+            quote!(let #value: #element = #slice[(__fused_i % #cols) * #rows + __fused_i / #cols];)
+        } else {
+            quote!(let #value: #element = #slice[__fused_i];)
+        }
+    });
+    let bytes = (read.len() + roots.len()) * len;
+    let size = quote!(::core::mem::size_of::<#element>());
+    let record = {
+        let outputs = roots.len();
+        quote!(::tensorcrate::__private::record_kernel(#bytes * #size, #outputs);)
+    };
+    let wrap = |values: TokenStream, shape: Shape| match shape {
+        Shape::Vector(_) => {
+            quote!(::tensorcrate::tensors::Vector::<#element, ::tensorcrate::tensors::Host>::new(#values))
+        }
+        _ => {
+            quote!(::tensorcrate::tensors::Matrix::<#element, ::tensorcrate::tensors::Host>::from_flat(#rows, #cols, #values))
+        }
+    };
+
+    if let [root] = roots {
+        let value = host_expr(&root.node);
+        let tensor = wrap(quote!(__fused_out), root.shape);
+        return quote! {
+            #(#slices)*
+            #record
+            let __fused_out: ::std::vec::Vec<#element> = (0..#len)
+                .map(|__fused_i| {
+                    #(#loads)*
+                    #value
+                })
+                .collect();
+            #tensor
+        };
+    }
+
+    let outputs: Vec<Ident> = (0..roots.len())
+        .map(|k| format_ident!("__fused_out{k}"))
+        .collect();
+    let values = roots.iter().map(|root| host_expr(&root.node));
+    let tensors = outputs
+        .iter()
+        .zip(roots)
+        .map(|(out, root)| wrap(quote!(#out), root.shape));
+    let zero = Literal::f64_unsuffixed(0.0);
+    quote! {
+        #(#slices)*
+        #record
+        #(let mut #outputs: ::std::vec::Vec<#element> = ::std::vec![#zero; #len];)*
+        for __fused_i in 0..#len {
+            #(#loads)*
+            #(#outputs[__fused_i] = #values;)*
+        }
+        (#(#tensors),*)
+    }
+}
+
+/// One element of a root, as Rust over the loaded leaves and the constants.
+fn host_expr(node: &Node) -> TokenStream {
+    match node {
+        Node::Leaf(i) => {
+            let value = format_ident!("__fused_x{i}");
+            quote!(#value)
+        }
+        Node::Scalar(i) => {
+            let value = format_ident!("__fused_k{i}");
+            quote!(#value)
+        }
+        Node::Binary(op, a, b) => {
+            let (a, b) = (host_expr(a), host_expr(b));
+            match op {
+                Arith::Add => quote!((#a + #b)),
+                Arith::Sub => quote!((#a - #b)),
+                Arith::Mul => quote!((#a * #b)),
+                Arith::Div => quote!((#a / #b)),
+                Arith::Rem => quote!((#a % #b)),
+            }
+        }
+        Node::Neg(a) => {
+            let a = host_expr(a);
+            quote!((-#a))
+        }
+        Node::Unary(name, a) => {
+            let a = host_expr(a);
+            let (_, trait_name) = ANALYTIC.iter().find(|(n, _)| n == name).unwrap();
+            let (trait_ident, method) = (
+                Ident::new(trait_name, Span::call_site()),
+                Ident::new(name, Span::call_site()),
+            );
+            // The same scalar function the unfused host kernel maps.
+            quote!(::tensorcrate::numbers::#trait_ident::#method(#a))
+        }
+        Node::MinMax(max, a, b) => {
+            let (a, b) = (host_expr(a), host_expr(b));
+            if *max {
+                quote!((#a).max(#b))
+            } else {
+                quote!((#a).min(#b))
+            }
+        }
+        Node::Clamp(a, low, high) => {
+            let a = host_expr(a);
+            let (low, high) = (
+                format_ident!("__fused_k{low}"),
+                format_ident!("__fused_k{high}"),
+            );
+            quote!((#a).max(#low).min(#high))
+        }
+    }
+}
+
+// ---- Metal: register allocation -------------------------------------------------------
+
+/// An instruction, before it becomes tokens.
+#[derive(Clone, Debug)]
+enum Ins {
+    Load { dst: u8, input: usize },
+    Const { dst: u8, value: Constant },
+    Binary { dst: u8, op: Arith, a: u8, b: u8 },
+    Unary { dst: u8, name: &'static str, a: u8 },
+    Cmp { dst: u8, max: bool, a: u8, b: u8 },
+    Store { src: u8, output: usize },
+}
+
+#[derive(Copy, Clone, Debug)]
+enum Constant {
+    Scalar(usize),
+    MinusOne,
+}
+
+/// Why a group did not fit one program.
+struct DoesNotFit;
+
+/// Linear register allocation over the trees, in Sethi–Ullman order: the
+/// operand that needs more registers is evaluated first, and a register is
+/// freed after the last instruction that reads it — which may then be the
+/// instruction's own destination, as every backend reads operands before it
+/// writes.
+struct Allocator<'a> {
+    inputs: &'a [usize],
+    free: Vec<u8>,
+    used: usize,
+    code: Vec<Ins>,
+    /// The register each input is loaded into, once it has been.
+    loaded: Vec<Option<u8>>,
+    /// Reads of each input still to come.
+    remaining: Vec<usize>,
+}
+
+/// Who is responsible for freeing an operand's register.
+enum Owner {
+    Temporary,
+    Input(usize),
+}
+
+fn count_reads(node: &Node, inputs: &[usize], counts: &mut [usize]) {
+    if let Node::Leaf(i) = node {
+        counts[inputs.iter().position(|j| j == i).unwrap()] += 1;
+    }
+    for child in node.children() {
+        count_reads(child, inputs, counts);
+    }
+}
+
+fn need(node: &Node) -> usize {
+    match node {
+        Node::Leaf(_) | Node::Scalar(_) => 1,
+        Node::Neg(a) | Node::Unary(_, a) => need(a),
+        Node::Clamp(a, ..) => need(a).max(2),
+        Node::Binary(_, a, b) | Node::MinMax(_, a, b) => {
+            let (a, b) = (need(a), need(b));
+            if a == b { a + 1 } else { a.max(b) }
+        }
+    }
+}
+
+impl Allocator<'_> {
+    fn allocate(&mut self) -> Result<u8, DoesNotFit> {
+        if let Some(reg) = self.free.pop() {
+            return Ok(reg);
+        }
+        if self.used == REGISTERS {
+            return Err(DoesNotFit);
+        }
+        self.used += 1;
+        Ok((self.used - 1) as u8)
+    }
+
+    fn release(&mut self, reg: u8, owner: Owner) {
+        match owner {
+            Owner::Temporary => self.free.push(reg),
+            Owner::Input(i) => {
+                if self.remaining[i] == 0 {
+                    self.free.push(reg);
+                }
+            }
+        }
+    }
+
+    fn constant(&mut self, value: Constant) -> Result<(u8, Owner), DoesNotFit> {
+        let dst = self.allocate()?;
+        self.code.push(Ins::Const { dst, value });
+        Ok((dst, Owner::Temporary))
+    }
+
+    fn eval(&mut self, node: &Node) -> Result<(u8, Owner), DoesNotFit> {
+        match node {
+            Node::Leaf(leaf) => {
+                let input = self.inputs.iter().position(|j| j == leaf).unwrap();
+                self.remaining[input] -= 1;
+                let reg = match self.loaded[input] {
+                    Some(reg) => reg,
+                    None => {
+                        let dst = self.allocate()?;
+                        self.code.push(Ins::Load { dst, input });
+                        self.loaded[input] = Some(dst);
+                        dst
+                    }
+                };
+                Ok((reg, Owner::Input(input)))
+            }
+            Node::Scalar(i) => self.constant(Constant::Scalar(*i)),
+            Node::Neg(a) => {
+                // `x · −1` flips the sign exactly, zeros included, where
+                // `0 − x` would turn `+0` into `+0`.
+                let a = self.eval(a)?;
+                let minus_one = self.constant(Constant::MinusOne)?;
+                self.combine(a, minus_one, |dst, a, b| Ins::Binary {
+                    dst,
+                    op: Arith::Mul,
+                    a,
+                    b,
+                })
+            }
+            Node::Unary(name, a) => {
+                let (a, owner) = self.eval(a)?;
+                self.release(a, owner);
+                let dst = self.allocate()?;
+                self.code.push(Ins::Unary { dst, name, a });
+                Ok((dst, Owner::Temporary))
+            }
+            Node::Clamp(a, low, high) => {
+                // `x.max(low).min(high)`, as the clamp kernel computes it.
+                let a = self.eval(a)?;
+                let low = self.constant(Constant::Scalar(*low))?;
+                let raised = self.combine(a, low, |dst, a, b| Ins::Cmp {
+                    dst,
+                    max: true,
+                    a,
+                    b,
+                })?;
+                let high = self.constant(Constant::Scalar(*high))?;
+                self.combine(raised, high, |dst, a, b| Ins::Cmp {
+                    dst,
+                    max: false,
+                    a,
+                    b,
+                })
+            }
+            Node::Binary(op, a, b) => {
+                let (a, b) = self.both(a, b)?;
+                let op = *op;
+                self.combine(a, b, |dst, a, b| Ins::Binary { dst, op, a, b })
+            }
+            Node::MinMax(max, a, b) => {
+                let (a, b) = self.both(a, b)?;
+                let max = *max;
+                self.combine(a, b, |dst, a, b| Ins::Cmp { dst, max, a, b })
+            }
+        }
+    }
+
+    /// Evaluate two operands, the hungrier first, returning them in order.
+    #[allow(clippy::type_complexity)]
+    fn both(&mut self, a: &Node, b: &Node) -> Result<((u8, Owner), (u8, Owner)), DoesNotFit> {
+        if need(b) > need(a) {
+            let b = self.eval(b)?;
+            let a = self.eval(a)?;
+            Ok((a, b))
+        } else {
+            let a = self.eval(a)?;
+            let b = self.eval(b)?;
+            Ok((a, b))
+        }
+    }
+
+    fn combine(
+        &mut self,
+        (a, a_owner): (u8, Owner),
+        (b, b_owner): (u8, Owner),
+        instruction: impl FnOnce(u8, u8, u8) -> Ins,
+    ) -> Result<(u8, Owner), DoesNotFit> {
+        self.release(a, a_owner);
+        if b != a {
+            self.release(b, b_owner);
+        }
+        let dst = self.allocate()?;
+        self.code.push(instruction(dst, a, b));
+        Ok((dst, Owner::Temporary))
+    }
+}
+
+/// Allocate one program computing every root, or report that it does not fit.
+fn allocate(roots: &[&Node]) -> Result<(Vec<usize>, Vec<Ins>), DoesNotFit> {
+    let mut inputs = Vec::new();
+    for root in roots {
+        root.leaves(&mut inputs);
+    }
+    if inputs.len() > MAX_INPUTS || roots.len() > MAX_OUTPUTS {
+        return Err(DoesNotFit);
+    }
+    let mut remaining = vec![0; inputs.len()];
+    for root in roots {
+        count_reads(root, &inputs, &mut remaining);
+    }
+    let mut allocator = Allocator {
+        inputs: &inputs,
+        free: Vec::new(),
+        used: 0,
+        code: Vec::new(),
+        loaded: vec![None; inputs.len()],
+        remaining,
+    };
+    for (output, root) in roots.iter().enumerate() {
+        let (src, owner) = allocator.eval(root)?;
+        allocator.code.push(Ins::Store { src, output });
+        allocator.release(src, owner);
+    }
+    let code = allocator.code;
+    if code.len() > MAX_INSTRUCTIONS {
+        return Err(DoesNotFit);
+    }
+    Ok((inputs, code))
+}
+
+/// The largest proper subtree of any root, by size, as a path of child
+/// indices from that root.
+fn largest_subtree(roots: &[Root]) -> Option<(usize, Vec<usize>)> {
+    fn search(node: &Node, path: &mut Vec<usize>, best: &mut Option<(usize, Vec<usize>)>) {
+        for (i, child) in node.children().into_iter().enumerate() {
+            path.push(i);
+            let size = child.size();
+            if size > 1 && best.as_ref().is_none_or(|(s, _)| size > *s) {
+                *best = Some((size, path.clone()));
+            }
+            search(child, path, best);
+            path.pop();
+        }
+    }
+    let mut best: Option<(usize, usize, Vec<usize>)> = None;
+    for (r, root) in roots.iter().enumerate() {
+        let mut found = None;
+        search(&root.node, &mut Vec::new(), &mut found);
+        if let Some((size, path)) = found
+            && best.as_ref().is_none_or(|(s, ..)| size > *s)
+        {
+            best = Some((size, r, path));
+        }
+    }
+    best.map(|(_, r, path)| (r, path))
+}
+
+/// The Metal form: the macro allocates the program, splitting off subtrees
+/// into kernels of their own until every program fits the shader.
+fn emit_metal(site: &mut Site<'_>, mut roots: Vec<Root>) -> syn::Result<TokenStream> {
+    let mut kernels = TokenStream::new();
+    let shape = roots[0].shape;
+    loop {
+        let nodes: Vec<&Node> = roots.iter().map(|root| &root.node).collect();
+        if let Ok((inputs, code)) = allocate(&nodes) {
+            let outputs: Vec<Shape> = roots.iter().map(|root| root.shape).collect();
+            let run = metal_program(site, &inputs, &code, shape, &outputs);
+            return Ok(quote! { #kernels #run });
+        }
+        // Too big for one program: materialize the largest subtree as a kernel
+        // of its own and read its result as a leaf.
+        let Some((root, path)) = largest_subtree(&roots) else {
+            return Err(syn::Error::new(
+                Span::call_site(),
+                "math! cannot fit this elementwise expression in a fused Metal kernel",
+            ));
+        };
+        let mut node = &mut roots[root].node;
+        for &step in &path {
+            node = node.children_mut().into_iter().nth(step).unwrap();
+        }
+        let ident = format_ident!("__fused_t{}", site.leaves.len());
+        let subtree = std::mem::replace(node, Node::Leaf(site.leaves.len()));
+        site.leaves.push(Leaf {
+            ident: ident.clone(),
+            value: None,
+            transposed: false,
+            key: ident.to_string(),
+        });
+        let sub = emit_metal(
+            site,
+            vec![Root {
+                node: subtree,
+                shape,
+            }],
+        )?;
+        kernels.extend(quote! {
+            let #ident = { #sub };
+            let #ident = &#ident;
+        });
+    }
+}
+
+/// Tokens running one allocated program and unpacking its outputs.
+fn metal_program(
+    site: &Site<'_>,
+    inputs: &[usize],
+    code: &[Ins],
+    shape: Shape,
+    outputs: &[Shape],
+) -> TokenStream {
+    let fused = quote!(::tensorcrate::tensors::fused);
+    let instructions = code.iter().map(|ins| match *ins {
+        Ins::Load { dst, input } => {
+            let remap = if site.leaves[inputs[input]].transposed {
+                quote!(Transpose)
+            } else {
+                quote!(Identity)
+            };
+            let input = input as u8;
+            quote!(#fused::Instr::<f32>::Load { dst: #dst, input: #input, remap: #fused::Remap::#remap })
+        }
+        Ins::Const { dst, value } => {
+            let value = match value {
+                Constant::Scalar(i) => {
+                    let ident = format_ident!("__fused_k{i}");
+                    quote!(#ident)
+                }
+                Constant::MinusOne => quote!(-1.0f32),
+            };
+            quote!(#fused::Instr::<f32>::Const { dst: #dst, value: #value })
+        }
+        Ins::Binary { dst, op, a, b } => {
+            let op = match op {
+                Arith::Add => quote!(Add),
+                Arith::Sub => quote!(Sub),
+                Arith::Mul => quote!(Mul),
+                Arith::Div => quote!(Div),
+                Arith::Rem => quote!(Rem),
+            };
+            quote!(#fused::Instr::<f32>::Binary { dst: #dst, op: ::tensorcrate::tensors::BinaryOp::#op, a: #a, b: #b })
+        }
+        Ins::Unary { dst, name, a } => {
+            let (_, variant) = ANALYTIC.iter().find(|(n, _)| *n == name).unwrap();
+            let variant = Ident::new(variant, Span::call_site());
+            quote!(#fused::Instr::<f32>::Unary { dst: #dst, op: ::tensorcrate::tensors::Analytic::#variant, a: #a })
+        }
+        Ins::Cmp { dst, max, a, b } => {
+            let op = if max { quote!(Max) } else { quote!(Min) };
+            quote!(#fused::Instr::<f32>::Cmp { dst: #dst, op: ::tensorcrate::tensors::Compare::#op, a: #a, b: #b })
+        }
+        Ins::Store { src, output } => {
+            let output = output as u8;
+            quote!(#fused::Instr::<f32>::Store { src: #src, output: #output })
+        }
+    });
+    let (rows, cols) = extent(shape);
+    let (input_count, output_count) = (inputs.len(), outputs.len());
+    let operands = inputs.iter().map(|&i| {
+        let ident = &site.leaves[i].ident;
+        quote!(#ident as &dyn #fused::Fusable<::tensorcrate::tensors::Metal>)
+    });
+    let unpack = outputs.iter().map(|shape| {
+        let into = match shape {
+            Shape::Vector(_) => quote!(into_vector::<f32>),
+            _ => quote!(into_matrix::<f32>),
+        };
+        quote!(__fused_outputs.next().expect("one output per root").#into())
+    });
+    let result = if outputs.len() == 1 {
+        quote!(#(#unpack)*)
+    } else {
+        quote!((#(#unpack),*))
+    };
+    quote! {
+        let __fused_program = #fused::Program::<f32>::new(
+            ::std::vec![#(#instructions),*],
+            ::std::vec![#fused::DType::F32; #input_count],
+            ::std::vec![#fused::DType::F32; #output_count],
+            0,
+        )
+        .expect("math! allocates programs that fit the fused kernel");
+        let mut __fused_outputs = __fused_program
+            .run::<::tensorcrate::tensors::Metal>((#rows, #cols), &[#(#operands),*], &mut [])
+            .into_iter();
+        #result
+    }
+}
