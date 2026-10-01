@@ -660,6 +660,12 @@ template [[host_name("transpose_tiled_" #S)]] kernel void transpose_tiled<T>(  \
     device const T*, device T*, constant uint&, constant uint&, uint2, uint2);
 FOR_EACH_ELEMENT(INSTANTIATE_TRANSPOSE)
 
+// The shader builds with fast math, whose hyperbolics are formed from `exp`:
+// `tanh` becomes `inf / inf = NaN` once `exp(2x)` overflows (|x| > ~44), and
+// `sinh`/`cosh` reach `inf` near |x| = 89 where the true value is still finite.
+// The `precise::` forms saturate and overflow where the host's do, and the rest
+// of the shader keeps fast math.
+//
 // These variants must agree with `tensors::kernels::Analytic`, and each
 // derivative must match the corresponding `Dual` implementation.
 //
@@ -682,9 +688,9 @@ inline T analytic_value(AnalyticOp op, T x) {
         case AnalyticOp::Arctan: return T(atan(x));
         case AnalyticOp::Exp:    return T(exp(x));
         case AnalyticOp::Ln:     return T(log(x));
-        case AnalyticOp::Sinh:   return T(sinh(x));
-        case AnalyticOp::Cosh:   return T(cosh(x));
-        case AnalyticOp::Tanh:   return T(tanh(x));
+        case AnalyticOp::Sinh:   return T(precise::sinh(x));
+        case AnalyticOp::Cosh:   return T(precise::cosh(x));
+        case AnalyticOp::Tanh:   return T(precise::tanh(x));
         case AnalyticOp::Sqrt:   return T(sqrt(x));
         default: return T(NAN);
     }
@@ -704,9 +710,9 @@ inline T analytic_derivative(AnalyticOp op, T x) {
         case AnalyticOp::Arctan: return one / (one + x * x);
         case AnalyticOp::Exp:    return T(exp(x));
         case AnalyticOp::Ln:     return one / x;
-        case AnalyticOp::Sinh:   return T(cosh(x));
-        case AnalyticOp::Cosh:   return T(sinh(x));
-        case AnalyticOp::Tanh:   { T t = T(tanh(x)); return one - t * t; }
+        case AnalyticOp::Sinh:   return T(precise::cosh(x));
+        case AnalyticOp::Cosh:   return T(precise::sinh(x));
+        case AnalyticOp::Tanh:   { T t = T(precise::tanh(x)); return one - t * t; }
         case AnalyticOp::Sqrt:   return one / ((one + one) * T(sqrt(x)));
         default: return T(NAN);
     }
