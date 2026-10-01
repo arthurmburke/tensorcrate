@@ -3,6 +3,12 @@
 //! Public entry points perform runtime selection once per operation. AVX2 with
 //! FMA is used when available; SSE2 is the x86_64 baseline and keeps the SIMD
 //! feature useful on older processors.
+//!
+//! The public functions are safe: each checks its slice lengths (and matrix
+//! extents) before choosing an implementation. The `unsafe fn` bodies behind
+//! them are unchecked and share one contract, stated on each as `# Safety`:
+//! the CPU supports the function's `target_feature`, and the slices have the
+//! lengths the safe entry point verified.
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
@@ -32,6 +38,7 @@ macro_rules! x86_kernels {
             use core::arch::x86_64::*;
             use std::arch::is_x86_feature_detected;
 
+            use crate::simd::contract;
             use crate::tensors::{BinaryOp, Compare, Reduce};
 
             /// Lanes used by the preferred AVX2 implementation.
@@ -49,7 +56,7 @@ macro_rules! x86_kernels {
 
             #[inline]
             pub fn dot(a: &[$t], b: &[$t]) -> $t {
-                debug_assert_eq!(a.len(), b.len());
+                contract::same_len("dot", &[a.len(), b.len()]);
                 if has_avx2_fma() {
                     unsafe { dot_avx(a, b) }
                 } else {
@@ -57,6 +64,10 @@ macro_rules! x86_kernels {
                 }
             }
 
+            /// # Safety
+            ///
+            /// The CPU must support `avx2` and `fma`, and the slices must have the
+            /// lengths the safe entry point checks before calling this.
             #[target_feature(enable = "avx2,fma")]
             unsafe fn dot_avx(a: &[$t], b: &[$t]) -> $t {
                 let mut i = 0;
@@ -88,6 +99,10 @@ macro_rules! x86_kernels {
                 sum
             }
 
+            /// # Safety
+            ///
+            /// The CPU must support `sse2`, and the slices must have the
+            /// lengths the safe entry point checks before calling this.
             #[target_feature(enable = "sse2")]
             unsafe fn dot_sse(a: &[$t], b: &[$t]) -> $t {
                 let mut i = 0;
@@ -123,7 +138,7 @@ macro_rules! x86_kernels {
 
             #[inline]
             pub fn elementwise(a: &[$t], b: &[$t], op: BinaryOp, out: &mut [$t]) {
-                debug_assert!(a.len() == b.len() && a.len() == out.len());
+                contract::same_len("elementwise", &[a.len(), b.len(), out.len()]);
                 if op == BinaryOp::Rem {
                     for i in 0..a.len() {
                         out[i] = a[i] % b[i];
@@ -135,6 +150,10 @@ macro_rules! x86_kernels {
                 }
             }
 
+            /// # Safety
+            ///
+            /// The CPU must support `avx2`, and the slices must have the
+            /// lengths the safe entry point checks before calling this.
             #[target_feature(enable = "avx2")]
             unsafe fn elementwise_avx(a: &[$t], b: &[$t], op: BinaryOp, out: &mut [$t]) {
                 let mut i = 0;
@@ -154,6 +173,10 @@ macro_rules! x86_kernels {
                 scalar_elementwise(a, b, op, out, i);
             }
 
+            /// # Safety
+            ///
+            /// The CPU must support `sse2`, and the slices must have the
+            /// lengths the safe entry point checks before calling this.
             #[target_feature(enable = "sse2")]
             unsafe fn elementwise_sse(a: &[$t], b: &[$t], op: BinaryOp, out: &mut [$t]) {
                 let mut i = 0;
@@ -193,7 +216,7 @@ macro_rules! x86_kernels {
                 scalar_left: bool,
                 out: &mut [$t],
             ) {
-                debug_assert_eq!(values.len(), out.len());
+                contract::same_len("broadcast", &[values.len(), out.len()]);
                 if op == BinaryOp::Rem {
                     scalar_broadcast(values, scalar, op, scalar_left, out, 0);
                 } else if has_avx2() {
@@ -203,6 +226,10 @@ macro_rules! x86_kernels {
                 }
             }
 
+            /// # Safety
+            ///
+            /// The CPU must support `avx2`, and the slices must have the
+            /// lengths the safe entry point checks before calling this.
             #[target_feature(enable = "avx2")]
             unsafe fn broadcast_avx(
                 values: &[$t],
@@ -233,6 +260,10 @@ macro_rules! x86_kernels {
                 scalar_broadcast(values, scalar_value(scalar), op, scalar_left, out, i);
             }
 
+            /// # Safety
+            ///
+            /// The CPU must support `sse2`, and the slices must have the
+            /// lengths the safe entry point checks before calling this.
             #[target_feature(enable = "sse2")]
             unsafe fn broadcast_sse(
                 values: &[$t],
@@ -263,6 +294,9 @@ macro_rules! x86_kernels {
                 scalar_broadcast(values, scalar_value_, op, scalar_left, out, i);
             }
 
+            /// # Safety
+            ///
+            /// The CPU must support `avx2`.
             #[target_feature(enable = "avx2")]
             unsafe fn scalar_value(value: $avx_vec) -> $t {
                 let mut lanes = [0 as $t; $avx_lanes];
@@ -348,6 +382,9 @@ macro_rules! x86_kernels {
             //
             // aarch64 needs none of the NaN handling: `fminnm`/`fmaxnm` are the
             // IEEE `minNum`/`maxNum` that `f32::min` is defined as.
+            /// # Safety
+            ///
+            /// The CPU must support `avx2`.
             #[target_feature(enable = "avx2")]
             unsafe fn min_avx(a: $avx_vec, b: $avx_vec) -> $avx_vec {
                 let unordered = $avx_cmp::<_CMP_UNORD_Q>(b, b);
@@ -357,6 +394,9 @@ macro_rules! x86_kernels {
                 )
             }
 
+            /// # Safety
+            ///
+            /// The CPU must support `avx2`.
             #[target_feature(enable = "avx2")]
             unsafe fn max_avx(a: $avx_vec, b: $avx_vec) -> $avx_vec {
                 let unordered = $avx_cmp::<_CMP_UNORD_Q>(b, b);
@@ -366,6 +406,9 @@ macro_rules! x86_kernels {
                 )
             }
 
+            /// # Safety
+            ///
+            /// The CPU must support `sse2`.
             #[target_feature(enable = "sse2")]
             unsafe fn min_sse(a: $sse_vec, b: $sse_vec) -> $sse_vec {
                 let unordered = $sse_cmpunord(b, b);
@@ -375,6 +418,9 @@ macro_rules! x86_kernels {
                 )
             }
 
+            /// # Safety
+            ///
+            /// The CPU must support `sse2`.
             #[target_feature(enable = "sse2")]
             unsafe fn max_sse(a: $sse_vec, b: $sse_vec) -> $sse_vec {
                 let unordered = $sse_cmpunord(b, b);
@@ -410,6 +456,9 @@ macro_rules! x86_kernels {
                 }
             }
 
+            /// # Safety
+            ///
+            /// The CPU must support `sse2`.
             #[target_feature(enable = "sse2")]
             unsafe fn compare_sse(op: Compare, a: $sse_vec, b: $sse_vec) -> $sse_vec {
                 let one = $sse_set1(1.0);
@@ -432,7 +481,7 @@ macro_rules! x86_kernels {
             /// Elementwise comparison of two slices.
             #[inline]
             pub fn compare(a: &[$t], b: &[$t], op: Compare, out: &mut [$t]) {
-                debug_assert!(a.len() == b.len() && a.len() == out.len());
+                contract::same_len("compare", &[a.len(), b.len(), out.len()]);
                 if has_avx2() {
                     unsafe { compare_slices_avx(a, b, op, out) };
                 } else {
@@ -440,6 +489,10 @@ macro_rules! x86_kernels {
                 }
             }
 
+            /// # Safety
+            ///
+            /// The CPU must support `avx2`, and the slices must have the
+            /// lengths the safe entry point checks before calling this.
             #[target_feature(enable = "avx2")]
             unsafe fn compare_slices_avx(a: &[$t], b: &[$t], op: Compare, out: &mut [$t]) {
                 let mut i = 0;
@@ -452,6 +505,10 @@ macro_rules! x86_kernels {
                 scalar_compare(a, b, op, out, i);
             }
 
+            /// # Safety
+            ///
+            /// The CPU must support `sse2`, and the slices must have the
+            /// lengths the safe entry point checks before calling this.
             #[target_feature(enable = "sse2")]
             unsafe fn compare_slices_sse(a: &[$t], b: &[$t], op: Compare, out: &mut [$t]) {
                 let mut i = 0;
@@ -480,7 +537,7 @@ macro_rules! x86_kernels {
                 scalar_left: bool,
                 out: &mut [$t],
             ) {
-                debug_assert_eq!(values.len(), out.len());
+                contract::same_len("compare_scalar", &[values.len(), out.len()]);
                 if has_avx2() {
                     unsafe { compare_scalar_avx(values, scalar, op, scalar_left, out) };
                 } else {
@@ -488,6 +545,10 @@ macro_rules! x86_kernels {
                 }
             }
 
+            /// # Safety
+            ///
+            /// The CPU must support `avx2`, and the slices must have the
+            /// lengths the safe entry point checks before calling this.
             #[target_feature(enable = "avx2")]
             unsafe fn compare_scalar_avx(
                 values: &[$t],
@@ -511,6 +572,10 @@ macro_rules! x86_kernels {
                 scalar_compare_scalar(values, scalar, op, scalar_left, out, i);
             }
 
+            /// # Safety
+            ///
+            /// The CPU must support `sse2`, and the slices must have the
+            /// lengths the safe entry point checks before calling this.
             #[target_feature(enable = "sse2")]
             unsafe fn compare_scalar_sse(
                 values: &[$t],
@@ -556,7 +621,7 @@ macro_rules! x86_kernels {
             /// rounded, so every lane agrees with the scalar `sqrt` bit for bit.
             #[inline]
             pub fn sqrt(values: &[$t], out: &mut [$t]) {
-                debug_assert_eq!(values.len(), out.len());
+                contract::same_len("sqrt", &[values.len(), out.len()]);
                 if has_avx2() {
                     unsafe { sqrt_avx(values, out) };
                 } else {
@@ -564,6 +629,10 @@ macro_rules! x86_kernels {
                 }
             }
 
+            /// # Safety
+            ///
+            /// The CPU must support `avx2`, and the slices must have the
+            /// lengths the safe entry point checks before calling this.
             #[target_feature(enable = "avx2")]
             unsafe fn sqrt_avx(values: &[$t], out: &mut [$t]) {
                 let mut i = 0;
@@ -577,6 +646,10 @@ macro_rules! x86_kernels {
                 }
             }
 
+            /// # Safety
+            ///
+            /// The CPU must support `sse2`, and the slices must have the
+            /// lengths the safe entry point checks before calling this.
             #[target_feature(enable = "sse2")]
             unsafe fn sqrt_sse(values: &[$t], out: &mut [$t]) {
                 let mut i = 0;
@@ -593,7 +666,7 @@ macro_rules! x86_kernels {
             /// Confine every element to `[low, high]`, in one pass.
             #[inline]
             pub fn clamp(values: &[$t], low: $t, high: $t, out: &mut [$t]) {
-                debug_assert_eq!(values.len(), out.len());
+                contract::same_len("clamp", &[values.len(), out.len()]);
                 if has_avx2() {
                     unsafe { clamp_avx(values, low, high, out) };
                 } else {
@@ -601,6 +674,10 @@ macro_rules! x86_kernels {
                 }
             }
 
+            /// # Safety
+            ///
+            /// The CPU must support `avx2`, and the slices must have the
+            /// lengths the safe entry point checks before calling this.
             #[target_feature(enable = "avx2")]
             unsafe fn clamp_avx(values: &[$t], low: $t, high: $t, out: &mut [$t]) {
                 let (vlow, vhigh) = ($avx_set1(low), $avx_set1(high));
@@ -616,6 +693,10 @@ macro_rules! x86_kernels {
                 scalar_clamp(values, low, high, out, i);
             }
 
+            /// # Safety
+            ///
+            /// The CPU must support `sse2`, and the slices must have the
+            /// lengths the safe entry point checks before calling this.
             #[target_feature(enable = "sse2")]
             unsafe fn clamp_sse(values: &[$t], low: $t, high: $t, out: &mut [$t]) {
                 let (vlow, vhigh) = ($sse_set1(low), $sse_set1(high));
@@ -669,6 +750,10 @@ macro_rules! x86_kernels {
                 }
             }
 
+            /// # Safety
+            ///
+            /// The CPU must support `avx2`, and the slices must have the
+            /// lengths the safe entry point checks before calling this.
             #[target_feature(enable = "avx2")]
             unsafe fn reduce_avx(values: &[$t], op: Reduce) -> $t {
                 let mut acc: [$avx_vec; 4] = [$avx_set1(identity(op)); 4];
@@ -704,6 +789,10 @@ macro_rules! x86_kernels {
                 scalar_reduce(values, op, total, i)
             }
 
+            /// # Safety
+            ///
+            /// The CPU must support `sse2`, and the slices must have the
+            /// lengths the safe entry point checks before calling this.
             #[target_feature(enable = "sse2")]
             unsafe fn reduce_sse(values: &[$t], op: Reduce) -> $t {
                 let mut acc: [$sse_vec; 4] = [$sse_set1(identity(op)); 4];
@@ -760,6 +849,10 @@ macro_rules! x86_kernels {
                 }
             }
 
+            /// # Safety
+            ///
+            /// The CPU must support `avx2` and `fma`, and the slices must have the
+            /// lengths the safe entry point checks before calling this.
             #[target_feature(enable = "avx2,fma")]
             unsafe fn sum_squared_deviations_avx(values: &[$t], mean: $t) -> $t {
                 let center = $avx_set1(mean);
@@ -784,6 +877,10 @@ macro_rules! x86_kernels {
                 scalar_squared_deviations(values, mean, lanes.into_iter().sum(), i)
             }
 
+            /// # Safety
+            ///
+            /// The CPU must support `sse2`, and the slices must have the
+            /// lengths the safe entry point checks before calling this.
             #[target_feature(enable = "sse2")]
             unsafe fn sum_squared_deviations_sse(values: &[$t], mean: $t) -> $t {
                 let center = $sse_set1(mean);
@@ -829,7 +926,7 @@ macro_rules! x86_kernels {
             /// turn.
             #[inline]
             pub fn accumulate(totals: &mut [$t], values: &[$t]) {
-                debug_assert_eq!(totals.len(), values.len());
+                contract::same_len("accumulate", &[totals.len(), values.len()]);
                 if has_avx2() {
                     unsafe { accumulate_avx(totals, values) };
                 } else {
@@ -837,6 +934,10 @@ macro_rules! x86_kernels {
                 }
             }
 
+            /// # Safety
+            ///
+            /// The CPU must support `avx2`, and the slices must have the
+            /// lengths the safe entry point checks before calling this.
             #[target_feature(enable = "avx2")]
             unsafe fn accumulate_avx(totals: &mut [$t], values: &[$t]) {
                 let mut i = 0;
@@ -851,6 +952,10 @@ macro_rules! x86_kernels {
                 scalar_accumulate(totals, values, i);
             }
 
+            /// # Safety
+            ///
+            /// The CPU must support `sse2`, and the slices must have the
+            /// lengths the safe entry point checks before calling this.
             #[target_feature(enable = "sse2")]
             unsafe fn accumulate_sse(totals: &mut [$t], values: &[$t]) {
                 let mut i = 0;
@@ -875,7 +980,10 @@ macro_rules! x86_kernels {
             /// column-wise counterpart of [`sum_squared_deviations`].
             #[inline]
             pub fn accumulate_squared_deviations(totals: &mut [$t], values: &[$t], means: &[$t]) {
-                debug_assert!(values.len() == totals.len() && means.len() == totals.len());
+                contract::same_len(
+                    "accumulate_squared_deviations",
+                    &[totals.len(), values.len(), means.len()],
+                );
                 if has_avx2_fma() {
                     unsafe { accumulate_squared_deviations_avx(totals, values, means) };
                 } else {
@@ -883,6 +991,10 @@ macro_rules! x86_kernels {
                 }
             }
 
+            /// # Safety
+            ///
+            /// The CPU must support `avx2` and `fma`, and the slices must have the
+            /// lengths the safe entry point checks before calling this.
             #[target_feature(enable = "avx2,fma")]
             unsafe fn accumulate_squared_deviations_avx(
                 totals: &mut [$t],
@@ -902,6 +1014,10 @@ macro_rules! x86_kernels {
                 scalar_accumulate_squared_deviations(totals, values, means, i);
             }
 
+            /// # Safety
+            ///
+            /// The CPU must support `sse2`, and the slices must have the
+            /// lengths the safe entry point checks before calling this.
             #[target_feature(enable = "sse2")]
             unsafe fn accumulate_squared_deviations_sse(
                 totals: &mut [$t],
@@ -949,6 +1065,7 @@ macro_rules! x86_kernels {
                 n: usize,
                 out: &mut [$t],
             ) {
+                contract::same_len("matmul_add", &[out.len(), addend.len()]);
                 out.copy_from_slice(addend);
                 matmul_accumulate(a, b, m, k, n, out);
             }
@@ -962,7 +1079,7 @@ macro_rules! x86_kernels {
                 n: usize,
                 out: &mut [$t],
             ) {
-                debug_assert!(a.len() == m * k && b.len() == k * n && out.len() == m * n);
+                contract::matmul("matmul", a.len(), b.len(), out.len(), (m, k, n));
                 if has_avx2_fma() {
                     unsafe { matmul_avx(a, b, m, k, n, out) };
                 } else {
@@ -970,6 +1087,10 @@ macro_rules! x86_kernels {
                 }
             }
 
+            /// # Safety
+            ///
+            /// The CPU must support `avx2` and `fma`, and the slices must have the
+            /// lengths the safe entry point checks before calling this.
             #[target_feature(enable = "avx2,fma")]
             unsafe fn matmul_avx(a: &[$t], b: &[$t], m: usize, k: usize, n: usize, out: &mut [$t]) {
                 for i in 0..m {
@@ -997,6 +1118,10 @@ macro_rules! x86_kernels {
                 }
             }
 
+            /// # Safety
+            ///
+            /// The CPU must support `sse2`, and the slices must have the
+            /// lengths the safe entry point checks before calling this.
             #[target_feature(enable = "sse2")]
             unsafe fn matmul_sse(a: &[$t], b: &[$t], m: usize, k: usize, n: usize, out: &mut [$t]) {
                 for i in 0..m {
@@ -1102,7 +1227,7 @@ pub mod fft_f32 {
 
     /// Radix-2 FFT over an interleaved complex buffer.
     pub fn radix2(buf: &mut [f32], n: usize, direction: f32) {
-        debug_assert_eq!(buf.len(), 2 * n);
+        crate::simd::contract::fft("radix2", buf.len(), n);
         if n <= 1 {
             return;
         }
@@ -1168,6 +1293,14 @@ pub mod fft_f32 {
         }
     }
 
+    /// One stage's butterflies for the block at `start`, four complex points
+    /// at a time; returns how many it did, leaving the tail to the scalar loop.
+    ///
+    /// # Safety
+    ///
+    /// The CPU must support `avx`; `buf` must hold `2 * (start + 2 * half)`
+    /// values and `twiddles` `2 * half`, which [`radix2`] guarantees by
+    /// checking that `n` is a power of two and `buf.len() == 2 * n`.
     #[target_feature(enable = "avx")]
     unsafe fn butterflies_avx(
         buf: &mut [f32],

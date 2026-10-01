@@ -13,6 +13,61 @@
 //! generic-to-concrete bridge (via `TypeId`) lives in
 //! `tensors::simd_dispatch`, which keeps the scalar path as the correctness
 //! oracle for every non-float element type (integers, `Complex`, `Dual`).
+//!
+//! Every public function here is safe to call with any arguments. Each checks
+//! its slice lengths and matrix extents with [`assert!`] before it reads or
+//! writes through a raw pointer, and panics on a mismatch rather than touching
+//! memory outside the slices — in release builds too. The unchecked bodies are
+//! private `unsafe` code whose contract is exactly those checks.
+
+/// The checks the safe entry points make before their unchecked loops.
+///
+/// These are the safety boundary, so they are real assertions: a debug-only
+/// check would let a release build read past the end of a slice.
+mod contract {
+    /// Panics unless every slice an operation reads or writes has one length.
+    #[track_caller]
+    #[inline]
+    pub(super) fn same_len(operation: &str, lengths: &[usize]) {
+        assert!(
+            lengths.windows(2).all(|pair| pair[0] == pair[1]),
+            "simd::{operation}: slice lengths differ: {lengths:?}"
+        );
+    }
+
+    /// Panics unless `a` is `m×k`, `b` is `k×n` and `out` is `m×n`, with no
+    /// extent product overflowing (which would let a wrapped product match a
+    /// short slice).
+    #[track_caller]
+    #[inline]
+    pub(super) fn matmul(
+        operation: &str,
+        a: usize,
+        b: usize,
+        out: usize,
+        (m, k, n): (usize, usize, usize),
+    ) {
+        assert!(
+            m.checked_mul(k) == Some(a)
+                && k.checked_mul(n) == Some(b)
+                && m.checked_mul(n) == Some(out),
+            "simd::{operation}: slices of {a}, {b} and {out} elements do not hold \
+             a {m}×{k} by {k}×{n} product"
+        );
+    }
+
+    /// Panics unless `buf` interleaves `n` complex values and `n` is a power of
+    /// two (or zero), which the butterfly stages index by.
+    #[track_caller]
+    #[inline]
+    pub(super) fn fft(operation: &str, len: usize, n: usize) {
+        assert!(
+            (n == 0 || n.is_power_of_two()) && n.checked_mul(2) == Some(len),
+            "simd::{operation}: a buffer of {len} values does not hold {n} complex \
+             points, or {n} is not a power of two"
+        );
+    }
+}
 
 /// Generates the elementwise / reduction / matmul kernels for one float type.
 ///
@@ -30,6 +85,7 @@ macro_rules! neon_kernels {
         cgt = $cgt:ident, clt = $clt:ident, cge = $cge:ident, cle = $cle:ident
     ) => {
         pub mod $modname {
+            use crate::simd::contract;
             use crate::tensors::{BinaryOp, Compare, Reduce};
             use core::arch::aarch64::*;
 
@@ -44,10 +100,13 @@ macro_rules! neon_kernels {
             /// its `sum` carries a serial dependency across every element.
             #[inline]
             pub fn dot(a: &[$t], b: &[$t]) -> $t {
-                debug_assert_eq!(a.len(), b.len());
+                contract::same_len("dot", &[a.len(), b.len()]);
                 let n = a.len();
                 let mut i = 0;
                 let mut total: $t;
+                // SAFETY: `a` and `b` were checked to share `n`, and every
+                // vector access covers `LANES` elements that end at or before
+                // `n`.
                 unsafe {
                     let mut acc = [$dup(0 as $t); 4];
                     while i + 4 * LANES <= n {
@@ -82,7 +141,7 @@ macro_rules! neon_kernels {
             #[inline]
             pub fn elementwise(a: &[$t], b: &[$t], op: BinaryOp, out: &mut [$t]) {
                 let n = a.len();
-                debug_assert!(b.len() == n && out.len() == n);
+                contract::same_len("elementwise", &[n, b.len(), out.len()]);
                 if op == BinaryOp::Rem {
                     for i in 0..n {
                         out[i] = a[i] % b[i];
@@ -90,6 +149,9 @@ macro_rules! neon_kernels {
                     return;
                 }
                 let mut i = 0;
+                // SAFETY: the slice lengths were checked on entry, and every
+                // vector access covers `LANES` elements that end at or before
+                // `n`.
                 unsafe {
                     while i + LANES <= n {
                         let va = $load(a.as_ptr().add(i));
@@ -128,7 +190,7 @@ macro_rules! neon_kernels {
                 out: &mut [$t],
             ) {
                 let n = values.len();
-                debug_assert_eq!(out.len(), n);
+                contract::same_len("broadcast", &[n, out.len()]);
                 if op == BinaryOp::Rem {
                     for i in 0..n {
                         out[i] = if scalar_left {
@@ -140,6 +202,9 @@ macro_rules! neon_kernels {
                     return;
                 }
                 let mut i = 0;
+                // SAFETY: the slice lengths were checked on entry, and every
+                // vector access covers `LANES` elements that end at or before
+                // `n`.
                 unsafe {
                     let vs = $dup(scalar);
                     while i + LANES <= n {
@@ -228,6 +293,8 @@ macro_rules! neon_kernels {
             /// no conversion instruction.
             #[inline]
             unsafe fn compare_vectors(op: Compare, a: $v, b: $v) -> $v {
+                // SAFETY: NEON is part of the aarch64 baseline, and these
+                // intrinsics only touch registers.
                 unsafe {
                     let one = $dup(1.0);
                     let zero = $dup(0.0);
@@ -252,8 +319,11 @@ macro_rules! neon_kernels {
             #[inline]
             pub fn compare(a: &[$t], b: &[$t], op: Compare, out: &mut [$t]) {
                 let n = a.len();
-                debug_assert!(b.len() == n && out.len() == n);
+                contract::same_len("compare", &[n, b.len(), out.len()]);
                 let mut i = 0;
+                // SAFETY: the slice lengths were checked on entry, and every
+                // vector access covers `LANES` elements that end at or before
+                // `n`.
                 unsafe {
                     while i + LANES <= n {
                         let va = $load(a.as_ptr().add(i));
@@ -279,8 +349,11 @@ macro_rules! neon_kernels {
                 out: &mut [$t],
             ) {
                 let n = values.len();
-                debug_assert_eq!(out.len(), n);
+                contract::same_len("compare_scalar", &[n, out.len()]);
                 let mut i = 0;
+                // SAFETY: the slice lengths were checked on entry, and every
+                // vector access covers `LANES` elements that end at or before
+                // `n`.
                 unsafe {
                     let vs = $dup(scalar);
                     while i + LANES <= n {
@@ -307,8 +380,11 @@ macro_rules! neon_kernels {
             #[inline]
             pub fn sqrt(values: &[$t], out: &mut [$t]) {
                 let n = values.len();
-                debug_assert_eq!(out.len(), n);
+                contract::same_len("sqrt", &[n, out.len()]);
                 let mut i = 0;
+                // SAFETY: the slice lengths were checked on entry, and every
+                // vector access covers `LANES` elements that end at or before
+                // `n`.
                 unsafe {
                     while i + LANES <= n {
                         let vx = $load(values.as_ptr().add(i));
@@ -329,8 +405,11 @@ macro_rules! neon_kernels {
             #[inline]
             pub fn clamp(values: &[$t], low: $t, high: $t, out: &mut [$t]) {
                 let n = values.len();
-                debug_assert_eq!(out.len(), n);
+                contract::same_len("clamp", &[n, out.len()]);
                 let mut i = 0;
+                // SAFETY: the slice lengths were checked on entry, and every
+                // vector access covers `LANES` elements that end at or before
+                // `n`.
                 unsafe {
                     let (vlow, vhigh) = ($dup(low), $dup(high));
                     while i + LANES <= n {
@@ -374,6 +453,8 @@ macro_rules! neon_kernels {
                 let n = values.len();
                 let mut i = 0;
                 let mut total = identity(op);
+                // SAFETY: every vector access covers `LANES` elements of
+                // `values` that end at or before `n`.
                 unsafe {
                     let mut acc = [$dup(identity(op)); 4];
                     while i + 4 * LANES <= n {
@@ -424,6 +505,8 @@ macro_rules! neon_kernels {
                 let n = values.len();
                 let mut i = 0;
                 let mut total: $t;
+                // SAFETY: every vector access covers `LANES` elements of
+                // `values` that end at or before `n`.
                 unsafe {
                     let center = $dup(mean);
                     let mut acc = [$dup(0 as $t); 4];
@@ -461,8 +544,11 @@ macro_rules! neon_kernels {
             #[inline]
             pub fn accumulate(totals: &mut [$t], values: &[$t]) {
                 let n = totals.len();
-                debug_assert_eq!(values.len(), n);
+                contract::same_len("accumulate", &[n, values.len()]);
                 let mut i = 0;
+                // SAFETY: the slice lengths were checked on entry, and every
+                // vector access covers `LANES` elements that end at or before
+                // `n`.
                 unsafe {
                     while i + LANES <= n {
                         let t = $load(totals.as_ptr().add(i));
@@ -482,8 +568,14 @@ macro_rules! neon_kernels {
             #[inline]
             pub fn accumulate_squared_deviations(totals: &mut [$t], values: &[$t], means: &[$t]) {
                 let n = totals.len();
-                debug_assert!(values.len() == n && means.len() == n);
+                contract::same_len(
+                    "accumulate_squared_deviations",
+                    &[n, values.len(), means.len()],
+                );
                 let mut i = 0;
+                // SAFETY: the slice lengths were checked on entry, and every
+                // vector access covers `LANES` elements that end at or before
+                // `n`.
                 unsafe {
                     while i + LANES <= n {
                         let d = $sub($load(values.as_ptr().add(i)), $load(means.as_ptr().add(i)));
@@ -511,7 +603,7 @@ macro_rules! neon_kernels {
             /// down a column of `b` and defeats both.
             #[inline]
             pub fn matmul(a: &[$t], b: &[$t], m: usize, k: usize, n: usize, out: &mut [$t]) {
-                debug_assert!(a.len() == m * k && b.len() == k * n && out.len() == m * n);
+                contract::matmul("matmul", a.len(), b.len(), out.len(), (m, k, n));
                 for v in out.iter_mut() {
                     *v = 0 as $t;
                 }
@@ -532,16 +624,14 @@ macro_rules! neon_kernels {
                 n: usize,
                 out: &mut [$t],
             ) {
-                debug_assert!(
-                    a.len() == m * k
-                        && b.len() == k * n
-                        && addend.len() == m * n
-                        && out.len() == m * n
-                );
+                contract::matmul("matmul_add", a.len(), b.len(), out.len(), (m, k, n));
+                contract::same_len("matmul_add", &[out.len(), addend.len()]);
                 out.copy_from_slice(addend);
                 matmul_accumulate(a, b, m, k, n, out);
             }
 
+            /// Row-major `out += a·b`, the loop [`matmul`] and [`matmul_add`]
+            /// share once they have initialized `out`.
             #[inline]
             pub fn matmul_accumulate(
                 a: &[$t],
@@ -551,6 +641,10 @@ macro_rules! neon_kernels {
                 n: usize,
                 out: &mut [$t],
             ) {
+                contract::matmul("matmul_accumulate", a.len(), b.len(), out.len(), (m, k, n));
+                // SAFETY: the extents were checked against the slice lengths
+                // above, so every row offset plus a full or partial vector of
+                // columns stays inside `a`, `b` and `out`.
                 unsafe {
                     for i in 0..m {
                         let arow = i * k;
@@ -617,7 +711,7 @@ pub mod fft_f32 {
     /// (matching `radix2_fft`'s sign convention; normalization is the caller's
     /// job, exactly as in the scalar path).
     pub fn radix2(buf: &mut [f32], n: usize, direction: f32) {
-        debug_assert_eq!(buf.len(), 2 * n);
+        super::contract::fft("radix2", buf.len(), n);
         if n <= 1 {
             return;
         }
@@ -665,6 +759,10 @@ pub mod fft_f32 {
             let mut start = 0;
             while start < n {
                 let mut o = 0;
+                // SAFETY: `n` is a power of two with `buf.len() == 2 * n`
+                // (checked on entry), so each block's `start + o + half + 4`
+                // points stay in `buf`, and `o + 4 <= half` keeps the twiddle
+                // loads in range.
                 unsafe {
                     while o + 4 <= half {
                         let eptr = buf.as_ptr().add(2 * (start + o));
