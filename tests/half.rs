@@ -500,4 +500,52 @@ mod metal {
         dispatches::<f16>();
         dispatches::<bf16>();
     }
+
+    fn epilogue_matches_host<T: MetalElement + tensorcrate::tensors::fused::Element>(
+        dtype: DType,
+        ulps: f64,
+    ) {
+        use tensorcrate::tensors::fused::{Fusable, Remap};
+        use tensorcrate::tensors::Compare;
+
+        let mut b = Builder::<T>::new();
+        let product = b.input(dtype);
+        let bias = b.input_remapped(dtype, Remap::Row);
+        let shifted = b.add(product, bias);
+        let zero = b.constant(T::zero());
+        let relu = b.compare(Compare::Max, shifted, zero);
+        b.output(relu, dtype);
+        let program = b.build().unwrap();
+
+        let mut rng = Lcg(17);
+        for tensorops in [true, false] {
+            tensorcrate::metal::set_tensorops(tensorops);
+            for (m, k, n) in [(3usize, 5usize, 2usize), (17, 33, 15), (65, 130, 67)] {
+                let a = Matrix::<T, Host>::from_flat(m, k, rng.vector::<T>(m * k, -1.0, 1.0));
+                let w = Matrix::<T, Host>::from_flat(k, n, rng.vector::<T>(k * n, -1.0, 1.0));
+                let bias = Vector::<T, Host>::new(rng.vector::<T>(n, -1.0, 1.0));
+                let host = program
+                    .run_matmul(&a, &w, &[&bias as &dyn Fusable<Host>])
+                    .remove(0)
+                    .into_vector::<T>();
+                let (ga, gw, gb) = (a.to_backend::<Metal>(), w.to_backend::<Metal>(), bias.to_backend::<Metal>());
+                let gpu = program
+                    .run_matmul(&ga, &gw, &[&gb as &dyn Fusable<Metal>])
+                    .remove(0)
+                    .into_vector::<T>();
+                assert!(gpu.is_device_resident());
+                close(&gpu.to_vec(), &host.to_vec(), ulps, &format!("{m}×{k}×{n}, tensorops {tensorops}"));
+            }
+        }
+        tensorcrate::metal::set_tensorops(true);
+    }
+
+    #[test]
+    fn compact_matmul_epilogues_on_the_gpu_match_the_host() {
+        // The f32 accumulators sum in different orders, then round to the
+        // compact type once; the epilogue rounds every operation.
+        epilogue_matches_host::<f16>(DType::F16, 4.0);
+        epilogue_matches_host::<bf16>(DType::Bf16, 4.0);
+        epilogue_matches_host::<f32>(DType::F32, 64.0);
+    }
 }

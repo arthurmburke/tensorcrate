@@ -1,5 +1,4 @@
-#include <metal_stdlib>
-using namespace metal;
+#include "common.h"
 
 #define TILE 16
 #define REDUCE_GROUP 256
@@ -16,54 +15,6 @@ using namespace metal;
 // has no `bfloat` overloads, so `bfloat` transcendentals evaluate in `float`
 // and round once, as the host's do.
 #define FOR_EACH_ELEMENT(M) M(float, f32) M(half, f16) M(bfloat, bf16)
-
-enum class BinaryOp : ushort {
-    Add = 0,
-    Sub = 1,
-    Mul = 2,
-    Div = 3,
-    Rem = 4
-};
-
-// Comparisons and the subgradient they imply. `MaxShare` is the derivative of
-// `Max` with respect to its left operand: one where the left is larger, zero
-// where it is smaller, and a half where they tie, so a tied maximum splits its
-// gradient evenly between the two.
-// The last four are predicates, answering 1.0 or 0.0 — the mask a tensor
-// algebra with no boolean element type uses. They are the *ordered* comparisons,
-// so a NaN operand answers 0.0, which is what `a < b` does on the CPU side.
-enum class CompareOp : ushort {
-    Min = 0,
-    Max = 1,
-    MaxShare = 2,
-    Less = 3,
-    LessEqual = 4,
-    Greater = 5,
-    GreaterEqual = 6
-};
-
-enum class ReduceOp : ushort {
-    Sum = 0,
-    Min = 1,
-    Max = 2
-};
-
-enum class AnalyticOp : ushort {
-    Sin = 0,
-    Cos = 1,
-    Tan = 2,
-    Sec = 3,
-    Csc = 4,
-    Arcsin = 5,
-    Arccos = 6,
-    Arctan = 7,
-    Exp = 8,
-    Ln = 9,
-    Sinh = 10,
-    Cosh = 11,
-    Tanh = 12,
-    Sqrt = 13
-};
 
 // Which way a matrix reduction folds. `Rows` folds each row and leaves one
 // value per row, matching `tensors::kernels::Axis`.
@@ -83,21 +34,21 @@ enum class StatisticOp : ushort {
     Ppf = 2
 };
 
+// One output element of `A·B`, accumulated in `float` over `TILE`-wide
+// tiles staged in threadgroup memory. Every thread of the group must call it,
+// in or out of range, because of the barriers.
 template <typename T>
-kernel void matmul_tiled(
-    device const T* A [[buffer(0)]],
-    device const T* B [[buffer(1)]],
-    device T* C       [[buffer(2)]],
-    constant uint& M      [[buffer(3)]],
-    constant uint& K      [[buffer(4)]],
-    constant uint& N      [[buffer(5)]],
-    constant uint& accumulate [[buffer(6)]],
-    uint2 tid [[thread_position_in_threadgroup]],
-    uint2 gid [[thread_position_in_grid]])
+inline float tiled_product(
+    device const T* A,
+    device const T* B,
+    uint M,
+    uint K,
+    uint N,
+    uint2 tid,
+    uint2 gid,
+    threadgroup float (*Asub)[TILE],
+    threadgroup float (*Bsub)[TILE])
 {
-    threadgroup float Asub[TILE][TILE];
-    threadgroup float Bsub[TILE][TILE];
-
     uint row = gid.y;
     uint col = gid.x;
     float acc = 0.0f;
@@ -117,7 +68,27 @@ kernel void matmul_tiled(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    return acc;
+}
 
+template <typename T>
+kernel void matmul_tiled(
+    device const T* A [[buffer(0)]],
+    device const T* B [[buffer(1)]],
+    device T* C       [[buffer(2)]],
+    constant uint& M      [[buffer(3)]],
+    constant uint& K      [[buffer(4)]],
+    constant uint& N      [[buffer(5)]],
+    constant uint& accumulate [[buffer(6)]],
+    uint2 tid [[thread_position_in_threadgroup]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    threadgroup float Asub[TILE][TILE];
+    threadgroup float Bsub[TILE][TILE];
+    float acc = tiled_product(A, B, M, K, N, tid, gid, Asub, Bsub);
+
+    uint row = gid.y;
+    uint col = gid.x;
     if (row < M && col < N) {
         // `accumulate` adds into C instead of overwriting it, which is what the
         // forward-mode tangent `A'B + AB'` and reverse-mode gradient
@@ -134,16 +105,6 @@ FOR_EACH_ELEMENT(INSTANTIATE_MATMUL)
 
 // `+ - * /` in the element type. There is no remainder kernel; the host keeps
 // `BinaryOp::Rem` for itself.
-template <typename T>
-inline T binary_values(BinaryOp op, T a, T b) {
-    switch (op) {
-        case BinaryOp::Add: return a + b;
-        case BinaryOp::Sub: return a - b;
-        case BinaryOp::Mul: return a * b;
-        default: return a / b;
-    }
-}
-
 template <typename T>
 kernel void elementwise(
     device const T* A [[buffer(0)]],
@@ -223,25 +184,6 @@ template [[host_name("broadcast_" #S)]] kernel void broadcast<T>(              \
     device const T*, device T*, constant float&, constant BinaryOp&,           \
     constant uint&, uint);
 FOR_EACH_ELEMENT(INSTANTIATE_BROADCAST)
-
-// `fmin`/`fmax` in the element type. MSL returns `float` for `bfloat` operands,
-// which the conversion rounds straight back — exactly, since the result is one
-// of the two operands.
-template <typename T> inline T element_min(T a, T b) { return T(fmin(a, b)); }
-template <typename T> inline T element_max(T a, T b) { return T(fmax(a, b)); }
-
-template <typename T>
-inline T compare_values(CompareOp op, T a, T b) {
-    switch (op) {
-        case CompareOp::Min: return element_min(a, b);
-        case CompareOp::Max: return element_max(a, b);
-        case CompareOp::MaxShare: return a > b ? T(1.0f) : (a < b ? T(0.0f) : T(0.5f));
-        case CompareOp::Less: return a < b ? T(1.0f) : T(0.0f);
-        case CompareOp::LessEqual: return a <= b ? T(1.0f) : T(0.0f);
-        case CompareOp::Greater: return a > b ? T(1.0f) : T(0.0f);
-        default: return a >= b ? T(1.0f) : T(0.0f);
-    }
-}
 
 template <typename T>
 kernel void compare(
@@ -659,42 +601,6 @@ kernel void transpose_tiled(
 template [[host_name("transpose_tiled_" #S)]] kernel void transpose_tiled<T>(  \
     device const T*, device T*, constant uint&, constant uint&, uint2, uint2);
 FOR_EACH_ELEMENT(INSTANTIATE_TRANSPOSE)
-
-// The shader builds with fast math, whose hyperbolics are formed from `exp`:
-// `tanh` becomes `inf / inf = NaN` once `exp(2x)` overflows (|x| > ~44), and
-// `sinh`/`cosh` reach `inf` near |x| = 89 where the true value is still finite.
-// The `precise::` forms saturate and overflow where the host's do, and the rest
-// of the shader keeps fast math.
-//
-// These variants must agree with `tensors::kernels::Analytic`, and each
-// derivative must match the corresponding `Dual` implementation.
-//
-// Each function is evaluated in the element type and every intermediate rounds
-// to it, in the order the host's `Analytic::value` and `derivative` use, so a
-// `half` derivative is built from `half` operations exactly as the CPU's `f16`
-// one is. `T(...)` around a library call is the identity for `float` and
-// `half`, and the single rounding of a `float` result for `bfloat`.
-template <typename T>
-inline T analytic_value(AnalyticOp op, T x) {
-    const T one = T(1.0f);
-    switch (op) {
-        case AnalyticOp::Sin:    return T(sin(x));
-        case AnalyticOp::Cos:    return T(cos(x));
-        case AnalyticOp::Tan:    return T(tan(x));
-        case AnalyticOp::Sec:    return one / T(cos(x));
-        case AnalyticOp::Csc:    return one / T(sin(x));
-        case AnalyticOp::Arcsin: return T(asin(x));
-        case AnalyticOp::Arccos: return T(acos(x));
-        case AnalyticOp::Arctan: return T(atan(x));
-        case AnalyticOp::Exp:    return T(exp(x));
-        case AnalyticOp::Ln:     return T(log(x));
-        case AnalyticOp::Sinh:   return T(precise::sinh(x));
-        case AnalyticOp::Cosh:   return T(precise::cosh(x));
-        case AnalyticOp::Tanh:   return T(precise::tanh(x));
-        case AnalyticOp::Sqrt:   return T(sqrt(x));
-        default: return T(NAN);
-    }
-}
 
 template <typename T>
 inline T analytic_derivative(AnalyticOp op, T x) {
@@ -1163,68 +1069,6 @@ FOR_EACH_ELEMENT(INSTANTIATE_AXIS_DISTRIBUTION)
 // so the `switch` on each opcode never diverges within a SIMD group, and the
 // intermediates stay in the `r` array rather than going back to memory.
 
-#define FUSED_REGISTERS 16
-
-// Must match `fused::Encoded`: twelve bytes, four-aligned.
-struct FusedInstr {
-    ushort kind;   // 0 load, 1 const, 2 binary, 3 unary, 4 compare, 5 store
-    ushort op;     // remap, BinaryOp, AnalyticOp or CompareOp
-    uchar dst;
-    uchar a;       // load: input slot; others: register
-    uchar b;       // load/store: storage type; binary/compare: register
-    uchar aux;     // store: output slot
-    float value;   // const
-};
-
-struct FusedShape {
-    uint rows;
-    uint cols;
-    uint count;    // instructions
-};
-
-// Storage types, matching `fused::DType`.
-inline float fused_load(device const uchar* base, uint dtype, uint index) {
-    switch (dtype) {
-        case 1: return float(((device const half*)base)[index]);
-        // bf16 is the top half of an f32, so widening is a shift.
-        case 2: return as_type<float>(uint(((device const ushort*)base)[index]) << 16);
-        default: return ((device const float*)base)[index];
-    }
-}
-
-// Round to nearest, ties to even, quieting NaNs — the same rule as
-// `half::bf16::from_f32`, so both backends narrow a given f32 identically.
-inline ushort fused_to_bf16(float value) {
-    uint x = as_type<uint>(value);
-    if ((x & 0x7fffffffu) > 0x7f800000u) {
-        return ushort((x >> 16) | 0x0040u);
-    }
-    uint round_bit = 0x00008000u;
-    if ((x & round_bit) != 0 && (x & (3u * round_bit - 1u)) != 0) {
-        return ushort(x >> 16) + 1;
-    }
-    return ushort(x >> 16);
-}
-
-inline void fused_store(device uchar* base, uint dtype, uint index, float value) {
-    switch (dtype) {
-        case 1: ((device half*)base)[index] = half(value); break;
-        case 2: ((device ushort*)base)[index] = fused_to_bf16(value); break;
-        default: ((device float*)base)[index] = value; break;
-    }
-}
-
-// Which input element feeds output element `i`, matching `fused::Remap`.
-inline uint fused_remap(ushort remap, uint i, uint rows, uint cols) {
-    switch (remap) {
-        case 1: return (i % cols) * rows + i / cols;  // transpose
-        case 2: return i % cols;                      // row vector, down every row
-        case 3: return i / cols;                      // column vector, across every column
-        default: return i;
-    }
-}
-
-
 // Sixteen input and eight output slots, plus the program and its shape: 26 of
 // Metal's 31 buffer arguments. Unused slots are bound to a used buffer, which is
 // never touched because no instruction names them. A tensor updated in place is
@@ -1260,41 +1104,12 @@ kernel void fused_elementwise(
     device uchar* out7 [[buffer(25)]],
     uint i [[thread_position_in_grid]])
 {
-    device const uchar* inputs[16] = {
-        in0, in1, in2, in3, in4, in5, in6, in7,
-        in8, in9, in10, in11, in12, in13, in14, in15
+    FusedBuffers buffers = {
+        { in0, in1, in2, in3, in4, in5, in6, in7,
+          in8, in9, in10, in11, in12, in13, in14, in15 },
+        { out0, out1, out2, out3, out4, out5, out6, out7 }
     };
-    device uchar* outputs[8] = { out0, out1, out2, out3, out4, out5, out6, out7 };
-
-    T r[FUSED_REGISTERS];
-    for (uint pc = 0; pc < shape.count; pc++) {
-        FusedInstr instr = code[pc];
-        switch (instr.kind) {
-            case 0:
-                // Every storage type widens to `float` exactly, so this is one
-                // rounding, to `T`.
-                r[instr.dst] = T(fused_load(
-                    inputs[instr.a], instr.b,
-                    fused_remap(instr.op, i, shape.rows, shape.cols)));
-                break;
-            case 1:
-                // A `Program<T>` constant is a `T`, which `float` holds exactly.
-                r[instr.dst] = T(instr.value);
-                break;
-            case 2:
-                r[instr.dst] = binary_values(BinaryOp(instr.op), r[instr.a], r[instr.b]);
-                break;
-            case 3:
-                r[instr.dst] = analytic_value(AnalyticOp(instr.op), r[instr.a]);
-                break;
-            case 4:
-                r[instr.dst] = compare_values(CompareOp(instr.op), r[instr.a], r[instr.b]);
-                break;
-            default:
-                fused_store(outputs[instr.aux], instr.b, i, float(r[instr.a]));
-                break;
-        }
-    }
+    fused_run<T>(code, shape.count, buffers, i, shape.rows, shape.cols, false, 0.0f);
 }
 
 #define INSTANTIATE_FUSED(T, S)                                                \
@@ -1309,3 +1124,75 @@ template [[host_name("fused_elementwise_" #S)]] kernel void fused_elementwise<T>
     device uchar*, device uchar*, device uchar*, device uchar*,                \
     device uchar*, device uchar*, device uchar*, device uchar*, uint);
 FOR_EACH_ELEMENT(INSTANTIATE_FUSED)
+
+// ---- matrix products with an epilogue -----------------------------------------
+//
+// `A·B` whose every element goes straight into a fused program as its input 0,
+// before anything is stored: bias, activation, scaling — whatever the program
+// says — at the cost of the product alone. The shape is the product's
+// (`rows = M`, `cols = N`), so the program's other inputs are addressed, and
+// its remaps resolved, exactly as `fused_elementwise` would for the stored
+// product. Slot 0's buffer is never read.
+template <typename T>
+kernel void matmul_epilogue(
+    constant FusedInstr* code   [[buffer(0)]],
+    constant FusedShape& shape  [[buffer(1)]],
+    device const T* A  [[buffer(2)]],
+    device const T* B  [[buffer(3)]],
+    constant uint& K   [[buffer(4)]],
+    device const uchar* in1  [[buffer(5)]],
+    device const uchar* in2  [[buffer(6)]],
+    device const uchar* in3  [[buffer(7)]],
+    device const uchar* in4  [[buffer(8)]],
+    device const uchar* in5  [[buffer(9)]],
+    device const uchar* in6  [[buffer(10)]],
+    device const uchar* in7  [[buffer(11)]],
+    device const uchar* in8  [[buffer(12)]],
+    device const uchar* in9  [[buffer(13)]],
+    device const uchar* in10 [[buffer(14)]],
+    device const uchar* in11 [[buffer(15)]],
+    device const uchar* in12 [[buffer(16)]],
+    device const uchar* in13 [[buffer(17)]],
+    device const uchar* in14 [[buffer(18)]],
+    device const uchar* in15 [[buffer(19)]],
+    device uchar* out0 [[buffer(20)]],
+    device uchar* out1 [[buffer(21)]],
+    device uchar* out2 [[buffer(22)]],
+    device uchar* out3 [[buffer(23)]],
+    device uchar* out4 [[buffer(24)]],
+    device uchar* out5 [[buffer(25)]],
+    device uchar* out6 [[buffer(26)]],
+    device uchar* out7 [[buffer(27)]],
+    uint2 tid [[thread_position_in_threadgroup]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    threadgroup float Asub[TILE][TILE];
+    threadgroup float Bsub[TILE][TILE];
+    uint M = shape.rows;
+    uint N = shape.cols;
+    float acc = tiled_product(A, B, M, K, N, tid, gid, Asub, Bsub);
+
+    uint row = gid.y;
+    uint col = gid.x;
+    if (row < M && col < N) {
+        FusedBuffers buffers = {
+            { (device const uchar*)A, in1, in2, in3, in4, in5, in6, in7,
+              in8, in9, in10, in11, in12, in13, in14, in15 },
+            { out0, out1, out2, out3, out4, out5, out6, out7 }
+        };
+        fused_run<T>(code, shape.count, buffers, row * N + col, M, N, true, acc);
+    }
+}
+
+#define INSTANTIATE_MATMUL_EPILOGUE(T, S)                                      \
+template [[host_name("matmul_epilogue_" #S)]] kernel void matmul_epilogue<T>(  \
+    constant FusedInstr*, constant FusedShape&, device const T*,               \
+    device const T*, constant uint&,                                           \
+    device const uchar*, device const uchar*, device const uchar*,             \
+    device const uchar*, device const uchar*, device const uchar*,             \
+    device const uchar*, device const uchar*, device const uchar*,             \
+    device const uchar*, device const uchar*, device const uchar*,             \
+    device const uchar*, device const uchar*, device const uchar*,             \
+    device uchar*, device uchar*, device uchar*, device uchar*,                \
+    device uchar*, device uchar*, device uchar*, device uchar*, uint2, uint2);
+FOR_EACH_ELEMENT(INSTANTIATE_MATMUL_EPILOGUE)

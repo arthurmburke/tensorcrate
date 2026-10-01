@@ -24,7 +24,7 @@
 //! kernel. [`MetalBuffer`] is that storage, usable directly when the
 //! `Vector`/`Matrix` types do not fit.
 
-use std::cell::{OnceCell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::marker::PhantomData;
 use std::mem::{ManuallyDrop, size_of};
 use std::ptr::NonNull;
@@ -224,6 +224,10 @@ struct Typed {
     distribution: Pipeline,
     axis_distribution: Pipeline,
     fused: Pipeline,
+    /// A product whose elements feed a fused program before any store.
+    matmul_epilogue: Pipeline,
+    /// The same on TensorOps, on M5-class GPUs.
+    tensorops_epilogue: Option<Pipeline>,
 }
 
 impl Gpu {
@@ -240,6 +244,20 @@ struct TensorOpsPipelines {
 
 thread_local! {
     static GPU: OnceCell<Option<Gpu>> = const { OnceCell::new() };
+    static TENSOROPS: Cell<bool> = const { Cell::new(true) };
+}
+
+/// Whether matrix products on this thread may use TensorOps where the GPU has
+/// them (M5-class), or must use the tiled kernel. On by default; turning it
+/// off is for testing the tiled kernels on hardware that would never reach
+/// them, and for comparing the two.
+#[doc(hidden)]
+pub fn set_tensorops(enabled: bool) {
+    TENSOROPS.with(|cell| cell.set(enabled));
+}
+
+fn tensorops_enabled() -> bool {
+    TENSOROPS.with(Cell::get)
 }
 
 fn build_gpu() -> Option<Gpu> {
@@ -322,6 +340,8 @@ fn build_gpu() -> Option<Gpu> {
             distribution: kernel("distribution")?,
             axis_distribution: kernel("axis_distribution")?,
             fused: kernel("fused_elementwise")?,
+            matmul_epilogue: kernel("matmul_epilogue")?,
+            tensorops_epilogue: tensorops_pipeline(&format!("matmul_tensorops_epilogue_{suffix}")),
         })
     };
     Some(Gpu {
@@ -1206,7 +1226,10 @@ fn encode_matmul<T: MetalElement>(
     n: usize,
     accumulate: bool,
 ) -> Option<()> {
-    if !accumulate && let Some(pipeline) = &gpu.kernels::<T>().tensorops {
+    if !accumulate
+        && tensorops_enabled()
+        && let Some(pipeline) = &gpu.kernels::<T>().tensorops
+    {
         return encode_tensorops_matmul(
             gpu,
             pipeline,
@@ -2091,6 +2114,93 @@ pub(crate) fn fused_elementwise<T: MetalElement>(
             }
         }
         dispatch_1d(&encoder, len);
+        encoder.endEncoding();
+        commit(gpu, command)
+    })
+}
+
+/// Encode `program(a·b, inputs…)`: an `m × k` by `k × n` product whose every
+/// element is the program's input 0, fed to it before anything is stored.
+///
+/// `inputs` are the program's input slots from 1 on; slot 0's buffer is never
+/// read. On an M5-class GPU the product runs on TensorOps and the program on
+/// the staged tile; elsewhere on the tiled kernel.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn matmul_epilogue<T: MetalElement>(
+    code: &[crate::tensors::fused::Encoded],
+    (m, k, n): (usize, usize, usize),
+    a: &ProtocolObject<dyn MTLBuffer>,
+    b: &ProtocolObject<dyn MTLBuffer>,
+    inputs: &[&ProtocolObject<dyn MTLBuffer>],
+    outputs: &[&ProtocolObject<dyn MTLBuffer>],
+) -> Option<()> {
+    if m == 0
+        || n == 0
+        || k == 0
+        || code.is_empty()
+        || outputs.is_empty()
+        || inputs.len() >= FUSED_INPUT_SLOTS
+        || outputs.len() > FUSED_OUTPUT_SLOTS
+    {
+        return None;
+    }
+    let shape = FusedShape {
+        rows: u32::try_from(m).ok()?,
+        cols: u32::try_from(n).ok()?,
+        count: u32::try_from(code.len()).ok()?,
+    };
+    let inner = u32::try_from(k).ok()?;
+    let code_bytes = std::mem::size_of_val(code);
+    if code_bytes > 4096 {
+        return None;
+    }
+    with_gpu(|gpu| {
+        let kernels = gpu.kernels::<T>();
+        let command = gpu.queue.commandBuffer()?;
+        let encoder = command.computeCommandEncoder()?;
+        let tensorops = kernels.tensorops_epilogue.as_ref().filter(|_| tensorops_enabled());
+        encoder.setComputePipelineState(tensorops.unwrap_or(&kernels.matmul_epilogue));
+        unsafe {
+            encoder.setBytes_length_atIndex(NonNull::from(&code[0]).cast(), code_bytes, 0);
+            encoder.setBytes_length_atIndex(NonNull::from(&shape).cast(), size_of::<FusedShape>(), 1);
+            encoder.setBuffer_offset_atIndex(Some(a), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(b), 0, 3);
+            encoder.setBytes_length_atIndex(NonNull::from(&inner).cast(), 4, 4);
+            for slot in 1..FUSED_INPUT_SLOTS {
+                let buffer = inputs.get(slot - 1).copied().unwrap_or(a);
+                encoder.setBuffer_offset_atIndex(Some(buffer), 0, 4 + slot);
+            }
+            for slot in 0..FUSED_OUTPUT_SLOTS {
+                let buffer = outputs.get(slot).copied().unwrap_or(outputs[0]);
+                encoder.setBuffer_offset_atIndex(Some(buffer), 0, 4 + FUSED_INPUT_SLOTS + slot);
+            }
+        }
+        match tensorops {
+            Some(pipeline) => encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: n.div_ceil(TENSOROPS_TILE_COLS),
+                    height: m.div_ceil(TENSOROPS_TILE_ROWS),
+                    depth: 1,
+                },
+                MTLSize {
+                    width: pipeline.threadExecutionWidth() * 4,
+                    height: 1,
+                    depth: 1,
+                },
+            ),
+            None => encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: n.div_ceil(TILE),
+                    height: m.div_ceil(TILE),
+                    depth: 1,
+                },
+                MTLSize {
+                    width: TILE,
+                    height: TILE,
+                    depth: 1,
+                },
+            ),
+        }
         encoder.endEncoding();
         commit(gpu, command)
     })

@@ -168,17 +168,6 @@ impl Remap {
         }
     }
 
-    /// The input element that feeds output element `index`.
-    #[inline]
-    fn source(self, index: usize, (rows, cols): (usize, usize)) -> usize {
-        match self {
-            Remap::Identity => index,
-            Remap::Transpose => (index % cols) * rows + index / cols,
-            Remap::Row => index % cols,
-            Remap::Column => index / cols,
-        }
-    }
-
     fn name(self) -> &'static str {
         match self {
             Remap::Identity => "",
@@ -568,6 +557,108 @@ impl<T: Real> Program<T> {
         self.run((1, len), &inputs, &mut [])
             .into_iter()
             .map(Output::into_vector)
+            .collect()
+    }
+
+    /// Run the program as the epilogue of the matrix product `a·b`.
+    ///
+    /// The product is the program's input 0 and is consumed as it is computed:
+    /// on Metal the product and the program are one dispatch, and the product
+    /// is never written to memory unless the program stores it. `inputs` fill
+    /// slots 1 on. The iteration space is the product's shape, so a bias added
+    /// to every row is an input read through [`Remap::Row`].
+    ///
+    /// ```
+    /// use tensorcrate::tensors::fused::{Builder, DType, Remap};
+    /// use tensorcrate::tensors::{Compare, Matrix, Vector};
+    ///
+    /// // relu(x·w + bias), one kernel.
+    /// let mut b = Builder::new();
+    /// let product = b.input(DType::F32);
+    /// let bias = b.input_remapped(DType::F32, Remap::Row);
+    /// let shifted = b.add(product, bias);
+    /// let zero = b.constant(0.0);
+    /// let relu = b.compare(Compare::Max, shifted, zero);
+    /// b.output(relu, DType::F32);
+    /// let layer = b.build().unwrap();
+    ///
+    /// let x = Matrix::from_rows([[1.0f32, 2.0], [3.0, 4.0]]);
+    /// let w = Matrix::from_rows([[1.0f32, -1.0], [0.0, 1.0]]);
+    /// let bias = Vector::new([0.5f32, -2.5]);
+    /// let y = layer.run_matmul(&x, &w, &[&bias]).remove(0).into_matrix::<f32>();
+    /// assert_eq!(y.to_rows(), [[1.5, 0.0], [3.5, 0.0]]);
+    /// ```
+    ///
+    /// On the host the product is computed first and the program then runs over
+    /// it, which is exactly the unfused computation, so the result is the same
+    /// bit for bit. On Metal it agrees within the usual tolerance.
+    ///
+    /// # Panics
+    ///
+    /// If the inner dimensions disagree, if input 0 is not stored as `T` or is
+    /// read through a remap, if the program updates tensors in place, or if
+    /// `inputs` disagree with the program as in [`run`](Self::run).
+    #[track_caller]
+    pub fn run_matmul<B: Kernels<T>>(
+        &self,
+        a: &Matrix<T, B>,
+        b: &Matrix<T, B>,
+        inputs: &[&dyn Fusable<B>],
+    ) -> Vec<Output<B>>
+    where
+        T: Element,
+    {
+        assert_eq!(
+            a.cols(),
+            b.rows(),
+            "fused matmul: inner dimensions {} and {} disagree",
+            a.cols(),
+            b.rows()
+        );
+        assert_eq!(self.updated, 0, "fused matmul: the epilogue cannot update tensors in place");
+        assert!(
+            !self.inputs.is_empty(),
+            "fused matmul: the epilogue must read the product as input 0"
+        );
+        assert_eq!(
+            inputs.len() + 1,
+            self.fresh_inputs(),
+            "fused matmul: expected {} inputs besides the product, got {}",
+            self.fresh_inputs() - 1,
+            inputs.len()
+        );
+        for instr in &self.code {
+            if let Instr::Load { input: 0, remap, .. } = *instr {
+                assert_eq!(remap, Remap::Identity, "fused matmul: the product is read through {remap:?}");
+            }
+        }
+        let shape = (a.rows(), b.cols());
+        let len = shape.0 * shape.1;
+        self.check_input(0, T::DTYPE, len, shape);
+        let sources: Vec<Source<'_, B>> = inputs.iter().map(|input| input.source()).collect();
+        for (slot, source) in sources.iter().enumerate() {
+            self.check_input(slot + 1, source.dtype(), source.len, shape);
+        }
+
+        let fresh = match mode() {
+            Mode::Fused => {
+                // The operands are read and the product is not.
+                let operands = (a.rows() * a.cols() + b.rows() * b.cols()) * T::DTYPE.size();
+                counters::kernel(
+                    self.bytes(len) - len * T::DTYPE.size() + operands,
+                    self.fresh_outputs(),
+                );
+                B::matmul_epilogue(self, a, b, &sources)
+            }
+            Mode::Unfused => {
+                let product = B::matmul(a, b);
+                let sources = with_product(&product, &sources);
+                unfused(self, shape, &sources, &mut [])
+            }
+        };
+        fresh
+            .into_iter()
+            .map(|data| Output { shape, data })
             .collect()
     }
 
@@ -1137,6 +1228,20 @@ pub struct Sink<'a, B: Backend> {
 }
 
 impl<B: Backend> Source<'_, B> {
+    /// Another handle on the same storage.
+    fn reborrow(&self) -> Source<'_, B> {
+        let data = match self.data {
+            SourceData::F32(storage) => SourceData::F32(storage),
+            SourceData::F16(storage) => SourceData::F16(storage),
+            SourceData::Bf16(storage) => SourceData::Bf16(storage),
+            SourceData::F64(storage) => SourceData::F64(storage),
+        };
+        Source {
+            data,
+            len: self.len,
+        }
+    }
+
     fn dtype(&self) -> DType {
         match self.data {
             SourceData::F32(_) => DType::F32,
@@ -1580,20 +1685,54 @@ impl Slice<'_> {
         }
     }
 
-    /// Convert `out.len()` elements from `start`, read through `remap`, into `out`.
-    fn gather<T: Real>(&self, start: usize, shape: (usize, usize), remap: Remap, out: &mut [T]) {
-        if remap == Remap::Identity {
-            let end = start + out.len();
-            match self {
-                Slice::F32(values) => convert_into(&values[start..end], out),
-                Slice::F16(values) => convert_into(&values[start..end], out),
-                Slice::Bf16(values) => convert_into(&values[start..end], out),
-                Slice::F64(values) => convert_into(&values[start..end], out),
-            }
-            return;
+    /// Convert `out.len()` contiguous elements from `start` into `out`.
+    fn copy_into<T: Real>(&self, start: usize, out: &mut [T]) {
+        let end = start + out.len();
+        match self {
+            Slice::F32(values) => convert_into(&values[start..end], out),
+            Slice::F16(values) => convert_into(&values[start..end], out),
+            Slice::Bf16(values) => convert_into(&values[start..end], out),
+            Slice::F64(values) => convert_into(&values[start..end], out),
         }
-        for (offset, out) in out.iter_mut().enumerate() {
-            *out = self.get(remap.source(start + offset, shape));
+    }
+
+    /// Convert `out.len()` elements from `start`, read through `remap`, into `out`.
+    ///
+    /// The broadcasts walk the space a row segment at a time: a [`Row`]
+    /// segment is a contiguous run of the vector, a [`Column`] segment one
+    /// value repeated, so neither pays an index computation per element.
+    ///
+    /// [`Row`]: Remap::Row
+    /// [`Column`]: Remap::Column
+    fn gather<T: Real>(&self, start: usize, shape: (usize, usize), remap: Remap, out: &mut [T]) {
+        let (rows, cols) = shape;
+        match remap {
+            Remap::Identity => self.copy_into(start, out),
+            Remap::Row | Remap::Column => {
+                let mut offset = 0;
+                while offset < out.len() {
+                    let (row, col) = ((start + offset) / cols, (start + offset) % cols);
+                    let run = (cols - col).min(out.len() - offset);
+                    let segment = &mut out[offset..offset + run];
+                    if remap == Remap::Row {
+                        self.copy_into(col, segment);
+                    } else {
+                        segment.fill(self.get(row));
+                    }
+                    offset += run;
+                }
+            }
+            Remap::Transpose => {
+                let (mut row, mut col) = (start / cols, start % cols);
+                for out in out.iter_mut() {
+                    *out = self.get(col * rows + row);
+                    col += 1;
+                    if col == cols {
+                        col = 0;
+                        row += 1;
+                    }
+                }
+            }
         }
     }
 }
@@ -1985,6 +2124,31 @@ mod kernel {
     }
 }
 
+/// `product` as input 0, then `inputs`.
+fn with_product<'a, T: Element, B: Backend>(
+    product: &'a Matrix<T, B>,
+    inputs: &'a [Source<'_, B>],
+) -> Vec<Source<'a, B>> {
+    let mut sources = Vec::with_capacity(inputs.len() + 1);
+    sources.push(product.source());
+    sources.extend(inputs.iter().map(Source::reborrow));
+    sources
+}
+
+/// The [`Host`] entry point for [`Kernels::matmul_epilogue`]: the product,
+/// then the interpreter over it — the unfused computation, without counting
+/// two kernels.
+pub(crate) fn host_matmul<T: Element>(
+    program: &Program<T>,
+    a: &Matrix<T, Host>,
+    b: &Matrix<T, Host>,
+    inputs: &[Source<'_, Host>],
+) -> Vec<Fresh<Host>> {
+    let product = a.matmul(b);
+    let sources = with_product(&product, inputs);
+    interpret_on(program, product.shape(), &sources, &mut [])
+}
+
 /// The [`Host`] entry point for [`Kernels::fused`].
 pub(crate) fn host<T: Real>(
     program: &Program<T>,
@@ -2015,6 +2179,104 @@ pub(crate) fn metal<T: crate::metal::MetalElement>(
         .unwrap_or_else(|| interpret_on(program, shape, inputs, updated))
 }
 
+/// The [`Metal`](super::Metal) entry point for [`Kernels::matmul_epilogue`]:
+/// one dispatch when the operands are device-resident and the program runs on
+/// the shader, and otherwise the product followed by [`metal`].
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub(crate) fn metal_matmul<T: crate::metal::MetalElement + Element>(
+    program: &Program<T>,
+    a: &Matrix<T, super::Metal>,
+    b: &Matrix<T, super::Metal>,
+    inputs: &[Source<'_, super::Metal>],
+) -> Vec<Fresh<super::Metal>> {
+    resident_matmul(program, a, b, inputs).unwrap_or_else(|| {
+        let product = a.matmul(b);
+        let sources = with_product(&product, inputs);
+        metal(program, product.shape(), &sources, &mut [])
+    })
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+mod device {
+    use half::{bf16, f16};
+    use objc2::runtime::ProtocolObject;
+    use objc2_metal::MTLBuffer;
+
+    use super::{DType, Fresh, Program, SinkData, Source, SourceData};
+    use crate::metal::MetalBuffer;
+    use crate::tensors::{Metal, MetalStorage};
+
+    pub(super) type Raw = ProtocolObject<dyn MTLBuffer>;
+
+    pub(super) fn raw<T: Copy + 'static>(storage: &MetalStorage<T>) -> Option<&Raw> {
+        Some(storage.device()?.raw())
+    }
+
+    /// The device buffer behind each source, or `None` if any is not resident
+    /// or is `f64`, which the shaders do not have.
+    pub(super) fn sources<'a>(inputs: &'a [Source<'_, Metal>]) -> Option<Vec<&'a Raw>> {
+        inputs
+            .iter()
+            .map(|input| match input.data {
+                SourceData::F32(storage) => raw(storage),
+                SourceData::F16(storage) => raw(storage),
+                SourceData::Bf16(storage) => raw(storage),
+                SourceData::F64(_) => None,
+            })
+            .collect()
+    }
+
+    /// The device buffer behind an in-place operand.
+    pub(super) fn sink<'a>(data: &'a SinkData<'_, Metal>) -> Option<&'a Raw> {
+        match data {
+            SinkData::F32(storage) => raw(storage),
+            SinkData::F16(storage) => raw(storage),
+            SinkData::Bf16(storage) => raw(storage),
+            SinkData::F64(_) => None,
+        }
+    }
+
+    /// A fresh output buffer of one of the shader's storage types.
+    pub(super) enum Allocation {
+        F32(MetalBuffer<f32>),
+        F16(MetalBuffer<f16>),
+        Bf16(MetalBuffer<bf16>),
+    }
+
+    impl Allocation {
+        pub(super) fn raw(&self) -> &Raw {
+            match self {
+                Allocation::F32(buffer) => buffer.raw(),
+                Allocation::F16(buffer) => buffer.raw(),
+                Allocation::Bf16(buffer) => buffer.raw(),
+            }
+        }
+
+        pub(super) fn into_fresh(self) -> Fresh<Metal> {
+            match self {
+                Allocation::F32(buffer) => Fresh::F32(MetalStorage::from_device(buffer)),
+                Allocation::F16(buffer) => Fresh::F16(MetalStorage::from_device(buffer)),
+                Allocation::Bf16(buffer) => Fresh::Bf16(MetalStorage::from_device(buffer)),
+            }
+        }
+    }
+
+    /// Buffers for the program's fresh outputs, `len` elements each.
+    pub(super) fn allocate<T>(program: &Program<T>, len: usize) -> Option<Vec<Allocation>> {
+        program.outputs[program.updated..]
+            .iter()
+            .map(|dtype| {
+                Some(match dtype {
+                    DType::F32 => Allocation::F32(MetalBuffer::allocate(len)?),
+                    DType::F16 => Allocation::F16(MetalBuffer::allocate(len)?),
+                    DType::Bf16 => Allocation::Bf16(MetalBuffer::allocate(len)?),
+                    DType::F64 => return None,
+                })
+            })
+            .collect()
+    }
+}
+
 #[cfg(all(feature = "metal", target_os = "macos"))]
 fn resident<T: crate::metal::MetalElement>(
     program: &Program<T>,
@@ -2022,70 +2284,43 @@ fn resident<T: crate::metal::MetalElement>(
     inputs: &[Source<'_, super::Metal>],
     updated: &[Sink<'_, super::Metal>],
 ) -> Option<Vec<Fresh<super::Metal>>> {
-    use objc2::runtime::ProtocolObject;
-    use objc2_metal::MTLBuffer;
-
-    use super::MetalStorage;
-    use crate::metal::MetalBuffer;
-
     if !program.runs_on_metal() {
         return None;
     }
     let len = shape.0 * shape.1;
-
-    fn raw<T: Copy + 'static>(storage: &MetalStorage<T>) -> Option<&ProtocolObject<dyn MTLBuffer>> {
-        Some(storage.device()?.raw())
-    }
-    let mut read = Vec::with_capacity(program.inputs.len());
-    for input in inputs {
-        read.push(match input.data {
-            SourceData::F32(storage) => raw(storage)?,
-            SourceData::F16(storage) => raw(storage)?,
-            SourceData::Bf16(storage) => raw(storage)?,
-            SourceData::F64(_) => return None,
-        });
-    }
+    let mut read = device::sources(inputs)?;
     let mut written = Vec::with_capacity(program.outputs.len());
     for target in updated {
-        let buffer = match &target.data {
-            SinkData::F32(storage) => raw(storage)?,
-            SinkData::F16(storage) => raw(storage)?,
-            SinkData::Bf16(storage) => raw(storage)?,
-            SinkData::F64(_) => return None,
-        };
+        let buffer = device::sink(&target.data)?;
         read.push(buffer);
         written.push(buffer);
     }
-
-    enum Allocation {
-        F32(MetalBuffer<f32>),
-        F16(MetalBuffer<f16>),
-        Bf16(MetalBuffer<bf16>),
-    }
-    let mut fresh = Vec::with_capacity(program.fresh_outputs());
-    for dtype in &program.outputs[program.updated..] {
-        fresh.push(match dtype {
-            DType::F32 => Allocation::F32(MetalBuffer::allocate(len)?),
-            DType::F16 => Allocation::F16(MetalBuffer::allocate(len)?),
-            DType::Bf16 => Allocation::Bf16(MetalBuffer::allocate(len)?),
-            DType::F64 => return None,
-        });
-    }
-    written.extend(fresh.iter().map(|allocation| match allocation {
-        Allocation::F32(buffer) => buffer.raw(),
-        Allocation::F16(buffer) => buffer.raw(),
-        Allocation::Bf16(buffer) => buffer.raw(),
-    }));
+    let fresh = device::allocate(program, len)?;
+    written.extend(fresh.iter().map(device::Allocation::raw));
 
     crate::metal::fused_elementwise::<T>(&program.encode(), shape, &read, &written)?;
-    Some(
-        fresh
-            .into_iter()
-            .map(|allocation| match allocation {
-                Allocation::F32(buffer) => Fresh::F32(MetalStorage::from_device(buffer)),
-                Allocation::F16(buffer) => Fresh::F16(MetalStorage::from_device(buffer)),
-                Allocation::Bf16(buffer) => Fresh::Bf16(MetalStorage::from_device(buffer)),
-            })
-            .collect(),
-    )
+    Some(fresh.into_iter().map(device::Allocation::into_fresh).collect())
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn resident_matmul<T: crate::metal::MetalElement>(
+    program: &Program<T>,
+    a: &Matrix<T, super::Metal>,
+    b: &Matrix<T, super::Metal>,
+    inputs: &[Source<'_, super::Metal>],
+) -> Option<Vec<Fresh<super::Metal>>> {
+    use super::Backend;
+
+    if !program.runs_on_metal() {
+        return None;
+    }
+    let (m, k, n) = (a.rows(), a.cols(), b.cols());
+    let left = device::raw(super::Metal::matrix_as_vector(a.storage()))?;
+    let right = device::raw(super::Metal::matrix_as_vector(b.storage()))?;
+    let read = device::sources(inputs)?;
+    let fresh = device::allocate(program, m * n)?;
+    let written: Vec<&device::Raw> = fresh.iter().map(device::Allocation::raw).collect();
+
+    crate::metal::matmul_epilogue::<T>(&program.encode(), (m, k, n), left, right, &read, &written)?;
+    Some(fresh.into_iter().map(device::Allocation::into_fresh).collect())
 }

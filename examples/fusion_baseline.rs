@@ -5,12 +5,14 @@
 //! cargo run --release --features counters --example fusion_baseline
 //! ```
 //!
-//! Three workloads, the ones the fusion plan baselines:
+//! Four workloads, the ones the fusion plan baselines:
 //!
 //! 1. an Adam update of a 1M-element parameter tensor;
 //! 2. one softmax cross-entropy step: forward, backward and an Adam update —
 //!    for a linear classifier;
-//! 3. one step of a two-layer MLP, every weight and bias updated by Adam.
+//! 3. `relu(X·W + b)` for a 512×1024 batch through a 1024-wide layer, the
+//!    bias and activation fused into the product as its epilogue;
+//! 4. one step of a two-layer MLP, every weight and bias updated by Adam.
 //!
 //! Each is run twice per backend: as it runs today, and with fusion switched off
 //! through [`fused::with_mode`], which reproduces the old one-kernel-per-operation
@@ -21,8 +23,8 @@ use std::time::Instant;
 
 use tensorcrate::counters::{self, Counts};
 use tensorcrate::optim::{Adam, Rule};
-use tensorcrate::tensors::fused::{self, Mode};
-use tensorcrate::tensors::{Host, Kernels, Matrix, Tape, Vector};
+use tensorcrate::tensors::fused::{self, Builder, DType, Mode, Remap};
+use tensorcrate::tensors::{Compare, Host, Kernels, Matrix, Tape, Vector};
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use tensorcrate::tensors::Metal;
@@ -64,6 +66,14 @@ fn run<B: Kernels>(backend: &str) {
             backend,
             mode,
             measure(mode, softmax_step::<B>()),
+        );
+    }
+    for mode in [Mode::Unfused, Mode::Fused] {
+        report(
+            "dense layer, 512×1024²",
+            backend,
+            mode,
+            measure(mode, dense_layer::<B>()),
         );
     }
     for mode in [Mode::Unfused, Mode::Fused] {
@@ -153,6 +163,26 @@ fn softmax_step<B: Kernels>() -> impl FnMut() {
             .scale(-1.0 / BATCH as f32);
         loss.backward();
         rule.update(&mut weights, &w.grad());
+    }
+}
+
+/// `relu(X·W + b)`: one product with its bias and activation as the epilogue.
+fn dense_layer<B: Kernels>() -> impl FnMut() {
+    const BATCH: usize = 512;
+    const WIDTH: usize = 1024;
+    let x = Matrix::from_flat(BATCH, WIDTH, values(BATCH * WIDTH, 11)).to_backend::<B>();
+    let w = Matrix::from_flat(WIDTH, WIDTH, values(WIDTH * WIDTH, 12)).to_backend::<B>();
+    let bias = Vector::new(values(WIDTH, 13)).to_backend::<B>();
+    let mut b = Builder::new();
+    let product = b.input(DType::F32);
+    let row = b.input_remapped(DType::F32, Remap::Row);
+    let shifted = b.add(product, row);
+    let zero = b.constant(0.0);
+    let relu = b.compare(Compare::Max, shifted, zero);
+    b.output(relu, DType::F32);
+    let layer = b.build().unwrap();
+    move || {
+        layer.run_matmul(&x, &w, &[&bias]);
     }
 }
 

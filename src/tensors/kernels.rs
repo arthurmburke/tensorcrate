@@ -995,6 +995,20 @@ pub trait Kernels<T: Real = f32>: Backend {
         inputs: &[Source<'_, Self>],
         updated: &mut [Sink<'_, Self>],
     ) -> Vec<Fresh<Self>>;
+
+    /// Run a fused elementwise program as the epilogue of `a·b`: the product
+    /// is the program's input 0 and `inputs` fill slots 1 on. Reach this
+    /// through [`Program::run_matmul`](super::fused::Program::run_matmul),
+    /// which checks the operands first.
+    #[doc(hidden)]
+    fn matmul_epilogue(
+        program: &Program<T>,
+        a: &Matrix<T, Self>,
+        b: &Matrix<T, Self>,
+        inputs: &[Source<'_, Self>],
+    ) -> Vec<Fresh<Self>>
+    where
+        T: fused::Element;
 }
 
 /// Every operation here already exists as an inherent method or an operator on
@@ -1425,6 +1439,18 @@ impl<T: Real> Kernels<T> for Host {
         updated: &mut [Sink<'_, Self>],
     ) -> Vec<Fresh<Self>> {
         fused::host(program, shape, inputs, updated)
+    }
+
+    fn matmul_epilogue(
+        program: &Program<T>,
+        a: &Matrix<T, Self>,
+        b: &Matrix<T, Self>,
+        inputs: &[Source<'_, Self>],
+    ) -> Vec<Fresh<Self>>
+    where
+        T: fused::Element,
+    {
+        fused::host_matmul(program, a, b, inputs)
     }
 }
 
@@ -2041,6 +2067,18 @@ mod gpu {
             updated: &mut [Sink<'_, Self>],
         ) -> Vec<Fresh<Self>> {
             fused::metal(program, shape, inputs, updated)
+        }
+
+        fn matmul_epilogue(
+            program: &Program<T>,
+            a: &Matrix<T, Self>,
+            b: &Matrix<T, Self>,
+            inputs: &[Source<'_, Self>],
+        ) -> Vec<Fresh<Self>>
+        where
+            T: fused::Element,
+        {
+            fused::metal_matmul(program, a, b, inputs)
         }
     }
 

@@ -891,3 +891,153 @@ fn metal_remaps_in_place_updates_and_compact_types() {
         );
     }
 }
+
+// ---- matrix products with an epilogue ---------------------------------------------
+
+/// Three epilogues: a dense layer (`relu(xw + bias)`), a gated one that keeps
+/// the product too (`[p, tanh(0.5·p + c)·g]`), and one that reads a whole
+/// second matrix (`exp(−p²)·m`).
+fn epilogues() -> Vec<(Program, Vec<Remap>)> {
+    let mut layer = Builder::new();
+    let p = layer.input(DType::F32);
+    let bias = layer.input_remapped(DType::F32, Remap::Row);
+    let shifted = layer.add(p, bias);
+    let zero = layer.constant(0.0);
+    let relu = layer.compare(Compare::Max, shifted, zero);
+    layer.output(relu, DType::F32);
+
+    let mut gated = Builder::new();
+    let p = gated.input(DType::F32);
+    let c = gated.input_remapped(DType::F32, Remap::Column);
+    let g = gated.input_remapped(DType::F32, Remap::Transpose);
+    let half = gated.scale(p, 0.5);
+    let shifted = gated.add(half, c);
+    let squashed = gated.unary(Analytic::Tanh, shifted);
+    let out = gated.mul(squashed, g);
+    gated.output(p, DType::F32);
+    gated.output(out, DType::F32);
+
+    let mut bump = Builder::new();
+    let p = bump.input(DType::F32);
+    let m = bump.input(DType::F32);
+    let square = bump.mul(p, p);
+    let negated = bump.scale(square, -1.0);
+    let e = bump.unary(Analytic::Exp, negated);
+    let out = bump.mul(e, m);
+    bump.output(out, DType::F32);
+
+    vec![
+        (layer.build().unwrap(), vec![Remap::Row]),
+        (gated.build().unwrap(), vec![Remap::Column, Remap::Transpose]),
+        (bump.build().unwrap(), vec![Remap::Identity]),
+    ]
+}
+
+/// Shapes `(m, k, n)` on and off the 16- and 64-wide tile edges.
+const PRODUCTS: [(usize, usize, usize); 7] = [
+    (1, 1, 1),
+    (3, 5, 2),
+    (16, 16, 16),
+    (17, 33, 15),
+    (64, 64, 64),
+    (65, 130, 67),
+    (128, 7, 200),
+];
+
+fn epilogue_operands(rng: &mut Lcg, (m, k, n): (usize, usize, usize), remaps: &[Remap]) -> (Matrix<f32>, Matrix<f32>, Vec<Vector<f32>>) {
+    let a = Matrix::from_flat(m, k, rng.vector(m * k, -1.0, 1.0));
+    let b = Matrix::from_flat(k, n, rng.vector(k * n, -1.0, 1.0));
+    let inputs = remaps
+        .iter()
+        .map(|remap| Vector::new(rng.vector(remap.input_len((m, n)), -1.0, 1.0)))
+        .collect();
+    (a, b, inputs)
+}
+
+fn run_matmul_on<B: Kernels>(program: &Program, a: &Matrix<f32>, b: &Matrix<f32>, inputs: &[Vector<f32>]) -> Vec<Vec<f32>> {
+    let inputs: Vec<Vector<f32, B>> = inputs.iter().map(|v| v.to_backend::<B>()).collect();
+    let refs: Vec<&dyn Fusable<B>> = inputs.iter().map(|v| v as &dyn Fusable<B>).collect();
+    program
+        .run_matmul(&a.to_backend::<B>(), &b.to_backend::<B>(), &refs)
+        .into_iter()
+        .map(|output| output.into_vector::<f32>().to_vec())
+        .collect()
+}
+
+#[test]
+fn a_matmul_epilogue_is_the_product_then_the_program_bit_for_bit() {
+    let mut rng = Lcg(31);
+    for (program, remaps) in epilogues() {
+        for shape in PRODUCTS {
+            let (a, b, inputs) = epilogue_operands(&mut rng, shape, &remaps);
+            let fused = run_matmul_on::<Host>(&program, &a, &b, &inputs);
+            let unfused = fused::with_mode(Mode::Unfused, || run_matmul_on::<Host>(&program, &a, &b, &inputs));
+            // And by hand: the product materialized, then the program over it.
+            let product = Vector::new(a.matmul(&b).data().to_vec());
+            let mut operands = vec![product];
+            operands.extend(inputs.iter().cloned());
+            let by_hand = run_on::<Host>(&program, (shape.0, shape.2), &operands);
+            for (k, ((f, u), h)) in fused.iter().zip(&unfused).zip(&by_hand).enumerate() {
+                assert_bits_eq(f, u, &format!("{shape:?} output {k} against unfused"));
+                assert_bits_eq(f, h, &format!("{shape:?} output {k} against by hand"));
+            }
+        }
+    }
+}
+
+#[cfg(feature = "counters")]
+#[test]
+fn a_matmul_epilogue_is_one_kernel_that_never_writes_the_product() {
+    use tensorcrate::counters;
+    let (program, remaps) = epilogues().remove(0);
+    let (m, k, n) = (32, 48, 64);
+    let (a, b, inputs) = epilogue_operands(&mut Lcg(5), (m, k, n), &remaps);
+    counters::reset();
+    run_matmul_on::<Host>(&program, &a, &b, &inputs);
+    let counts = counters::snapshot();
+    assert_eq!(counts.kernels, 1);
+    assert_eq!(counts.allocations, 1);
+    // Both operands and the bias row read, the result written.
+    assert_eq!(counts.bytes as usize, (m * k + k * n + n * m + m * n) * 4);
+}
+
+#[test]
+#[should_panic(expected = "the product is read through")]
+fn a_matmul_epilogue_reads_the_product_unremapped() {
+    let mut b = Builder::new();
+    let p = b.input_remapped(DType::F32, Remap::Transpose);
+    b.output(p, DType::F32);
+    let program = b.build().unwrap();
+    let square = Matrix::from_flat(2, 2, vec![1.0f32; 4]);
+    program.run_matmul(&square, &square, &[]);
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+fn metal_matmul_epilogues_agree_with_the_host_on_both_product_kernels() {
+    let mut rng = Lcg(77);
+    for tensorops in [true, false] {
+        tensorcrate::metal::set_tensorops(tensorops);
+        for (program, remaps) in epilogues() {
+            for (m, k, n) in PRODUCTS {
+                let (a, b, inputs) = epilogue_operands(&mut rng, (m, k, n), &remaps);
+                let host = run_matmul_on::<Host>(&program, &a, &b, &inputs);
+                let metal = run_matmul_on::<Metal>(&program, &a, &b, &inputs);
+                let unfused = fused::with_mode(Mode::Unfused, || run_matmul_on::<Metal>(&program, &a, &b, &inputs));
+                // A sum of k products in a different order: scale the tolerance
+                // with k.
+                let tolerance = 1e-6 * (k as f32).sqrt() * 4.0;
+                for (out, ((m_out, u_out), h_out)) in metal.iter().zip(&unfused).zip(&host).enumerate() {
+                    for (i, ((&x, &u), &h)) in m_out.iter().zip(u_out).zip(h_out).enumerate() {
+                        assert!(
+                            (x - u).abs() <= tolerance * (1.0 + u.abs()) && (x - h).abs() <= tolerance * (1.0 + h.abs()),
+                            "tensorops {tensorops}, {m}×{k}×{n}, output {out}, element {i}: fused {x}, \
+                             unfused {u}, host {h}\n{program}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    tensorcrate::metal::set_tensorops(true);
+}
