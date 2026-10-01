@@ -307,7 +307,7 @@ fn the_fast_exponents_are_correctly_rounded() {
         (0.0, |_| 1.0),
         (1.0, |x| x),
         (2.0, |x| x * x),
-        (0.5, |x| x.sqrt() + 0.0),
+        (0.5, |x| if x == f64::NEG_INFINITY { f64::INFINITY } else { x.sqrt() + 0.0 }),
         (-1.0, |x| 1.0 / x),
     ];
     for (exponent, expected) in exact {

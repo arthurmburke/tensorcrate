@@ -450,7 +450,9 @@ mod neon {
             asm!(
                 "fcvtl {lo:v}.4s, {a:v}.4h",
                 "fcvtl2 {hi:v}.4s, {a:v}.8h",
-                lo = lateout(vreg) lo,
+                // `lo` is written before `a` is read again, so it must not
+                // share `a`'s register: `out`, not `lateout`.
+                lo = out(vreg) lo,
                 hi = lateout(vreg) hi,
                 a = in(vreg) a,
                 options(pure, nomem, nostack, preserves_flags),

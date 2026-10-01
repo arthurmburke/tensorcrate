@@ -354,8 +354,8 @@ enum FastExponent {
     /// `x¹ = x`, sign of zero and NaN payload intact. Also exact.
     One,
     Square,
-    /// `x^½`. `sqrt` answers `−0` where `powf` answers `+0`, which is the one
-    /// disagreement between them and what the added zero repairs.
+    /// `x^½`. `sqrt` answers `−0` where `powf` answers `+0`, which the added
+    /// zero repairs, and NaN at `−∞` where `powf` answers `+∞`.
     Root,
     Reciprocal,
 }
@@ -385,7 +385,11 @@ macro_rules! fast_power_impl {
                 FastExponent::Zero => out.resize(values.len(), 1.0),
                 FastExponent::One => out.extend_from_slice(values),
                 FastExponent::Square => out.extend(values.iter().map(|&x| x * x)),
-                FastExponent::Root => out.extend(values.iter().map(|&x| x.sqrt() + 0.0)),
+                FastExponent::Root => out.extend(values.iter().map(|&x| {
+                    // `pow(−∞, ½) = +∞`, where `sqrt(−∞)` is NaN.
+                    let root = x.sqrt() + 0.0;
+                    if x == <$t>::NEG_INFINITY { <$t>::INFINITY } else { root }
+                })),
                 FastExponent::Reciprocal => out.extend(values.iter().map(|&x| 1.0 / x)),
             }
             Some(out)
