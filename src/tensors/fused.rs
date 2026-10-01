@@ -1195,6 +1195,15 @@ pub enum SourceData<'a, B: Backend> {
     F64(&'a B::Vector<f64>),
 }
 
+// Shared references whatever `B` is, so copyable without `B: Copy`.
+impl<B: Backend> Clone for SourceData<'_, B> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<B: Backend> Copy for SourceData<'_, B> {}
+
 /// Mutably borrowed storage of one of the [`DType`]s.
 #[doc(hidden)]
 pub enum SinkData<'a, B: Backend> {
@@ -1230,14 +1239,8 @@ pub struct Sink<'a, B: Backend> {
 impl<B: Backend> Source<'_, B> {
     /// Another handle on the same storage.
     fn reborrow(&self) -> Source<'_, B> {
-        let data = match self.data {
-            SourceData::F32(storage) => SourceData::F32(storage),
-            SourceData::F16(storage) => SourceData::F16(storage),
-            SourceData::Bf16(storage) => SourceData::Bf16(storage),
-            SourceData::F64(storage) => SourceData::F64(storage),
-        };
         Source {
-            data,
+            data: self.data,
             len: self.len,
         }
     }

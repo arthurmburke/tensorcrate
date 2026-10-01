@@ -41,6 +41,11 @@
 //! fused bytecode shader. The macro allocates its registers itself and splits a
 //! group that would exceed the shader's register or input limits, so those
 //! limits are met by construction rather than checked at runtime.
+//!
+//! When that program is the only kernel at its site and reads a product of two
+//! matrices written inline (`tanh(x @ w + b)`), it runs as the product's
+//! epilogue (`Program::run_matmul`): one dispatch, and the product never
+//! reaches memory. A product read transposed as well is materialized instead.
 
 use std::collections::{HashMap, HashSet};
 
@@ -357,6 +362,12 @@ struct Leaf {
     transposed: bool,
     /// Its dedup key: the lowered tokens and the orientation.
     key: String,
+    /// For a product of two matrices on Metal, its lowered operands: the
+    /// group reading it may run as the product's epilogue instead.
+    product: Option<(TokenStream, TokenStream)>,
+    /// The product runs with the group as its epilogue, so only its operands
+    /// are bound.
+    epilogue: bool,
 }
 
 /// Several groups' worth of shared state: every leaf and scalar is lowered once
@@ -395,11 +406,26 @@ impl<'e> Site<'e> {
             return Ok(Node::Leaf(i));
         }
         let ident = format_ident!("__fused_in{}", self.leaves.len());
+        let product = match matmul_operands(expr) {
+            Some((left, right)) if self.backend.is_metal() => {
+                let (left_ty, right_ty) = (infer(left, self.env)?, infer(right, self.env)?);
+                match (left_ty.shape, right_ty.shape) {
+                    (Shape::Matrix(..), Shape::Matrix(..)) => Some((
+                        lower(left, left_ty, self.env, self.backend)?,
+                        lower(right, right_ty, self.env, self.backend)?,
+                    )),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
         self.leaves.push(Leaf {
             ident,
             value: Some(value),
             transposed,
             key,
+            product,
+            epilogue: false,
         });
         Ok(Node::Leaf(self.leaves.len() - 1))
     }
@@ -573,6 +599,11 @@ fn emit(mut site: Site<'_>, roots: Vec<Root>) -> syn::Result<TokenStream> {
     };
     let bind_leaves = site.leaves.iter().filter_map(|leaf| {
         let ident = &leaf.ident;
+        if leaf.epilogue {
+            let (left, right) = leaf.product.as_ref().expect("an epilogue reads a product");
+            let (left_ident, right_ident) = operand_idents(ident);
+            return Some(quote!(let #left_ident = &(#left); let #right_ident = &(#right);));
+        }
         leaf.value
             .as_ref()
             .map(|value| quote!(let #ident = &(#value);))
@@ -985,9 +1016,12 @@ fn emit_metal(site: &mut Site<'_>, mut roots: Vec<Root>) -> syn::Result<TokenStr
     let shape = roots[0].shape;
     loop {
         let nodes: Vec<&Node> = roots.iter().map(|root| &root.node).collect();
-        if let Ok((inputs, code)) = allocate(&nodes) {
+        if let Ok((mut inputs, mut code)) = allocate(&nodes) {
+            // A program that is the site's only kernel can be the epilogue of
+            // a product it reads, which then never reaches memory.
+            let epilogue = kernels.is_empty() && as_epilogue(site, shape, &mut inputs, &mut code);
             let outputs: Vec<Shape> = roots.iter().map(|root| root.shape).collect();
-            let run = metal_program(site, &inputs, &code, shape, &outputs);
+            let run = metal_program(site, &inputs, &code, shape, &outputs, epilogue);
             return Ok(quote! { #kernels #run });
         }
         // Too big for one program: materialize the largest subtree as a kernel
@@ -1009,6 +1043,8 @@ fn emit_metal(site: &mut Site<'_>, mut roots: Vec<Root>) -> syn::Result<TokenStr
             value: None,
             transposed: false,
             key: ident.to_string(),
+            product: None,
+            epilogue: false,
         });
         let sub = emit_metal(
             site,
@@ -1024,6 +1060,50 @@ fn emit_metal(site: &mut Site<'_>, mut roots: Vec<Root>) -> syn::Result<TokenStr
     }
 }
 
+/// The identifiers a product's two operands are bound to.
+fn operand_idents(ident: &Ident) -> (Ident, Ident) {
+    (format_ident!("{ident}_left"), format_ident!("{ident}_right"))
+}
+
+/// Make the program the epilogue of a matrix product it reads, if it reads
+/// one untransposed over the program's own shape and no other kernel needs it:
+/// that leaf moves to input slot 0, where `run_matmul` supplies the product.
+fn as_epilogue(site: &mut Site<'_>, shape: Shape, inputs: &mut [usize], code: &mut [Ins]) -> bool {
+    if !matches!(shape, Shape::Matrix(..)) {
+        return false;
+    }
+    let Some(slot) = inputs.iter().position(|&leaf| {
+        let leaf = &site.leaves[leaf];
+        leaf.product.is_some() && !leaf.transposed && !leaf.epilogue
+    }) else {
+        return false;
+    };
+    // A product read both straight and transposed is two leaves; the
+    // transposed read still needs it materialized.
+    let key = site.leaves[inputs[slot]].key.split_once(':').map(|(_, value)| value.to_owned());
+    let read_twice = site
+        .leaves
+        .iter()
+        .filter(|leaf| leaf.key.split_once(':').map(|(_, value)| value.to_owned()) == key)
+        .count()
+        > 1;
+    if read_twice {
+        return false;
+    }
+    inputs.swap(0, slot);
+    for ins in code.iter_mut() {
+        if let Ins::Load { input, .. } = ins {
+            if *input == 0 {
+                *input = slot;
+            } else if *input == slot {
+                *input = 0;
+            }
+        }
+    }
+    site.leaves[inputs[0]].epilogue = true;
+    true
+}
+
 /// Tokens running one allocated program and unpacking its outputs.
 fn metal_program(
     site: &Site<'_>,
@@ -1031,6 +1111,7 @@ fn metal_program(
     code: &[Ins],
     shape: Shape,
     outputs: &[Shape],
+    epilogue: bool,
 ) -> TokenStream {
     let fused = quote!(::tensorcrate::tensors::fused);
     let instructions = code.iter().map(|ins| match *ins {
@@ -1079,7 +1160,7 @@ fn metal_program(
     });
     let (rows, cols) = extent(shape);
     let (input_count, output_count) = (inputs.len(), outputs.len());
-    let operands = inputs.iter().map(|&i| {
+    let operands = inputs.iter().skip(usize::from(epilogue)).map(|&i| {
         let ident = &site.leaves[i].ident;
         quote!(#ident as &dyn #fused::Fusable<::tensorcrate::tensors::Metal>)
     });
@@ -1095,6 +1176,12 @@ fn metal_program(
     } else {
         quote!((#(#unpack),*))
     };
+    let run = if epilogue {
+        let (left, right) = operand_idents(&site.leaves[inputs[0]].ident);
+        quote!(__fused_program.run_matmul::<::tensorcrate::tensors::Metal>(#left, #right, &[#(#operands),*]))
+    } else {
+        quote!(__fused_program.run::<::tensorcrate::tensors::Metal>((#rows, #cols), &[#(#operands),*], &mut []))
+    };
     quote! {
         let __fused_program = #fused::Program::<f32>::new(
             ::std::vec![#(#instructions),*],
@@ -1103,9 +1190,7 @@ fn metal_program(
             0,
         )
         .expect("math! allocates programs that fit the fused kernel");
-        let mut __fused_outputs = __fused_program
-            .run::<::tensorcrate::tensors::Metal>((#rows, #cols), &[#(#operands),*], &mut [])
-            .into_iter();
+        let mut __fused_outputs = #run.into_iter();
         #result
     }
 }

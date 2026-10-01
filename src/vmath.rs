@@ -728,7 +728,9 @@ mod tests {
 
     /// Each function, its `f64` reference and its tolerance in ulps, as
     /// measured by `sweep` over every 61st `f32` in the trigonometric range.
-    const REFERENCES: [(Analytic, fn(f64) -> f64, u32); 14] = [
+    type Reference = (Analytic, fn(f64) -> f64, u32);
+
+    const REFERENCES: [Reference; 14] = [
         (Analytic::Exp, f64::exp, 1),
         (Analytic::Ln, f64::ln, 1),
         (Analytic::Sin, f64::sin, 1),
@@ -755,7 +757,7 @@ mod tests {
             while bits < u32::MAX - 61 {
                 let x = f32::from_bits(bits);
                 bits += 61;
-                if !(x.abs() < 9000.0) {
+                if x.is_nan() || x.abs() >= 9000.0 {
                     continue;
                 }
                 let gap = ulps(value(op, x), reference(f64::from(x)));

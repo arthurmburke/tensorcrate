@@ -299,6 +299,8 @@ let out: Matrix<f32, Metal> = math! {
   operations in the same order as the unfused code, so the result is identical bit for bit. On
   `Metal` it becomes one fused program for the bytecode shader. The macro allocates its registers
   and splits any chain that would exceed the shader's limits, so a block that compiles always fits.
+- On `Metal`, a chain that reads a matrix product written inline, such as `tanh(x @ w + b)`, runs
+  as that product's epilogue: the product, bias and activation are one dispatch.
 
 Products, reductions, sorts, `pow`, and complex or dual values are not fused; they run as before,
 and the fused chains around them read their results. Fusion is on by default.

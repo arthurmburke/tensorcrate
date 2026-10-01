@@ -206,7 +206,8 @@ mod counts {
     #[test]
     fn independent_bindings_share_a_kernel() {
         // `a` and `b` each feed the product, so both are materialized — by one
-        // kernel, not two; the product and the final `* 3 + 1` are two more.
+        // kernel, not two; the product carries the final `* 3 + 1` as its
+        // epilogue, which is one more.
         let counts = command_buffers(|| {
             math! {
                 backend = Metal;
@@ -216,7 +217,23 @@ mod counts {
                 (a @ b) * 3 + 1
             }
         });
-        assert_eq!(counts, (3, 7));
+        assert_eq!(counts, (2, 7));
+    }
+
+    #[test]
+    fn a_dense_layer_is_one_kernel() {
+        let counts = command_buffers(|| {
+            math! {
+                backend = Metal;
+                let x = [[1, 2], [3, 4], [5, 6]];
+                let w = [[0.5, -1], [0.25, 2]];
+                let b = [[1, -1], [1, -1], [1, -1]];
+                tanh(x @ w + b)
+            }
+        });
+        // Three literals uploaded is no kernel; the product, the bias and the
+        // activation are one. Unfused: the product, the add and the tanh.
+        assert_eq!(counts, (1, 3));
     }
 
     #[test]
@@ -271,6 +288,42 @@ mod metal {
             "against unfused",
         );
         close(fused.as_slice(), host.as_slice(), "against the host");
+    }
+
+    #[test]
+    fn products_become_epilogues_only_where_they_can() {
+        // Read straight: the epilogue. Read straight and transposed: the
+        // product is materialized and both reads load it.
+        let metal: (Matrix<f32, Metal>, Matrix<f32, Metal>) = (
+            math! {
+                backend = Metal;
+                let x = [[1, 2, 3], [4, 5, 6]];
+                let w = [[0.5, -1], [0.25, 2], [1, 0]];
+                sqrt(x @ w .* (x @ w) + 1) - 2
+            },
+            math! {
+                backend = Metal;
+                let x = [[1, 2], [3, 4]];
+                let w = [[0.5, -1], [0.25, 2]];
+                transpose(x @ w) * 2 + (x @ w)
+            },
+        );
+        let host: (Matrix<f32>, Matrix<f32>) = (
+            math! {
+                dtype = f32;
+                let x = [[1, 2, 3], [4, 5, 6]];
+                let w = [[0.5, -1], [0.25, 2], [1, 0]];
+                sqrt(x @ w .* (x @ w) + 1) - 2
+            },
+            math! {
+                dtype = f32;
+                let x = [[1, 2], [3, 4]];
+                let w = [[0.5, -1], [0.25, 2]];
+                transpose(x @ w) * 2 + (x @ w)
+            },
+        );
+        close(metal.0.to_backend::<Host>().as_slice(), host.0.as_slice(), "epilogue");
+        close(metal.1.to_backend::<Host>().as_slice(), host.1.as_slice(), "transposed too");
     }
 
     #[test]
