@@ -22,6 +22,7 @@
 //! loops over elements: the shapes are runtime values, and a per-element loop
 //! would be a scalar CPU loop even when the vector lives in GPU memory.
 
+use crate::numbers::Real;
 use crate::tensors::{BinaryOp, Compare, Kernels, Ordered, Reduce, SortOrder, Vector};
 
 /// The Euclidean projection of `values` onto `{r : r ≥ 0, Σr ≤ cap}` — the
@@ -56,17 +57,28 @@ use crate::tensors::{BinaryOp, Compare, Kernels, Ordered, Reduce, SortOrder, Vec
 ///
 /// # Numerics
 ///
-/// The index arithmetic runs through `f32`, which represents integers exactly up
-/// to 2²⁴, so vectors longer than about 16 million elements would need a wider
-/// index than this. NaN inputs have no meaningful projection and are not
-/// handled specially.
-pub fn project_onto_capped_simplex<B: Kernels>(
-    values: &Vector<f32, B>,
-    cap: f32,
-) -> Vector<f32, B> {
+/// The index arithmetic runs in the element type, which represents integers
+/// exactly only up to `2/ε` — 2²⁴ for `f32`, 2⁵³ for `f64`, but just 2¹¹ and 2⁸
+/// for `f16` and `bf16`. A longer vector would need a wider index than that, and
+/// panics rather than answering wrongly; project in `f32` or `f64` instead. NaN
+/// inputs have no meaningful projection and are not handled specially.
+///
+/// # Panics
+///
+/// If `values` is longer than the element type can index.
+#[track_caller]
+pub fn project_onto_capped_simplex<T: Real, B: Kernels<T>>(
+    values: &Vector<T, B>,
+    cap: T,
+) -> Vector<T, B> {
     let len = values.len();
+    assert!(
+        len as f64 <= 2.0 / T::epsilon().into_f64(),
+        "project_onto_capped_simplex: {len} elements exceed the integers this element type \
+         represents exactly"
+    );
     // Clipping alone is the projection when the budget is not binding.
-    let clamped = values.max_scalar(0.0);
+    let clamped = values.max_scalar(T::zero());
     if len == 0 || clamped.sum() <= cap {
         return clamped;
     }
@@ -78,7 +90,7 @@ pub fn project_onto_capped_simplex<B: Kernels>(
     // candidate[i] = (running[i] − cap) / (i + 1): the offset that would make
     // the first i + 1 entries sum to exactly `cap`.
     let over_budget = B::vector_broadcast(&running, cap, BinaryOp::Sub, false);
-    let divisors = Vector::<f32, B>::ramp(len, 1.0, 1.0);
+    let divisors = Vector::<T, B>::ramp(len, T::one(), T::one());
     let candidates = B::vector_elementwise(&over_budget, &divisors, BinaryOp::Div);
 
     // The candidate stops being admissible once it exceeds the value it is
@@ -87,20 +99,24 @@ pub fn project_onto_capped_simplex<B: Kernels>(
     // carrying their own index, so the smallest mark is the first offending
     // index, and `len` means there was none.
     let offending = candidates.compare(&sorted, Compare::Greater);
-    let admissible = B::vector_broadcast(&offending, 1.0, BinaryOp::Sub, true);
-    let bias = B::vector_broadcast(&admissible, len as f32, BinaryOp::Mul, false);
-    let marks = B::vector_elementwise(&Vector::<f32, B>::ramp(len, 0.0, 1.0), &bias, BinaryOp::Add);
-    let first_offending = marks.reduce(Reduce::Min) as usize;
+    let admissible = B::vector_broadcast(&offending, T::one(), BinaryOp::Sub, true);
+    let bias = B::vector_broadcast(&admissible, T::from_f64(len as f64), BinaryOp::Mul, false);
+    let marks = B::vector_elementwise(
+        &Vector::<T, B>::ramp(len, T::zero(), T::one()),
+        &bias,
+        BinaryOp::Add,
+    );
+    let first_offending = marks.reduce(Reduce::Min).to_usize().unwrap_or(len);
 
     // The offset is the last admissible candidate; if even the first entry
     // offends, no entry is dropped and nothing is subtracted.
     let offset = if first_offending == 0 {
-        0.0
+        T::zero()
     } else {
         candidates.as_slice()[first_offending.min(len) - 1]
     };
 
-    B::vector_broadcast(values, offset, BinaryOp::Sub, false).max_scalar(0.0)
+    B::vector_broadcast(values, offset, BinaryOp::Sub, false).max_scalar(T::zero())
 }
 
 /// The Euclidean projection onto the box `[low, high]` — clipping, which is what
@@ -113,11 +129,11 @@ pub fn project_onto_capped_simplex<B: Kernels>(
 ///
 /// If `low > high`, which describes no feasible set at all.
 #[track_caller]
-pub fn project_onto_box<B: Kernels>(
-    values: &Vector<f32, B>,
-    low: f32,
-    high: f32,
-) -> Vector<f32, B> {
+pub fn project_onto_box<T: Real, B: Kernels<T>>(
+    values: &Vector<T, B>,
+    low: T,
+    high: T,
+) -> Vector<T, B> {
     B::vector_clamp(values, low, high)
 }
 
@@ -131,8 +147,11 @@ pub fn project_onto_box<B: Kernels>(
 ///
 /// If `radius` is negative.
 #[track_caller]
-pub fn project_onto_ball<B: Kernels>(values: &Vector<f32, B>, radius: f32) -> Vector<f32, B> {
-    assert!(radius >= 0.0, "project_onto_ball: the radius is negative");
+pub fn project_onto_ball<T: Real, B: Kernels<T>>(values: &Vector<T, B>, radius: T) -> Vector<T, B> {
+    assert!(
+        radius >= T::zero(),
+        "project_onto_ball: the radius is negative"
+    );
     let norm = B::vector_elementwise(values, values, BinaryOp::Mul)
         .sum()
         .sqrt();

@@ -109,8 +109,7 @@ fn bowl<'t>(
 /// The same regression fitted on all the data at once and on mini-batches.
 ///
 /// A stochastic step is cheaper and noisier: it sees a quarter of the samples, so
-/// it costs a quarter of the work and points in roughly — not exactly — the
-/// descent direction. Over enough steps the noise averages out.
+/// it costs a quarter of the work and points in roughly the descent direction.
 fn stochastic_against_full_batch() {
     const SAMPLES: usize = 32;
     const BATCH: usize = 8;
@@ -154,8 +153,7 @@ fn stochastic_against_full_batch() {
 /// A weight matrix and a bias vector, each with its own rule.
 ///
 /// `minimize` drives one parameter tensor, so a model with several wants the loop
-/// written out — which is four lines, and makes it obvious that the rules are the
-/// only stateful part.
+/// written out which makes it obvious that the rules are the only stateful part.
 fn two_parameters_two_rules() {
     const IN: usize = 3;
     const OUT: usize = 2;

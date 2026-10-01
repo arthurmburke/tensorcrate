@@ -89,9 +89,9 @@ fn stacking_vectors_uses_row_major_matrix_layout() {
     );
 
     // A zero extent on either axis is still a shape the storage layer accepts.
-    let empty = Metal::vstack(&[], 3);
+    let empty = Metal::vstack::<f32>(&[], 3);
     assert!(Metal::matrix_slice(&empty).is_empty());
-    let empty = Metal::hstack(&[], 2);
+    let empty = Metal::hstack::<f32>(&[], 2);
     assert!(Metal::matrix_slice(&empty).is_empty());
 }
 
@@ -175,8 +175,8 @@ fn merging_matrix_collections_preserves_input_order() {
         ]
     );
 
-    assert!(Metal::matrix_slice(&Metal::hmerge(&[], 2, 3)).is_empty());
-    assert!(Metal::matrix_slice(&Metal::vmerge(&[], 2, 3)).is_empty());
+    assert!(Metal::matrix_slice(&Metal::hmerge::<f32>(&[], 2, 3)).is_empty());
+    assert!(Metal::matrix_slice(&Metal::vmerge::<f32>(&[], 2, 3)).is_empty());
 }
 
 #[test]
@@ -294,8 +294,8 @@ fn low_precision_storage_supports_compact_and_f32_products() {
 
 #[test]
 fn large_products_agree_with_the_host_within_float_tolerance() {
-    // Big enough that the host backend offloads to Metal itself, and big enough
-    // that the tiled GPU kernel and the CPU loops sum in different orders.
+    // Big enough that the tiled GPU kernel and the CPU loops sum in different
+    // orders.
     const N: usize = 96;
     let a = Matrix::<f32>::from_rows((0..N).map(|row| {
         (0..N)

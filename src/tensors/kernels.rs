@@ -1,4 +1,4 @@
-//! The `f32` tensor algebra, named per backend.
+//! The tensor algebra, named per backend.
 //!
 //! [`Vector`] and [`Matrix`] implement their products and elementwise
 //! operations as inherent methods, once for each backend, and nothing ties those
@@ -19,6 +19,7 @@ use std::cmp::Ordering;
 use super::fused::{self, Fresh, Program, Sink, Source};
 use super::{Backend, Host, Matrix, Vector};
 use crate::counters;
+use crate::numbers::Real;
 use crate::statistics::{Distribution, Moments};
 
 /// An elementwise binary operation.
@@ -133,19 +134,20 @@ impl Compare {
 
     /// Apply the comparison to a pair of values — the CPU counterpart of the
     /// `compare` shader, and the definition the GPU is tested against.
-    pub fn value(self, a: f32, b: f32) -> f32 {
+    pub fn value<T: Real>(self, a: T, b: T) -> T {
+        let predicate = |holds: bool| if holds { T::one() } else { T::zero() };
         match self {
             Compare::Min => a.min(b),
             Compare::Max => a.max(b),
             Compare::MaxShare => match a.partial_cmp(&b) {
-                Some(Ordering::Greater) => 1.0,
-                Some(Ordering::Less) => 0.0,
-                _ => 0.5,
+                Some(Ordering::Greater) => T::one(),
+                Some(Ordering::Less) => T::zero(),
+                _ => T::from_f64(0.5),
             },
-            Compare::Less => f32::from(a < b),
-            Compare::LessEqual => f32::from(a <= b),
-            Compare::Greater => f32::from(a > b),
-            Compare::GreaterEqual => f32::from(a >= b),
+            Compare::Less => predicate(a < b),
+            Compare::LessEqual => predicate(a <= b),
+            Compare::Greater => predicate(a > b),
+            Compare::GreaterEqual => predicate(a >= b),
         }
     }
 }
@@ -189,17 +191,17 @@ impl Reduce {
 
     /// The value that leaves the fold unchanged, and therefore the answer for an
     /// empty tensor.
-    pub fn identity(self) -> f32 {
+    pub fn identity<T: Real>(self) -> T {
         match self {
-            Reduce::Sum => 0.0,
-            Reduce::Min => f32::INFINITY,
-            Reduce::Max => f32::NEG_INFINITY,
+            Reduce::Sum => T::zero(),
+            Reduce::Min => T::infinity(),
+            Reduce::Max => T::neg_infinity(),
         }
     }
 
     /// Combine two partial results. `Min`/`Max` follow [`f32::min`]/[`f32::max`],
     /// so a NaN operand loses to a number rather than poisoning the fold.
-    pub fn combine(self, a: f32, b: f32) -> f32 {
+    pub fn combine<T: Real>(self, a: T, b: T) -> T {
         match self {
             Reduce::Sum => a + b,
             Reduce::Min => a.min(b),
@@ -209,7 +211,14 @@ impl Reduce {
 
     /// Fold a slice left to right — the scalar definition the vector and GPU
     /// paths are tested against.
-    pub fn fold(self, values: &[f32]) -> f32 {
+    ///
+    /// `f16` and `bf16` fold in `f32` and round once, which is what every
+    /// backend does for them: a 16-bit running total would stop growing at
+    /// `2048` (or `256`) ones.
+    pub fn fold<T: Real>(self, values: &[T]) -> T {
+        if let Some(total) = crate::compact::fold(values, self) {
+            return total;
+        }
         values
             .iter()
             .fold(self.identity(), |total, &value| self.combine(total, value))
@@ -232,7 +241,7 @@ impl TryFrom<u16> for Reduce {
 
 /// Which way a sort runs.
 ///
-/// Both directions order by [`f32::total_cmp`] — the IEEE total order, under
+/// Both directions order by the IEEE total order ([`f32::total_cmp`] for `f32`), under
 /// which `−0.0` precedes `+0.0` and NaNs sit at the ends by sign rather than
 /// comparing unordered. That is a stronger promise than the `<` of a comparison
 /// kernel, and it is what lets the GPU sort agree with the CPU one on every
@@ -250,10 +259,10 @@ impl SortOrder {
 
     /// The comparator this order sorts by, for handing to [`slice::sort_by`] —
     /// or to [`Vector::sort_by`](crate::tensors::Vector::sort_by).
-    pub fn comparator(self) -> impl Fn(&f32, &f32) -> Ordering + Copy {
-        move |left: &f32, right: &f32| match self {
-            SortOrder::Ascending => left.total_cmp(right),
-            SortOrder::Descending => right.total_cmp(left),
+    pub fn comparator<T: Real>(self) -> impl Fn(&T, &T) -> Ordering + Copy {
+        move |left: &T, right: &T| match self {
+            SortOrder::Ascending => left.total_order(right),
+            SortOrder::Descending => right.total_order(left),
         }
     }
 }
@@ -317,7 +326,7 @@ impl Analytic {
     ];
 
     /// `f(x)`.
-    pub fn value(self, x: f32) -> f32 {
+    pub fn value<T: Real>(self, x: T) -> T {
         match self {
             Analytic::Sin => x.sin(),
             Analytic::Cos => x.cos(),
@@ -337,7 +346,8 @@ impl Analytic {
     }
 
     /// `f'(x)`.
-    pub fn derivative(self, x: f32) -> f32 {
+    pub fn derivative<T: Real>(self, x: T) -> T {
+        let one = T::one();
         match self {
             Analytic::Sin => x.cos(),
             Analytic::Cos => -x.sin(),
@@ -353,18 +363,18 @@ impl Analytic {
                 let sin = x.sin();
                 -x.cos() / (sin * sin)
             }
-            Analytic::Arcsin => (1.0 - x * x).sqrt().recip(),
-            Analytic::Arccos => -(1.0 - x * x).sqrt().recip(),
-            Analytic::Arctan => (1.0 + x * x).recip(),
+            Analytic::Arcsin => (one - x * x).sqrt().recip(),
+            Analytic::Arccos => -(one - x * x).sqrt().recip(),
+            Analytic::Arctan => (one + x * x).recip(),
             Analytic::Exp => x.exp(),
             Analytic::Ln => x.recip(),
             Analytic::Sinh => x.cosh(),
             Analytic::Cosh => x.sinh(),
             Analytic::Tanh => {
                 let tanh = x.tanh();
-                1.0 - tanh * tanh
+                one - tanh * tanh
             }
-            Analytic::Sqrt => (2.0 * x.sqrt()).recip(),
+            Analytic::Sqrt => ((one + one) * x.sqrt()).recip(),
         }
     }
 }
@@ -442,8 +452,8 @@ impl TryFrom<u16> for Axis {
 
 /// A distribution family, as an operation code.
 ///
-/// The parameters travel separately, as a pair of `f32`, because that is the
-/// only shape a shader argument can take — see
+/// The parameters travel separately, as a pair of the element type, because that
+/// is the only shape a shader argument can take — see
 /// [`Distribution`](crate::statistics::Distribution) for the typed form these
 /// two are decomposed from.
 ///
@@ -565,27 +575,34 @@ mod operation_tests {
 /// code goes through here:
 ///
 /// ```
+/// use tensorcrate::numbers::Real;
 /// use tensorcrate::tensors::{Kernels, Ordered, Vector};
 ///
 /// // Note the `Kernels` bound: `Backend` says where elements live, `Kernels`
-/// // says what can be computed on them.
-/// fn relu_then_cap<B: Kernels>(v: &Vector<f32, B>, cap: f32) -> Vector<f32, B> {
-///     v.max_scalar(0.0).min_scalar(cap)
+/// // says what can be computed on them, in which element type.
+/// fn relu_then_cap<T: Real, B: Kernels<T>>(v: &Vector<T, B>, cap: T) -> Vector<T, B> {
+///     v.max_scalar(T::zero()).min_scalar(cap)
 /// }
 ///
 /// let v = Vector::new([-1.0f32, 0.5, 9.0]);
 /// assert_eq!(relu_then_cap(&v, 2.0).data(), [0.0, 0.5, 2.0]);
+///
+/// let wide = Vector::new([-1.0f64, 0.5, 9.0]);
+/// assert_eq!(relu_then_cap(&wide, 2.0).data(), [0.0, 0.5, 2.0]);
 /// ```
 ///
 /// On a concrete backend the inherent method wins method resolution and this
 /// trait is never consulted; both run the same kernel and give the same answer,
-/// so which one resolved is not observable. The inherent versions also cover
-/// element types this trait cannot — `Vector<f64, Host>::max` is real, while the
-/// 32-bit shaders mean the backend-generic surface is `f32` only.
+/// so which one resolved is not observable. The element type is any [`Real`]
+/// that the backend implements [`Kernels`] for: all of them on `Host`, and
+/// `f32`, `f16` and `bf16` on `Metal`.
 ///
 /// [`Vector<f32, Host>`]: Vector
 /// [`Vector<f32, Metal>`]: Vector
 pub trait Ordered: Sized {
+    /// The element type the comparisons are made in.
+    type Elem: Real;
+
     /// Elementwise minimum.
     ///
     /// # Panics
@@ -601,17 +618,17 @@ pub trait Ordered: Sized {
     fn max(&self, other: &Self) -> Self;
 
     /// The lesser of each element and `scalar`.
-    fn min_scalar(&self, scalar: f32) -> Self;
+    fn min_scalar(&self, scalar: Self::Elem) -> Self;
 
     /// The greater of each element and `scalar` — `max_scalar(0.0)` is a relu.
-    fn max_scalar(&self, scalar: f32) -> Self;
+    fn max_scalar(&self, scalar: Self::Elem) -> Self;
 
     /// Confine every element to `[low, high]`, in one pass.
     ///
     /// # Panics
     ///
     /// If `low > high`.
-    fn clamp(&self, low: f32, high: f32) -> Self;
+    fn clamp(&self, low: Self::Elem, high: Self::Elem) -> Self;
 
     /// Elementwise comparison, including the [`Compare`] predicates.
     ///
@@ -622,22 +639,22 @@ pub trait Ordered: Sized {
 
     /// Elementwise comparison against a scalar; `scalar_left` puts the scalar on
     /// the left, which matters for every op but `Min` and `Max`.
-    fn compare_scalar(&self, scalar: f32, op: Compare, scalar_left: bool) -> Self;
+    fn compare_scalar(&self, scalar: Self::Elem, op: Compare, scalar_left: bool) -> Self;
 
     /// Fold the whole vector to one value; an empty vector gives
     /// [`op.identity()`](Reduce::identity).
-    fn reduce(&self, op: Reduce) -> f32;
+    fn reduce(&self, op: Reduce) -> Self::Elem;
 
     /// The sum of every element.
-    fn sum(&self) -> f32 {
+    fn sum(&self) -> Self::Elem {
         self.reduce(Reduce::Sum)
     }
 
     /// The smallest element, or `None` when there are none.
-    fn minimum(&self) -> Option<f32>;
+    fn minimum(&self) -> Option<Self::Elem>;
 
     /// The largest element, or `None` when there are none.
-    fn maximum(&self) -> Option<f32>;
+    fn maximum(&self) -> Option<Self::Elem>;
 
     /// Inclusive prefix sum: `out[i] = Σ_{j ≤ i} self[j]`.
     fn prefix_sum(&self) -> Self;
@@ -650,10 +667,12 @@ pub trait Ordered: Sized {
     /// A closure cannot cross to the GPU, so on a device-resident vector this
     /// one sorts on the CPU and stores the result back; [`sorted`](Self::sorted)
     /// is the version that stays put.
-    fn sorted_by(&self, compare: impl FnMut(&f32, &f32) -> Ordering) -> Self;
+    fn sorted_by(&self, compare: impl FnMut(&Self::Elem, &Self::Elem) -> Ordering) -> Self;
 }
 
-impl<B: Kernels> Ordered for Vector<f32, B> {
+impl<T: Real, B: Kernels<T>> Ordered for Vector<T, B> {
+    type Elem = T;
+
     #[track_caller]
     fn min(&self, other: &Self) -> Self {
         B::vector_compare(self, other, Compare::Min)
@@ -664,16 +683,16 @@ impl<B: Kernels> Ordered for Vector<f32, B> {
         B::vector_compare(self, other, Compare::Max)
     }
 
-    fn min_scalar(&self, scalar: f32) -> Self {
+    fn min_scalar(&self, scalar: T) -> Self {
         B::vector_compare_scalar(self, scalar, Compare::Min, false)
     }
 
-    fn max_scalar(&self, scalar: f32) -> Self {
+    fn max_scalar(&self, scalar: T) -> Self {
         B::vector_compare_scalar(self, scalar, Compare::Max, false)
     }
 
     #[track_caller]
-    fn clamp(&self, low: f32, high: f32) -> Self {
+    fn clamp(&self, low: T, high: T) -> Self {
         B::vector_clamp(self, low, high)
     }
 
@@ -682,19 +701,19 @@ impl<B: Kernels> Ordered for Vector<f32, B> {
         B::vector_compare(self, other, op)
     }
 
-    fn compare_scalar(&self, scalar: f32, op: Compare, scalar_left: bool) -> Self {
+    fn compare_scalar(&self, scalar: T, op: Compare, scalar_left: bool) -> Self {
         B::vector_compare_scalar(self, scalar, op, scalar_left)
     }
 
-    fn reduce(&self, op: Reduce) -> f32 {
+    fn reduce(&self, op: Reduce) -> T {
         B::vector_reduce(self, op)
     }
 
-    fn minimum(&self) -> Option<f32> {
+    fn minimum(&self) -> Option<T> {
         (!self.is_empty()).then(|| self.reduce(Reduce::Min))
     }
 
-    fn maximum(&self) -> Option<f32> {
+    fn maximum(&self) -> Option<T> {
         (!self.is_empty()).then(|| self.reduce(Reduce::Max))
     }
 
@@ -706,14 +725,25 @@ impl<B: Kernels> Ordered for Vector<f32, B> {
         B::vector_sort(self, order)
     }
 
-    fn sorted_by(&self, compare: impl FnMut(&f32, &f32) -> Ordering) -> Self {
+    fn sorted_by(&self, compare: impl FnMut(&T, &T) -> Ordering) -> Self {
         let mut values = self.as_slice().to_vec();
         values.sort_by(compare);
-        Vector::<f32, Host>::new(values).to_backend()
+        Vector::<T, Host>::new(values).to_backend()
     }
 }
 
-/// The `f32` tensor operations a [`Backend`] provides.
+/// The tensor operations a [`Backend`] provides, over elements of type `T`.
+///
+/// `T` defaults to `f32`, so a bare `B: Kernels` bound means the `f32` algebra.
+/// [`Host`] implements `Kernels<T>` for every [`Real`] element type, and
+/// `Metal` for `f32`, `f16` and `bf16`, each with its own compiled kernels —
+/// which is what lets the differentiation, optimization and statistics layers
+/// run in `f64` or the compact floats by writing `B: Kernels<T>`.
+///
+/// Whatever `T` is, an elementwise operation rounds to `T`, and for `f16` and
+/// `bf16` every accumulation — [`vector_reduce`](Self::vector_reduce),
+/// [`dot`](Self::dot), the matrix products, the prefix sum, the moments and the
+/// correlations — runs in `f32` and rounds once.
 ///
 /// Every method reads the shapes it needs from its operands, so the trait names
 /// the operations without naming any dimension. The shape *rules* still hold —
@@ -723,36 +753,32 @@ impl<B: Kernels> Ordered for Vector<f32, B> {
 /// This is the operation-enum-shaped surface: `B::vector_compare(&a, &b,
 /// Compare::Max)`. [`Ordered`] is the same operations spelled as methods —
 /// `a.max(&b)` — for the cases where that reads better.
-pub trait Kernels: Backend {
+pub trait Kernels<T: Real = f32>: Backend {
     // ---- vectors ----
 
     fn vector_elementwise(
-        a: &Vector<f32, Self>,
-        b: &Vector<f32, Self>,
+        a: &Vector<T, Self>,
+        b: &Vector<T, Self>,
         op: BinaryOp,
-    ) -> Vector<f32, Self>;
+    ) -> Vector<T, Self>;
 
     fn vector_broadcast(
-        a: &Vector<f32, Self>,
-        scalar: f32,
+        a: &Vector<T, Self>,
+        scalar: T,
         op: BinaryOp,
         scalar_left: bool,
-    ) -> Vector<f32, Self>;
+    ) -> Vector<T, Self>;
 
     /// Elementwise comparison of two vectors.
-    fn vector_compare(
-        a: &Vector<f32, Self>,
-        b: &Vector<f32, Self>,
-        op: Compare,
-    ) -> Vector<f32, Self>;
+    fn vector_compare(a: &Vector<T, Self>, b: &Vector<T, Self>, op: Compare) -> Vector<T, Self>;
 
     /// Elementwise comparison against a scalar.
     fn vector_compare_scalar(
-        a: &Vector<f32, Self>,
-        scalar: f32,
+        a: &Vector<T, Self>,
+        scalar: T,
         op: Compare,
         scalar_left: bool,
-    ) -> Vector<f32, Self>;
+    ) -> Vector<T, Self>;
 
     /// Confine every element to `[low, high]`.
     ///
@@ -761,20 +787,20 @@ pub trait Kernels: Backend {
     /// dispatches.
     ///
     /// Panics unless `low ≤ high`.
-    fn vector_clamp(a: &Vector<f32, Self>, low: f32, high: f32) -> Vector<f32, Self>;
+    fn vector_clamp(a: &Vector<T, Self>, low: T, high: T) -> Vector<T, Self>;
 
     /// Fold the whole vector to one value; an empty vector gives
     /// [`op.identity()`](Reduce::identity).
-    fn vector_reduce(a: &Vector<f32, Self>, op: Reduce) -> f32;
+    fn vector_reduce(a: &Vector<T, Self>, op: Reduce) -> T;
 
     /// Inclusive prefix sum: `out[i] = Σ_{j ≤ i} a[j]`.
-    fn vector_prefix_sum(a: &Vector<f32, Self>) -> Vector<f32, Self>;
+    fn vector_prefix_sum(a: &Vector<T, Self>) -> Vector<T, Self>;
 
     /// The elements in [`SortOrder`]'s total order.
-    fn vector_sort(a: &Vector<f32, Self>, order: SortOrder) -> Vector<f32, Self>;
+    fn vector_sort(a: &Vector<T, Self>, order: SortOrder) -> Vector<T, Self>;
 
     /// `f(a)`, elementwise.
-    fn vector_unary(a: &Vector<f32, Self>, f: Analytic) -> Vector<f32, Self>;
+    fn vector_unary(a: &Vector<T, Self>, f: Analytic) -> Vector<T, Self>;
 
     /// Elementwise `a^b`.
     ///
@@ -782,91 +808,79 @@ pub trait Kernels: Backend {
     /// defined for every [`Coefficient`](crate::numbers::Coefficient), and
     /// raising an integer to an integer leaves the integers. So it travels as
     /// its own kernel rather than a fifth arithmetic code.
-    fn vector_power(a: &Vector<f32, Self>, b: &Vector<f32, Self>) -> Vector<f32, Self>;
+    fn vector_power(a: &Vector<T, Self>, b: &Vector<T, Self>) -> Vector<T, Self>;
 
     /// The same with one operand fixed: `scalar_left` selects `scalar^x` over
     /// `x^scalar`.
-    fn vector_power_scalar(
-        a: &Vector<f32, Self>,
-        scalar: f32,
-        scalar_left: bool,
-    ) -> Vector<f32, Self>;
+    fn vector_power_scalar(a: &Vector<T, Self>, scalar: T, scalar_left: bool) -> Vector<T, Self>;
 
     /// `(f(value), f'(value) ⊙ tangent)` — one forward-mode step.
     fn vector_unary_dual(
-        value: &Vector<f32, Self>,
-        tangent: &Vector<f32, Self>,
+        value: &Vector<T, Self>,
+        tangent: &Vector<T, Self>,
         f: Analytic,
-    ) -> (Vector<f32, Self>, Vector<f32, Self>);
+    ) -> (Vector<T, Self>, Vector<T, Self>);
 
-    fn dot(a: &Vector<f32, Self>, b: &Vector<f32, Self>) -> f32;
+    fn dot(a: &Vector<T, Self>, b: &Vector<T, Self>) -> T;
 
-    fn vecmat(v: &Vector<f32, Self>, m: &Matrix<f32, Self>) -> Vector<f32, Self>;
+    fn vecmat(v: &Vector<T, Self>, m: &Matrix<T, Self>) -> Vector<T, Self>;
 
-    fn matvec(m: &Matrix<f32, Self>, v: &Vector<f32, Self>) -> Vector<f32, Self>;
+    fn matvec(m: &Matrix<T, Self>, v: &Vector<T, Self>) -> Vector<T, Self>;
 
     /// `addend + m·v`, using `addend` as the accumulator when possible.
     fn matvec_add(
-        m: &Matrix<f32, Self>,
-        v: &Vector<f32, Self>,
-        addend: Vector<f32, Self>,
-    ) -> Vector<f32, Self>;
+        m: &Matrix<T, Self>,
+        v: &Vector<T, Self>,
+        addend: Vector<T, Self>,
+    ) -> Vector<T, Self>;
 
     // ---- matrices ----
 
     fn matrix_elementwise(
-        a: &Matrix<f32, Self>,
-        b: &Matrix<f32, Self>,
+        a: &Matrix<T, Self>,
+        b: &Matrix<T, Self>,
         op: BinaryOp,
-    ) -> Matrix<f32, Self>;
+    ) -> Matrix<T, Self>;
 
     fn matrix_broadcast(
-        a: &Matrix<f32, Self>,
-        scalar: f32,
+        a: &Matrix<T, Self>,
+        scalar: T,
         op: BinaryOp,
         scalar_left: bool,
-    ) -> Matrix<f32, Self>;
+    ) -> Matrix<T, Self>;
 
     /// Elementwise comparison of two matrices.
-    fn matrix_compare(
-        a: &Matrix<f32, Self>,
-        b: &Matrix<f32, Self>,
-        op: Compare,
-    ) -> Matrix<f32, Self>;
+    fn matrix_compare(a: &Matrix<T, Self>, b: &Matrix<T, Self>, op: Compare) -> Matrix<T, Self>;
 
     /// Elementwise comparison against a scalar.
     fn matrix_compare_scalar(
-        a: &Matrix<f32, Self>,
-        scalar: f32,
+        a: &Matrix<T, Self>,
+        scalar: T,
         op: Compare,
         scalar_left: bool,
-    ) -> Matrix<f32, Self>;
+    ) -> Matrix<T, Self>;
 
     /// Confine every element to `[low, high]`; see
     /// [`vector_clamp`](Kernels::vector_clamp).
-    fn matrix_clamp(a: &Matrix<f32, Self>, low: f32, high: f32) -> Matrix<f32, Self>;
+    fn matrix_clamp(a: &Matrix<T, Self>, low: T, high: T) -> Matrix<T, Self>;
 
     /// `f(a)`, elementwise.
-    fn matrix_unary(a: &Matrix<f32, Self>, f: Analytic) -> Matrix<f32, Self>;
+    fn matrix_unary(a: &Matrix<T, Self>, f: Analytic) -> Matrix<T, Self>;
 
     /// Elementwise `a^b` over matrices; see [`vector_power`](Self::vector_power).
-    fn matrix_power(a: &Matrix<f32, Self>, b: &Matrix<f32, Self>) -> Matrix<f32, Self>;
+    fn matrix_power(a: &Matrix<T, Self>, b: &Matrix<T, Self>) -> Matrix<T, Self>;
 
     /// The same with one operand fixed.
-    fn matrix_power_scalar(
-        a: &Matrix<f32, Self>,
-        scalar: f32,
-        scalar_left: bool,
-    ) -> Matrix<f32, Self>;
+    fn matrix_power_scalar(a: &Matrix<T, Self>, scalar: T, scalar_left: bool) -> Matrix<T, Self>;
 
     /// `(f(value), f'(value) ⊙ tangent)` — one forward-mode step.
     fn matrix_unary_dual(
-        value: &Matrix<f32, Self>,
-        tangent: &Matrix<f32, Self>,
+        value: &Matrix<T, Self>,
+        tangent: &Matrix<T, Self>,
         f: Analytic,
-    ) -> (Matrix<f32, Self>, Matrix<f32, Self>);
+    ) -> (Matrix<T, Self>, Matrix<T, Self>);
 
-    fn matmul(a: &Matrix<f32, Self>, b: &Matrix<f32, Self>) -> Matrix<f32, Self>;
+    fn matmul(a: &Matrix<T, Self>, b: &Matrix<T, Self>) -> Matrix<T, Self>;
 
     /// `addend + a·b`.
     ///
@@ -874,12 +888,12 @@ pub trait Kernels: Backend {
     /// what makes a dual matmul two dispatches instead of three. `addend` is
     /// consumed because it may become the accumulator.
     fn matmul_add(
-        a: &Matrix<f32, Self>,
-        b: &Matrix<f32, Self>,
-        addend: Matrix<f32, Self>,
-    ) -> Matrix<f32, Self>;
+        a: &Matrix<T, Self>,
+        b: &Matrix<T, Self>,
+        addend: Matrix<T, Self>,
+    ) -> Matrix<T, Self>;
 
-    fn transpose(m: &Matrix<f32, Self>) -> Matrix<f32, Self>;
+    fn transpose(m: &Matrix<T, Self>) -> Matrix<T, Self>;
 
     /// Valid cross-correlation: output `(i, j)` is the window-shaped patch of
     /// `input` at `(i, j)` dotted with `window`, so the result is
@@ -890,11 +904,7 @@ pub trait Kernels: Backend {
     /// one) — and is also what the input-side gradient of either needs.
     ///
     /// Panics unless the window fits inside the input.
-    fn correlate(
-        input: &Matrix<f32, Self>,
-        window: &Matrix<f32, Self>,
-        flip: bool,
-    ) -> Matrix<f32, Self>;
+    fn correlate(input: &Matrix<T, Self>, window: &Matrix<T, Self>, flip: bool) -> Matrix<T, Self>;
 
     /// `∂L/∂window` for a valid correlation: the input windowed by the output
     /// adjoint, which comes out exactly the window's shape —
@@ -905,78 +915,75 @@ pub trait Kernels: Backend {
     /// reach it by different routes, and because the pairing of `input` with
     /// `adjoint` is what fixes the result shape.
     fn correlate_window_gradient(
-        input: &Matrix<f32, Self>,
-        adjoint: &Matrix<f32, Self>,
-    ) -> Matrix<f32, Self>;
+        input: &Matrix<T, Self>,
+        adjoint: &Matrix<T, Self>,
+    ) -> Matrix<T, Self>;
 
     /// `∂L/∂input` for a valid correlation: the full correlation of the adjoint
     /// with the window, which is the padded one, giving back the input's shape
     /// `(A+KR−1) × (B+KC−1)`. `forward_flip` says which convention the forward
     /// pass used; the gradient applies the window the other way round.
     fn correlate_input_gradient(
-        adjoint: &Matrix<f32, Self>,
-        window: &Matrix<f32, Self>,
+        adjoint: &Matrix<T, Self>,
+        window: &Matrix<T, Self>,
         forward_flip: bool,
-    ) -> Matrix<f32, Self>;
+    ) -> Matrix<T, Self>;
 
     /// Surround a matrix with `pad_rows` and `pad_cols` zeros on every side,
     /// giving `(R + 2·PR) × (C + 2·PC)`.
-    fn pad(input: &Matrix<f32, Self>, pad_rows: usize, pad_cols: usize) -> Matrix<f32, Self>;
+    fn pad(input: &Matrix<T, Self>, pad_rows: usize, pad_cols: usize) -> Matrix<T, Self>;
 
     /// Reverse both axes.
-    fn flip(input: &Matrix<f32, Self>) -> Matrix<f32, Self>;
+    fn flip(input: &Matrix<T, Self>) -> Matrix<T, Self>;
 
     /// The mean and `Σ(xᵢ − mean)²` of a vector, as `(mean, deviations)`.
     ///
     /// Both passes in one call, because on a GPU the mean has to come back to
     /// the CPU before the second pass can be encoded — returning it alongside
     /// the deviations means the caller never has to ask twice.
-    fn vector_moments(a: &Vector<f32, Self>) -> (f32, f32);
+    fn vector_moments(a: &Vector<T, Self>) -> (T, T);
 
     /// The same over every element of a matrix, ignoring its shape.
-    fn matrix_moments(a: &Matrix<f32, Self>) -> (f32, f32);
+    fn matrix_moments(a: &Matrix<T, Self>) -> (T, T);
 
     /// The same along one axis: one mean and one deviation sum per row or per
     /// column, as `(means, deviations)`.
-    fn matrix_axis_moments(
-        a: &Matrix<f32, Self>,
-        axis: Axis,
-    ) -> (Vector<f32, Self>, Vector<f32, Self>);
+    fn matrix_axis_moments(a: &Matrix<T, Self>, axis: Axis) -> (Vector<T, Self>, Vector<T, Self>);
 
     /// A distribution function applied elementwise, with one parameter pair for
     /// the whole vector.
     fn vector_distribution(
-        a: &Vector<f32, Self>,
+        a: &Vector<T, Self>,
         family: Family,
         statistic: Statistic,
-        parameters: (f32, f32),
-    ) -> Vector<f32, Self>;
+        parameters: (T, T),
+    ) -> Vector<T, Self>;
 
     /// The same over a matrix.
     fn matrix_distribution(
-        a: &Matrix<f32, Self>,
+        a: &Matrix<T, Self>,
         family: Family,
         statistic: Statistic,
-        parameters: (f32, f32),
-    ) -> Matrix<f32, Self>;
+        parameters: (T, T),
+    ) -> Matrix<T, Self>;
 
     /// The same, with one parameter pair per row or per column: `first` and
     /// `second` hold one parameter each per slice along `axis`.
     fn matrix_axis_distribution(
-        a: &Matrix<f32, Self>,
+        a: &Matrix<T, Self>,
         axis: Axis,
         family: Family,
         statistic: Statistic,
-        first: &Vector<f32, Self>,
-        second: &Vector<f32, Self>,
-    ) -> Matrix<f32, Self>;
+        first: &Vector<T, Self>,
+        second: &Vector<T, Self>,
+    ) -> Matrix<T, Self>;
 
     /// Run a fused elementwise program as one kernel. Reach this through
     /// [`Program::run`](super::fused::Program::run), which checks the operands
     /// against the program first.
     #[doc(hidden)]
     fn fused(
-        program: &Program,
+        program: &Program<T>,
         shape: (usize, usize),
         inputs: &[Source<'_, Self>],
         updated: &mut [Sink<'_, Self>],
@@ -985,13 +992,13 @@ pub trait Kernels: Backend {
 
 /// Every operation here already exists as an inherent method or an operator on
 /// the host-backed tensors; this is pure forwarding.
-impl Kernels for Host {
+impl<T: Real> Kernels<T> for Host {
     fn vector_elementwise(
-        a: &Vector<f32, Self>,
-        b: &Vector<f32, Self>,
+        a: &Vector<T, Self>,
+        b: &Vector<T, Self>,
         op: BinaryOp,
-    ) -> Vector<f32, Self> {
-        counters::elementwise(a.len(), 2);
+    ) -> Vector<T, Self> {
+        counters::elementwise_of::<T>(a.len(), 2);
         match op {
             BinaryOp::Add => a + b,
             BinaryOp::Sub => a - b,
@@ -1002,12 +1009,12 @@ impl Kernels for Host {
     }
 
     fn vector_broadcast(
-        a: &Vector<f32, Self>,
-        scalar: f32,
+        a: &Vector<T, Self>,
+        scalar: T,
         op: BinaryOp,
         scalar_left: bool,
-    ) -> Vector<f32, Self> {
-        counters::elementwise(a.len(), 1);
+    ) -> Vector<T, Self> {
+        counters::elementwise_of::<T>(a.len(), 1);
         if scalar_left {
             a.broadcast_left(scalar, op)
         } else {
@@ -1015,61 +1022,59 @@ impl Kernels for Host {
         }
     }
 
-    fn vector_compare(
-        a: &Vector<f32, Self>,
-        b: &Vector<f32, Self>,
-        op: Compare,
-    ) -> Vector<f32, Self> {
-        counters::elementwise(a.len(), 2);
+    fn vector_compare(a: &Vector<T, Self>, b: &Vector<T, Self>, op: Compare) -> Vector<T, Self> {
+        counters::elementwise_of::<T>(a.len(), 2);
         a.compare(b, op)
     }
 
     fn vector_compare_scalar(
-        a: &Vector<f32, Self>,
-        scalar: f32,
+        a: &Vector<T, Self>,
+        scalar: T,
         op: Compare,
         scalar_left: bool,
-    ) -> Vector<f32, Self> {
-        counters::elementwise(a.len(), 1);
+    ) -> Vector<T, Self> {
+        counters::elementwise_of::<T>(a.len(), 1);
         a.compare_scalar(scalar, op, scalar_left)
     }
 
-    fn vector_clamp(a: &Vector<f32, Self>, low: f32, high: f32) -> Vector<f32, Self> {
-        counters::elementwise(a.len(), 1);
+    fn vector_clamp(a: &Vector<T, Self>, low: T, high: T) -> Vector<T, Self> {
+        counters::elementwise_of::<T>(a.len(), 1);
         a.clamp(low, high)
     }
 
-    fn vector_reduce(a: &Vector<f32, Self>, op: Reduce) -> f32 {
-        counters::kernel(a.len() * 4, 0);
+    fn vector_reduce(a: &Vector<T, Self>, op: Reduce) -> T {
+        counters::kernel(a.len() * size_of::<T>(), 0);
         a.reduce(op)
     }
 
-    fn vector_prefix_sum(a: &Vector<f32, Self>) -> Vector<f32, Self> {
-        counters::elementwise(a.len(), 1);
+    fn vector_prefix_sum(a: &Vector<T, Self>) -> Vector<T, Self> {
+        counters::elementwise_of::<T>(a.len(), 1);
         a.prefix_sum()
     }
 
-    fn vector_sort(a: &Vector<f32, Self>, order: SortOrder) -> Vector<f32, Self> {
-        counters::elementwise(a.len(), 1);
+    fn vector_sort(a: &Vector<T, Self>, order: SortOrder) -> Vector<T, Self> {
+        counters::elementwise_of::<T>(a.len(), 1);
         a.sorted(order)
     }
 
-    fn vector_unary(a: &Vector<f32, Self>, f: Analytic) -> Vector<f32, Self> {
-        counters::elementwise(a.len(), 1);
+    fn vector_unary(a: &Vector<T, Self>, f: Analytic) -> Vector<T, Self> {
+        counters::elementwise_of::<T>(a.len(), 1);
+        if f == Analytic::Sqrt {
+            let mut out = vec![T::zero(); a.len()];
+            if crate::compact::sqrt(a.data(), &mut out) {
+                return Vector::new(out);
+            }
+        }
         a.map(|&x| f.value(x))
     }
 
-    fn vector_power(a: &Vector<f32, Self>, b: &Vector<f32, Self>) -> Vector<f32, Self> {
-        counters::elementwise(a.len(), 2);
+    fn vector_power(a: &Vector<T, Self>, b: &Vector<T, Self>) -> Vector<T, Self> {
+        counters::elementwise_of::<T>(a.len(), 2);
         a.pow_elementwise(b)
     }
 
-    fn vector_power_scalar(
-        a: &Vector<f32, Self>,
-        scalar: f32,
-        scalar_left: bool,
-    ) -> Vector<f32, Self> {
-        counters::elementwise(a.len(), 1);
+    fn vector_power_scalar(a: &Vector<T, Self>, scalar: T, scalar_left: bool) -> Vector<T, Self> {
+        counters::elementwise_of::<T>(a.len(), 1);
         if scalar_left {
             a.map(|&x| scalar.powf(x))
         } else {
@@ -1078,11 +1083,11 @@ impl Kernels for Host {
     }
 
     fn vector_unary_dual(
-        value: &Vector<f32, Self>,
-        tangent: &Vector<f32, Self>,
+        value: &Vector<T, Self>,
+        tangent: &Vector<T, Self>,
         f: Analytic,
-    ) -> (Vector<f32, Self>, Vector<f32, Self>) {
-        counters::kernel(4 * value.len() * 4, 2);
+    ) -> (Vector<T, Self>, Vector<T, Self>) {
+        counters::kernel(4 * value.len() * size_of::<T>(), 2);
         assert_eq!(
             value.len(),
             tangent.len(),
@@ -1097,36 +1102,45 @@ impl Kernels for Host {
         (value.map(|&x| f.value(x)), Vector::new(derivatives))
     }
 
-    fn dot(a: &Vector<f32, Self>, b: &Vector<f32, Self>) -> f32 {
-        counters::kernel(2 * a.len() * 4, 0);
+    fn dot(a: &Vector<T, Self>, b: &Vector<T, Self>) -> T {
+        counters::kernel(2 * a.len() * size_of::<T>(), 0);
         a.dot(b)
     }
 
-    fn vecmat(v: &Vector<f32, Self>, m: &Matrix<f32, Self>) -> Vector<f32, Self> {
-        counters::kernel((v.len() + m.rows() * m.cols() + m.cols()) * 4, 1);
+    fn vecmat(v: &Vector<T, Self>, m: &Matrix<T, Self>) -> Vector<T, Self> {
+        counters::kernel(
+            (v.len() + m.rows() * m.cols() + m.cols()) * size_of::<T>(),
+            1,
+        );
         v.vecmat(m)
     }
 
-    fn matvec(m: &Matrix<f32, Self>, v: &Vector<f32, Self>) -> Vector<f32, Self> {
-        counters::kernel((v.len() + m.rows() * m.cols() + m.rows()) * 4, 1);
+    fn matvec(m: &Matrix<T, Self>, v: &Vector<T, Self>) -> Vector<T, Self> {
+        counters::kernel(
+            (v.len() + m.rows() * m.cols() + m.rows()) * size_of::<T>(),
+            1,
+        );
         m.matvec(v)
     }
 
     fn matvec_add(
-        m: &Matrix<f32, Self>,
-        v: &Vector<f32, Self>,
-        addend: Vector<f32, Self>,
-    ) -> Vector<f32, Self> {
-        counters::kernel((v.len() + m.rows() * m.cols() + 2 * m.rows()) * 4, 0);
+        m: &Matrix<T, Self>,
+        v: &Vector<T, Self>,
+        addend: Vector<T, Self>,
+    ) -> Vector<T, Self> {
+        counters::kernel(
+            (v.len() + m.rows() * m.cols() + 2 * m.rows()) * size_of::<T>(),
+            0,
+        );
         m.matvec_add(v, addend)
     }
 
     fn matrix_elementwise(
-        a: &Matrix<f32, Self>,
-        b: &Matrix<f32, Self>,
+        a: &Matrix<T, Self>,
+        b: &Matrix<T, Self>,
         op: BinaryOp,
-    ) -> Matrix<f32, Self> {
-        counters::elementwise(a.rows() * a.cols(), 2);
+    ) -> Matrix<T, Self> {
+        counters::elementwise_of::<T>(a.rows() * a.cols(), 2);
         match op {
             BinaryOp::Add => a + b,
             BinaryOp::Sub => a - b,
@@ -1137,12 +1151,12 @@ impl Kernels for Host {
     }
 
     fn matrix_broadcast(
-        a: &Matrix<f32, Self>,
-        scalar: f32,
+        a: &Matrix<T, Self>,
+        scalar: T,
         op: BinaryOp,
         scalar_left: bool,
-    ) -> Matrix<f32, Self> {
-        counters::elementwise(a.rows() * a.cols(), 1);
+    ) -> Matrix<T, Self> {
+        counters::elementwise_of::<T>(a.rows() * a.cols(), 1);
         if scalar_left {
             a.broadcast_left(scalar, op)
         } else {
@@ -1150,46 +1164,44 @@ impl Kernels for Host {
         }
     }
 
-    fn matrix_compare(
-        a: &Matrix<f32, Self>,
-        b: &Matrix<f32, Self>,
-        op: Compare,
-    ) -> Matrix<f32, Self> {
-        counters::elementwise(a.rows() * a.cols(), 2);
+    fn matrix_compare(a: &Matrix<T, Self>, b: &Matrix<T, Self>, op: Compare) -> Matrix<T, Self> {
+        counters::elementwise_of::<T>(a.rows() * a.cols(), 2);
         a.compare(b, op)
     }
 
     fn matrix_compare_scalar(
-        a: &Matrix<f32, Self>,
-        scalar: f32,
+        a: &Matrix<T, Self>,
+        scalar: T,
         op: Compare,
         scalar_left: bool,
-    ) -> Matrix<f32, Self> {
-        counters::elementwise(a.rows() * a.cols(), 1);
+    ) -> Matrix<T, Self> {
+        counters::elementwise_of::<T>(a.rows() * a.cols(), 1);
         a.compare_scalar(scalar, op, scalar_left)
     }
 
-    fn matrix_clamp(a: &Matrix<f32, Self>, low: f32, high: f32) -> Matrix<f32, Self> {
-        counters::elementwise(a.rows() * a.cols(), 1);
+    fn matrix_clamp(a: &Matrix<T, Self>, low: T, high: T) -> Matrix<T, Self> {
+        counters::elementwise_of::<T>(a.rows() * a.cols(), 1);
         a.clamp(low, high)
     }
 
-    fn matrix_unary(a: &Matrix<f32, Self>, f: Analytic) -> Matrix<f32, Self> {
-        counters::elementwise(a.rows() * a.cols(), 1);
+    fn matrix_unary(a: &Matrix<T, Self>, f: Analytic) -> Matrix<T, Self> {
+        counters::elementwise_of::<T>(a.rows() * a.cols(), 1);
+        if f == Analytic::Sqrt {
+            let mut out = vec![T::zero(); a.rows() * a.cols()];
+            if crate::compact::sqrt(a.data(), &mut out) {
+                return Matrix::from_flat(a.rows(), a.cols(), out);
+            }
+        }
         a.map(|&x| f.value(x))
     }
 
-    fn matrix_power(a: &Matrix<f32, Self>, b: &Matrix<f32, Self>) -> Matrix<f32, Self> {
-        counters::elementwise(a.rows() * a.cols(), 2);
+    fn matrix_power(a: &Matrix<T, Self>, b: &Matrix<T, Self>) -> Matrix<T, Self> {
+        counters::elementwise_of::<T>(a.rows() * a.cols(), 2);
         a.pow_elementwise(b)
     }
 
-    fn matrix_power_scalar(
-        a: &Matrix<f32, Self>,
-        scalar: f32,
-        scalar_left: bool,
-    ) -> Matrix<f32, Self> {
-        counters::elementwise(a.rows() * a.cols(), 1);
+    fn matrix_power_scalar(a: &Matrix<T, Self>, scalar: T, scalar_left: bool) -> Matrix<T, Self> {
+        counters::elementwise_of::<T>(a.rows() * a.cols(), 1);
         if scalar_left {
             a.map(|&x| scalar.powf(x))
         } else {
@@ -1198,11 +1210,11 @@ impl Kernels for Host {
     }
 
     fn matrix_unary_dual(
-        value: &Matrix<f32, Self>,
-        tangent: &Matrix<f32, Self>,
+        value: &Matrix<T, Self>,
+        tangent: &Matrix<T, Self>,
         f: Analytic,
-    ) -> (Matrix<f32, Self>, Matrix<f32, Self>) {
-        counters::kernel(4 * value.rows() * value.cols() * 4, 2);
+    ) -> (Matrix<T, Self>, Matrix<T, Self>) {
+        counters::kernel(4 * value.rows() * value.cols() * size_of::<T>(), 2);
         assert_eq!(
             value.shape(),
             tangent.shape(),
@@ -1221,59 +1233,50 @@ impl Kernels for Host {
         )
     }
 
-    fn matmul(a: &Matrix<f32, Self>, b: &Matrix<f32, Self>) -> Matrix<f32, Self> {
-        counters::kernel((a.rows() * a.cols() + b.rows() * b.cols() + a.rows() * b.cols()) * 4, 1);
+    fn matmul(a: &Matrix<T, Self>, b: &Matrix<T, Self>) -> Matrix<T, Self> {
+        counters::kernel(
+            (a.rows() * a.cols() + b.rows() * b.cols() + a.rows() * b.cols()) * size_of::<T>(),
+            1,
+        );
         a.matmul(b)
     }
 
     fn matmul_add(
-        a: &Matrix<f32, Self>,
-        b: &Matrix<f32, Self>,
-        addend: Matrix<f32, Self>,
-    ) -> Matrix<f32, Self> {
-        counters::kernel((a.rows() * a.cols() + b.rows() * b.cols() + 2 * a.rows() * b.cols()) * 4, 0);
+        a: &Matrix<T, Self>,
+        b: &Matrix<T, Self>,
+        addend: Matrix<T, Self>,
+    ) -> Matrix<T, Self> {
+        counters::kernel(
+            (a.rows() * a.cols() + b.rows() * b.cols() + 2 * a.rows() * b.cols()) * size_of::<T>(),
+            0,
+        );
         a.matmul_add(b, addend)
     }
 
-    fn transpose(m: &Matrix<f32, Self>) -> Matrix<f32, Self> {
-        counters::elementwise(m.rows() * m.cols(), 1);
+    fn transpose(m: &Matrix<T, Self>) -> Matrix<T, Self> {
+        counters::elementwise_of::<T>(m.rows() * m.cols(), 1);
         m.transpose()
     }
 
-    fn correlate(
-        input: &Matrix<f32, Self>,
-        window: &Matrix<f32, Self>,
-        flip: bool,
-    ) -> Matrix<f32, Self> {
-        counters::kernel((input.rows() * input.cols() + window.rows() * window.cols() + correlation_shape(input.shape(), window.shape()).0 * correlation_shape(input.shape(), window.shape()).1) * 4, 1);
-        let cols = input.cols();
-        let (window_rows, window_cols) = window.shape();
-        let (out_rows, out_cols) = correlation_shape(input.shape(), window.shape());
-        let (values, taps) = (input.data(), window.data());
-
-        let mut out = Vec::with_capacity(out_rows * out_cols);
-        for row in 0..out_rows {
-            for col in 0..out_cols {
-                let mut sum = 0.0;
-                for window_row in 0..window_rows {
-                    for window_col in 0..window_cols {
-                        let (tap_row, tap_col) = if flip {
-                            (window_rows - 1 - window_row, window_cols - 1 - window_col)
-                        } else {
-                            (window_row, window_col)
-                        };
-                        sum += values[(row + window_row) * cols + col + window_col]
-                            * taps[tap_row * window_cols + tap_col];
-                    }
-                }
-                out.push(sum);
-            }
+    fn correlate(input: &Matrix<T, Self>, window: &Matrix<T, Self>, flip: bool) -> Matrix<T, Self> {
+        counters::kernel(
+            (input.rows() * input.cols()
+                + window.rows() * window.cols()
+                + correlation_shape(input.shape(), window.shape()).0
+                    * correlation_shape(input.shape(), window.shape()).1)
+                * size_of::<T>(),
+            1,
+        );
+        // `f16` and `bf16` accumulate the taps in `f32` and round each output
+        // once, as the GPU kernel does.
+        if let (Some(input), Some(window)) = (widened(input), widened(window)) {
+            return narrowed(correlate_values(&input, &window, flip));
         }
-        Matrix::from_flat(out_rows, out_cols, out)
+        correlate_values(input, window, flip)
     }
 
-    fn flip(input: &Matrix<f32, Self>) -> Matrix<f32, Self> {
-        counters::elementwise(input.rows() * input.cols(), 1);
+    fn flip(input: &Matrix<T, Self>) -> Matrix<T, Self> {
+        counters::elementwise_of::<T>(input.rows() * input.cols(), 1);
         let (rows, cols) = input.shape();
         let values = input.data();
         let mut out = Vec::with_capacity(rows * cols);
@@ -1286,58 +1289,39 @@ impl Kernels for Host {
     }
 
     fn correlate_window_gradient(
-        input: &Matrix<f32, Self>,
-        adjoint: &Matrix<f32, Self>,
-    ) -> Matrix<f32, Self> {
+        input: &Matrix<T, Self>,
+        adjoint: &Matrix<T, Self>,
+    ) -> Matrix<T, Self> {
         // K̄[a][b] = Σᵢⱼ Ȳ[i][j]·X[i+a][j+b] — the input correlated with the
         // adjoint, which lands on exactly the window's shape.
         Self::correlate(input, adjoint, false)
     }
 
     fn correlate_input_gradient(
-        adjoint: &Matrix<f32, Self>,
-        window: &Matrix<f32, Self>,
+        adjoint: &Matrix<T, Self>,
+        window: &Matrix<T, Self>,
         forward_flip: bool,
-    ) -> Matrix<f32, Self> {
-        counters::kernel((adjoint.rows() * adjoint.cols() + window.rows() * window.cols() + (adjoint.rows() + window.rows() - 1) * (adjoint.cols() + window.cols() - 1)) * 4, 1);
-        // X̄[p][q] = Σᵤᵥ Ȳ[p−u][q−v]·K[u][v], with the taps reversed when the
-        // forward pass reversed them. Out-of-range adjoint indices are the zeros
-        // a full correlation pads with.
-        let (out_rows, out_cols) = adjoint.shape();
-        let (window_rows, window_cols) = window.shape();
-        let (rows, cols) = (out_rows + window_rows - 1, out_cols + window_cols - 1);
-        let (upstream, taps) = (adjoint.data(), window.data());
-
-        let mut out = Vec::with_capacity(rows * cols);
-        for row in 0..rows {
-            for col in 0..cols {
-                let mut sum = 0.0;
-                for window_row in 0..window_rows {
-                    for window_col in 0..window_cols {
-                        if row < window_row || col < window_col {
-                            continue;
-                        }
-                        let (source_row, source_col) = (row - window_row, col - window_col);
-                        if source_row >= out_rows || source_col >= out_cols {
-                            continue;
-                        }
-                        let (tap_row, tap_col) = if forward_flip {
-                            (window_rows - 1 - window_row, window_cols - 1 - window_col)
-                        } else {
-                            (window_row, window_col)
-                        };
-                        sum += upstream[source_row * out_cols + source_col]
-                            * taps[tap_row * window_cols + tap_col];
-                    }
-                }
-                out.push(sum);
-            }
+    ) -> Matrix<T, Self> {
+        counters::kernel(
+            (adjoint.rows() * adjoint.cols()
+                + window.rows() * window.cols()
+                + (adjoint.rows() + window.rows() - 1) * (adjoint.cols() + window.cols() - 1))
+                * size_of::<T>(),
+            1,
+        );
+        if let (Some(adjoint), Some(window)) = (widened(adjoint), widened(window)) {
+            return narrowed(correlate_input_gradient_values(&adjoint, &window, forward_flip));
         }
-        Matrix::from_flat(rows, cols, out)
+        correlate_input_gradient_values(adjoint, window, forward_flip)
     }
 
-    fn pad(input: &Matrix<f32, Self>, pad_rows: usize, pad_cols: usize) -> Matrix<f32, Self> {
-        counters::kernel((input.rows() * input.cols() + (input.rows() + 2 * pad_rows) * (input.cols() + 2 * pad_cols)) * 4, 1);
+    fn pad(input: &Matrix<T, Self>, pad_rows: usize, pad_cols: usize) -> Matrix<T, Self> {
+        counters::kernel(
+            (input.rows() * input.cols()
+                + (input.rows() + 2 * pad_rows) * (input.cols() + 2 * pad_cols))
+                * size_of::<T>(),
+            1,
+        );
         let (rows, cols) = input.shape();
         let (padded_rows, padded_cols) = (rows + 2 * pad_rows, cols + 2 * pad_cols);
         let values = input.data();
@@ -1352,39 +1336,39 @@ impl Kernels for Host {
                 out.push(if inside {
                     values[(row - pad_rows) * cols + col - pad_cols]
                 } else {
-                    0.0
+                    T::zero()
                 });
             }
         }
         Matrix::from_flat(padded_rows, padded_cols, out)
     }
 
-    fn vector_moments(a: &Vector<f32, Self>) -> (f32, f32) {
-        counters::kernel(2 * a.len() * 4, 0);
+    fn vector_moments(a: &Vector<T, Self>) -> (T, T) {
+        counters::kernel(2 * a.len() * size_of::<T>(), 0);
         moments_pair(&a.moments())
     }
 
-    fn matrix_moments(a: &Matrix<f32, Self>) -> (f32, f32) {
-        counters::kernel(2 * a.rows() * a.cols() * 4, 0);
+    fn matrix_moments(a: &Matrix<T, Self>) -> (T, T) {
+        counters::kernel(2 * a.rows() * a.cols() * size_of::<T>(), 0);
         moments_pair(&a.moments())
     }
 
-    fn matrix_axis_moments(
-        a: &Matrix<f32, Self>,
-        axis: Axis,
-    ) -> (Vector<f32, Self>, Vector<f32, Self>) {
-        counters::kernel((2 * a.rows() * a.cols() + 2 * axis.extent(a.shape())) * 4, 2);
+    fn matrix_axis_moments(a: &Matrix<T, Self>, axis: Axis) -> (Vector<T, Self>, Vector<T, Self>) {
+        counters::kernel(
+            (2 * a.rows() * a.cols() + 2 * axis.extent(a.shape())) * size_of::<T>(),
+            2,
+        );
         let moments = a.moments_axis(axis);
         (moments.means, moments.sum_squared_deviations)
     }
 
     fn vector_distribution(
-        a: &Vector<f32, Self>,
+        a: &Vector<T, Self>,
         family: Family,
         statistic: Statistic,
-        parameters: (f32, f32),
-    ) -> Vector<f32, Self> {
-        counters::elementwise(a.len(), 1);
+        parameters: (T, T),
+    ) -> Vector<T, Self> {
+        counters::elementwise_of::<T>(a.len(), 1);
         a.distribution(
             statistic,
             &Distribution::from_parameters(family, parameters),
@@ -1392,12 +1376,12 @@ impl Kernels for Host {
     }
 
     fn matrix_distribution(
-        a: &Matrix<f32, Self>,
+        a: &Matrix<T, Self>,
         family: Family,
         statistic: Statistic,
-        parameters: (f32, f32),
-    ) -> Matrix<f32, Self> {
-        counters::elementwise(a.rows() * a.cols(), 1);
+        parameters: (T, T),
+    ) -> Matrix<T, Self> {
+        counters::elementwise_of::<T>(a.rows() * a.cols(), 1);
         a.distribution(
             statistic,
             &Distribution::from_parameters(family, parameters),
@@ -1405,19 +1389,22 @@ impl Kernels for Host {
     }
 
     fn matrix_axis_distribution(
-        a: &Matrix<f32, Self>,
+        a: &Matrix<T, Self>,
         axis: Axis,
         family: Family,
         statistic: Statistic,
-        first: &Vector<f32, Self>,
-        second: &Vector<f32, Self>,
-    ) -> Matrix<f32, Self> {
-        counters::kernel((2 * a.rows() * a.cols() + 2 * axis.extent(a.shape())) * 4, 1);
+        first: &Vector<T, Self>,
+        second: &Vector<T, Self>,
+    ) -> Matrix<T, Self> {
+        counters::kernel(
+            (2 * a.rows() * a.cols() + 2 * axis.extent(a.shape())) * size_of::<T>(),
+            1,
+        );
         a.distribution_axis(axis, statistic, &axis_distributions(family, first, second))
     }
 
     fn fused(
-        program: &Program,
+        program: &Program<T>,
         shape: (usize, usize),
         inputs: &[Source<'_, Self>],
         updated: &mut [Sink<'_, Self>],
@@ -1426,19 +1413,109 @@ impl Kernels for Host {
     }
 }
 
+/// The values of a valid correlation; the host kernel without its bookkeeping.
+fn correlate_values<T: Real>(input: &Matrix<T, Host>, window: &Matrix<T, Host>, flip: bool) -> Matrix<T, Host> {
+        let cols = input.cols();
+        let (window_rows, window_cols) = window.shape();
+        let (out_rows, out_cols) = correlation_shape(input.shape(), window.shape());
+        let (values, taps) = (input.data(), window.data());
+
+        let mut out = Vec::with_capacity(out_rows * out_cols);
+        for row in 0..out_rows {
+            for col in 0..out_cols {
+                let mut sum = T::zero();
+                for window_row in 0..window_rows {
+                    for window_col in 0..window_cols {
+                        let (tap_row, tap_col) = if flip {
+                            (window_rows - 1 - window_row, window_cols - 1 - window_col)
+                        } else {
+                            (window_row, window_col)
+                        };
+                        sum = sum
+                            + values[(row + window_row) * cols + col + window_col]
+                                * taps[tap_row * window_cols + tap_col];
+                    }
+                }
+                out.push(sum);
+            }
+        }
+        Matrix::from_flat(out_rows, out_cols, out)
+}
+
+/// The values of a correlation's input gradient — the full correlation of the
+/// adjoint with the window, applied the other way round.
+fn correlate_input_gradient_values<T: Real>(
+    adjoint: &Matrix<T, Host>,
+    window: &Matrix<T, Host>,
+    forward_flip: bool,
+) -> Matrix<T, Host> {
+        // X̄[p][q] = Σᵤᵥ Ȳ[p−u][q−v]·K[u][v], with the taps reversed when the
+        // forward pass reversed them. Out-of-range adjoint indices are the zeros
+        // a full correlation pads with.
+        let (out_rows, out_cols) = adjoint.shape();
+        let (window_rows, window_cols) = window.shape();
+        let (rows, cols) = (out_rows + window_rows - 1, out_cols + window_cols - 1);
+        let (upstream, taps) = (adjoint.data(), window.data());
+
+        let mut out = Vec::with_capacity(rows * cols);
+        for row in 0..rows {
+            for col in 0..cols {
+                let mut sum = T::zero();
+                for window_row in 0..window_rows {
+                    for window_col in 0..window_cols {
+                        if row < window_row || col < window_col {
+                            continue;
+                        }
+                        let (source_row, source_col) = (row - window_row, col - window_col);
+                        if source_row >= out_rows || source_col >= out_cols {
+                            continue;
+                        }
+                        let (tap_row, tap_col) = if forward_flip {
+                            (window_rows - 1 - window_row, window_cols - 1 - window_col)
+                        } else {
+                            (window_row, window_col)
+                        };
+                        sum = sum
+                            + upstream[source_row * out_cols + source_col]
+                                * taps[tap_row * window_cols + tap_col];
+                    }
+                }
+                out.push(sum);
+            }
+        }
+        Matrix::from_flat(rows, cols, out)
+}
+
+/// A compact (`f16` or `bf16`) matrix widened to `f32`, exactly; `None` for
+/// every other element type.
+fn widened<T: Real>(m: &Matrix<T, Host>) -> Option<Matrix<f32, Host>> {
+    let (rows, cols) = m.shape();
+    Some(Matrix::from_flat(rows, cols, crate::compact::widen(m.data())?))
+}
+
+/// An `f32` result rounded back to the compact type [`widened`] came from.
+fn narrowed<T: Real>(m: Matrix<f32, Host>) -> Matrix<T, Host> {
+    let (rows, cols) = m.shape();
+    Matrix::from_flat(
+        rows,
+        cols,
+        crate::compact::narrow(m.data()).expect("only compact types are widened"),
+    )
+}
+
 /// The pair the kernel interface passes moments around as, out of the named
 /// summary the tensor API returns.
-pub(crate) fn moments_pair(moments: &Moments<f32>) -> (f32, f32) {
+pub(crate) fn moments_pair<T: Real>(moments: &Moments<T>) -> (T, T) {
     (moments.mean, moments.sum_squared_deviations)
 }
 
 /// Rebuild one distribution per row or column from the two parameter vectors
 /// the axis kernels carry them in.
-pub(crate) fn axis_distributions<B: Backend>(
+pub(crate) fn axis_distributions<T: Real, B: Backend>(
     family: Family,
-    first: &Vector<f32, B>,
-    second: &Vector<f32, B>,
-) -> Vec<Distribution<f32>> {
+    first: &Vector<T, B>,
+    second: &Vector<T, B>,
+) -> Vec<Distribution<T>> {
     first
         .as_slice()
         .iter()
@@ -1469,28 +1546,31 @@ mod gpu {
         SortOrder, Source, Statistic, Vector, correlation_shape, fused,
     };
     use crate::counters;
+    use crate::metal::MetalElement;
+    use crate::numbers::Real;
     use crate::tensors::metal_backend::{matrix_elementwise, vector_elementwise};
     use crate::tensors::{Host, Metal, MetalStorage};
 
     /// Forwarding again, but to the resident operations: every one of these
-    /// leaves its result in GPU-shared memory.
-    impl Kernels for Metal {
+    /// leaves its result in GPU-shared memory, and runs the kernels compiled for
+    /// `T` — `T`, `f16` or `bf16`.
+    impl<T: MetalElement> Kernels<T> for Metal {
         fn vector_elementwise(
-            a: &Vector<f32, Self>,
-            b: &Vector<f32, Self>,
+            a: &Vector<T, Self>,
+            b: &Vector<T, Self>,
             op: BinaryOp,
-        ) -> Vector<f32, Self> {
-            counters::elementwise(a.len(), 2);
+        ) -> Vector<T, Self> {
+            counters::elementwise_of::<T>(a.len(), 2);
             vector_elementwise(a, b, op)
         }
 
         fn vector_broadcast(
-            a: &Vector<f32, Self>,
-            scalar: f32,
+            a: &Vector<T, Self>,
+            scalar: T,
             op: BinaryOp,
             scalar_left: bool,
-        ) -> Vector<f32, Self> {
-            counters::elementwise(a.len(), 1);
+        ) -> Vector<T, Self> {
+            counters::elementwise_of::<T>(a.len(), 1);
             if scalar_left {
                 a.broadcast_left(scalar, op)
             } else {
@@ -1499,69 +1579,69 @@ mod gpu {
         }
 
         fn vector_compare(
-            a: &Vector<f32, Self>,
-            b: &Vector<f32, Self>,
+            a: &Vector<T, Self>,
+            b: &Vector<T, Self>,
             op: Compare,
-        ) -> Vector<f32, Self> {
-            counters::elementwise(a.len(), 2);
+        ) -> Vector<T, Self> {
+            counters::elementwise_of::<T>(a.len(), 2);
             a.compare(b, op)
         }
 
         fn vector_compare_scalar(
-            a: &Vector<f32, Self>,
-            scalar: f32,
+            a: &Vector<T, Self>,
+            scalar: T,
             op: Compare,
             scalar_left: bool,
-        ) -> Vector<f32, Self> {
-            counters::elementwise(a.len(), 1);
+        ) -> Vector<T, Self> {
+            counters::elementwise_of::<T>(a.len(), 1);
             a.compare_scalar(scalar, op, scalar_left)
         }
 
-        fn vector_clamp(a: &Vector<f32, Self>, low: f32, high: f32) -> Vector<f32, Self> {
-            counters::elementwise(a.len(), 1);
+        fn vector_clamp(a: &Vector<T, Self>, low: T, high: T) -> Vector<T, Self> {
+            counters::elementwise_of::<T>(a.len(), 1);
             a.clamp(low, high)
         }
 
-        fn vector_reduce(a: &Vector<f32, Self>, op: Reduce) -> f32 {
-            counters::kernel(a.len() * 4, 0);
+        fn vector_reduce(a: &Vector<T, Self>, op: Reduce) -> T {
+            counters::kernel(a.len() * size_of::<T>(), 0);
             a.reduce(op)
         }
 
-        fn vector_prefix_sum(a: &Vector<f32, Self>) -> Vector<f32, Self> {
-            counters::elementwise(a.len(), 1);
+        fn vector_prefix_sum(a: &Vector<T, Self>) -> Vector<T, Self> {
+            counters::elementwise_of::<T>(a.len(), 1);
             a.prefix_sum()
         }
 
-        fn vector_sort(a: &Vector<f32, Self>, order: SortOrder) -> Vector<f32, Self> {
-            counters::elementwise(a.len(), 1);
+        fn vector_sort(a: &Vector<T, Self>, order: SortOrder) -> Vector<T, Self> {
+            counters::elementwise_of::<T>(a.len(), 1);
             a.sorted(order)
         }
 
-        fn vector_unary(a: &Vector<f32, Self>, f: Analytic) -> Vector<f32, Self> {
-            counters::elementwise(a.len(), 1);
+        fn vector_unary(a: &Vector<T, Self>, f: Analytic) -> Vector<T, Self> {
+            counters::elementwise_of::<T>(a.len(), 1);
             a.analytic(f)
         }
 
-        fn vector_power(a: &Vector<f32, Self>, b: &Vector<f32, Self>) -> Vector<f32, Self> {
-            counters::elementwise(a.len(), 2);
+        fn vector_power(a: &Vector<T, Self>, b: &Vector<T, Self>) -> Vector<T, Self> {
+            counters::elementwise_of::<T>(a.len(), 2);
             a.pow_elementwise(b)
         }
 
         fn vector_power_scalar(
-            a: &Vector<f32, Self>,
-            scalar: f32,
+            a: &Vector<T, Self>,
+            scalar: T,
             scalar_left: bool,
-        ) -> Vector<f32, Self> {
-            counters::elementwise(a.len(), 1);
+        ) -> Vector<T, Self> {
+            counters::elementwise_of::<T>(a.len(), 1);
             a.power_scalar(scalar, scalar_left)
         }
 
         fn vector_unary_dual(
-            value: &Vector<f32, Self>,
-            tangent: &Vector<f32, Self>,
+            value: &Vector<T, Self>,
+            tangent: &Vector<T, Self>,
             f: Analytic,
-        ) -> (Vector<f32, Self>, Vector<f32, Self>) {
-            counters::kernel(4 * value.len() * 4, 2);
+        ) -> (Vector<T, Self>, Vector<T, Self>) {
+            counters::kernel(4 * value.len() * size_of::<T>(), 2);
             match value.storage().unary_dual(tangent.storage(), f) {
                 Some((v, t)) => (
                     Vector::from_storage(value.len(), v),
@@ -1578,46 +1658,46 @@ mod gpu {
             }
         }
 
-        fn dot(a: &Vector<f32, Self>, b: &Vector<f32, Self>) -> f32 {
-            counters::kernel(2 * a.len() * 4, 0);
+        fn dot(a: &Vector<T, Self>, b: &Vector<T, Self>) -> T {
+            counters::kernel(2 * a.len() * size_of::<T>(), 0);
             a.dot(b)
         }
 
-        fn vecmat(v: &Vector<f32, Self>, m: &Matrix<f32, Self>) -> Vector<f32, Self> {
-            counters::kernel((v.len() + m.rows() * m.cols() + m.cols()) * 4, 1);
+        fn vecmat(v: &Vector<T, Self>, m: &Matrix<T, Self>) -> Vector<T, Self> {
+            counters::kernel((v.len() + m.rows() * m.cols() + m.cols()) * size_of::<T>(), 1);
             v.vecmat(m)
         }
 
-        fn matvec(m: &Matrix<f32, Self>, v: &Vector<f32, Self>) -> Vector<f32, Self> {
-            counters::kernel((v.len() + m.rows() * m.cols() + m.rows()) * 4, 1);
+        fn matvec(m: &Matrix<T, Self>, v: &Vector<T, Self>) -> Vector<T, Self> {
+            counters::kernel((v.len() + m.rows() * m.cols() + m.rows()) * size_of::<T>(), 1);
             m.matvec(v)
         }
 
         fn matvec_add(
-            m: &Matrix<f32, Self>,
-            v: &Vector<f32, Self>,
-            addend: Vector<f32, Self>,
-        ) -> Vector<f32, Self> {
-            counters::kernel((v.len() + m.rows() * m.cols() + 2 * m.rows()) * 4, 0);
+            m: &Matrix<T, Self>,
+            v: &Vector<T, Self>,
+            addend: Vector<T, Self>,
+        ) -> Vector<T, Self> {
+            counters::kernel((v.len() + m.rows() * m.cols() + 2 * m.rows()) * size_of::<T>(), 0);
             m.matvec_add(v, addend)
         }
 
         fn matrix_elementwise(
-            a: &Matrix<f32, Self>,
-            b: &Matrix<f32, Self>,
+            a: &Matrix<T, Self>,
+            b: &Matrix<T, Self>,
             op: BinaryOp,
-        ) -> Matrix<f32, Self> {
-            counters::elementwise(a.rows() * a.cols(), 2);
+        ) -> Matrix<T, Self> {
+            counters::elementwise_of::<T>(a.rows() * a.cols(), 2);
             matrix_elementwise(a, b, op)
         }
 
         fn matrix_broadcast(
-            a: &Matrix<f32, Self>,
-            scalar: f32,
+            a: &Matrix<T, Self>,
+            scalar: T,
             op: BinaryOp,
             scalar_left: bool,
-        ) -> Matrix<f32, Self> {
-            counters::elementwise(a.rows() * a.cols(), 1);
+        ) -> Matrix<T, Self> {
+            counters::elementwise_of::<T>(a.rows() * a.cols(), 1);
             if scalar_left {
                 a.broadcast_left(scalar, op)
             } else {
@@ -1626,54 +1706,54 @@ mod gpu {
         }
 
         fn matrix_compare(
-            a: &Matrix<f32, Self>,
-            b: &Matrix<f32, Self>,
+            a: &Matrix<T, Self>,
+            b: &Matrix<T, Self>,
             op: Compare,
-        ) -> Matrix<f32, Self> {
-            counters::elementwise(a.rows() * a.cols(), 2);
+        ) -> Matrix<T, Self> {
+            counters::elementwise_of::<T>(a.rows() * a.cols(), 2);
             a.compare(b, op)
         }
 
         fn matrix_compare_scalar(
-            a: &Matrix<f32, Self>,
-            scalar: f32,
+            a: &Matrix<T, Self>,
+            scalar: T,
             op: Compare,
             scalar_left: bool,
-        ) -> Matrix<f32, Self> {
-            counters::elementwise(a.rows() * a.cols(), 1);
+        ) -> Matrix<T, Self> {
+            counters::elementwise_of::<T>(a.rows() * a.cols(), 1);
             a.compare_scalar(scalar, op, scalar_left)
         }
 
-        fn matrix_clamp(a: &Matrix<f32, Self>, low: f32, high: f32) -> Matrix<f32, Self> {
-            counters::elementwise(a.rows() * a.cols(), 1);
+        fn matrix_clamp(a: &Matrix<T, Self>, low: T, high: T) -> Matrix<T, Self> {
+            counters::elementwise_of::<T>(a.rows() * a.cols(), 1);
             a.clamp(low, high)
         }
 
-        fn matrix_unary(a: &Matrix<f32, Self>, f: Analytic) -> Matrix<f32, Self> {
-            counters::elementwise(a.rows() * a.cols(), 1);
+        fn matrix_unary(a: &Matrix<T, Self>, f: Analytic) -> Matrix<T, Self> {
+            counters::elementwise_of::<T>(a.rows() * a.cols(), 1);
             a.analytic(f)
         }
 
-        fn matrix_power(a: &Matrix<f32, Self>, b: &Matrix<f32, Self>) -> Matrix<f32, Self> {
-            counters::elementwise(a.rows() * a.cols(), 2);
+        fn matrix_power(a: &Matrix<T, Self>, b: &Matrix<T, Self>) -> Matrix<T, Self> {
+            counters::elementwise_of::<T>(a.rows() * a.cols(), 2);
             a.pow_elementwise(b)
         }
 
         fn matrix_power_scalar(
-            a: &Matrix<f32, Self>,
-            scalar: f32,
+            a: &Matrix<T, Self>,
+            scalar: T,
             scalar_left: bool,
-        ) -> Matrix<f32, Self> {
-            counters::elementwise(a.rows() * a.cols(), 1);
+        ) -> Matrix<T, Self> {
+            counters::elementwise_of::<T>(a.rows() * a.cols(), 1);
             a.power_scalar(scalar, scalar_left)
         }
 
         fn matrix_unary_dual(
-            value: &Matrix<f32, Self>,
-            tangent: &Matrix<f32, Self>,
+            value: &Matrix<T, Self>,
+            tangent: &Matrix<T, Self>,
             f: Analytic,
-        ) -> (Matrix<f32, Self>, Matrix<f32, Self>) {
-            counters::kernel(4 * value.rows() * value.cols() * 4, 2);
+        ) -> (Matrix<T, Self>, Matrix<T, Self>) {
+            counters::kernel(4 * value.rows() * value.cols() * size_of::<T>(), 2);
             let (rows, cols) = value.shape();
             match value.storage().unary_dual(tangent.storage(), f) {
                 Some((v, t)) => (
@@ -1691,31 +1771,44 @@ mod gpu {
             }
         }
 
-        fn matmul(a: &Matrix<f32, Self>, b: &Matrix<f32, Self>) -> Matrix<f32, Self> {
-            counters::kernel((a.rows() * a.cols() + b.rows() * b.cols() + a.rows() * b.cols()) * 4, 1);
+        fn matmul(a: &Matrix<T, Self>, b: &Matrix<T, Self>) -> Matrix<T, Self> {
+            counters::kernel(
+                (a.rows() * a.cols() + b.rows() * b.cols() + a.rows() * b.cols()) * size_of::<T>(),
+                1,
+            );
             a.matmul(b)
         }
 
         fn matmul_add(
-            a: &Matrix<f32, Self>,
-            b: &Matrix<f32, Self>,
-            addend: Matrix<f32, Self>,
-        ) -> Matrix<f32, Self> {
-            counters::kernel((a.rows() * a.cols() + b.rows() * b.cols() + 2 * a.rows() * b.cols()) * 4, 0);
+            a: &Matrix<T, Self>,
+            b: &Matrix<T, Self>,
+            addend: Matrix<T, Self>,
+        ) -> Matrix<T, Self> {
+            counters::kernel(
+                (a.rows() * a.cols() + b.rows() * b.cols() + 2 * a.rows() * b.cols()) * size_of::<T>(),
+                0,
+            );
             a.matmul_add(b, addend)
         }
 
-        fn transpose(m: &Matrix<f32, Self>) -> Matrix<f32, Self> {
-            counters::elementwise(m.rows() * m.cols(), 1);
+        fn transpose(m: &Matrix<T, Self>) -> Matrix<T, Self> {
+            counters::elementwise_of::<T>(m.rows() * m.cols(), 1);
             m.transpose()
         }
 
         fn correlate(
-            input: &Matrix<f32, Self>,
-            window: &Matrix<f32, Self>,
+            input: &Matrix<T, Self>,
+            window: &Matrix<T, Self>,
             flip: bool,
-        ) -> Matrix<f32, Self> {
-            counters::kernel((input.rows() * input.cols() + window.rows() * window.cols() + correlation_shape(input.shape(), window.shape()).0 * correlation_shape(input.shape(), window.shape()).1) * 4, 1);
+        ) -> Matrix<T, Self> {
+            counters::kernel(
+                (input.rows() * input.cols()
+                    + window.rows() * window.cols()
+                    + correlation_shape(input.shape(), window.shape()).0
+                        * correlation_shape(input.shape(), window.shape()).1)
+                    * size_of::<T>(),
+                1,
+            );
             let (rows, cols) = input.shape();
             let (window_rows, window_cols) = window.shape();
             let (out_rows, out_cols) = correlation_shape(input.shape(), window.shape());
@@ -1737,8 +1830,8 @@ mod gpu {
             }
         }
 
-        fn flip(input: &Matrix<f32, Self>) -> Matrix<f32, Self> {
-            counters::elementwise(input.rows() * input.cols(), 1);
+        fn flip(input: &Matrix<T, Self>) -> Matrix<T, Self> {
+            counters::elementwise_of::<T>(input.rows() * input.cols(), 1);
             let (rows, cols) = input.shape();
             match input.storage().flip(rows, cols) {
                 Some(data) => Matrix::from_storage(rows, cols, data),
@@ -1747,9 +1840,9 @@ mod gpu {
         }
 
         fn correlate_window_gradient(
-            input: &Matrix<f32, Self>,
-            adjoint: &Matrix<f32, Self>,
-        ) -> Matrix<f32, Self> {
+            input: &Matrix<T, Self>,
+            adjoint: &Matrix<T, Self>,
+        ) -> Matrix<T, Self> {
             // Correlating the input with the adjoint as the window leaves
             // exactly the window's shape, and the storage layer takes the
             // extents as numbers.
@@ -1757,11 +1850,17 @@ mod gpu {
         }
 
         fn correlate_input_gradient(
-            adjoint: &Matrix<f32, Self>,
-            window: &Matrix<f32, Self>,
+            adjoint: &Matrix<T, Self>,
+            window: &Matrix<T, Self>,
             forward_flip: bool,
-        ) -> Matrix<f32, Self> {
-            counters::kernel((adjoint.rows() * adjoint.cols() + window.rows() * window.cols() + (adjoint.rows() + window.rows() - 1) * (adjoint.cols() + window.cols() - 1)) * 4, 1);
+        ) -> Matrix<T, Self> {
+            counters::kernel(
+                (adjoint.rows() * adjoint.cols()
+                    + window.rows() * window.cols()
+                    + (adjoint.rows() + window.rows() - 1) * (adjoint.cols() + window.cols() - 1))
+                    * size_of::<T>(),
+                1,
+            );
             let (out_rows, out_cols) = adjoint.shape();
             let (window_rows, window_cols) = window.shape();
             let (rows, cols) = (out_rows + window_rows - 1, out_cols + window_cols - 1);
@@ -1791,8 +1890,13 @@ mod gpu {
             }
         }
 
-        fn pad(input: &Matrix<f32, Self>, pad_rows: usize, pad_cols: usize) -> Matrix<f32, Self> {
-            counters::kernel((input.rows() * input.cols() + (input.rows() + 2 * pad_rows) * (input.cols() + 2 * pad_cols)) * 4, 1);
+        fn pad(input: &Matrix<T, Self>, pad_rows: usize, pad_cols: usize) -> Matrix<T, Self> {
+            counters::kernel(
+                (input.rows() * input.cols()
+                    + (input.rows() + 2 * pad_rows) * (input.cols() + 2 * pad_cols))
+                    * size_of::<T>(),
+                1,
+            );
             let (rows, cols) = input.shape();
             let (padded_rows, padded_cols) = (rows + 2 * pad_rows, cols + 2 * pad_cols);
             match input.storage().pad(rows, cols, pad_rows, pad_cols) {
@@ -1801,23 +1905,26 @@ mod gpu {
             }
         }
 
-        fn vector_moments(a: &Vector<f32, Self>) -> (f32, f32) {
-            counters::kernel(2 * a.len() * 4, 0);
+        fn vector_moments(a: &Vector<T, Self>) -> (T, T) {
+            counters::kernel(2 * a.len() * size_of::<T>(), 0);
             resident_moments(a.storage(), a.len())
-                .unwrap_or_else(|| Host::vector_moments(&a.to_backend::<Host>()))
+                .unwrap_or_else(|| <Host as Kernels<T>>::vector_moments(&a.to_backend::<Host>()))
         }
 
-        fn matrix_moments(a: &Matrix<f32, Self>) -> (f32, f32) {
-            counters::kernel(2 * a.rows() * a.cols() * 4, 0);
+        fn matrix_moments(a: &Matrix<T, Self>) -> (T, T) {
+            counters::kernel(2 * a.rows() * a.cols() * size_of::<T>(), 0);
             resident_moments(a.storage(), a.rows() * a.cols())
-                .unwrap_or_else(|| Host::matrix_moments(&a.to_backend::<Host>()))
+                .unwrap_or_else(|| <Host as Kernels<T>>::matrix_moments(&a.to_backend::<Host>()))
         }
 
         fn matrix_axis_moments(
-            a: &Matrix<f32, Self>,
+            a: &Matrix<T, Self>,
             axis: Axis,
-        ) -> (Vector<f32, Self>, Vector<f32, Self>) {
-            counters::kernel((2 * a.rows() * a.cols() + 2 * axis.extent(a.shape())) * 4, 2);
+        ) -> (Vector<T, Self>, Vector<T, Self>) {
+            counters::kernel(
+                (2 * a.rows() * a.cols() + 2 * axis.extent(a.shape())) * size_of::<T>(),
+                2,
+            );
             let (rows, cols) = a.shape();
             let extent = axis.extent((rows, cols));
             // An empty fold has no mean, and the shader has no thread to write
@@ -1839,13 +1946,13 @@ mod gpu {
         }
 
         fn vector_distribution(
-            a: &Vector<f32, Self>,
+            a: &Vector<T, Self>,
             family: Family,
             statistic: Statistic,
-            parameters: (f32, f32),
-        ) -> Vector<f32, Self> {
-            counters::elementwise(a.len(), 1);
-            match a.storage().distribution(family, statistic, parameters) {
+            parameters: (T, T),
+        ) -> Vector<T, Self> {
+            counters::elementwise_of::<T>(a.len(), 1);
+            match a.storage().distribution(family, statistic, widen_pair(parameters)) {
                 Some(data) => Vector::from_storage(a.len(), data),
                 None => Host::vector_distribution(
                     &a.to_backend::<Host>(),
@@ -1858,14 +1965,14 @@ mod gpu {
         }
 
         fn matrix_distribution(
-            a: &Matrix<f32, Self>,
+            a: &Matrix<T, Self>,
             family: Family,
             statistic: Statistic,
-            parameters: (f32, f32),
-        ) -> Matrix<f32, Self> {
-            counters::elementwise(a.rows() * a.cols(), 1);
+            parameters: (T, T),
+        ) -> Matrix<T, Self> {
+            counters::elementwise_of::<T>(a.rows() * a.cols(), 1);
             let (rows, cols) = a.shape();
-            match a.storage().distribution(family, statistic, parameters) {
+            match a.storage().distribution(family, statistic, widen_pair(parameters)) {
                 Some(data) => Matrix::from_storage(rows, cols, data),
                 None => Host::matrix_distribution(
                     &a.to_backend::<Host>(),
@@ -1878,14 +1985,17 @@ mod gpu {
         }
 
         fn matrix_axis_distribution(
-            a: &Matrix<f32, Self>,
+            a: &Matrix<T, Self>,
             axis: Axis,
             family: Family,
             statistic: Statistic,
-            first: &Vector<f32, Self>,
-            second: &Vector<f32, Self>,
-        ) -> Matrix<f32, Self> {
-            counters::kernel((2 * a.rows() * a.cols() + 2 * axis.extent(a.shape())) * 4, 1);
+            first: &Vector<T, Self>,
+            second: &Vector<T, Self>,
+        ) -> Matrix<T, Self> {
+            counters::kernel(
+                (2 * a.rows() * a.cols() + 2 * axis.extent(a.shape())) * size_of::<T>(),
+                1,
+            );
             let (rows, cols) = a.shape();
             let resident = a.storage().axis_distribution(
                 first.storage(),
@@ -1910,7 +2020,7 @@ mod gpu {
         }
 
         fn fused(
-            program: &Program,
+            program: &Program<T>,
             shape: (usize, usize),
             inputs: &[Source<'_, Self>],
             updated: &mut [Sink<'_, Self>],
@@ -1926,11 +2036,21 @@ mod gpu {
     /// between them rather than one fused kernel — the same shape the two-pass
     /// variance takes everywhere else. `None` where there is no device, which
     /// sends the caller to the host.
-    fn resident_moments(storage: &MetalStorage, len: usize) -> Option<(f32, f32)> {
+    ///
+    /// Both passes accumulate in `f32`, and the deviations are measured from
+    /// the unrounded `f32` mean; the pair rounds to `T` once, at the end.
+    fn resident_moments<T: MetalElement>(storage: &MetalStorage<T>, len: usize) -> Option<(T, T)> {
         if len == 0 {
             return None;
         }
         let mean = storage.reduce(Reduce::Sum)? / len as f32;
-        Some((mean, storage.sum_squared_deviations(mean)?))
+        let deviations = storage.sum_squared_deviations(mean)?;
+        Some((T::from_f64(f64::from(mean)), T::from_f64(f64::from(deviations))))
+    }
+
+    /// A distribution's parameters as the shader takes them. They are values
+    /// of `T`, which `f32` holds exactly.
+    fn widen_pair<T: Real>((first, second): (T, T)) -> (f32, f32) {
+        (first.into_f64() as f32, second.into_f64() as f32)
     }
 }

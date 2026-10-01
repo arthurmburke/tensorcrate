@@ -523,6 +523,44 @@ fn ordering_reduction_scan_and_sort_functions() {
 }
 
 #[test]
+fn host_blocks_can_compute_in_f32() {
+    use tensorcrate::numbers::{Complex, Dual};
+    use tensorcrate::tensors::{Host, Matrix, Vector};
+
+    // The default is f64; `dtype = f32;` changes only the coefficient type.
+    let scalar: f32 = math! { dtype = f32; 1 + 2 * 3 };
+    assert_eq!(scalar, 7.0);
+
+    let vector: Vector<f32, Host> = math! { dtype = f32; [1, 2, 3] * 2 };
+    assert_eq!(vector.data(), [2.0, 4.0, 6.0]);
+
+    let product: Matrix<f32, Host> = math! {
+        dtype = f32;
+        [[1, 2], [3, 4]] @ [[0, 1], [1, 0]]
+    };
+    assert_eq!(product.to_rows(), [[2.0, 1.0], [4.0, 3.0]]);
+
+    // The extension types follow the coefficient type.
+    let complex: Complex<f32> = math! { dtype = f32; (1 + 2i) * (1 - 2i) };
+    assert_eq!(complex, Complex::new(5.0, 0.0));
+    let dual: Dual<f32> = math! { dtype = f32; sin(3d) };
+    assert_eq!(dual.real, 0.0);
+    assert_eq!(dual.dual, 3.0); // d sin(3ε) = 3·cos(0)·ε
+
+    // Host-only operations still work, and the directives may come in either
+    // order, with or without an explicit backend.
+    let determinant: f32 = math! { dtype = f32; backend = Host; det([[1, 2], [3, 4]]) };
+    assert_eq!(determinant, -2.0);
+    let sorted: Vector<f32, Host> =
+        math! { backend = Host; dtype = f32; sorted([3, 1, 2], descending) };
+    assert_eq!(sorted.data(), [3.0, 2.0, 1.0]);
+
+    // `dtype = f64;` is the spelling of the default.
+    let wide: f64 = math! { dtype = f64; 0.1 + 0.2 };
+    assert_eq!(wide, 0.1 + 0.2);
+}
+
+#[test]
 fn the_host_backend_can_be_selected_explicitly() {
     let values: Vector<f64, Host> = math! {
         backend = Host;

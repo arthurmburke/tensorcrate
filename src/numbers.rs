@@ -90,6 +90,60 @@ macro_rules! half_coefficient {
 }
 half_coefficient!(f16, bf16);
 
+/// A floating-point element the generic tensor algebra runs on: `f32`, `f64`,
+/// and the compact `f16` and `bf16`.
+///
+/// This is [`Float`], [`Coefficient`] and [`Power`] together, plus the one
+/// thing none of them provides: the IEEE 754 *total* order, which sorting needs
+/// and `PartialOrd` cannot give. [`Kernels`](crate::tensors::Kernels), the
+/// optimizers, the automatic-differentiation types and the statistics are
+/// written once over `Real`, so a `f64` model uses exactly the same code as a
+/// `f32` one.
+///
+/// Every `Real` type computes in its own precision: elementwise operations
+/// round to the type each time, while sums and products of the compact types
+/// accumulate in `f32` and round once (see the `compact` CPU kernels and the
+/// Metal shaders). The Metal backend computes in `f32`, `f16` and `bf16`;
+/// `f64` stays on the host.
+pub trait Real: Float + Coefficient + Power<Output = Self> + fmt::Debug + Display {
+    /// IEEE 754 `totalOrder`: `−0.0` precedes `+0.0` and NaNs sort to the ends
+    /// by sign instead of comparing unordered.
+    fn total_order(&self, other: &Self) -> std::cmp::Ordering;
+
+    /// Round an `f64` to this type. Out-of-range values saturate to infinity,
+    /// as an `as` cast does.
+    fn from_f64(value: f64) -> Self {
+        <Self as num_traits::NumCast>::from(value).unwrap_or_else(|| {
+            if value.is_nan() {
+                Self::nan()
+            } else if value > 0.0 {
+                Self::infinity()
+            } else {
+                Self::neg_infinity()
+            }
+        })
+    }
+
+    /// Widen to an `f64`, exactly.
+    ///
+    /// Named `into_f64` because `to_f64` is already [`ToPrimitive`](num_traits::ToPrimitive)'s,
+    /// which every [`Float`] has, and the two would be ambiguous.
+    fn into_f64(self) -> f64 {
+        <Self as num_traits::ToPrimitive>::to_f64(&self).unwrap_or(f64::NAN)
+    }
+}
+
+macro_rules! real {
+    ($($t:ty),+ $(,)?) => {$(
+        impl Real for $t {
+            fn total_order(&self, other: &Self) -> std::cmp::Ordering {
+                self.total_cmp(other)
+            }
+        }
+    )+};
+}
+real!(f32, f64, f16, bf16);
+
 /// A numeric type usable for computing the result of `sin`.
 pub trait Sin {
     type Output;
@@ -1086,7 +1140,7 @@ impl<T: Display + PartialOrd + Zero> Display for Complex<T> {
 // Floats keep their precision (`Output = Self`); integers widen to `f64`, since
 // a transcendental of an integer is not an integer.
 
-/// Implement a unary analytic op for `f32`, `f64` and every integer type. The
+/// Implement a unary analytic op for every float and every integer type. The
 /// op is written once as an expression over a bound value `$x`.
 macro_rules! unary_number_impls {
     ($Trait:ident, $method:ident, $x:ident, $body:expr) => {
@@ -1098,8 +1152,17 @@ macro_rules! unary_number_impls {
             type Output = f64;
             fn $method(self) -> f64 { let $x = self; $body }
         }
+        unary_number_impls!(@half $Trait, $method, $x, $body, f16, bf16);
         unary_number_impls!(@int $Trait, $method, $x, $body, i8, u8, i16, u16, i32, u32, i64, u64);
     };
+    // The compact floats compute in `f32` and round once on the way out, which
+    // is how every half-precision library evaluates a transcendental.
+    (@half $Trait:ident, $method:ident, $x:ident, $body:expr, $($t:ty),+) => {$(
+        impl $Trait for $t {
+            type Output = $t;
+            fn $method(self) -> $t { let $x = f32::from(self); <$t>::from_f32($body) }
+        }
+    )+};
     (@int $Trait:ident, $method:ident, $x:ident, $body:expr, $($t:ty),+) => {$(
         impl $Trait for $t {
             type Output = f64;
@@ -1137,6 +1200,18 @@ impl Power for f64 {
         self.powf(exponent)
     }
 }
+
+macro_rules! power_half_impls {
+    ($($t:ty),+) => {$(
+        impl Power for $t {
+            type Output = $t;
+            fn power(self, exponent: $t) -> $t {
+                <$t>::from_f32(f32::from(self).powf(f32::from(exponent)))
+            }
+        }
+    )+};
+}
+power_half_impls!(f16, bf16);
 
 macro_rules! power_int_impls {
     ($($t:ty),+) => {$(

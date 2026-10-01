@@ -65,7 +65,7 @@ use std::fmt;
 
 use num_traits::Float;
 
-use crate::numbers::Coefficient;
+use crate::numbers::{Coefficient, Real};
 use crate::tensors::{Analytic, Backend, BinaryOp, Host, Kernels, Matrix, Vector};
 
 pub mod special;
@@ -413,7 +413,18 @@ fn deviation_of<T: Coefficient + Float>(values: &[T], mean: T) -> T {
 }
 
 /// Both passes over one contiguous run of values.
+///
+/// `f16` and `bf16` take both passes in `f32` — the deviations measured from
+/// the unrounded mean — and round the two results once.
 fn moments_of<T: Coefficient + Float>(values: &[T]) -> Moments<T> {
+    if let Some(wide) = crate::compact::widen(values) {
+        let moments = moments_of::<f32>(&wide);
+        return Moments {
+            count: moments.count,
+            mean: cast(f64::from(moments.mean)),
+            sum_squared_deviations: cast(f64::from(moments.sum_squared_deviations)),
+        };
+    }
     if values.is_empty() {
         return Moments {
             count: 0,
@@ -442,6 +453,16 @@ fn axis_moments_of<T: Coefficient + Float>(
     shape: (usize, usize),
     axis: Axis,
 ) -> AxisMoments<T> {
+    // As in `moments_of`: the compact types accumulate in `f32`.
+    if let Some(wide) = crate::compact::widen(data) {
+        let moments = axis_moments_of::<f32>(&wide, shape, axis);
+        let round = |v: &Vector<f32, Host>| v.map(|&x| cast::<T>(f64::from(x)));
+        return AxisMoments {
+            count: moments.count,
+            means: round(&moments.means),
+            sum_squared_deviations: round(&moments.sum_squared_deviations),
+        };
+    }
     let (rows, cols) = shape;
     let count = axis.depth(shape);
     let extent = axis.extent(shape);
@@ -785,14 +806,16 @@ impl<T: Coefficient + Float> Matrix<T, Host> {
 /// The inherent methods above are defined for `Host` tensors of any float
 /// element type, which is an impl that cannot also cover `Vector<f32, Metal>` —
 /// the two would overlap at `Vector<f32, Host>`. This trait is the other half:
-/// `f32` only, because the shaders are, but generic over the backend, so one
-/// function can summarize either.
+/// generic over the backend and over the element type, so one function can
+/// summarize either. (`Metal` computes in `f32`, `f16` and `bf16`; moments
+/// accumulate in `f32` on every backend.)
 ///
 /// ```
+/// use tensorcrate::numbers::Real;
 /// use tensorcrate::statistics::{Correction, Distribution, Statistics};
 /// use tensorcrate::tensors::{Kernels, Vector};
 ///
-/// fn standardized<B: Kernels>(v: &Vector<f32, B>) -> Vector<f32, B> {
+/// fn standardized<T: Real, B: Kernels<T>>(v: &Vector<T, B>) -> Vector<T, B> {
 ///     let fitted = Distribution::Normal {
 ///         mean: v.mean(),
 ///         stddev: v.stddev(Correction::Sample),
@@ -802,55 +825,63 @@ impl<T: Coefficient + Float> Matrix<T, Host> {
 ///
 /// let v = Vector::new([1.0f32, 2.0, 3.0]);
 /// assert!((standardized(&v).data()[1] - 0.5).abs() < 1e-6);
+///
+/// let wide = Vector::new([1.0f64, 2.0, 3.0]);
+/// assert!((standardized(&wide).data()[1] - 0.5).abs() < 1e-15);
 /// ```
 ///
 /// On `Vector<f32, Host>` the inherent method wins method resolution and this
 /// trait is never consulted; both run the same kernel, so which one resolved is
 /// not observable.
 pub trait Statistics: Sized {
+    /// The element type the statistics are computed in.
+    type Elem: Real;
+
     /// The count, mean, and summed squared deviations, in two passes.
-    fn moments(&self) -> Moments<f32>;
+    fn moments(&self) -> Moments<Self::Elem>;
 
     /// The arithmetic mean of every element.
-    fn mean(&self) -> f32 {
+    fn mean(&self) -> Self::Elem {
         self.moments().mean
     }
 
     /// The variance of every element, under `correction`.
-    fn variance(&self, correction: Correction) -> f32 {
+    fn variance(&self, correction: Correction) -> Self::Elem {
         self.moments().variance(correction)
     }
 
     /// The standard deviation of every element, under `correction`.
-    fn stddev(&self, correction: Correction) -> f32 {
+    fn stddev(&self, correction: Correction) -> Self::Elem {
         self.moments().stddev(correction)
     }
 
     /// Estimate a `family` distribution from these values.
-    fn fit(&self, family: Family, correction: Correction) -> Distribution<f32>;
+    fn fit(&self, family: Family, correction: Correction) -> Distribution<Self::Elem>;
 
     /// A distribution function, chosen at runtime, at every element.
-    fn distribution(&self, statistic: Statistic, distribution: &Distribution<f32>) -> Self;
+    fn distribution(&self, statistic: Statistic, distribution: &Distribution<Self::Elem>) -> Self;
 
     /// The density of `distribution` at every element.
-    fn pdf(&self, distribution: &Distribution<f32>) -> Self {
+    fn pdf(&self, distribution: &Distribution<Self::Elem>) -> Self {
         self.distribution(Statistic::Pdf, distribution)
     }
 
     /// The distribution function of `distribution` at every element.
-    fn cdf(&self, distribution: &Distribution<f32>) -> Self {
+    fn cdf(&self, distribution: &Distribution<Self::Elem>) -> Self {
         self.distribution(Statistic::Cdf, distribution)
     }
 
     /// The quantile of `distribution` at every element, which are read as
     /// probabilities.
-    fn ppf(&self, distribution: &Distribution<f32>) -> Self {
+    fn ppf(&self, distribution: &Distribution<Self::Elem>) -> Self {
         self.distribution(Statistic::Ppf, distribution)
     }
 }
 
-impl<B: Kernels> Statistics for Vector<f32, B> {
-    fn moments(&self) -> Moments<f32> {
+impl<T: Real, B: Kernels<T>> Statistics for Vector<T, B> {
+    type Elem = T;
+
+    fn moments(&self) -> Moments<T> {
         let (mean, sum_squared_deviations) = B::vector_moments(self);
         Moments {
             count: self.len(),
@@ -859,7 +890,7 @@ impl<B: Kernels> Statistics for Vector<f32, B> {
         }
     }
 
-    fn fit(&self, family: Family, correction: Correction) -> Distribution<f32> {
+    fn fit(&self, family: Family, correction: Correction) -> Distribution<T> {
         // The values are read through the shared allocation rather than copied
         // back, so this costs a CPU traversal but no transfer.
         fit_with_moments(
@@ -870,7 +901,7 @@ impl<B: Kernels> Statistics for Vector<f32, B> {
         )
     }
 
-    fn distribution(&self, statistic: Statistic, distribution: &Distribution<f32>) -> Self {
+    fn distribution(&self, statistic: Statistic, distribution: &Distribution<T>) -> Self {
         B::vector_distribution(
             self,
             distribution.family(),
@@ -880,8 +911,10 @@ impl<B: Kernels> Statistics for Vector<f32, B> {
     }
 }
 
-impl<B: Kernels> Statistics for Matrix<f32, B> {
-    fn moments(&self) -> Moments<f32> {
+impl<T: Real, B: Kernels<T>> Statistics for Matrix<T, B> {
+    type Elem = T;
+
+    fn moments(&self) -> Moments<T> {
         let (mean, sum_squared_deviations) = B::matrix_moments(self);
         Moments {
             count: self.rows() * self.cols(),
@@ -890,7 +923,7 @@ impl<B: Kernels> Statistics for Matrix<f32, B> {
         }
     }
 
-    fn fit(&self, family: Family, correction: Correction) -> Distribution<f32> {
+    fn fit(&self, family: Family, correction: Correction) -> Distribution<T> {
         fit_with_moments(
             family,
             self.as_slice(),
@@ -899,7 +932,7 @@ impl<B: Kernels> Statistics for Matrix<f32, B> {
         )
     }
 
-    fn distribution(&self, statistic: Statistic, distribution: &Distribution<f32>) -> Self {
+    fn distribution(&self, statistic: Statistic, distribution: &Distribution<T>) -> Self {
         B::matrix_distribution(
             self,
             distribution.family(),
@@ -911,23 +944,30 @@ impl<B: Kernels> Statistics for Matrix<f32, B> {
 
 /// The same, along one axis of a matrix, on whatever backend it is on.
 pub trait AxisStatistics: Sized {
+    /// The element type the statistics are computed in.
+    type Elem: Real;
+
     /// Where this matrix's elements live, and therefore where the reduced
     /// vectors land.
-    type Backend: Kernels;
+    type Backend: Kernels<Self::Elem>;
 
     /// The count, means, and summed squared deviations along one axis.
-    fn moments_axis(&self, axis: Axis) -> AxisMoments<f32, Self::Backend>;
+    fn moments_axis(&self, axis: Axis) -> AxisMoments<Self::Elem, Self::Backend>;
 
     /// One mean per row or column.
-    fn mean_axis(&self, axis: Axis) -> Vector<f32, Self::Backend> {
+    fn mean_axis(&self, axis: Axis) -> Vector<Self::Elem, Self::Backend> {
         self.moments_axis(axis).means
     }
 
     /// One variance per row or column, under `correction`.
-    fn variance_axis(&self, axis: Axis, correction: Correction) -> Vector<f32, Self::Backend>;
+    fn variance_axis(
+        &self,
+        axis: Axis,
+        correction: Correction,
+    ) -> Vector<Self::Elem, Self::Backend>;
 
     /// One standard deviation per row or column, under `correction`.
-    fn stddev_axis(&self, axis: Axis, correction: Correction) -> Vector<f32, Self::Backend> {
+    fn stddev_axis(&self, axis: Axis, correction: Correction) -> Vector<Self::Elem, Self::Backend> {
         Self::Backend::vector_unary(&self.variance_axis(axis, correction), Analytic::Sqrt)
     }
 
@@ -937,7 +977,7 @@ pub trait AxisStatistics: Sized {
         axis: Axis,
         family: Family,
         correction: Correction,
-    ) -> Vec<Distribution<f32>>;
+    ) -> Vec<Distribution<Self::Elem>>;
 
     /// A distribution function, chosen at runtime, at every element — under
     /// that element's own row or column distribution.
@@ -950,7 +990,7 @@ pub trait AxisStatistics: Sized {
         &self,
         axis: Axis,
         statistic: Statistic,
-        distributions: &[Distribution<f32>],
+        distributions: &[Distribution<Self::Elem>],
     ) -> Self;
 
     /// The density at every element, under its own row or column distribution.
@@ -959,7 +999,7 @@ pub trait AxisStatistics: Sized {
     ///
     /// Unless there is one distribution per row or column and they all belong
     /// to one family.
-    fn pdf_axis(&self, axis: Axis, distributions: &[Distribution<f32>]) -> Self {
+    fn pdf_axis(&self, axis: Axis, distributions: &[Distribution<Self::Elem>]) -> Self {
         self.distribution_axis(axis, Statistic::Pdf, distributions)
     }
 
@@ -970,7 +1010,7 @@ pub trait AxisStatistics: Sized {
     ///
     /// Unless there is one distribution per row or column and they all belong
     /// to one family.
-    fn cdf_axis(&self, axis: Axis, distributions: &[Distribution<f32>]) -> Self {
+    fn cdf_axis(&self, axis: Axis, distributions: &[Distribution<Self::Elem>]) -> Self {
         self.distribution_axis(axis, Statistic::Cdf, distributions)
     }
 
@@ -981,15 +1021,16 @@ pub trait AxisStatistics: Sized {
     ///
     /// Unless there is one distribution per row or column and they all belong
     /// to one family.
-    fn ppf_axis(&self, axis: Axis, distributions: &[Distribution<f32>]) -> Self {
+    fn ppf_axis(&self, axis: Axis, distributions: &[Distribution<Self::Elem>]) -> Self {
         self.distribution_axis(axis, Statistic::Ppf, distributions)
     }
 }
 
-impl<B: Kernels> AxisStatistics for Matrix<f32, B> {
+impl<T: Real, B: Kernels<T>> AxisStatistics for Matrix<T, B> {
+    type Elem = T;
     type Backend = B;
 
-    fn moments_axis(&self, axis: Axis) -> AxisMoments<f32, B> {
+    fn moments_axis(&self, axis: Axis) -> AxisMoments<T, B> {
         let (means, sum_squared_deviations) = B::matrix_axis_moments(self, axis);
         AxisMoments {
             count: axis.depth(self.shape()),
@@ -998,25 +1039,20 @@ impl<B: Kernels> AxisStatistics for Matrix<f32, B> {
         }
     }
 
-    fn variance_axis(&self, axis: Axis, correction: Correction) -> Vector<f32, B> {
+    fn variance_axis(&self, axis: Axis, correction: Correction) -> Vector<T, B> {
         let moments = AxisStatistics::moments_axis(self, axis);
         match correction.divisor(moments.count) {
             Some(divisor) => B::vector_broadcast(
                 &moments.sum_squared_deviations,
-                divisor as f32,
+                T::from_f64(divisor as f64),
                 BinaryOp::Div,
                 false,
             ),
-            None => Vector::filled(axis.extent(self.shape()), f32::NAN),
+            None => Vector::filled(axis.extent(self.shape()), T::nan()),
         }
     }
 
-    fn fit_axis(
-        &self,
-        axis: Axis,
-        family: Family,
-        correction: Correction,
-    ) -> Vec<Distribution<f32>> {
+    fn fit_axis(&self, axis: Axis, family: Family, correction: Correction) -> Vec<Distribution<T>> {
         fit_axis_of(self.as_slice(), self.shape(), axis, family, correction)
     }
 
@@ -1024,7 +1060,7 @@ impl<B: Kernels> AxisStatistics for Matrix<f32, B> {
         &self,
         axis: Axis,
         statistic: Statistic,
-        distributions: &[Distribution<f32>],
+        distributions: &[Distribution<T>],
     ) -> Self {
         assert_axis_distributions(distributions, self.shape(), axis, "distribution_axis");
         // The parameters travel as two vectors on the tensor's own backend, so
@@ -1032,11 +1068,11 @@ impl<B: Kernels> AxisStatistics for Matrix<f32, B> {
         let family = distributions
             .first()
             .map_or(Family::Normal, Distribution::family);
-        let first: Vec<f32> = distributions
+        let first: Vec<T> = distributions
             .iter()
             .map(|distribution| distribution.parameters().0)
             .collect();
-        let second: Vec<f32> = distributions
+        let second: Vec<T> = distributions
             .iter()
             .map(|distribution| distribution.parameters().1)
             .collect();

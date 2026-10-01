@@ -31,7 +31,7 @@ fn main() {
     let truth = Vector::new([0.8f32, 1.5]);
     let clean = design.matvec(&truth);
 
-    // One sample is badly wrong — a sensor glitch, a transcription error.
+    // One sample is badly wrong.
     let mut corrupted = clean.data().to_vec();
     corrupted[SAMPLES / 2] += 9.0;
     let corrupted = Vector::new(corrupted);
@@ -62,7 +62,7 @@ fn main() {
     };
     println!();
     println!(
-        "  distance from the truth — squares {:.3}, log-cosh {:.3}, absolute {:.3}, weighted {:.3}",
+        "  distance from the truth: squares {:.3}, log-cosh {:.3}, absolute {:.3}, weighted {:.3}",
         error(&squares),
         error(&log_cosh),
         error(&absolute),
@@ -74,12 +74,12 @@ enum Objective {
     /// `Σ rᵢ²`: the Gaussian log-likelihood, up to constants.
     SumOfSquares,
     /// `Σ ln cosh rᵢ`: quadratic for small residuals, linear for large ones, and
-    /// smooth everywhere — so its gradient `tanh(r)` is bounded by one and a
+    /// smooth everywhere, so its gradient `tanh(r)` is bounded by one and a
     /// single bad sample cannot dominate.
     LogCosh,
     /// `Σ|rᵢ|`: the Laplace log-likelihood, which fits the conditional median.
     /// Its gradient is `sign(r)`, so a residual of 9 pulls exactly as hard as one
-    /// of 0.01 — bounded influence taken to its limit. The flip side is that the
+    /// of 0.01, bounded influence taken to its limit. The flip side is that the
     /// gradient never shrinks near the optimum, so a fixed step size dithers
     /// around it rather than settling.
     AbsoluteError,

@@ -1,4 +1,4 @@
-//! What one training step costs, in kernels, bytes and allocations — with and
+//! What one training step costs, in kernels, bytes and allocations, with and
 //! without fusion, on each backend.
 //!
 //! ```text
@@ -8,7 +8,7 @@
 //! Three workloads, the ones the fusion plan baselines:
 //!
 //! 1. an Adam update of a 1M-element parameter tensor;
-//! 2. one softmax cross-entropy step — forward, backward and an Adam update —
+//! 2. one softmax cross-entropy step: forward, backward and an Adam update —
 //!    for a linear classifier;
 //! 3. one step of a two-layer MLP, every weight and bias updated by Adam.
 //!
@@ -34,7 +34,15 @@ const STEPS: usize = 10;
 fn main() {
     println!(
         "{:<26} {:<8} {:<8} {:>9} {:>10} {:>7} {:>8} {:>6} {:>10}",
-        "per step", "backend", "fusion", "kernels", "MB moved", "allocs", "cmdbufs", "syncs", "time"
+        "per step",
+        "backend",
+        "fusion",
+        "kernels",
+        "MB moved",
+        "allocs",
+        "cmdbufs",
+        "syncs",
+        "time"
     );
     run::<Host>("host");
     #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -43,18 +51,28 @@ fn main() {
 
 fn run<B: Kernels>(backend: &str) {
     for mode in [Mode::Unfused, Mode::Fused] {
-        report("adam, 1M parameters", backend, mode, measure::<B>(mode, adam_step::<B>()));
+        report(
+            "adam, 1M parameters",
+            backend,
+            mode,
+            measure(mode, adam_step::<B>()),
+        );
     }
     for mode in [Mode::Unfused, Mode::Fused] {
         report(
             "softmax cross-entropy",
             backend,
             mode,
-            measure::<B>(mode, softmax_step::<B>()),
+            measure(mode, softmax_step::<B>()),
         );
     }
     for mode in [Mode::Unfused, Mode::Fused] {
-        report("two-layer MLP", backend, mode, measure::<B>(mode, mlp_step::<B>()));
+        report(
+            "two-layer MLP",
+            backend,
+            mode,
+            measure(mode, mlp_step::<B>()),
+        );
     }
 }
 
@@ -76,7 +94,7 @@ fn report(name: &str, backend: &str, mode: Mode, (counts, seconds): (Counts, f64
 }
 
 /// One warm-up call, then `STEPS` measured ones, in `mode`.
-fn measure<B: Kernels>(mode: Mode, mut step: impl FnMut()) -> (Counts, f64) {
+fn measure(mode: Mode, mut step: impl FnMut()) -> (Counts, f64) {
     fused::with_mode(mode, || {
         step();
         #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -147,18 +165,27 @@ fn mlp_step<B: Kernels>() -> impl FnMut() {
     let inputs = Matrix::from_flat(IN, BATCH, values(IN * BATCH, 5)).to_backend::<B>();
     let targets = Matrix::from_flat(OUT, BATCH, values(OUT * BATCH, 6)).to_backend::<B>();
     let ones = Vector::<f32>::filled(BATCH, 1.0).to_backend::<B>();
-    let mut w1 = Matrix::from_flat(HIDDEN, IN, values(HIDDEN * IN, 7))
-        .to_backend::<B>();
+    let mut w1 = Matrix::from_flat(HIDDEN, IN, values(HIDDEN * IN, 7)).to_backend::<B>();
     let mut b1 = Vector::new(values(HIDDEN, 8)).to_backend::<B>();
     let mut w2 = Matrix::from_flat(OUT, HIDDEN, values(OUT * HIDDEN, 9)).to_backend::<B>();
     let mut b2 = Vector::new(values(OUT, 10)).to_backend::<B>();
-    let (mut r1, mut rb1, mut r2, mut rb2) =
-        (Adam::new(1e-3), Adam::new(1e-3), Adam::new(1e-3), Adam::new(1e-3));
+    let (mut r1, mut rb1, mut r2, mut rb2) = (
+        Adam::new(1e-3),
+        Adam::new(1e-3),
+        Adam::new(1e-3),
+        Adam::new(1e-3),
+    );
 
     move || {
         let tape = Tape::<B>::new();
-        let (w1v, b1v) = (tape.matrix(w1.to_backend::<B>()), tape.vector(b1.to_backend::<B>()));
-        let (w2v, b2v) = (tape.matrix(w2.to_backend::<B>()), tape.vector(b2.to_backend::<B>()));
+        let (w1v, b1v) = (
+            tape.matrix(w1.to_backend::<B>()),
+            tape.vector(b1.to_backend::<B>()),
+        );
+        let (w2v, b2v) = (
+            tape.matrix(w2.to_backend::<B>()),
+            tape.vector(b2.to_backend::<B>()),
+        );
         let ones = tape.vector(ones.to_backend::<B>());
         let hidden =
             (&w1v.matmul(&tape.matrix(inputs.to_backend::<B>())) + &b1v.outer(&ones)).relu();

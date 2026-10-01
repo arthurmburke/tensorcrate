@@ -9,7 +9,7 @@
 //! is what a GPU launch really costs.
 //!
 //! Compiled only with the `counters` feature. Without it every recording call is
-//! an empty inline function and [`snapshot`] does not exist, so production builds
+//! an empty inline function and `snapshot` does not exist, so production builds
 //! pay nothing.
 //!
 //! The counters are per thread, like the Metal device, so a test measuring its
@@ -126,10 +126,13 @@ mod enabled {
 }
 
 #[cfg(feature = "counters")]
-pub use enabled::{measure, reset, snapshot};
-#[cfg(feature = "counters")]
-#[cfg_attr(not(all(feature = "metal", target_os = "macos")), allow(unused_imports))]
+#[cfg_attr(
+    not(all(feature = "metal", target_os = "macos")),
+    allow(unused_imports)
+)]
 pub(crate) use enabled::{command_buffer, kernel, sync};
+#[cfg(feature = "counters")]
+pub use enabled::{measure, reset, snapshot};
 
 #[cfg(not(feature = "counters"))]
 mod disabled {
@@ -146,12 +149,15 @@ mod disabled {
 }
 
 #[cfg(not(feature = "counters"))]
-#[cfg_attr(not(all(feature = "metal", target_os = "macos")), allow(unused_imports))]
+#[cfg_attr(
+    not(all(feature = "metal", target_os = "macos")),
+    allow(unused_imports)
+)]
 pub(crate) use disabled::{command_buffer, kernel, sync};
 
-/// Record one elementwise-shaped kernel: `inputs` operands of `len` `f32`s read
+/// Record one elementwise-shaped kernel: `inputs` operands of `len` `T`s read
 /// and one `len`-long result written into a fresh allocation.
 #[inline(always)]
-pub(crate) fn elementwise(len: usize, inputs: usize) {
-    kernel((inputs + 1) * len * size_of::<f32>(), 1);
+pub(crate) fn elementwise_of<T>(len: usize, inputs: usize) {
+    kernel((inputs + 1) * len * size_of::<T>(), 1);
 }

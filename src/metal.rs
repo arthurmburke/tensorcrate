@@ -1,10 +1,13 @@
 //! GPU-accelerated tensor kernels via Apple Metal.
 //!
-//! Compiled only with the `metal` feature on macOS. It offloads large `f32`
-//! matrix/vector products, elementwise and broadcast operations, and radix-2
-//! FFTs to the GPU. M5 GPUs additionally use Metal 4 TensorOps for `f32`, `f16`,
-//! and `bf16` matrix products. `f64`, matrix inversion, and non-radix-2 FFT
-//! leaves stay on the CPU path.
+//! Compiled only with the `metal` feature on macOS. It runs matrix and vector
+//! products, elementwise, broadcast, reduction, sorting, convolution, statistics
+//! and analytic operations, and fused elementwise programs on the GPU, for every
+//! [`MetalElement`] — `f32`, `f16` and `bf16` — with each kernel compiled once
+//! per type. Arithmetic runs in the element type; sums, products and moments
+//! accumulate in `f32` and round once. M5 GPUs additionally use Metal 4
+//! TensorOps for matrix products. Radix-2 FFTs run in `f32`; `f64`, matrix
+//! inversion, and non-radix-2 FFTs stay on the CPU.
 //!
 //! Every entry point returns `Option`: if no Metal device is available or an
 //! operation cannot be encoded, the caller falls back to the CPU kernel. A
@@ -14,13 +17,8 @@
 //! Input/output buffers are recycled through a small per-thread pool so
 //! repeated calls avoid re-allocating GPU memory.
 //!
-//! The tensor API on its default `Host` backend offloads above fixed size
-//! thresholds: 32,768 multiply-accumulates for products, 4,096 values for
-//! elementwise and broadcast work, and 1,024 values for radix-2 FFTs. Because
-//! those tensors live in host memory, each such call has to upload its operands
-//! and download its result.
-//!
-//! To keep a *sequence* of operations on the GPU, put the tensors on the
+//! The `Host` backend never comes here: its tensors stay on the CPU whatever
+//! their size. To run on the GPU, put the tensors on the
 //! [`Metal`](crate::tensors::Metal) backend, which stores their elements in
 //! `MTLStorageModeShared` memory and passes the allocations from kernel to
 //! kernel. [`MetalBuffer`] is that storage, usable directly when the
@@ -42,6 +40,7 @@ use objc2_metal::{
     MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily, MTLLibrary, MTLResourceOptions, MTLSize,
 };
 
+use crate::numbers::Real;
 use crate::tensors::{Analytic, Axis, BinaryOp, Compare, Family, Reduce, SortOrder, Statistic};
 
 /// Threadgroup tile edge; must match `TILE` in the shader. 16×16 = 256 threads.
@@ -64,6 +63,63 @@ const REDUCE_GROUP: usize = 256;
 const KERNEL_LIBRARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tensorcrate.metallib"));
 const TENSOROPS_LIBRARY: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/tensorcrate_tensorops.metallib"));
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for f32 {}
+    impl Sealed for half::f16 {}
+    impl Sealed for half::bf16 {}
+}
+
+/// An element type the Metal kernels are compiled for: `f32`, `f16` or `bf16`.
+///
+/// Every typed shader is instantiated once per element type and the host picks
+/// the instance by this trait, so a `MetalBuffer<f16>` runs `half` kernels and
+/// never passes through `f32` storage. Accumulations — reductions, matrix
+/// products, convolutions, moments — are the exception by design: they fold in
+/// `f32` and round to the element type once, as the host's do.
+pub trait MetalElement: Real + sealed::Sealed {
+    /// The kernel-name suffix of this type's shader instances.
+    #[doc(hidden)]
+    const SUFFIX: &'static str;
+
+    /// Position in [`Gpu::typed`].
+    #[doc(hidden)]
+    const INDEX: usize;
+
+    /// The extreme of the IEEE total order at the end a sort trims its padding
+    /// from: the largest key for an ascending sort, the smallest for a
+    /// descending one. Both are NaNs, so no input NaN can sort past them.
+    #[doc(hidden)]
+    fn sort_padding(ascending: bool) -> Self;
+}
+
+impl MetalElement for f32 {
+    const SUFFIX: &'static str = "f32";
+    const INDEX: usize = 0;
+
+    fn sort_padding(ascending: bool) -> Self {
+        f32::from_bits(if ascending { 0x7FFF_FFFF } else { 0xFFFF_FFFF })
+    }
+}
+
+impl MetalElement for f16 {
+    const SUFFIX: &'static str = "f16";
+    const INDEX: usize = 1;
+
+    fn sort_padding(ascending: bool) -> Self {
+        f16::from_bits(if ascending { 0x7FFF } else { 0xFFFF })
+    }
+}
+
+impl MetalElement for bf16 {
+    const SUFFIX: &'static str = "bf16";
+    const INDEX: usize = 2;
+
+    fn sort_padding(ascending: bool) -> Self {
+        bf16::from_bits(if ascending { 0x7FFF } else { 0xFFFF })
+    }
+}
 
 /// A pool of reusable Metal buffers (recycled across calls to avoid repeated
 /// allocation). A buffer is reused when it is at least as large as requested.
@@ -120,46 +176,66 @@ impl Pool {
 struct Gpu {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
-    matmul: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// One set of pipelines per [`MetalElement`], indexed by
+    /// [`MetalElement::INDEX`].
+    typed: [Typed; 3],
+    /// The `f16`/`bf16` × `f32`-output TensorOps products behind `matmul_f32`.
     tensorops: Option<TensorOpsPipelines>,
-    elementwise: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    broadcast: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    compare: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    compare_scalar: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    clamp: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    reduce: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// The scan runs over a `float` buffer whatever the tensor's type.
     scan: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    sort_prepare: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    bitonic: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    stack_vector: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    concat_horizontal: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    merge_horizontal: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    transpose: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    correlate: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    pad_zeros: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    flip_both: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    unary: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    unary_dual: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    power: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    power_scalar: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    deviation: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    axis_moments: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    distribution: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    axis_distribution: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     fft_bit_reverse: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     fft_stage: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    fused: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pool: RefCell<Pool>,
     /// Command buffers committed but not yet waited on — see [`commit`].
     pending: RefCell<Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>>,
 }
 
+type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
+
+/// The pipelines for one element type: each is the `_f32`, `_f16` or `_bf16`
+/// instance of the shader of the same name.
+struct Typed {
+    matmul: Pipeline,
+    /// The TensorOps product for this type, on M5-class GPUs.
+    tensorops: Option<Pipeline>,
+    elementwise: Pipeline,
+    broadcast: Pipeline,
+    compare: Pipeline,
+    compare_scalar: Pipeline,
+    clamp: Pipeline,
+    reduce: Pipeline,
+    widen: Pipeline,
+    narrow: Pipeline,
+    sort_prepare: Pipeline,
+    bitonic: Pipeline,
+    stack_vector: Pipeline,
+    concat_horizontal: Pipeline,
+    merge_horizontal: Pipeline,
+    transpose: Pipeline,
+    correlate: Pipeline,
+    pad_zeros: Pipeline,
+    flip_both: Pipeline,
+    unary: Pipeline,
+    unary_dual: Pipeline,
+    power: Pipeline,
+    power_scalar: Pipeline,
+    deviation: Pipeline,
+    axis_moments: Pipeline,
+    distribution: Pipeline,
+    axis_distribution: Pipeline,
+    fused: Pipeline,
+}
+
+impl Gpu {
+    /// The pipelines compiled for element type `T`.
+    fn kernels<T: MetalElement>(&self) -> &Typed {
+        &self.typed[T::INDEX]
+    }
+}
+
 struct TensorOpsPipelines {
-    f32: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    f16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    f16_f32: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    bf16: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    bf16_f32: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    f16_f32: Pipeline,
+    bf16_f32: Pipeline,
 }
 
 thread_local! {
@@ -193,58 +269,71 @@ fn build_gpu() -> Option<Gpu> {
             })
             .ok()
     };
-    let tensorops = (|| {
+    let tensorops_library = (|| {
         // Apple10 is the M5/A19 GPU family. Earlier families retain the tiled
         // kernel even though they can load Metal 4 code.
         if !device.supportsFamily(MTLGPUFamily::Apple10) {
             return None;
         }
         let data = DispatchData::from_static_bytes(TENSOROPS_LIBRARY);
-        let library = device.newLibraryWithData_error(&data).ok()?;
-        let pipeline = |name: &str| {
-            let function = library.newFunctionWithName(&NSString::from_str(name))?;
-            device
-                .newComputePipelineStateWithFunction_error(&function)
-                .ok()
-        };
+        device.newLibraryWithData_error(&data).ok()
+    })();
+    let tensorops_pipeline = |name: &str| {
+        let library = tensorops_library.as_ref()?;
+        let function = library.newFunctionWithName(&NSString::from_str(name))?;
+        device
+            .newComputePipelineStateWithFunction_error(&function)
+            .ok()
+    };
+    let tensorops = (|| {
         Some(TensorOpsPipelines {
-            f32: pipeline("matmul_tensorops_f32")?,
-            f16: pipeline("matmul_tensorops_f16")?,
-            f16_f32: pipeline("matmul_tensorops_f16_f32")?,
-            bf16: pipeline("matmul_tensorops_bf16")?,
-            bf16_f32: pipeline("matmul_tensorops_bf16_f32")?,
+            f16_f32: tensorops_pipeline("matmul_tensorops_f16_f32")?,
+            bf16_f32: tensorops_pipeline("matmul_tensorops_bf16_f32")?,
         })
     })();
+    let typed = |suffix: &str| -> Option<Typed> {
+        let kernel = |name: &str| pipeline(&format!("{name}_{suffix}"));
+        Some(Typed {
+            matmul: kernel("matmul_tiled")?,
+            tensorops: tensorops_pipeline(&format!("matmul_tensorops_{suffix}")),
+            elementwise: kernel("elementwise")?,
+            broadcast: kernel("broadcast")?,
+            compare: kernel("compare")?,
+            compare_scalar: kernel("compare_scalar")?,
+            clamp: kernel("clamp_values")?,
+            reduce: kernel("reduce_partial")?,
+            widen: kernel("widen")?,
+            narrow: kernel("narrow")?,
+            sort_prepare: kernel("sort_prepare")?,
+            bitonic: kernel("bitonic_stage")?,
+            stack_vector: kernel("stack_vector")?,
+            concat_horizontal: kernel("concat_horizontal")?,
+            merge_horizontal: kernel("merge_horizontal")?,
+            transpose: kernel("transpose_tiled")?,
+            correlate: kernel("correlate")?,
+            pad_zeros: kernel("pad_zeros")?,
+            flip_both: kernel("flip_both")?,
+            unary: kernel("unary")?,
+            unary_dual: kernel("unary_dual")?,
+            power: kernel("power")?,
+            power_scalar: kernel("power_scalar")?,
+            deviation: kernel("deviation_partial")?,
+            axis_moments: kernel("axis_moments")?,
+            distribution: kernel("distribution")?,
+            axis_distribution: kernel("axis_distribution")?,
+            fused: kernel("fused_elementwise")?,
+        })
+    };
     Some(Gpu {
-        matmul: pipeline("matmul_tiled")?,
+        typed: [
+            typed(f32::SUFFIX)?,
+            typed(f16::SUFFIX)?,
+            typed(bf16::SUFFIX)?,
+        ],
         tensorops,
-        elementwise: pipeline("elementwise")?,
-        broadcast: pipeline("broadcast")?,
-        compare: pipeline("compare")?,
-        compare_scalar: pipeline("compare_scalar")?,
-        clamp: pipeline("clamp_values")?,
-        reduce: pipeline("reduce_partial")?,
         scan: pipeline("scan_step")?,
-        sort_prepare: pipeline("sort_prepare")?,
-        bitonic: pipeline("bitonic_stage")?,
-        stack_vector: pipeline("stack_vector")?,
-        concat_horizontal: pipeline("concat_horizontal")?,
-        merge_horizontal: pipeline("merge_horizontal")?,
-        transpose: pipeline("transpose_tiled")?,
-        correlate: pipeline("correlate")?,
-        pad_zeros: pipeline("pad_zeros")?,
-        flip_both: pipeline("flip_both")?,
-        unary: pipeline("unary")?,
-        unary_dual: pipeline("unary_dual")?,
-        power: pipeline("power")?,
-        power_scalar: pipeline("power_scalar")?,
-        deviation: pipeline("deviation_partial")?,
-        axis_moments: pipeline("axis_moments")?,
-        distribution: pipeline("distribution")?,
-        axis_distribution: pipeline("axis_distribution")?,
         fft_bit_reverse: pipeline("fft_bit_reverse")?,
         fft_stage: pipeline("fft_stage")?,
-        fused: pipeline("fused_elementwise")?,
         pool: RefCell::new(Pool::default()),
         pending: RefCell::new(Vec::new()),
         device,
@@ -369,9 +458,10 @@ impl<T: Copy + 'static> MetalBuffer<T> {
     }
 }
 
-impl MetalBuffer<f32> {
-    /// Tiled matrix multiplication, with both inputs and the result remaining
-    /// in shared Metal buffers.
+impl<T: MetalElement> MetalBuffer<T> {
+    /// Matrix multiplication, with both inputs and the result remaining in
+    /// shared Metal buffers. The products accumulate in `f32` and each output
+    /// element rounds to `T` once.
     pub fn matmul(&self, rhs: &Self, m: usize, k: usize, n: usize) -> Option<Self> {
         if self.len != m.checked_mul(k)? || rhs.len != k.checked_mul(n)? {
             return None;
@@ -381,10 +471,12 @@ impl MetalBuffer<f32> {
             return Self::from_slice(&[]);
         }
         if k == 0 {
-            return Self::from_slice(&vec![0.0; output_len]);
+            return Self::from_slice(&vec![T::zero(); output_len]);
         }
         let output = Self::allocate(output_len)?;
-        with_gpu(|gpu| encode_matmul(gpu, &self.raw, &rhs.raw, &output.raw, m, k, n, false))?;
+        with_gpu(|gpu| {
+            encode_matmul::<T>(gpu, &self.raw, &rhs.raw, &output.raw, m, k, n, false)
+        })?;
         Some(output)
     }
 
@@ -395,7 +487,7 @@ impl MetalBuffer<f32> {
         }
         let output = Self::allocate(self.len)?;
         if self.len != 0 {
-            with_gpu(|gpu| encode_transpose(gpu, &self.raw, &output.raw, rows, cols))?;
+            with_gpu(|gpu| encode_transpose::<T>(gpu, &self.raw, &output.raw, rows, cols))?;
         }
         Some(output)
     }
@@ -424,14 +516,14 @@ impl MetalBuffer<f32> {
         if target.len == 0 || k == 0 {
             return Some(());
         }
-        with_gpu(|gpu| encode_matmul(gpu, &self.raw, &rhs.raw, &target.raw, m, k, n, true))
+        with_gpu(|gpu| encode_matmul::<T>(gpu, &self.raw, &rhs.raw, &target.raw, m, k, n, true))
     }
 
     /// Apply an analytic function elementwise.
     pub fn unary(&self, op: Analytic) -> Option<Self> {
         let output = Self::allocate(self.len)?;
         if self.len != 0 {
-            with_gpu(|gpu| encode_unary(gpu, &self.raw, &output.raw, self.len, op))?;
+            with_gpu(|gpu| encode_unary::<T>(gpu, &self.raw, &output.raw, self.len, op))?;
         }
         Some(output)
     }
@@ -448,7 +540,7 @@ impl MetalBuffer<f32> {
         let out_tangent = Self::allocate(self.len)?;
         if self.len != 0 {
             with_gpu(|gpu| {
-                encode_unary_dual(
+                encode_unary_dual::<T>(
                     gpu,
                     &self.raw,
                     &tangent.raw,
@@ -470,7 +562,7 @@ impl MetalBuffer<f32> {
         let output = Self::allocate(self.len)?;
         if self.len != 0 {
             with_gpu(|gpu| {
-                encode_elementwise(gpu, &self.raw, &rhs.raw, &output.raw, self.len, op)
+                encode_elementwise::<T>(gpu, &self.raw, &rhs.raw, &output.raw, self.len, op)
             })?;
         }
         Some(output)
@@ -483,18 +575,21 @@ impl MetalBuffer<f32> {
         }
         let output = Self::allocate(self.len)?;
         if self.len != 0 {
-            with_gpu(|gpu| encode_power(gpu, &self.raw, &rhs.raw, &output.raw, self.len))?;
+            with_gpu(|gpu| encode_power::<T>(gpu, &self.raw, &rhs.raw, &output.raw, self.len))?;
         }
         Some(output)
     }
 
     /// Elementwise power with one operand fixed. `scalar_left` selects
     /// `scalar^x` over `x^scalar`.
-    pub fn power_scalar(&self, scalar: f32, scalar_left: bool) -> Option<Self> {
+    ///
+    /// Scalars cross to the shader as `f32`, which holds every `T` exactly.
+    pub fn power_scalar(&self, scalar: T, scalar_left: bool) -> Option<Self> {
+        let scalar = scalar.into_f64() as f32;
         let output = Self::allocate(self.len)?;
         if self.len != 0 {
             with_gpu(|gpu| {
-                encode_power_scalar(gpu, &self.raw, &output.raw, self.len, scalar, scalar_left)
+                encode_power_scalar::<T>(gpu, &self.raw, &output.raw, self.len, scalar, scalar_left)
             })?;
         }
         Some(output)
@@ -523,7 +618,7 @@ impl MetalBuffer<f32> {
         let output = Self::allocate(out_rows.checked_mul(out_cols)?)?;
         if output.len != 0 {
             with_gpu(|gpu| {
-                encode_correlate(
+                encode_correlate::<T>(
                     gpu,
                     &self.raw,
                     &weights.raw,
@@ -547,7 +642,7 @@ impl MetalBuffer<f32> {
         let output = Self::allocate((rows + 2 * pad_rows).checked_mul(cols + 2 * pad_cols)?)?;
         if output.len != 0 {
             with_gpu(|gpu| {
-                encode_pad(gpu, &self.raw, &output.raw, rows, cols, pad_rows, pad_cols)
+                encode_pad::<T>(gpu, &self.raw, &output.raw, rows, cols, pad_rows, pad_cols)
             })?;
         }
         Some(output)
@@ -560,7 +655,7 @@ impl MetalBuffer<f32> {
         }
         let output = Self::allocate(self.len)?;
         if self.len != 0 {
-            with_gpu(|gpu| encode_flip(gpu, &self.raw, &output.raw, rows, cols))?;
+            with_gpu(|gpu| encode_flip::<T>(gpu, &self.raw, &output.raw, rows, cols))?;
         }
         Some(output)
     }
@@ -572,18 +667,19 @@ impl MetalBuffer<f32> {
         }
         let output = Self::allocate(self.len)?;
         if self.len != 0 {
-            with_gpu(|gpu| encode_compare(gpu, &self.raw, &rhs.raw, &output.raw, self.len, op))?;
+            with_gpu(|gpu| encode_compare::<T>(gpu, &self.raw, &rhs.raw, &output.raw, self.len, op))?;
         }
         Some(output)
     }
 
     /// Elementwise comparison against a scalar; `scalar_left` puts the scalar on
     /// the left, which matters for [`Compare::MaxShare`].
-    pub fn compare_scalar(&self, scalar: f32, op: Compare, scalar_left: bool) -> Option<Self> {
+    pub fn compare_scalar(&self, scalar: T, op: Compare, scalar_left: bool) -> Option<Self> {
+        let scalar = scalar.into_f64() as f32;
         let output = Self::allocate(self.len)?;
         if self.len != 0 {
             with_gpu(|gpu| {
-                encode_compare_scalar(
+                encode_compare_scalar::<T>(
                     gpu,
                     &self.raw,
                     &output.raw,
@@ -598,10 +694,11 @@ impl MetalBuffer<f32> {
     }
 
     /// Confine every element to `[low, high]`, in one dispatch.
-    pub fn clamp(&self, low: f32, high: f32) -> Option<Self> {
+    pub fn clamp(&self, low: T, high: T) -> Option<Self> {
+        let (low, high) = (low.into_f64() as f32, high.into_f64() as f32);
         let output = Self::allocate(self.len)?;
         if self.len != 0 {
-            with_gpu(|gpu| encode_clamp(gpu, &self.raw, &output.raw, self.len, low, high))?;
+            with_gpu(|gpu| encode_clamp::<T>(gpu, &self.raw, &output.raw, self.len, low, high))?;
         }
         Some(output)
     }
@@ -613,28 +710,32 @@ impl MetalBuffer<f32> {
     /// The answer has to come back to the CPU, so this is one of the few
     /// operations that ends in a synchronization rather than leaving work
     /// queued.
+    ///
+    /// The fold runs in `f32` whatever `T` is, and the `f32` total is what
+    /// comes back: rounding it to `T` is the caller's one rounding, and a mean
+    /// or a variance built from it should use the unrounded value.
     pub fn reduce(&self, op: Reduce) -> Option<f32> {
         if self.len == 0 {
             return Some(op.identity());
         }
         if self.len == 1 {
-            return Some(self.as_slice()[0]);
+            return Some(self.as_slice()[0].into_f64() as f32);
         }
 
-        // Ping-pong between two scratch buffers: a round reads one and writes
-        // the (much shorter) other.
+        // Ping-pong between two `f32` scratch buffers: a round reads one and
+        // writes the (much shorter) other. Only the first round reads `T`.
         let mut groups = self.len.div_ceil(REDUCE_GROUP);
-        let mut front = Self::allocate(groups)?;
-        with_gpu(|gpu| encode_reduce(gpu, &self.raw, &front.raw, self.len, groups, op))?;
+        let mut front = MetalBuffer::<f32>::allocate(groups)?;
+        with_gpu(|gpu| encode_reduce::<T>(gpu, &self.raw, &front.raw, self.len, groups, op))?;
         let mut count = groups;
         if count == 1 {
             return Some(front.as_slice()[0]);
         }
 
-        let mut back = Self::allocate(count.div_ceil(REDUCE_GROUP))?;
+        let mut back = MetalBuffer::<f32>::allocate(count.div_ceil(REDUCE_GROUP))?;
         while count > 1 {
             groups = count.div_ceil(REDUCE_GROUP);
-            with_gpu(|gpu| encode_reduce(gpu, &front.raw, &back.raw, count, groups, op))?;
+            with_gpu(|gpu| encode_reduce::<f32>(gpu, &front.raw, &back.raw, count, groups, op))?;
             std::mem::swap(&mut front, &mut back);
             count = groups;
         }
@@ -647,19 +748,25 @@ impl MetalBuffer<f32> {
     /// alternate and the result is whichever one the last sweep wrote. The
     /// additions land in a different order from the CPU's running total, which
     /// is a rounding difference rather than a disagreement.
+    ///
+    /// The running totals are `f32`: a 16-bit buffer is widened into an `f32`
+    /// one, scanned there, and each total rounds to `T` once on the way back.
     pub fn prefix_sum(&self) -> Option<Self> {
         if self.len <= 1 {
             return Self::from_slice(self.as_slice());
         }
-        let mut front = Self::from_slice(self.as_slice())?;
-        let mut back = Self::allocate(self.len)?;
+        let mut front = MetalBuffer::<f32>::allocate(self.len)?;
+        with_gpu(|gpu| encode_convert(gpu, &gpu.kernels::<T>().widen, &self.raw, &front.raw, self.len))?;
+        let mut back = MetalBuffer::<f32>::allocate(self.len)?;
         let mut offset = 1;
         while offset < self.len {
             with_gpu(|gpu| encode_scan(gpu, &front.raw, &back.raw, self.len, offset))?;
             std::mem::swap(&mut front, &mut back);
             offset *= 2;
         }
-        Some(front)
+        let output = Self::allocate(self.len)?;
+        with_gpu(|gpu| encode_convert(gpu, &gpu.kernels::<T>().narrow, &front.raw, &output.raw, self.len))?;
+        Some(output)
     }
 
     /// Sort the elements in IEEE total order, on the GPU.
@@ -669,33 +776,26 @@ impl MetalBuffer<f32> {
     /// with a value that sorts to the far end, so trimming the tail afterwards
     /// leaves exactly the input's elements. The shader compares monotone
     /// integer keys rather than the floats themselves, which is what makes the
-    /// result identical to a CPU [`f32::total_cmp`] sort rather than merely
-    /// similar: NaNs and `−0.0` land where the total order puts them instead of
-    /// wherever an unordered compare-exchange left them.
+    /// result identical to a CPU total-order sort (`f32::total_cmp`, or the
+    /// 16-bit types' own) rather than merely similar: NaNs and `−0.0` land where
+    /// the total order puts them instead of wherever an unordered
+    /// compare-exchange left them.
     pub fn sort(&self, order: SortOrder) -> Option<Self> {
         if self.len <= 1 {
             return Self::from_slice(self.as_slice());
         }
         let padded = self.len.checked_next_power_of_two()?;
         let ascending = order == SortOrder::Ascending;
-        // The extreme of the total order at the end the padding is trimmed
-        // from: the largest key for an ascending sort, the smallest for a
-        // descending one. Both are NaNs, which is the point — a NaN in the
-        // input can never sort past them.
-        let padding = if ascending {
-            f32::from_bits(0x7FFF_FFFF)
-        } else {
-            f32::from_bits(0xFFFF_FFFF)
-        };
+        let padding = T::sort_padding(ascending);
 
         let buffer = Self::allocate(padded)?;
         with_gpu(|gpu| {
-            encode_sort_prepare(gpu, &self.raw, &buffer.raw, padded, self.len, padding)?;
+            encode_sort_prepare::<T>(gpu, &self.raw, &buffer.raw, padded, self.len, padding)?;
             let mut block = 2;
             while block <= padded {
                 let mut stride = block / 2;
                 while stride > 0 {
-                    encode_bitonic_stage(gpu, &buffer.raw, padded, block, stride, ascending)?;
+                    encode_bitonic_stage::<T>(gpu, &buffer.raw, padded, block, stride, ascending)?;
                     stride /= 2;
                 }
                 block *= 2;
@@ -717,27 +817,32 @@ impl MetalBuffer<f32> {
     /// deviation as it reads the value; every round after it is the ordinary
     /// summing reduction over the partials. So the buffer is read once, not
     /// once to write an elementwise result and again to fold it.
+    ///
+    /// Like [`reduce`](Self::reduce), this accumulates in `f32` and returns the
+    /// unrounded `f32` sum; `mean` is the unrounded `f32` mean.
     pub fn sum_squared_deviations(&self, mean: f32) -> Option<f32> {
         if self.len == 0 {
             return Some(0.0);
         }
         if self.len == 1 {
-            let deviation = self.as_slice()[0] - mean;
+            let deviation = self.as_slice()[0].into_f64() as f32 - mean;
             return Some(deviation * deviation);
         }
 
         let mut groups = self.len.div_ceil(REDUCE_GROUP);
-        let mut front = Self::allocate(groups)?;
-        with_gpu(|gpu| encode_deviation(gpu, &self.raw, &front.raw, self.len, groups, mean))?;
+        let mut front = MetalBuffer::<f32>::allocate(groups)?;
+        with_gpu(|gpu| encode_deviation::<T>(gpu, &self.raw, &front.raw, self.len, groups, mean))?;
         let mut count = groups;
         if count == 1 {
             return Some(front.as_slice()[0]);
         }
 
-        let mut back = Self::allocate(count.div_ceil(REDUCE_GROUP))?;
+        let mut back = MetalBuffer::<f32>::allocate(count.div_ceil(REDUCE_GROUP))?;
         while count > 1 {
             groups = count.div_ceil(REDUCE_GROUP);
-            with_gpu(|gpu| encode_reduce(gpu, &front.raw, &back.raw, count, groups, Reduce::Sum))?;
+            with_gpu(|gpu| {
+                encode_reduce::<f32>(gpu, &front.raw, &back.raw, count, groups, Reduce::Sum)
+            })?;
             std::mem::swap(&mut front, &mut back);
             count = groups;
         }
@@ -760,7 +865,7 @@ impl MetalBuffer<f32> {
         let deviations = Self::allocate(extent)?;
         if extent != 0 && axis.depth((rows, cols)) != 0 {
             with_gpu(|gpu| {
-                encode_axis_moments(
+                encode_axis_moments::<T>(
                     gpu,
                     &self.raw,
                     &means.raw,
@@ -786,7 +891,7 @@ impl MetalBuffer<f32> {
         let output = Self::allocate(self.len)?;
         if self.len != 0 {
             with_gpu(|gpu| {
-                encode_distribution(
+                encode_distribution::<T>(
                     gpu,
                     &self.raw,
                     &output.raw,
@@ -822,7 +927,7 @@ impl MetalBuffer<f32> {
         let output = Self::allocate(self.len)?;
         if self.len != 0 {
             with_gpu(|gpu| {
-                encode_axis_distribution(
+                encode_axis_distribution::<T>(
                     gpu,
                     &self.raw,
                     &output.raw,
@@ -841,14 +946,15 @@ impl MetalBuffer<f32> {
 
     /// Broadcast operation with a scalar. `op` has the same encoding as
     /// [`elementwise`](Self::elementwise).
-    pub fn broadcast(&self, scalar: f32, op: BinaryOp, scalar_left: bool) -> Option<Self> {
+    pub fn broadcast(&self, scalar: T, op: BinaryOp, scalar_left: bool) -> Option<Self> {
         if op == BinaryOp::Rem {
             return None;
         }
+        let scalar = scalar.into_f64() as f32;
         let output = Self::allocate(self.len)?;
         if self.len != 0 {
             with_gpu(|gpu| {
-                encode_broadcast(
+                encode_broadcast::<T>(
                     gpu,
                     &self.raw,
                     &output.raw,
@@ -885,7 +991,7 @@ impl MetalBuffer<f32> {
         let output = Self::allocate(inputs.len().checked_mul(vector_len)?)?;
         if output.len != 0 {
             with_gpu(|gpu| {
-                encode_stack(gpu, inputs, &output.raw, vector_len, output_stride, offset)
+                encode_stack::<T>(gpu, inputs, &output.raw, vector_len, output_stride, offset)
             })?;
         }
         Some(output)
@@ -906,7 +1012,7 @@ impl MetalBuffer<f32> {
         let output = Self::allocate(rows.checked_mul(output_cols)?)?;
         if output.len != 0 {
             with_gpu(|gpu| {
-                encode_concat(
+                encode_concat::<T>(
                     gpu,
                     &self.raw,
                     &rhs.raw,
@@ -934,7 +1040,7 @@ impl MetalBuffer<f32> {
         let output = Self::allocate(self.len.checked_add(rhs.len)?)?;
         if output.len != 0 {
             with_gpu(|gpu| {
-                encode_matrix_stack(gpu, &self.raw, &rhs.raw, &output.raw, self.len, rhs.len)
+                encode_matrix_stack::<T>(gpu, &self.raw, &rhs.raw, &output.raw, self.len, rhs.len)
             })?;
         }
         Some(output)
@@ -948,7 +1054,7 @@ impl MetalBuffer<f32> {
         }
         let output = Self::allocate(matrix_len.checked_mul(inputs.len())?)?;
         if output.len != 0 {
-            with_gpu(|gpu| encode_hmerge(gpu, inputs, &output.raw, rows, cols))?;
+            with_gpu(|gpu| encode_hmerge::<T>(gpu, inputs, &output.raw, rows, cols))?;
         }
         Some(output)
     }
@@ -961,11 +1067,14 @@ impl MetalBuffer<f32> {
         }
         let output = Self::allocate(matrix_len.checked_mul(inputs.len())?)?;
         if output.len != 0 {
-            with_gpu(|gpu| encode_vmerge(gpu, inputs, &output.raw, matrix_len))?;
+            with_gpu(|gpu| encode_vmerge::<T>(gpu, inputs, &output.raw, matrix_len))?;
         }
         Some(output)
     }
 
+}
+
+impl MetalBuffer<f32> {
     /// Radix-2 FFT over interleaved complex values. The layout is
     /// `[real0, imag0, real1, imag1, ...]`.
     pub fn fft(&self) -> Option<Self> {
@@ -995,11 +1104,6 @@ impl MetalBuffer<f32> {
 }
 
 impl MetalBuffer<f16> {
-    /// Multiply with an FP16 cooperative accumulator and FP16 output.
-    pub(crate) fn matmul(&self, rhs: &Self, m: usize, k: usize, n: usize) -> Option<Self> {
-        matmul_tensorops(self, rhs, m, k, n, f16::ZERO, |pipelines| &pipelines.f16)
-    }
-
     /// Multiply FP16 inputs with TensorOps and accumulate into FP32 output.
     pub(crate) fn matmul_f32(
         &self,
@@ -1013,11 +1117,6 @@ impl MetalBuffer<f16> {
 }
 
 impl MetalBuffer<bf16> {
-    /// Multiply with a BF16 cooperative accumulator and BF16 output.
-    pub(crate) fn matmul(&self, rhs: &Self, m: usize, k: usize, n: usize) -> Option<Self> {
-        matmul_tensorops(self, rhs, m, k, n, bf16::ZERO, |pipelines| &pipelines.bf16)
-    }
-
     /// Multiply BF16 inputs with TensorOps and accumulate into FP32 output.
     pub(crate) fn matmul_f32(
         &self,
@@ -1097,7 +1196,7 @@ impl<T> Drop for MetalBuffer<T> {
 // One argument over clippy's threshold: the kernel takes three shapes and an
 // accumulate flag, and naming them beats packing them into a struct here.
 #[allow(clippy::too_many_arguments)]
-fn encode_matmul(
+fn encode_matmul<T: MetalElement>(
     gpu: &Gpu,
     a: &ProtocolObject<dyn MTLBuffer>,
     b: &ProtocolObject<dyn MTLBuffer>,
@@ -1107,10 +1206,10 @@ fn encode_matmul(
     n: usize,
     accumulate: bool,
 ) -> Option<()> {
-    if !accumulate && let Some(pipelines) = &gpu.tensorops {
+    if !accumulate && let Some(pipeline) = &gpu.kernels::<T>().tensorops {
         return encode_tensorops_matmul(
             gpu,
-            &pipelines.f32,
+            pipeline,
             a,
             b,
             output,
@@ -1118,12 +1217,12 @@ fn encode_matmul(
             k,
             n,
             accumulate,
-            size_of::<f32>(),
+            size_of::<T>(),
         );
     }
     let command = gpu.queue.commandBuffer()?;
     let encoder = command.computeCommandEncoder()?;
-    encoder.setComputePipelineState(&gpu.matmul);
+    encoder.setComputePipelineState(&gpu.kernels::<T>().matmul);
     let (mu, ku, nu) = (
         u32::try_from(m).ok()?,
         u32::try_from(k).ok()?,
@@ -1209,7 +1308,7 @@ fn encode_tensorops_matmul(
     commit(gpu, command)
 }
 
-fn encode_transpose(
+fn encode_transpose<T: MetalElement>(
     gpu: &Gpu,
     input: &ProtocolObject<dyn MTLBuffer>,
     output: &ProtocolObject<dyn MTLBuffer>,
@@ -1220,7 +1319,7 @@ fn encode_transpose(
     let cols_u32 = u32::try_from(cols).ok()?;
     let command = gpu.queue.commandBuffer()?;
     let encoder = command.computeCommandEncoder()?;
-    encoder.setComputePipelineState(&gpu.transpose);
+    encoder.setComputePipelineState(&gpu.kernels::<T>().transpose);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
         encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
@@ -1242,7 +1341,7 @@ fn encode_transpose(
     commit(gpu, command)
 }
 
-fn encode_elementwise(
+fn encode_elementwise<T: MetalElement>(
     gpu: &Gpu,
     a: &ProtocolObject<dyn MTLBuffer>,
     b: &ProtocolObject<dyn MTLBuffer>,
@@ -1252,7 +1351,7 @@ fn encode_elementwise(
 ) -> Option<()> {
     let command = gpu.queue.commandBuffer()?;
     let encoder = command.computeCommandEncoder()?;
-    encoder.setComputePipelineState(&gpu.elementwise);
+    encoder.setComputePipelineState(&gpu.kernels::<T>().elementwise);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(a), 0, 0);
         encoder.setBuffer_offset_atIndex(Some(b), 0, 1);
@@ -1264,7 +1363,7 @@ fn encode_elementwise(
     commit(gpu, command)
 }
 
-fn encode_compare(
+fn encode_compare<T: MetalElement>(
     gpu: &Gpu,
     a: &ProtocolObject<dyn MTLBuffer>,
     b: &ProtocolObject<dyn MTLBuffer>,
@@ -1274,7 +1373,7 @@ fn encode_compare(
 ) -> Option<()> {
     let command = gpu.queue.commandBuffer()?;
     let encoder = command.computeCommandEncoder()?;
-    encoder.setComputePipelineState(&gpu.compare);
+    encoder.setComputePipelineState(&gpu.kernels::<T>().compare);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(a), 0, 0);
         encoder.setBuffer_offset_atIndex(Some(b), 0, 1);
@@ -1286,7 +1385,7 @@ fn encode_compare(
     commit(gpu, command)
 }
 
-fn encode_compare_scalar(
+fn encode_compare_scalar<T: MetalElement>(
     gpu: &Gpu,
     input: &ProtocolObject<dyn MTLBuffer>,
     output: &ProtocolObject<dyn MTLBuffer>,
@@ -1297,7 +1396,7 @@ fn encode_compare_scalar(
 ) -> Option<()> {
     let command = gpu.queue.commandBuffer()?;
     let encoder = command.computeCommandEncoder()?;
-    encoder.setComputePipelineState(&gpu.compare_scalar);
+    encoder.setComputePipelineState(&gpu.kernels::<T>().compare_scalar);
     let scalar_left = u32::from(scalar_left);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
@@ -1311,7 +1410,7 @@ fn encode_compare_scalar(
     commit(gpu, command)
 }
 
-fn encode_clamp(
+fn encode_clamp<T: MetalElement>(
     gpu: &Gpu,
     input: &ProtocolObject<dyn MTLBuffer>,
     output: &ProtocolObject<dyn MTLBuffer>,
@@ -1321,7 +1420,7 @@ fn encode_clamp(
 ) -> Option<()> {
     let command = gpu.queue.commandBuffer()?;
     let encoder = command.computeCommandEncoder()?;
-    encoder.setComputePipelineState(&gpu.clamp);
+    encoder.setComputePipelineState(&gpu.kernels::<T>().clamp);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
         encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
@@ -1339,7 +1438,7 @@ fn encode_clamp(
 /// require every thread of a group to arrive, which a ragged final group under
 /// `dispatchThreads` would not do. The threads past `count` read the identity
 /// instead.
-fn encode_reduce(
+fn encode_reduce<T: MetalElement>(
     gpu: &Gpu,
     input: &ProtocolObject<dyn MTLBuffer>,
     output: &ProtocolObject<dyn MTLBuffer>,
@@ -1350,7 +1449,7 @@ fn encode_reduce(
     let command = gpu.queue.commandBuffer()?;
     let encoder = command.computeCommandEncoder()?;
     let count_u32 = u32::try_from(count).ok()?;
-    encoder.setComputePipelineState(&gpu.reduce);
+    encoder.setComputePipelineState(&gpu.kernels::<T>().reduce);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
         encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
@@ -1369,6 +1468,27 @@ fn encode_reduce(
             depth: 1,
         },
     );
+    encoder.endEncoding();
+    commit(gpu, command)
+}
+
+/// One elementwise conversion between a typed buffer and an `f32` one —
+/// `pipeline` is a type's `widen` or `narrow`.
+fn encode_convert(
+    gpu: &Gpu,
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    input: &ProtocolObject<dyn MTLBuffer>,
+    output: &ProtocolObject<dyn MTLBuffer>,
+    len: usize,
+) -> Option<()> {
+    let command = gpu.queue.commandBuffer()?;
+    let encoder = command.computeCommandEncoder()?;
+    encoder.setComputePipelineState(pipeline);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
+    }
+    dispatch_1d(&encoder, len);
     encoder.endEncoding();
     commit(gpu, command)
 }
@@ -1394,30 +1514,30 @@ fn encode_scan(
     commit(gpu, command)
 }
 
-fn encode_sort_prepare(
+fn encode_sort_prepare<T: MetalElement>(
     gpu: &Gpu,
     input: &ProtocolObject<dyn MTLBuffer>,
     output: &ProtocolObject<dyn MTLBuffer>,
     padded: usize,
     count: usize,
-    padding: f32,
+    padding: T,
 ) -> Option<()> {
     let command = gpu.queue.commandBuffer()?;
     let encoder = command.computeCommandEncoder()?;
     let count_u32 = u32::try_from(count).ok()?;
-    encoder.setComputePipelineState(&gpu.sort_prepare);
+    encoder.setComputePipelineState(&gpu.kernels::<T>().sort_prepare);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
         encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
         encoder.setBytes_length_atIndex(NonNull::from(&count_u32).cast(), 4, 2);
-        encoder.setBytes_length_atIndex(NonNull::from(&padding).cast(), 4, 3);
+        encoder.setBytes_length_atIndex(NonNull::from(&padding).cast(), size_of::<T>(), 3);
     }
     dispatch_1d(&encoder, padded);
     encoder.endEncoding();
     commit(gpu, command)
 }
 
-fn encode_bitonic_stage(
+fn encode_bitonic_stage<T: MetalElement>(
     gpu: &Gpu,
     values: &ProtocolObject<dyn MTLBuffer>,
     padded: usize,
@@ -1430,7 +1550,7 @@ fn encode_bitonic_stage(
     let block_u32 = u32::try_from(block).ok()?;
     let stride_u32 = u32::try_from(stride).ok()?;
     let ascending_u32 = u32::from(ascending);
-    encoder.setComputePipelineState(&gpu.bitonic);
+    encoder.setComputePipelineState(&gpu.kernels::<T>().bitonic);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(values), 0, 0);
         encoder.setBytes_length_atIndex(NonNull::from(&block_u32).cast(), 4, 1);
@@ -1442,7 +1562,7 @@ fn encode_bitonic_stage(
     commit(gpu, command)
 }
 
-fn encode_broadcast(
+fn encode_broadcast<T: MetalElement>(
     gpu: &Gpu,
     input: &ProtocolObject<dyn MTLBuffer>,
     output: &ProtocolObject<dyn MTLBuffer>,
@@ -1453,7 +1573,7 @@ fn encode_broadcast(
 ) -> Option<()> {
     let command = gpu.queue.commandBuffer()?;
     let encoder = command.computeCommandEncoder()?;
-    encoder.setComputePipelineState(&gpu.broadcast);
+    encoder.setComputePipelineState(&gpu.kernels::<T>().broadcast);
     let scalar_left = u32::from(scalar_left);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
@@ -1467,9 +1587,9 @@ fn encode_broadcast(
     commit(gpu, command)
 }
 
-fn encode_stack(
+fn encode_stack<T: MetalElement>(
     gpu: &Gpu,
-    inputs: &[&MetalBuffer],
+    inputs: &[&MetalBuffer<T>],
     output: &ProtocolObject<dyn MTLBuffer>,
     vector_len: usize,
     output_stride: usize,
@@ -1483,7 +1603,7 @@ fn encode_stack(
 
     let command = gpu.queue.commandBuffer()?;
     let encoder = command.computeCommandEncoder()?;
-    encoder.setComputePipelineState(&gpu.stack_vector);
+    encoder.setComputePipelineState(&gpu.kernels::<T>().stack_vector);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
         encoder.setBytes_length_atIndex(NonNull::from(&count).cast(), 4, 2);
@@ -1500,7 +1620,7 @@ fn encode_stack(
     commit(gpu, command)
 }
 
-fn encode_concat(
+fn encode_concat<T: MetalElement>(
     gpu: &Gpu,
     left: &ProtocolObject<dyn MTLBuffer>,
     right: &ProtocolObject<dyn MTLBuffer>,
@@ -1516,7 +1636,7 @@ fn encode_concat(
 
     let command = gpu.queue.commandBuffer()?;
     let encoder = command.computeCommandEncoder()?;
-    encoder.setComputePipelineState(&gpu.concat_horizontal);
+    encoder.setComputePipelineState(&gpu.kernels::<T>().concat_horizontal);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(left), 0, 0);
         encoder.setBuffer_offset_atIndex(Some(right), 0, 1);
@@ -1540,7 +1660,7 @@ fn encode_concat(
     commit(gpu, command)
 }
 
-fn encode_matrix_stack(
+fn encode_matrix_stack<T: MetalElement>(
     gpu: &Gpu,
     top: &ProtocolObject<dyn MTLBuffer>,
     bottom: &ProtocolObject<dyn MTLBuffer>,
@@ -1548,8 +1668,8 @@ fn encode_matrix_stack(
     top_len: usize,
     bottom_len: usize,
 ) -> Option<()> {
-    let top_bytes = top_len.checked_mul(size_of::<f32>())?;
-    let bottom_bytes = bottom_len.checked_mul(size_of::<f32>())?;
+    let top_bytes = top_len.checked_mul(size_of::<T>())?;
+    let bottom_bytes = bottom_len.checked_mul(size_of::<T>())?;
     let command = gpu.queue.commandBuffer()?;
     let encoder = command.blitCommandEncoder()?;
     unsafe {
@@ -1572,9 +1692,9 @@ fn encode_matrix_stack(
     commit(gpu, command)
 }
 
-fn encode_hmerge(
+fn encode_hmerge<T: MetalElement>(
     gpu: &Gpu,
-    inputs: &[&MetalBuffer],
+    inputs: &[&MetalBuffer<T>],
     output: &ProtocolObject<dyn MTLBuffer>,
     rows: usize,
     cols: usize,
@@ -1589,7 +1709,7 @@ fn encode_hmerge(
 
     let command = gpu.queue.commandBuffer()?;
     let encoder = command.computeCommandEncoder()?;
-    encoder.setComputePipelineState(&gpu.merge_horizontal);
+    encoder.setComputePipelineState(&gpu.kernels::<T>().merge_horizontal);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
         encoder.setBytes_length_atIndex(NonNull::from(&rows_u32).cast(), 4, 2);
@@ -1617,13 +1737,13 @@ fn encode_hmerge(
     commit(gpu, command)
 }
 
-fn encode_vmerge(
+fn encode_vmerge<T: MetalElement>(
     gpu: &Gpu,
-    inputs: &[&MetalBuffer],
+    inputs: &[&MetalBuffer<T>],
     output: &ProtocolObject<dyn MTLBuffer>,
     matrix_len: usize,
 ) -> Option<()> {
-    let matrix_bytes = matrix_len.checked_mul(size_of::<f32>())?;
+    let matrix_bytes = matrix_len.checked_mul(size_of::<T>())?;
     let command = gpu.queue.commandBuffer()?;
     let encoder = command.blitCommandEncoder()?;
     for (index, input) in inputs.iter().enumerate() {
@@ -1646,7 +1766,7 @@ fn encode_vmerge(
 ///
 /// Dispatched as whole threadgroups for the same reason [`encode_reduce`] is —
 /// every thread in a group has to reach the barriers.
-fn encode_deviation(
+fn encode_deviation<T: MetalElement>(
     gpu: &Gpu,
     input: &ProtocolObject<dyn MTLBuffer>,
     output: &ProtocolObject<dyn MTLBuffer>,
@@ -1657,7 +1777,7 @@ fn encode_deviation(
     let command = gpu.queue.commandBuffer()?;
     let encoder = command.computeCommandEncoder()?;
     let count_u32 = u32::try_from(count).ok()?;
-    encoder.setComputePipelineState(&gpu.deviation);
+    encoder.setComputePipelineState(&gpu.kernels::<T>().deviation);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
         encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
@@ -1681,7 +1801,7 @@ fn encode_deviation(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn encode_axis_moments(
+fn encode_axis_moments<T: MetalElement>(
     gpu: &Gpu,
     input: &ProtocolObject<dyn MTLBuffer>,
     means: &ProtocolObject<dyn MTLBuffer>,
@@ -1694,7 +1814,7 @@ fn encode_axis_moments(
     let command = gpu.queue.commandBuffer()?;
     let encoder = command.computeCommandEncoder()?;
     let (rows_u32, cols_u32) = (u32::try_from(rows).ok()?, u32::try_from(cols).ok()?);
-    encoder.setComputePipelineState(&gpu.axis_moments);
+    encoder.setComputePipelineState(&gpu.kernels::<T>().axis_moments);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
         encoder.setBuffer_offset_atIndex(Some(means), 0, 1);
@@ -1709,7 +1829,7 @@ fn encode_axis_moments(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn encode_distribution(
+fn encode_distribution<T: MetalElement>(
     gpu: &Gpu,
     input: &ProtocolObject<dyn MTLBuffer>,
     output: &ProtocolObject<dyn MTLBuffer>,
@@ -1720,7 +1840,7 @@ fn encode_distribution(
 ) -> Option<()> {
     let command = gpu.queue.commandBuffer()?;
     let encoder = command.computeCommandEncoder()?;
-    encoder.setComputePipelineState(&gpu.distribution);
+    encoder.setComputePipelineState(&gpu.kernels::<T>().distribution);
     let (first, second) = parameters;
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
@@ -1740,7 +1860,7 @@ fn encode_distribution(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn encode_axis_distribution(
+fn encode_axis_distribution<T: MetalElement>(
     gpu: &Gpu,
     input: &ProtocolObject<dyn MTLBuffer>,
     output: &ProtocolObject<dyn MTLBuffer>,
@@ -1755,7 +1875,7 @@ fn encode_axis_distribution(
     let command = gpu.queue.commandBuffer()?;
     let encoder = command.computeCommandEncoder()?;
     let cols_u32 = u32::try_from(cols).ok()?;
-    encoder.setComputePipelineState(&gpu.axis_distribution);
+    encoder.setComputePipelineState(&gpu.kernels::<T>().axis_distribution);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
         encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
@@ -1775,7 +1895,7 @@ fn encode_axis_distribution(
     commit(gpu, command)
 }
 
-fn encode_power(
+fn encode_power<T: MetalElement>(
     gpu: &Gpu,
     a: &ProtocolObject<dyn MTLBuffer>,
     b: &ProtocolObject<dyn MTLBuffer>,
@@ -1784,7 +1904,7 @@ fn encode_power(
 ) -> Option<()> {
     let command = gpu.queue.commandBuffer()?;
     let encoder = command.computeCommandEncoder()?;
-    encoder.setComputePipelineState(&gpu.power);
+    encoder.setComputePipelineState(&gpu.kernels::<T>().power);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(a), 0, 0);
         encoder.setBuffer_offset_atIndex(Some(b), 0, 1);
@@ -1795,7 +1915,7 @@ fn encode_power(
     commit(gpu, command)
 }
 
-fn encode_power_scalar(
+fn encode_power_scalar<T: MetalElement>(
     gpu: &Gpu,
     input: &ProtocolObject<dyn MTLBuffer>,
     output: &ProtocolObject<dyn MTLBuffer>,
@@ -1805,7 +1925,7 @@ fn encode_power_scalar(
 ) -> Option<()> {
     let command = gpu.queue.commandBuffer()?;
     let encoder = command.computeCommandEncoder()?;
-    encoder.setComputePipelineState(&gpu.power_scalar);
+    encoder.setComputePipelineState(&gpu.kernels::<T>().power_scalar);
     let scalar_left = u32::from(scalar_left);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
@@ -1818,7 +1938,7 @@ fn encode_power_scalar(
     commit(gpu, command)
 }
 
-fn encode_unary(
+fn encode_unary<T: MetalElement>(
     gpu: &Gpu,
     input: &ProtocolObject<dyn MTLBuffer>,
     output: &ProtocolObject<dyn MTLBuffer>,
@@ -1827,7 +1947,7 @@ fn encode_unary(
 ) -> Option<()> {
     let command = gpu.queue.commandBuffer()?;
     let encoder = command.computeCommandEncoder()?;
-    encoder.setComputePipelineState(&gpu.unary);
+    encoder.setComputePipelineState(&gpu.kernels::<T>().unary);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
         encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
@@ -1838,7 +1958,7 @@ fn encode_unary(
     commit(gpu, command)
 }
 
-fn encode_unary_dual(
+fn encode_unary_dual<T: MetalElement>(
     gpu: &Gpu,
     value: &ProtocolObject<dyn MTLBuffer>,
     tangent: &ProtocolObject<dyn MTLBuffer>,
@@ -1849,7 +1969,7 @@ fn encode_unary_dual(
 ) -> Option<()> {
     let command = gpu.queue.commandBuffer()?;
     let encoder = command.computeCommandEncoder()?;
-    encoder.setComputePipelineState(&gpu.unary_dual);
+    encoder.setComputePipelineState(&gpu.kernels::<T>().unary_dual);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(value), 0, 0);
         encoder.setBuffer_offset_atIndex(Some(tangent), 0, 1);
@@ -1924,7 +2044,7 @@ const FUSED_OUTPUT_SLOTS: usize = 8;
 /// `inputs` and `outputs` are bound in slot order. A tensor updated in place
 /// appears in both lists. Unused slots are bound to a buffer that is in use —
 /// the program never names them, so they are never read or written.
-pub(crate) fn fused_elementwise(
+pub(crate) fn fused_elementwise<T: MetalElement>(
     code: &[crate::tensors::fused::Encoded],
     (rows, cols): (usize, usize),
     inputs: &[&ProtocolObject<dyn MTLBuffer>],
@@ -1953,7 +2073,7 @@ pub(crate) fn fused_elementwise(
     with_gpu(|gpu| {
         let command = gpu.queue.commandBuffer()?;
         let encoder = command.computeCommandEncoder()?;
-        encoder.setComputePipelineState(&gpu.fused);
+        encoder.setComputePipelineState(&gpu.kernels::<T>().fused);
         unsafe {
             encoder.setBytes_length_atIndex(NonNull::from(&code[0]).cast(), code_bytes, 0);
             encoder.setBytes_length_atIndex(
@@ -2086,7 +2206,7 @@ pub fn elementwise_f32(a: &[f32], b: &[f32], op: BinaryOp) -> Option<Vec<f32>> {
         upload(&buf_a, a);
         upload(&buf_b, b);
 
-        encode_elementwise(gpu, &buf_a, &buf_b, &buf_c, len, op)?;
+        encode_elementwise::<f32>(gpu, &buf_a, &buf_b, &buf_c, len, op)?;
 
         sync(gpu)?;
         let out = download(&buf_c, len);
@@ -2124,7 +2244,7 @@ pub fn broadcast_f32(
         };
         upload(&input, values);
 
-        encode_broadcast(gpu, &input, &output, len, scalar, op, scalar_left)?;
+        encode_broadcast::<f32>(gpu, &input, &output, len, scalar, op, scalar_left)?;
 
         sync(gpu)?;
         let out = download(&output, len);
@@ -2179,7 +2299,7 @@ fn fourier_transform_f32_interleaved(input: &[f32], inverse: bool) -> Option<Vec
 }
 
 #[allow(clippy::too_many_arguments)]
-fn encode_correlate(
+fn encode_correlate<T: MetalElement>(
     gpu: &Gpu,
     input: &ProtocolObject<dyn MTLBuffer>,
     weights: &ProtocolObject<dyn MTLBuffer>,
@@ -2192,7 +2312,7 @@ fn encode_correlate(
 ) -> Option<()> {
     let command = gpu.queue.commandBuffer()?;
     let encoder = command.computeCommandEncoder()?;
-    encoder.setComputePipelineState(&gpu.correlate);
+    encoder.setComputePipelineState(&gpu.kernels::<T>().correlate);
     let shape = [
         u32::try_from(rows).ok()?,
         u32::try_from(cols).ok()?,
@@ -2214,7 +2334,7 @@ fn encode_correlate(
     commit(gpu, command)
 }
 
-fn encode_pad(
+fn encode_pad<T: MetalElement>(
     gpu: &Gpu,
     input: &ProtocolObject<dyn MTLBuffer>,
     output: &ProtocolObject<dyn MTLBuffer>,
@@ -2225,7 +2345,7 @@ fn encode_pad(
 ) -> Option<()> {
     let command = gpu.queue.commandBuffer()?;
     let encoder = command.computeCommandEncoder()?;
-    encoder.setComputePipelineState(&gpu.pad_zeros);
+    encoder.setComputePipelineState(&gpu.kernels::<T>().pad_zeros);
     let shape = [
         u32::try_from(rows).ok()?,
         u32::try_from(cols).ok()?,
@@ -2244,7 +2364,7 @@ fn encode_pad(
     commit(gpu, command)
 }
 
-fn encode_flip(
+fn encode_flip<T: MetalElement>(
     gpu: &Gpu,
     input: &ProtocolObject<dyn MTLBuffer>,
     output: &ProtocolObject<dyn MTLBuffer>,
@@ -2253,7 +2373,7 @@ fn encode_flip(
 ) -> Option<()> {
     let command = gpu.queue.commandBuffer()?;
     let encoder = command.computeCommandEncoder()?;
-    encoder.setComputePipelineState(&gpu.flip_both);
+    encoder.setComputePipelineState(&gpu.kernels::<T>().flip_both);
     let (rows_u, cols_u) = (u32::try_from(rows).ok()?, u32::try_from(cols).ok()?);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
@@ -2563,7 +2683,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(transposed.to_vec(), expected);
 
-        let empty = MetalBuffer::from_slice(&[]).unwrap();
+        let empty = MetalBuffer::<f32>::from_slice(&[]).unwrap();
         assert!(empty.transpose(0, COLS).unwrap().is_empty());
     }
 

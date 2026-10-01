@@ -21,9 +21,11 @@
 /// matrix/vector products use `@`, vector `*` vector is a dot product, `.*` is
 /// explicit elementwise multiplication, and analytic and ordering functions
 /// map over tensors. A leading `backend = Metal;` selects resident `f32` Metal
-/// tensors; `Host`/`f64` is the default.
+/// tensors, and `dtype = f32;` makes a host block compute in `f32`; `Host` with
+/// `f64` is the default.
 pub use tensorcrate_macros::math;
 
+mod compact;
 pub mod counters;
 pub mod errors;
 #[cfg(all(feature = "metal", target_os = "macos"))]
