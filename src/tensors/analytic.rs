@@ -61,7 +61,8 @@ use crate::metal::MetalElement;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use crate::tensors::Metal;
 use crate::tensors::kernels::{Analytic, Kernels};
-use crate::tensors::{Host, Matrix, Vector, assert_same_len, assert_same_shape};
+use crate::tensors::shape::{assert_same_len, assert_same_shape};
+use crate::tensors::{Host, Matrix, Vector};
 
 impl<T: Real> Vector<T, Host> {
     /// Apply an analytic function to every element.
@@ -537,9 +538,10 @@ scalar_base_power!(f32, f64, f16, bf16);
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod resident {
-    use super::{Matrix, Metal, Power, Vector, assert_same_len, assert_same_shape};
+    use super::{Matrix, Metal, Power, Vector};
     use crate::metal::MetalElement;
     use crate::tensors::Host;
+    use crate::tensors::shape::{assert_same_len, assert_same_shape};
 
     impl<T: MetalElement> Vector<T, Metal> {
         /// Raise every element to `exponent`, on the GPU.

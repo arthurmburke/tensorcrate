@@ -41,9 +41,9 @@ use std::ops::{Add, Div, Mul, Neg, Rem, Sub};
 use half::{bf16, f16};
 use num_traits::PrimInt;
 
+use super::shape::{assert_inner, assert_ordered_bounds, assert_same_len, assert_same_shape};
 use super::{
     Analytic, Backend, BinaryOp, Compare, Host, Kernels, Matrix, Metal, Reduce, SortOrder, Vector,
-    assert_inner, assert_ordered_bounds, assert_same_len, assert_same_shape,
 };
 use crate::metal::MetalElement;
 
