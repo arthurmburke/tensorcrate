@@ -24,14 +24,16 @@
 //! Tensors use the host backend by default, with `f64` coefficients. A leading
 //! `backend = Metal;` directive selects resident `f32` Metal tensors instead;
 //! `backend = Host;` is the explicit spelling of the default. A leading
-//! `dtype = f32;` (or `dtype = f64;`) chooses the coefficient type, so a host
-//! block can compute in `f32` too. The directives may come in either order;
-//! Metal's shaders are `f32`, so `backend = Metal;` with `dtype = f64;` is an
-//! error.
+//! `dtype = f64;`, `f32`, `f16` or `bf16` chooses the coefficient type. The
+//! directives may come in any order; Metal's shaders compute in `f32`, `f16` and
+//! `bf16`, so `backend = Metal;` with `dtype = f64;` is an error, and the 16-bit
+//! types are real-only.
 //!
 //! Chains of elementwise tensor operations are fused into single kernels while
-//! the block expands — see [`fusion`]. A leading `fuse = false;` turns that off
-//! for the block.
+//! the block expands — see [`fusion`] — and each kernel is optimized by the
+//! shared `tensorcrate-fusion` crate. A leading `fuse = false;` turns fusion off
+//! for the block; `reassociate = false;` keeps it but forbids regrouping
+//! associative chains, so results match the unfused block bit for bit.
 //!
 //! Expansion runs in three stages around one tree, `ast`:
 //!
@@ -70,14 +72,14 @@ fn expand(input: TokenStream) -> syn::Result<TokenStream> {
     let block = types::check_block(&source, backend)?;
     let annotated = block.result.ty.rust_type(backend);
 
-    let unfused = emit::block(&block, backend, None)?;
+    let unfused = emit::block(&block, backend, None, directives.reassociate)?;
     // The block once as written and once fused. Both are emitted when they
     // differ, so `fused::Mode::Unfused` can still select the original at
     // runtime — the exact reference fusion is checked against, and a way to
     // rule fusion in or out when debugging.
     let body = if directives.fuse {
         let inline = fusion::plan_inlining(&block.bindings, &block.result);
-        let fused = emit::block(&block, backend, Some(inline))?;
+        let fused = emit::block(&block, backend, Some(inline), directives.reassociate)?;
         if fused.to_string() == unfused.to_string() {
             unfused
         } else {
@@ -146,17 +148,52 @@ mod tests {
         );
         assert!(
             expansion_error(quote! { backend = Metal; [1 + 1i] })
-                .contains("Metal backend supports real f32 values only")
+                .contains("Metal backend supports real values only")
         );
     }
 
     #[test]
+    fn static_kernels_are_optimized() {
+        // `exp(x)` is written twice and computed once.
+        let shared = expansion(quote! { backend = Metal; let x = [1, 2]; exp(x) * 2 + exp(x) / 3 });
+        assert_eq!(shared.matches("Analytic :: Exp").count(), 1, "{shared}");
+
+        // `x · 2 · 3` multiplies by one folded constant when chains may be
+        // regrouped, and twice when they may not.
+        // Counted among the program's instructions, not the unfused fallback.
+        let multiplies = |code: &str| code.matches("op : :: tensorcrate :: tensors :: BinaryOp :: Mul").count();
+        let folded = expansion(quote! { backend = Metal; let x = [1, 2]; x * 2 * 3 + x });
+        assert_eq!(multiplies(&folded), 1, "{folded}");
+        let exact = expansion(quote! { backend = Metal; reassociate = false; let x = [1, 2]; x * 2 * 3 + x });
+        assert_eq!(multiplies(&exact), 2, "{exact}");
+
+        // On the host the folded constant is computed once, before the loop.
+        let host = expansion(quote! { let x = [1, 2]; x * 2 * 3 + x });
+        assert!(host.contains("__fused_c"), "{host}");
+    }
+
+    #[test]
     fn dtype_directives_are_validated() {
-        assert!(expansion_error(quote! { dtype = f16; [1, 2] }).contains("dtype must be `f32`"));
+        assert!(
+            expansion_error(quote! { dtype = f8; [1, 2] })
+                .contains("dtype must be `f64`, `f32`, `f16` or `bf16`")
+        );
         assert!(
             expansion_error(quote! { backend = Metal; dtype = f64; [1, 2] })
-                .contains("Metal backend computes in f32")
+                .contains("Metal backend computes in f32, f16 or bf16")
         );
+        assert!(
+            expansion_error(quote! { dtype = bf16; [1 + 1i] })
+                .contains("complex and dual values need")
+        );
+        // Every float type expands, on either backend where it exists.
+        for dtype in [quote!(f64), quote!(f32), quote!(f16), quote!(bf16)] {
+            expansion(quote! { dtype = #dtype; let a = [1, 2]; sin(a * 2 + 1) - a });
+        }
+        for dtype in [quote!(f32), quote!(f16), quote!(bf16)] {
+            let metal = expansion(quote! { backend = Metal; dtype = #dtype; let a = [1, 2]; sin(a * 2 + 1) - a });
+            assert!(metal.contains("Program"), "{metal}");
+        }
         assert!(expansion_error(quote! { dtype = f32; dtype = f64; [1, 2] }).contains("set twice"));
         assert!(
             expansion_error(quote! { backend = Host; backend = Host; [1, 2] })
@@ -185,6 +222,13 @@ mod tests {
     #[test]
     fn fusion_directives_are_validated() {
         assert!(expansion_error(quote! { fuse = maybe; [1, 2] }).contains("`true` or `false`"));
+        assert!(
+            expansion_error(quote! { reassociate = 1; [1, 2] }).contains("reassociate must be")
+        );
+        assert!(
+            expansion_error(quote! { reassociate = true; reassociate = false; [1, 2] })
+                .contains("set twice")
+        );
         assert!(
             expansion_error(quote! { fuse = true; fuse = false; [1, 2] }).contains("set twice")
         );

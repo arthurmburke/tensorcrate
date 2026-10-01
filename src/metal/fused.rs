@@ -7,6 +7,7 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize};
 
 use super::MetalElement;
+use super::codegen;
 use super::device::with_gpu;
 use super::encode::{TENSOROPS_TILE_COLS, TENSOROPS_TILE_ROWS, TILE, dispatch_1d};
 use super::sync::{compute, queued};
@@ -58,9 +59,29 @@ pub(crate) fn fused_elementwise<T: MetalElement>(
     let filler = inputs.first().copied().unwrap_or(outputs[0]);
     with_gpu(|gpu| {
         let encoder = compute(gpu)?;
-        encoder.setComputePipelineState(&gpu.kernels::<T>().fused);
+        // A program seen before runs as a kernel of its own, reading its
+        // constants from slot 0; otherwise the interpreter reads the program.
+        let specialized = codegen::enabled()
+            .then(|| gpu.specialized::<T>(code))
+            .flatten();
+        match &specialized {
+            Some(pipeline) => {
+                let constants = codegen::constants(code);
+                let bytes = std::mem::size_of_val(constants.as_slice()).max(4);
+                encoder.setComputePipelineState(pipeline);
+                unsafe {
+                    let first = constants.first().unwrap_or(&0.0);
+                    encoder.setBytes_length_atIndex(NonNull::from(first).cast(), bytes, 0);
+                }
+            }
+            None => {
+                encoder.setComputePipelineState(&gpu.kernels::<T>().fused);
+                unsafe {
+                    encoder.setBytes_length_atIndex(NonNull::from(&code[0]).cast(), code_bytes, 0);
+                }
+            }
+        }
         unsafe {
-            encoder.setBytes_length_atIndex(NonNull::from(&code[0]).cast(), code_bytes, 0);
             encoder.setBytes_length_atIndex(
                 NonNull::from(&shape).cast(),
                 size_of::<FusedShape>(),

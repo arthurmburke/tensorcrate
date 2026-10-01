@@ -204,7 +204,7 @@ pub(crate) enum Function {
 }
 
 impl Function {
-    const ALL: [Function; 14] = [
+    pub(crate) const ALL: [Function; 14] = [
         Function::Sin,
         Function::Cos,
         Function::Tan,
@@ -225,6 +225,12 @@ impl Function {
         Self::ALL
             .into_iter()
             .find(|function| function.name() == name)
+    }
+
+    /// Its `tensorcrate::tensors::Analytic` code, which is its place in
+    /// [`ALL`](Self::ALL).
+    pub(crate) fn code(self) -> u16 {
+        Self::ALL.iter().position(|&f| f == self).unwrap() as u16
     }
 
     /// The name it is called by, which is also the method implementing it.

@@ -580,3 +580,89 @@ fn relaxed_matmul_stays_close_to_the_exact_product() {
         );
     }
 }
+
+/// A program run twice is compiled into a kernel of its own, which must
+/// compute what the interpreter does: for every element type, through remapped
+/// loads, an in-place update and compact storage.
+#[test]
+fn specialized_kernels_match_the_interpreter() {
+    use super::codegen::set_fused_codegen;
+    use super::device::Specialized;
+    use crate::tensors::fused::{Builder, DType, Element, Fusable, Remap};
+    use crate::tensors::{Analytic, Compare, Host, Matrix, Metal, Vector};
+
+    fn check<T: super::MetalElement + Element>(tolerance: f64) {
+        const ROWS: usize = 37;
+        const COLS: usize = 53;
+        let len = ROWS * COLS;
+        let values = |seed: usize, n: usize| -> Vec<T> {
+            (0..n)
+                .map(|i| {
+                    T::from_f64((((i * 2654435761 + seed * 40503) % 1000) as f64 / 500.0) - 1.0)
+                })
+                .collect()
+        };
+        let x = Matrix::<T>::from_flat(ROWS, COLS, values(1, len)).to_backend::<Metal>();
+        if !x.is_device_resident() {
+            eprintln!("no Metal device; skipping the specialized-kernel check");
+            return;
+        }
+        let t = Matrix::<T>::from_flat(COLS, ROWS, values(2, len)).to_backend::<Metal>();
+        let row = Vector::<T>::new(values(3, COLS)).to_backend::<Metal>();
+        let start = Matrix::<T>::from_flat(ROWS, COLS, values(4, len)).to_backend::<Metal>();
+
+        let mut b = Builder::<T>::new();
+        let xv = b.input(T::DTYPE);
+        let tv = b.input_remapped(T::DTYPE, Remap::Transpose);
+        let rv = b.input_remapped(T::DTYPE, Remap::Row);
+        let acc = b.update(T::DTYPE);
+        let product = b.mul(xv, tv);
+        let shifted = b.add(product, rv);
+        let squashed = b.unary(Analytic::Tanh, shifted);
+        let zero = b.constant(T::from_f64(0.25));
+        let floor = b.compare(Compare::Max, squashed, zero);
+        let step = b.scale(floor, T::from_f64(0.5));
+        let next = b.add(acc, step);
+        b.set(0, next);
+        b.output(squashed, DType::F32);
+        let program = b.build().unwrap();
+
+        let run = |codegen: bool| {
+            set_fused_codegen(codegen);
+            let mut state = start.clone();
+            let inputs: [&dyn Fusable<Metal>; 3] = [&x, &t, &row];
+            let mut out = program.run((ROWS, COLS), &inputs, &mut [&mut state]);
+            let fresh = out.remove(0).into_matrix::<f32>().to_backend::<Host>();
+            set_fused_codegen(true);
+            (state.to_backend::<Host>(), fresh)
+        };
+        let (want_state, want_fresh) = run(false);
+        for round in 0..3 {
+            let (state, fresh) = run(true);
+            for (got, want) in state.as_slice().iter().zip(want_state.as_slice()) {
+                let (got, want) = (got.into_f64(), want.into_f64());
+                assert!(
+                    (got - want).abs() <= tolerance * (1.0 + want.abs()),
+                    "round {round}: state {got} vs {want}"
+                );
+            }
+            for (got, want) in fresh.as_slice().iter().zip(want_fresh.as_slice()) {
+                assert!(
+                    (got - want).abs() <= tolerance as f32 * (1.0 + want.abs()),
+                    "round {round}: output {got} vs {want}"
+                );
+            }
+        }
+        let compiled = GPU.with(|cell| {
+            let gpu = cell.get().and_then(Option::as_ref).unwrap();
+            gpu.specialized
+                .borrow()
+                .values()
+                .any(|entry| matches!(entry, Specialized::Ready(_)))
+        });
+        assert!(compiled, "the repeated program was never compiled");
+    }
+    check::<f32>(1e-5);
+    check::<f16>(4e-3);
+    check::<bf16>(2e-2);
+}

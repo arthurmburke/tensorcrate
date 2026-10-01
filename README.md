@@ -112,7 +112,8 @@ expanded code.
 
 ### Literals and types
 
-- Unsuffixed numbers are `f64`, or `f32` in a block that starts with `dtype = f32;`.
+- Unsuffixed numbers are `f64`, or the block's type when it starts with a `dtype` directive:
+  `dtype = f32;`, `dtype = f16;` or `dtype = bf16;`.
 - `2i` means the imaginary value `2i`.
 - `1d` means the dual infinitesimal `1ε`; `d` is used because Rust reserves `e` in numeric
   exponents.
@@ -230,7 +231,8 @@ sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
 xcodebuild -downloadComponent MetalToolchain
 ```
 
-`backend = Metal;` emits real `f32` tensors directly on the Metal backend. Every tensor created in
+`backend = Metal;` emits real tensors directly on the Metal backend, `f32` unless a `dtype`
+directive picks `f16` or `bf16`. Every tensor created in
 the block and every tensor intermediate stays on that backend when the operation has a resident
 kernel:
 
@@ -246,9 +248,9 @@ let values: Vector<f32, Metal> = math! {
 };
 ```
 
-Host blocks compute in `f64` unless a `dtype = f32;` directive says otherwise; it may come before or
-after a backend directive, and changes only the coefficient type, so complex and dual values become
-`Complex<f32>` and `Dual<f32>`:
+Host blocks compute in `f64` unless a `dtype` directive says otherwise — `f32`, `f16` or `bf16`. It
+may come before or after a backend directive, and changes only the coefficient type, so complex and
+dual values become `Complex<f32>` and `Dual<f32>`; the 16-bit types are real-only:
 
 ```rust
 use tensorcrate::math;
@@ -260,8 +262,10 @@ let product: Matrix<f32, Host> = math! {
 };
 ```
 
-Metal blocks use `f32` because the shaders are 32-bit (so `dtype = f64;` with `backend = Metal;` is
-rejected), and reject complex (`i`) and dual (`d`) literals. `pow`, `det`, and `inv` currently make an explicit Host round trip because they do not
+Metal blocks compute in `f32`, `f16` or `bf16`, the types the shaders are compiled for (so
+`dtype = f64;` with `backend = Metal;` is rejected), and reject complex (`i`) and dual (`d`)
+literals. A 16-bit block stays in its type end to end: its literals, its tensors and its fused
+kernels. `pow`, `det`, and `inv` currently make an explicit Host round trip because they do not
 have resident Metal kernels; the result is converted back to Metal when it is a tensor. Use the
 regular tensor API for runtime-built shapes and autodiff tapes.
 
@@ -295,16 +299,23 @@ let out: Matrix<f32, Metal> = math! {
   is cheap: at most four operations and no transcendental functions.
 - Consecutive independent elementwise `let`s of the same shape are computed together by one
   kernel that writes all of them.
-- On `Host` a fused chain becomes a single loop that LLVM vectorizes. It performs the same
-  operations in the same order as the unfused code, so the result is identical bit for bit. On
-  `Metal` it becomes one fused program for the bytecode shader. The macro allocates its registers
-  and splits any chain that would exceed the shader's limits, so a block that compiles always fits.
+- Every fused kernel is optimized as the block expands, by the same optimizer that compiles
+  runtime programs (see [Fused elementwise programs](#fused-elementwise-programs)): a value
+  written twice is computed once, chains are regrouped and their constants folded, and the
+  cheapest equivalent program under a cost model is kept.
+- On `Host` a fused chain becomes a single loop that LLVM vectorizes, in the block's type. With
+  `reassociate = false;` it performs the same operations in the same order as the unfused code, so
+  the result is identical bit for bit; by default it may regroup associative chains, and agrees to
+  rounding. On `Metal` it becomes one fused program — `f32`, `f16` or `bf16` — which the GPU runs
+  as a kernel compiled for it. The macro allocates its registers and splits any chain that would
+  exceed the shader's limits, so a block that compiles always fits.
 - On `Metal`, a chain that reads a matrix product written inline, such as `tanh(x @ w + b)`, runs
   as that product's epilogue: the product, bias and activation are one dispatch.
 
 Products, reductions, sorts, `pow`, and complex or dual values are not fused; they run as before,
 and the fused chains around them read their results. Fusion is on by default.
-`fuse = false;` turns it off for one block. `fused::with_mode(Mode::Unfused, || ...)` turns it off
+`fuse = false;` turns it off for one block, and `reassociate = false;` keeps it but forbids
+regrouping, for results identical to the unfused block. `fused::with_mode(Mode::Unfused, || ...)` turns it off
 at runtime for every block on the current thread. Each block keeps its unfused form for that, which
 is also the reference the fused form is tested against.
 
@@ -759,10 +770,30 @@ let y = program.run_vectors(&[&Vector::new([3.0f32, 0.0]), &Vector::new([1.0f32,
 assert_eq!(y[0].as_slice(), [2.0, 1.0]);
 ```
 
-- On `Host`, a program runs as a tile interpreter over the existing SIMD kernels, and the result
-  is identical, bit for bit, to running the same operations unfused. On `Metal`, a single
-  bytecode shader interprets the program per thread. Like the other shaders it uses fast math, so
-  it agrees with the host within tolerance rather than exactly.
+- `build` optimizes the program. It considers equivalent programs — common subexpressions merged,
+  exact identities such as `x · 1 = x` applied, associative chains regrouped (balanced for a
+  shorter critical path, or left-deep for fewer registers) with their constants folded, constants
+  and loads recomputed where that frees registers, and many instruction orders — and keeps the
+  cheapest under the cost model
+
+  ```text
+  C = α · instructions + β · peak registers + γ · critical path + δ · memory traffic
+    + ε · special operations
+  ```
+
+  `fused::CostModel` has presets for the host interpreter and for compiled GPU kernels;
+  `Builder::build_with(&model, algebra)` takes any, and `program.cost(&model)` reports a program's
+  terms. Plans are cached by program structure, so a program rebuilt every step with new
+  constants — an optimizer's — is optimized once.
+- Regrouping (`fused::Algebra::Reassociate`, the default) can change results by rounding;
+  `fused::with_algebra(Algebra::Exact, || ...)` allows only rewrites that leave every bit as
+  written. Either way a program fused and the same program run unfused agree exactly on the host.
+- On `Host`, a program runs as a tile interpreter over the existing SIMD kernels, reading inputs
+  and writing outputs in place. On `Metal`, a program seen once runs on a bytecode interpreter;
+  from its second run it is compiled into a kernel of its own — straight-line code with every
+  operation and storage type fixed — and cached. A 9-operation GELU over a million elements takes
+  11 µs that way on an M5 Max, against 158 µs interpreted. Like the other shaders these use fast
+  math, so Metal agrees with the host within tolerance rather than exactly.
 - Loads can read a transposed matrix or broadcast a row or column vector without materializing it.
   Each input and output can be stored as `f32`, `f16`, `bf16` or `f64`, independently of the
   arithmetic, which runs in the program's element type: `Program<T>` and `Builder<T>` default to

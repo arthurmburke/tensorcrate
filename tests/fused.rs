@@ -8,7 +8,7 @@
 use half::{bf16, f16};
 use tensorcrate::optim::{AdaGrad, Adam, Momentum, Parameter, RmsProp, Rule, Sgd};
 use tensorcrate::tensors::fused::{
-    self, Builder, DType, Fusable, Instr, Mode, Program, ProgramError, Remap, Value,
+    self, Algebra, Builder, DType, Fusable, Instr, Mode, Program, ProgramError, Remap, Value,
 };
 use tensorcrate::tensors::{Analytic, BinaryOp, Compare, Host, Kernels, Matrix, Vector};
 
@@ -157,14 +157,36 @@ mod reference {
 }
 
 /// Drive every rule and its reference side by side for several steps, with a
-/// fresh gradient each step, and demand identical bits after each one.
+/// fresh gradient each step: under [`Algebra::Exact`] they must agree bit for
+/// bit after each one, and under [`Algebra::Reassociate`] — which may regroup
+/// the update's arithmetic — to within rounding.
 fn rules_match_their_references<P: Parameter<Elem = f32>>(
     start: &P,
     gradients: &[P],
     bits: impl Fn(&P) -> Vec<f32>,
 ) {
-    let same = |a: &P, b: &P, what: &str| assert_bits_eq(&bits(a), &bits(b), what);
+    fused::with_algebra(Algebra::Exact, || {
+        rules_agree(start, gradients, &|a: &P, b: &P, what: &str| {
+            assert_bits_eq(&bits(a), &bits(b), what)
+        })
+    });
+    fused::with_algebra(Algebra::Reassociate, || {
+        rules_agree(start, gradients, &|a: &P, b: &P, what: &str| {
+            for (i, (x, y)) in bits(a).iter().zip(bits(b)).enumerate() {
+                assert!(
+                    (x - y).abs() <= 1e-5 * (1.0 + y.abs()),
+                    "{what}, reassociated: element {i} is {x}, expected {y}"
+                );
+            }
+        })
+    });
+}
 
+fn rules_agree<P: Parameter<Elem = f32>>(
+    start: &P,
+    gradients: &[P],
+    same: &dyn Fn(&P, &P, &str),
+) {
     let (mut fused, mut unfused) = (start.duplicate(), start.duplicate());
     let mut rule = Sgd::new(0.05);
     for g in gradients {
@@ -684,20 +706,32 @@ fn the_builder_reuses_registers_once_values_die() {
     let program = b.build().unwrap();
     assert!(program.registers() <= 2, "{program}");
 
-    // Seventeen values all live at once cannot fit.
-    let mut b = Builder::new();
-    let values: Vec<Value> = (0..17).map(|i| b.constant(i as f32)).collect();
-    for (k, &value) in values.iter().enumerate().take(8) {
-        let _ = k;
-        b.output(value, DType::F32);
-    }
-    let mut sum = values[8];
-    for &value in &values[9..] {
-        sum = b.add(sum, value);
-    }
-    b.output(sum, DType::F32);
-    // Eight stored values plus the nine summed ones are 17 live at the first add.
-    assert_eq!(b.build(), Err(ProgramError::TooManyRegisters));
+    // Seventeen shared values, summed in one order and multiplied in the
+    // other: whichever chain runs first, every value is still owed to the
+    // other one, so all seventeen are live at once and cannot fit.
+    let build = |algebra: Algebra| {
+        let mut b = Builder::<f32>::new();
+        let inputs: Vec<Value> = (0..16).map(|_| b.input(DType::F32)).collect();
+        let mut values: Vec<Value> = inputs.iter().map(|&x| b.unary(Analytic::Sqrt, x)).collect();
+        let both = b.mul(inputs[0], inputs[1]);
+        values.push(b.unary(Analytic::Sqrt, both));
+        let mut sum = values[0];
+        for &value in &values[1..] {
+            sum = b.add(sum, value);
+        }
+        let mut product = values[16];
+        for &value in values[..16].iter().rev() {
+            product = b.mul(product, value);
+        }
+        b.output(sum, DType::F32);
+        b.output(product, DType::F32);
+        b.build_with(&fused::CostModel::BALANCED, algebra)
+    };
+    assert_eq!(build(Algebra::Exact), Err(ProgramError::TooManyRegisters));
+    // Reassociating puts both chains in one canonical order, so each value can
+    // be added and multiplied in as soon as it is computed.
+    let program = build(Algebra::Reassociate).expect("reassociated, it fits");
+    assert!(program.registers() <= fused::REGISTERS, "{program}");
 }
 
 #[test]
@@ -734,12 +768,24 @@ fn an_adam_step_is_one_kernel_with_no_allocations() {
     assert_eq!(steady.allocations, 0);
     assert_eq!(steady.bytes, 7 * n as u64 * 4);
 
-    // Unfused, the same step was fourteen kernels moving 33n floats.
+    // Unfused, the step as written is fourteen kernels moving 33n floats. The
+    // rule builds its programs when it is created, so that is when the algebra
+    // is chosen.
+    let mut exact = fused::with_algebra(Algebra::Exact, || Adam::new(0.01));
+    exact.update(&mut parameters, &gradient);
     let ((), unfused) = counters::measure(|| {
-        fused::with_mode(Mode::Unfused, || rule.update(&mut parameters, &gradient))
+        fused::with_mode(Mode::Unfused, || exact.update(&mut parameters, &gradient))
     });
     assert_eq!(unfused.kernels, 14);
     assert_eq!(unfused.bytes, 33 * n as u64 * 4);
+
+    // Reassociated, the bias correction and the rate fold into one constant,
+    // which saves a whole pass even before fusion.
+    let ((), regrouped) = counters::measure(|| {
+        fused::with_mode(Mode::Unfused, || rule.update(&mut parameters, &gradient))
+    });
+    assert!(regrouped.kernels < 14, "{regrouped:?}");
+    assert!(regrouped.bytes < 33 * n as u64 * 4, "{regrouped:?}");
 }
 
 // ---- Metal against the host -----------------------------------------------------------
@@ -1040,4 +1086,89 @@ fn metal_matmul_epilogues_agree_with_the_host_on_both_product_kernels() {
         }
     }
     tensorcrate::metal::set_tensorops(true);
+}
+
+// ---- uniforms ---------------------------------------------------------------------
+
+/// `exp(x · (u − 1)) · u + c`: one uniform read directly, and folded with
+/// constants into another constant.
+fn uniform_program(u: f32) -> (Program, Program) {
+    let build = |uniform: bool| {
+        let mut b = Builder::<f32>::new();
+        let x = b.input(DType::F32);
+        let u = if uniform { b.uniform(u) } else { b.constant(u) };
+        let one = b.constant(1.0);
+        let less = b.sub(u, one);
+        let scaled = b.mul(x, less);
+        let grown = b.unary(Analytic::Exp, scaled);
+        let weighted = b.mul(grown, u);
+        let shifted = b.shift(weighted, 0.25);
+        b.output(shifted, DType::F32);
+        fused::with_algebra(Algebra::Exact, || b.build().unwrap())
+    };
+    (build(true), build(false))
+}
+
+#[test]
+fn a_uniform_set_after_building_matches_a_program_built_with_it() {
+    let x = Vector::new(Lcg(3).vector(100, -1.0, 1.0));
+    let (mut program, _) = uniform_program(0.5);
+    assert_eq!(program.uniforms(), [0.5]);
+    for value in [0.5f32, 2.0, -3.25, 1.0, 0.0] {
+        program.set_uniform(0, value);
+        assert_eq!(program.uniforms(), [value]);
+        let (_, constant) = uniform_program(value);
+        let got = program.run_vectors(&[&x]).remove(0);
+        let want = constant.run_vectors(&[&x]).remove(0);
+        assert_bits_eq(got.as_slice(), want.as_slice(), &format!("uniform {value}"));
+    }
+}
+
+#[test]
+#[should_panic(expected = "uniform 1 out of 1")]
+fn setting_a_missing_uniform_panics() {
+    let (mut program, _) = uniform_program(0.5);
+    program.set_uniform(1, 2.0);
+}
+
+#[test]
+fn adam_coefficients_set_after_creation_take_effect() {
+    let mut rng = Lcg(5);
+    let gradients: Vec<_> = (0..3).map(|_| Vector::new(rng.vector(64, -1.0, 1.0))).collect();
+    let start = Vector::new(rng.vector(64, -1.0, 1.0));
+
+    let mut direct = Adam::new(0.01);
+    direct.first_decay = 0.8;
+    let mut changed = Adam::new(0.5);
+    changed.rate = 0.01;
+    changed.first_decay = 0.8;
+    let (mut a, mut b) = (start.clone(), start.clone());
+    for g in &gradients {
+        direct.update(&mut a, g);
+        changed.update(&mut b, g);
+        assert_bits_eq(a.as_slice(), b.as_slice(), "coefficients changed after creation");
+    }
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+fn a_uniform_set_after_building_reaches_the_gpu() {
+    let host = Vector::new(Lcg(9).vector(4096, -1.0, 1.0));
+    let x = host.to_backend::<Metal>();
+    if !x.is_device_resident() {
+        return;
+    }
+    let (mut program, _) = uniform_program(0.5);
+    // Several runs per value, so the specialized kernel is compiled and reused
+    // across values.
+    for value in [0.5f32, 2.0, -3.25] {
+        program.set_uniform(0, value);
+        let want = program.run_vectors(&[&host]).remove(0);
+        for _ in 0..3 {
+            let got = program.run_vectors(&[&x]).remove(0).to_backend::<Host>();
+            for (i, (&a, &e)) in got.as_slice().iter().zip(want.as_slice()).enumerate() {
+                assert!(close(a, e), "uniform {value}, element {i}: {a} vs {e}");
+            }
+        }
+    }
 }

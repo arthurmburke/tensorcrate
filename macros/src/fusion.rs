@@ -32,15 +32,26 @@
 //! shape and do not depend on one another are fused *horizontally*: one kernel
 //! computes them all, reading the inputs they share only once.
 //!
+//! # Optimization
+//!
+//! A group becomes a graph for the optimizer the library uses at run time
+//! (`tensorcrate-fusion`), which picks the cheapest equivalent program under a
+//! cost model: subexpressions written twice computed once, exact identities
+//! applied, and — unless the block says `reassociate = false;` — associative
+//! chains regrouped with their constants folded. Folded constants are scalars,
+//! computed once before the kernel in the block's type.
+//!
 //! # Code generation
 //!
 //! On the host a group becomes one closure over the element index, which LLVM
-//! vectorizes; it performs exactly the operations the unfused kernels would, in
-//! the same order, so its results are identical bit for bit. On Metal a group
-//! becomes a register [`Program`](tensorcrate::tensors::fused::Program) for the
-//! fused bytecode shader. The macro allocates its registers itself and splits a
-//! group that would exceed the shader's register or input limits, so those
-//! limits are met by construction rather than checked at runtime.
+//! vectorizes, computing the optimized program in the block's type. Without
+//! reassociation it performs exactly the operations the unfused kernels would,
+//! in the same order, so its results are identical bit for bit. On Metal a
+//! group becomes a register [`Program`](tensorcrate::tensors::fused::Program)
+//! in the block's type — `f32`, `f16` or `bf16` — allocated by the optimizer,
+//! which a group that would exceed the shader's register or input limits is
+//! split to fit, so those limits are met by construction rather than checked
+//! at runtime.
 //!
 //! When that program is the only kernel at its site and reads a product of two
 //! matrices written inline (`tanh(x @ w + b)`), it runs as the product's
@@ -49,8 +60,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use proc_macro2::{Ident, Literal, Span, TokenStream};
+use proc_macro2::{Ident, Span, TokenStream};
 use quote::{format_ident, quote};
+use tensorcrate_fusion as opt;
 
 use crate::ast::{Arith, Binding, Builtin, Expr, ExprKind, Function};
 use crate::emit::{Env, lower};
@@ -467,7 +479,7 @@ pub(crate) fn try_fuse_horizontally(
     }
     if backend.is_metal() {
         let nodes: Vec<&Node> = roots.iter().map(|root| &root.node).collect();
-        if allocate(&nodes).is_err() {
+        if plan(&site, &nodes).is_err() {
             // Splitting would only trade this kernel for several; leave the
             // bindings to fuse one by one.
             return Ok(None);
@@ -524,9 +536,10 @@ fn extent(shape: Shape) -> (usize, usize) {
 
 /// Bind every leaf and scalar, check `clamp` bounds, then run the kernels.
 fn emit(mut site: Site<'_>, roots: Vec<Root>) -> syn::Result<TokenStream> {
-    let kernels = match site.backend {
-        BackendChoice::Metal => emit_metal(&mut site, roots)?,
-        BackendChoice::Host | BackendChoice::HostF32 => emit_host(&site, &roots),
+    let kernels = if site.backend.is_metal() {
+        emit_metal(&mut site, roots)?
+    } else {
+        emit_host(&site, &roots)
     };
     let bind_leaves = site.leaves.iter().filter_map(|leaf| {
         let ident = &leaf.ident;
@@ -559,17 +572,183 @@ fn emit(mut site: Site<'_>, roots: Vec<Root>) -> syn::Result<TokenStream> {
     }})
 }
 
-/// The host form: one loop over the elements computing every root, which is
-/// the same arithmetic as the unfused kernels in the same order.
+// ---- the optimizer ------------------------------------------------------------------
+
+/// Why a group did not fit one program.
+struct DoesNotFit;
+
+/// The optimizer's graph for `roots`, and the leaf each of its input slots reads.
+///
+/// Each operation becomes the one the unfused kernels run: negation is
+/// multiplication by `−1`, which flips the sign exactly, zeros included, and
+/// `clamp` is `max` with the lower bound, then `min` with the upper.
+fn graph(site: &Site<'_>, roots: &[&Node]) -> (opt::Graph, Vec<usize>) {
+    let mut inputs = Vec::new();
+    for root in roots {
+        root.leaves(&mut inputs);
+    }
+    fn push(nodes: &mut Vec<opt::Node>, node: opt::Node) -> opt::Value {
+        nodes.push(node);
+        nodes.len() - 1
+    }
+    fn build(
+        node: &Node,
+        site: &Site<'_>,
+        inputs: &[usize],
+        nodes: &mut Vec<opt::Node>,
+    ) -> opt::Value {
+        match node {
+            Node::Leaf(leaf) => {
+                let slot = inputs.iter().position(|i| i == leaf).unwrap() as u8;
+                let remap = u8::from(site.leaves[*leaf].transposed);
+                push(nodes, opt::Node::Load { slot, remap })
+            }
+            Node::Scalar(i) => push(nodes, opt::Node::Const(opt::Scalar::Named(*i as u32))),
+            Node::Binary(op, a, b) => {
+                let (a, b) = (build(a, site, inputs, nodes), build(b, site, inputs, nodes));
+                push(nodes, opt::Node::Binary(bin(*op), a, b))
+            }
+            Node::Neg(a) => {
+                let a = build(a, site, inputs, nodes);
+                let minus_one = push(nodes, opt::Node::Const(opt::Scalar::literal(-1.0)));
+                push(nodes, opt::Node::Binary(opt::Bin::Mul, a, minus_one))
+            }
+            Node::Unary(function, a) => {
+                let a = build(a, site, inputs, nodes);
+                push(nodes, opt::Node::Unary(opt::Function(function.code()), a))
+            }
+            Node::MinMax(max, a, b) => {
+                let (a, b) = (build(a, site, inputs, nodes), build(b, site, inputs, nodes));
+                let op = if *max { opt::Cmp::Max } else { opt::Cmp::Min };
+                push(nodes, opt::Node::Cmp(op, a, b))
+            }
+            Node::Clamp(a, low, high) => {
+                let a = build(a, site, inputs, nodes);
+                let low = push(nodes, opt::Node::Const(opt::Scalar::Named(*low as u32)));
+                let raised = push(nodes, opt::Node::Cmp(opt::Cmp::Max, a, low));
+                let high = push(nodes, opt::Node::Const(opt::Scalar::Named(*high as u32)));
+                push(nodes, opt::Node::Cmp(opt::Cmp::Min, raised, high))
+            }
+        }
+    }
+    let mut nodes = Vec::new();
+    let stores = roots
+        .iter()
+        .enumerate()
+        .map(|(output, root)| opt::Store {
+            value: build(root, site, &inputs, &mut nodes),
+            output: output as u8,
+        })
+        .collect();
+    let size = site.backend.dtype.size();
+    let graph = opt::Graph {
+        nodes,
+        stores,
+        input_bytes: vec![size; inputs.len()],
+        output_bytes: vec![size; roots.len()],
+    };
+    (graph, inputs)
+}
+
+fn bin(op: Arith) -> opt::Bin {
+    match op {
+        Arith::Add => opt::Bin::Add,
+        Arith::Sub => opt::Bin::Sub,
+        Arith::Mul => opt::Bin::Mul,
+        Arith::Div => opt::Bin::Div,
+        Arith::Rem => opt::Bin::Rem,
+    }
+}
+
+/// The cheapest program computing `roots` on the site's backend, with the
+/// leaf each input slot reads.
+///
+/// On the host the kernel is a loop LLVM compiles, so only the cost model's
+/// verdict matters; on Metal it must also fit the fused shader's registers and
+/// instructions.
+fn plan(site: &Site<'_>, roots: &[&Node]) -> Result<(opt::Plan, Vec<usize>), DoesNotFit> {
+    let (graph, inputs) = graph(site, roots);
+    let metal = site.backend.is_metal();
+    if metal && (inputs.len() > MAX_INPUTS || roots.len() > MAX_OUTPUTS) {
+        return Err(DoesNotFit);
+    }
+    let options = opt::Options {
+        model: if metal {
+            opt::CostModel::METAL
+        } else {
+            opt::CostModel::HOST
+        },
+        reassociate: site.env.reassociate,
+        max_registers: if metal { REGISTERS } else { usize::MAX },
+        max_instructions: if metal { MAX_INSTRUCTIONS } else { usize::MAX },
+        ..opt::Options::default()
+    };
+    let plan = opt::optimize(&graph, &options).map_err(|_| DoesNotFit)?;
+    Ok((plan, inputs))
+}
+
+/// A constant as Rust of the block's type, evaluated where it is bound:
+/// literals rounded at compile time, the block's scalars by name, and folds in
+/// the element type, as the unfused kernels would have combined them.
+fn scalar_tokens(scalar: &opt::Scalar, site: &Site<'_>) -> TokenStream {
+    match scalar {
+        opt::Scalar::Literal(bits) => site.backend.dtype.literal(f64::from_bits(*bits)),
+        opt::Scalar::Named(i) => {
+            let ident = format_ident!("__fused_k{i}");
+            quote!(#ident)
+        }
+        // Negation as written, not as the multiplication by −1 it is folded as.
+        opt::Scalar::Binary(opt::Bin::Mul, a, b) if b.is(-1.0) || a.is(-1.0) => {
+            let value = scalar_tokens(if b.is(-1.0) { a } else { b }, site);
+            quote!((-#value))
+        }
+        opt::Scalar::Binary(op, a, b) => {
+            let (a, b) = (scalar_tokens(a, site), scalar_tokens(b, site));
+            let operator = binary_operator(*op);
+            quote!((#a #operator #b))
+        }
+    }
+}
+
+fn binary_operator(op: opt::Bin) -> TokenStream {
+    match op {
+        opt::Bin::Add => quote!(+),
+        opt::Bin::Sub => quote!(-),
+        opt::Bin::Mul => quote!(*),
+        opt::Bin::Div => quote!(/),
+        opt::Bin::Rem => quote!(%),
+    }
+}
+
+fn compare_variant(op: opt::Cmp) -> Ident {
+    let name = match op {
+        opt::Cmp::Min => "Min",
+        opt::Cmp::Max => "Max",
+        opt::Cmp::MaxShare => "MaxShare",
+        opt::Cmp::Less => "Less",
+        opt::Cmp::LessEqual => "LessEqual",
+        opt::Cmp::Greater => "Greater",
+        opt::Cmp::GreaterEqual => "GreaterEqual",
+    };
+    Ident::new(name, Span::call_site())
+}
+
+// ---- the host -----------------------------------------------------------------------
+
+/// The host form: one loop over the elements computing every root through
+/// the optimized program — the unfused kernels' arithmetic, in the same order
+/// unless the block allows reassociation, so without it the results are
+/// identical bit for bit.
 fn emit_host(site: &Site<'_>, roots: &[Root]) -> TokenStream {
+    let nodes: Vec<&Node> = roots.iter().map(|root| &root.node).collect();
+    let Ok((plan, inputs)) = plan(site, &nodes) else {
+        unreachable!("the host has no register or instruction limit")
+    };
     let element = site.element_type();
     let (rows, cols) = extent(roots[0].shape);
     let len = rows * cols;
 
-    let mut read = Vec::new();
-    for root in roots {
-        root.node.leaves(&mut read);
-    }
+    let mut read = inputs.clone();
     read.sort_unstable();
     let slices = read.iter().map(|&i| {
         let (ident, slice) = (&site.leaves[i].ident, format_ident!("__fused_s{i}"));
@@ -583,6 +762,70 @@ fn emit_host(site: &Site<'_>, roots: &[Root]) -> TokenStream {
             quote!(let #value: #element = #slice[__fused_i];)
         }
     });
+
+    // Folded constants are computed once, before the loop.
+    let mut hoisted = Vec::new();
+    let value = |v: opt::Value| format_ident!("__fused_v{v}");
+    let mut body = Vec::new();
+    for (at, node) in plan.graph.nodes.iter().enumerate() {
+        let is_minus_one =
+            |v: opt::Value| matches!(&plan.graph.nodes[v], opt::Node::Const(s) if s.is(-1.0));
+        let expr = match *node {
+            opt::Node::Load { slot, .. } => {
+                let x = format_ident!("__fused_x{}", inputs[usize::from(slot)]);
+                quote!(#x)
+            }
+            opt::Node::Const(ref scalar @ opt::Scalar::Binary(..)) => {
+                let ident = format_ident!("__fused_c{at}");
+                let folded = scalar_tokens(scalar, site);
+                hoisted.push(quote!(let #ident: #element = #folded;));
+                quote!(#ident)
+            }
+            opt::Node::Const(ref scalar) => scalar_tokens(scalar, site),
+            // Negation as the unfused code writes it.
+            opt::Node::Binary(opt::Bin::Mul, a, b) if is_minus_one(b) => {
+                let a = value(a);
+                quote!(-#a)
+            }
+            opt::Node::Binary(opt::Bin::Mul, a, b) if is_minus_one(a) => {
+                let b = value(b);
+                quote!(-#b)
+            }
+            opt::Node::Binary(op, a, b) => {
+                let (a, b, operator) = (value(a), value(b), binary_operator(op));
+                quote!(#a #operator #b)
+            }
+            opt::Node::Unary(function, a) => {
+                let function = Function::ALL[usize::from(function.0)];
+                let a = value(a);
+                let (trait_ident, method) = (
+                    Ident::new(function.trait_name(), Span::call_site()),
+                    Ident::new(function.name(), Span::call_site()),
+                );
+                // The same scalar function the unfused host kernel maps.
+                quote!(::tensorcrate::numbers::#trait_ident::#method(#a))
+            }
+            opt::Node::Cmp(op, a, b) => {
+                let (a, b) = (value(a), value(b));
+                match op {
+                    opt::Cmp::Min => quote!(#a.min(#b)),
+                    opt::Cmp::Max => quote!(#a.max(#b)),
+                    other => {
+                        let variant = compare_variant(other);
+                        quote!(::tensorcrate::tensors::Compare::#variant.value(#a, #b))
+                    }
+                }
+            }
+        };
+        let ident = value(at);
+        body.push(quote!(let #ident: #element = #expr;));
+    }
+    let results: Vec<Ident> = {
+        let mut stores = plan.graph.stores.clone();
+        stores.sort_by_key(|store| store.output);
+        stores.iter().map(|store| value(store.value)).collect()
+    };
+
     let bytes = (read.len() + roots.len()) * len;
     let size = quote!(::core::mem::size_of::<#element>());
     let record = {
@@ -599,15 +842,17 @@ fn emit_host(site: &Site<'_>, roots: &[Root]) -> TokenStream {
     };
 
     if let [root] = roots {
-        let value = host_expr(&root.node);
+        let result = &results[0];
         let tensor = wrap(quote!(__fused_out), root.shape);
         return quote! {
             #(#slices)*
+            #(#hoisted)*
             #record
             let __fused_out: ::std::vec::Vec<#element> = (0..#len)
                 .map(|__fused_i| {
                     #(#loads)*
-                    #value
+                    #(#body)*
+                    #result
                 })
                 .collect();
             #tensor
@@ -617,304 +862,26 @@ fn emit_host(site: &Site<'_>, roots: &[Root]) -> TokenStream {
     let outputs: Vec<Ident> = (0..roots.len())
         .map(|k| format_ident!("__fused_out{k}"))
         .collect();
-    let values = roots.iter().map(|root| host_expr(&root.node));
     let tensors = outputs
         .iter()
         .zip(roots)
         .map(|(out, root)| wrap(quote!(#out), root.shape));
-    let zero = Literal::f64_unsuffixed(0.0);
+    let zero = site.backend.dtype.literal(0.0);
     quote! {
         #(#slices)*
+        #(#hoisted)*
         #record
         #(let mut #outputs: ::std::vec::Vec<#element> = ::std::vec![#zero; #len];)*
         for __fused_i in 0..#len {
             #(#loads)*
-            #(#outputs[__fused_i] = #values;)*
+            #(#body)*
+            #(#outputs[__fused_i] = #results;)*
         }
         (#(#tensors),*)
     }
 }
 
-/// One element of a root, as Rust over the loaded leaves and the constants.
-fn host_expr(node: &Node) -> TokenStream {
-    match node {
-        Node::Leaf(i) => {
-            let value = format_ident!("__fused_x{i}");
-            quote!(#value)
-        }
-        Node::Scalar(i) => {
-            let value = format_ident!("__fused_k{i}");
-            quote!(#value)
-        }
-        Node::Binary(op, a, b) => {
-            let (a, b) = (host_expr(a), host_expr(b));
-            match op {
-                Arith::Add => quote!((#a + #b)),
-                Arith::Sub => quote!((#a - #b)),
-                Arith::Mul => quote!((#a * #b)),
-                Arith::Div => quote!((#a / #b)),
-                Arith::Rem => quote!((#a % #b)),
-            }
-        }
-        Node::Neg(a) => {
-            let a = host_expr(a);
-            quote!((-#a))
-        }
-        Node::Unary(function, a) => {
-            let a = host_expr(a);
-            let (trait_ident, method) = (
-                Ident::new(function.trait_name(), Span::call_site()),
-                Ident::new(function.name(), Span::call_site()),
-            );
-            // The same scalar function the unfused host kernel maps.
-            quote!(::tensorcrate::numbers::#trait_ident::#method(#a))
-        }
-        Node::MinMax(max, a, b) => {
-            let (a, b) = (host_expr(a), host_expr(b));
-            if *max {
-                quote!((#a).max(#b))
-            } else {
-                quote!((#a).min(#b))
-            }
-        }
-        Node::Clamp(a, low, high) => {
-            let a = host_expr(a);
-            let (low, high) = (
-                format_ident!("__fused_k{low}"),
-                format_ident!("__fused_k{high}"),
-            );
-            quote!((#a).max(#low).min(#high))
-        }
-    }
-}
-
-// ---- Metal: register allocation -------------------------------------------------------
-
-/// An instruction, before it becomes tokens.
-#[derive(Clone, Debug)]
-enum Ins {
-    Load { dst: u8, input: usize },
-    Const { dst: u8, value: Constant },
-    Binary { dst: u8, op: Arith, a: u8, b: u8 },
-    Unary { dst: u8, function: Function, a: u8 },
-    Cmp { dst: u8, max: bool, a: u8, b: u8 },
-    Store { src: u8, output: usize },
-}
-
-#[derive(Copy, Clone, Debug)]
-enum Constant {
-    Scalar(usize),
-    MinusOne,
-}
-
-/// Why a group did not fit one program.
-struct DoesNotFit;
-
-/// Linear register allocation over the trees, in Sethi–Ullman order: the
-/// operand that needs more registers is evaluated first, and a register is
-/// freed after the last instruction that reads it — which may then be the
-/// instruction's own destination, as every backend reads operands before it
-/// writes.
-struct Allocator<'a> {
-    inputs: &'a [usize],
-    free: Vec<u8>,
-    used: usize,
-    code: Vec<Ins>,
-    /// The register each input is loaded into, once it has been.
-    loaded: Vec<Option<u8>>,
-    /// Reads of each input still to come.
-    remaining: Vec<usize>,
-}
-
-/// Who is responsible for freeing an operand's register.
-enum Owner {
-    Temporary,
-    Input(usize),
-}
-
-fn count_reads(node: &Node, inputs: &[usize], counts: &mut [usize]) {
-    if let Node::Leaf(i) = node {
-        counts[inputs.iter().position(|j| j == i).unwrap()] += 1;
-    }
-    for child in node.children() {
-        count_reads(child, inputs, counts);
-    }
-}
-
-fn need(node: &Node) -> usize {
-    match node {
-        Node::Leaf(_) | Node::Scalar(_) => 1,
-        Node::Neg(a) | Node::Unary(_, a) => need(a),
-        Node::Clamp(a, ..) => need(a).max(2),
-        Node::Binary(_, a, b) | Node::MinMax(_, a, b) => {
-            let (a, b) = (need(a), need(b));
-            if a == b { a + 1 } else { a.max(b) }
-        }
-    }
-}
-
-impl Allocator<'_> {
-    fn allocate(&mut self) -> Result<u8, DoesNotFit> {
-        if let Some(reg) = self.free.pop() {
-            return Ok(reg);
-        }
-        if self.used == REGISTERS {
-            return Err(DoesNotFit);
-        }
-        self.used += 1;
-        Ok((self.used - 1) as u8)
-    }
-
-    fn release(&mut self, reg: u8, owner: Owner) {
-        match owner {
-            Owner::Temporary => self.free.push(reg),
-            Owner::Input(i) => {
-                if self.remaining[i] == 0 {
-                    self.free.push(reg);
-                }
-            }
-        }
-    }
-
-    fn constant(&mut self, value: Constant) -> Result<(u8, Owner), DoesNotFit> {
-        let dst = self.allocate()?;
-        self.code.push(Ins::Const { dst, value });
-        Ok((dst, Owner::Temporary))
-    }
-
-    fn eval(&mut self, node: &Node) -> Result<(u8, Owner), DoesNotFit> {
-        match node {
-            Node::Leaf(leaf) => {
-                let input = self.inputs.iter().position(|j| j == leaf).unwrap();
-                self.remaining[input] -= 1;
-                let reg = match self.loaded[input] {
-                    Some(reg) => reg,
-                    None => {
-                        let dst = self.allocate()?;
-                        self.code.push(Ins::Load { dst, input });
-                        self.loaded[input] = Some(dst);
-                        dst
-                    }
-                };
-                Ok((reg, Owner::Input(input)))
-            }
-            Node::Scalar(i) => self.constant(Constant::Scalar(*i)),
-            Node::Neg(a) => {
-                // `x · −1` flips the sign exactly, zeros included, where
-                // `0 − x` would turn `+0` into `+0`.
-                let a = self.eval(a)?;
-                let minus_one = self.constant(Constant::MinusOne)?;
-                self.combine(a, minus_one, |dst, a, b| Ins::Binary {
-                    dst,
-                    op: Arith::Mul,
-                    a,
-                    b,
-                })
-            }
-            Node::Unary(function, a) => {
-                let (a, owner) = self.eval(a)?;
-                self.release(a, owner);
-                let dst = self.allocate()?;
-                self.code.push(Ins::Unary {
-                    dst,
-                    function: *function,
-                    a,
-                });
-                Ok((dst, Owner::Temporary))
-            }
-            Node::Clamp(a, low, high) => {
-                // `x.max(low).min(high)`, as the clamp kernel computes it.
-                let a = self.eval(a)?;
-                let low = self.constant(Constant::Scalar(*low))?;
-                let raised = self.combine(a, low, |dst, a, b| Ins::Cmp {
-                    dst,
-                    max: true,
-                    a,
-                    b,
-                })?;
-                let high = self.constant(Constant::Scalar(*high))?;
-                self.combine(raised, high, |dst, a, b| Ins::Cmp {
-                    dst,
-                    max: false,
-                    a,
-                    b,
-                })
-            }
-            Node::Binary(op, a, b) => {
-                let (a, b) = self.both(a, b)?;
-                let op = *op;
-                self.combine(a, b, |dst, a, b| Ins::Binary { dst, op, a, b })
-            }
-            Node::MinMax(max, a, b) => {
-                let (a, b) = self.both(a, b)?;
-                let max = *max;
-                self.combine(a, b, |dst, a, b| Ins::Cmp { dst, max, a, b })
-            }
-        }
-    }
-
-    /// Evaluate two operands, the hungrier first, returning them in order.
-    #[allow(clippy::type_complexity)]
-    fn both(&mut self, a: &Node, b: &Node) -> Result<((u8, Owner), (u8, Owner)), DoesNotFit> {
-        if need(b) > need(a) {
-            let b = self.eval(b)?;
-            let a = self.eval(a)?;
-            Ok((a, b))
-        } else {
-            let a = self.eval(a)?;
-            let b = self.eval(b)?;
-            Ok((a, b))
-        }
-    }
-
-    fn combine(
-        &mut self,
-        (a, a_owner): (u8, Owner),
-        (b, b_owner): (u8, Owner),
-        instruction: impl FnOnce(u8, u8, u8) -> Ins,
-    ) -> Result<(u8, Owner), DoesNotFit> {
-        self.release(a, a_owner);
-        if b != a {
-            self.release(b, b_owner);
-        }
-        let dst = self.allocate()?;
-        self.code.push(instruction(dst, a, b));
-        Ok((dst, Owner::Temporary))
-    }
-}
-
-/// Allocate one program computing every root, or report that it does not fit.
-fn allocate(roots: &[&Node]) -> Result<(Vec<usize>, Vec<Ins>), DoesNotFit> {
-    let mut inputs = Vec::new();
-    for root in roots {
-        root.leaves(&mut inputs);
-    }
-    if inputs.len() > MAX_INPUTS || roots.len() > MAX_OUTPUTS {
-        return Err(DoesNotFit);
-    }
-    let mut remaining = vec![0; inputs.len()];
-    for root in roots {
-        count_reads(root, &inputs, &mut remaining);
-    }
-    let mut allocator = Allocator {
-        inputs: &inputs,
-        free: Vec::new(),
-        used: 0,
-        code: Vec::new(),
-        loaded: vec![None; inputs.len()],
-        remaining,
-    };
-    for (output, root) in roots.iter().enumerate() {
-        let (src, owner) = allocator.eval(root)?;
-        allocator.code.push(Ins::Store { src, output });
-        allocator.release(src, owner);
-    }
-    let code = allocator.code;
-    if code.len() > MAX_INSTRUCTIONS {
-        return Err(DoesNotFit);
-    }
-    Ok((inputs, code))
-}
+// ---- Metal ----------------------------------------------------------------------------
 
 /// The largest proper subtree of any root, by size, as a path of child
 /// indices from that root.
@@ -943,14 +910,15 @@ fn largest_subtree(roots: &[Root]) -> Option<(usize, Vec<usize>)> {
     best.map(|(_, r, path)| (r, path))
 }
 
-/// The Metal form: the macro allocates the program, splitting off subtrees
-/// into kernels of their own until every program fits the shader.
+/// The Metal form: the cheapest program that fits the fused shader, splitting
+/// off subtrees into kernels of their own until one does.
 fn emit_metal(site: &mut Site<'_>, mut roots: Vec<Root>) -> syn::Result<TokenStream> {
     let mut kernels = TokenStream::new();
     let shape = roots[0].shape;
     loop {
         let nodes: Vec<&Node> = roots.iter().map(|root| &root.node).collect();
-        if let Ok((mut inputs, mut code)) = allocate(&nodes) {
+        if let Ok((plan, mut inputs)) = plan(site, &nodes) {
+            let mut code = plan.code;
             // A program that is the site's only kernel can be the epilogue of
             // a product it reads, which then never reaches memory.
             let epilogue = kernels.is_empty() && as_epilogue(site, shape, &mut inputs, &mut code);
@@ -1005,7 +973,12 @@ fn operand_idents(ident: &Ident) -> (Ident, Ident) {
 /// Make the program the epilogue of a matrix product it reads, if it reads
 /// one untransposed over the program's own shape and no other kernel needs it:
 /// that leaf moves to input slot 0, where `run_matmul` supplies the product.
-fn as_epilogue(site: &mut Site<'_>, shape: Shape, inputs: &mut [usize], code: &mut [Ins]) -> bool {
+fn as_epilogue(
+    site: &mut Site<'_>,
+    shape: Shape,
+    inputs: &mut [usize],
+    code: &mut [opt::Instr],
+) -> bool {
     if !matches!(shape, Shape::Matrix(..)) {
         return false;
     }
@@ -1031,8 +1004,9 @@ fn as_epilogue(site: &mut Site<'_>, shape: Shape, inputs: &mut [usize], code: &m
         return false;
     }
     inputs.swap(0, slot);
-    for ins in code.iter_mut() {
-        if let Ins::Load { input, .. } = ins {
+    let slot = slot as u8;
+    for instr in code.iter_mut() {
+        if let opt::Instr::Load { slot: input, .. } = instr {
             if *input == 0 {
                 *input = slot;
             } else if *input == slot {
@@ -1048,53 +1022,51 @@ fn as_epilogue(site: &mut Site<'_>, shape: Shape, inputs: &mut [usize], code: &m
 fn metal_program(
     site: &Site<'_>,
     inputs: &[usize],
-    code: &[Ins],
+    code: &[opt::Instr],
     shape: Shape,
     outputs: &[Shape],
     epilogue: bool,
 ) -> TokenStream {
     let fused = quote!(::tensorcrate::tensors::fused);
-    let instructions = code.iter().map(|ins| match *ins {
-        Ins::Load { dst, input } => {
-            let remap = if site.leaves[inputs[input]].transposed {
+    let element = site.element_type();
+    let dtype = site.backend.dtype.fused_dtype();
+    let instructions = code.iter().map(|instr| match *instr {
+        opt::Instr::Load { dst, slot, remap } => {
+            let remap = if remap == 1 {
                 quote!(Transpose)
             } else {
                 quote!(Identity)
             };
-            let input = input as u8;
-            quote!(#fused::Instr::<f32>::Load { dst: #dst, input: #input, remap: #fused::Remap::#remap })
+            quote!(#fused::Instr::<#element>::Load { dst: #dst, input: #slot, remap: #fused::Remap::#remap })
         }
-        Ins::Const { dst, value } => {
-            let value = match value {
-                Constant::Scalar(i) => {
-                    let ident = format_ident!("__fused_k{i}");
-                    quote!(#ident)
-                }
-                Constant::MinusOne => quote!(-1.0f32),
-            };
-            quote!(#fused::Instr::<f32>::Const { dst: #dst, value: #value })
+        opt::Instr::Const { dst, ref value } => {
+            let value = scalar_tokens(value, site);
+            quote!(#fused::Instr::<#element>::Const { dst: #dst, value: #value })
         }
-        Ins::Binary { dst, op, a, b } => {
-            let op = match op {
-                Arith::Add => quote!(Add),
-                Arith::Sub => quote!(Sub),
-                Arith::Mul => quote!(Mul),
-                Arith::Div => quote!(Div),
-                Arith::Rem => quote!(Rem),
-            };
-            quote!(#fused::Instr::<f32>::Binary { dst: #dst, op: ::tensorcrate::tensors::BinaryOp::#op, a: #a, b: #b })
+        opt::Instr::Binary { dst, op, a, b } => {
+            let op = Ident::new(
+                match op {
+                    opt::Bin::Add => "Add",
+                    opt::Bin::Sub => "Sub",
+                    opt::Bin::Mul => "Mul",
+                    opt::Bin::Div => "Div",
+                    opt::Bin::Rem => "Rem",
+                },
+                Span::call_site(),
+            );
+            quote!(#fused::Instr::<#element>::Binary { dst: #dst, op: ::tensorcrate::tensors::BinaryOp::#op, a: #a, b: #b })
         }
-        Ins::Unary { dst, function, a } => {
+        opt::Instr::Unary { dst, function, a } => {
+            let function = Function::ALL[usize::from(function.0)];
             let variant = Ident::new(function.trait_name(), Span::call_site());
-            quote!(#fused::Instr::<f32>::Unary { dst: #dst, op: ::tensorcrate::tensors::Analytic::#variant, a: #a })
+            quote!(#fused::Instr::<#element>::Unary { dst: #dst, op: ::tensorcrate::tensors::Analytic::#variant, a: #a })
         }
-        Ins::Cmp { dst, max, a, b } => {
-            let op = if max { quote!(Max) } else { quote!(Min) };
-            quote!(#fused::Instr::<f32>::Cmp { dst: #dst, op: ::tensorcrate::tensors::Compare::#op, a: #a, b: #b })
+        opt::Instr::Cmp { dst, op, a, b } => {
+            let op = compare_variant(op);
+            quote!(#fused::Instr::<#element>::Cmp { dst: #dst, op: ::tensorcrate::tensors::Compare::#op, a: #a, b: #b })
         }
-        Ins::Store { src, output } => {
-            let output = output as u8;
-            quote!(#fused::Instr::<f32>::Store { src: #src, output: #output })
+        opt::Instr::Store { src, output } => {
+            quote!(#fused::Instr::<#element>::Store { src: #src, output: #output })
         }
     });
     let (rows, cols) = extent(shape);
@@ -1105,8 +1077,8 @@ fn metal_program(
     });
     let unpack = outputs.iter().map(|shape| {
         let into = match shape {
-            Shape::Vector(_) => quote!(into_vector::<f32>),
-            _ => quote!(into_matrix::<f32>),
+            Shape::Vector(_) => quote!(into_vector::<#element>),
+            _ => quote!(into_matrix::<#element>),
         };
         quote!(__fused_outputs.next().expect("one output per root").#into())
     });
@@ -1122,10 +1094,10 @@ fn metal_program(
         quote!(__fused_program.run::<::tensorcrate::tensors::Metal>((#rows, #cols), &[#(#operands),*], &mut []))
     };
     quote! {
-        let __fused_program = #fused::Program::<f32>::new(
+        let __fused_program = #fused::Program::<#element>::new(
             ::std::vec![#(#instructions),*],
-            ::std::vec![#fused::DType::F32; #input_count],
-            ::std::vec![#fused::DType::F32; #output_count],
+            ::std::vec![#dtype; #input_count],
+            ::std::vec![#dtype; #output_count],
             0,
         )
         .expect("math! allocates programs that fit the fused kernel");

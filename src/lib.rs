@@ -21,12 +21,14 @@
 /// matrix/vector products use `@`, vector `*` vector is a dot product, `.*` is
 /// explicit elementwise multiplication, and analytic and ordering functions
 /// map over tensors. A leading `backend = Metal;` selects resident `f32` Metal
-/// tensors, and `dtype = f32;` makes a host block compute in `f32`; `Host` with
-/// `f64` is the default.
+/// tensors, and `dtype = f32;` (or `f16`, `bf16`) makes a block compute in that
+/// type; `Host` with `f64` is the default, and Metal computes in `f32`, `f16`
+/// or `bf16`.
 ///
 /// Chains of elementwise tensor operations are fused into single kernels as the
-/// block expands, with identical results on the host; `fuse = false;` turns
-/// that off for one block, and
+/// block expands, and each kernel is optimized — regrouping associative chains
+/// unless `reassociate = false;` asks for results identical to the unfused
+/// block. `fuse = false;` turns fusion off for one block, and
 /// [`fused::with_mode`](crate::tensors::fused::with_mode) at runtime. See the
 /// fusion section of the README.
 pub use tensorcrate_macros::math;

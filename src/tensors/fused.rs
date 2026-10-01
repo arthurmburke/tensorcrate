@@ -38,20 +38,46 @@
 //! [`Program::new`] takes the instructions directly, for when the register
 //! assignment matters or the program comes from somewhere else.
 //!
+//! # Optimization
+//!
+//! [`Builder::build`] does not emit the operations as built: it hands them to
+//! the optimizer, which considers equivalent programs — common subexpressions
+//! merged, exact identities applied, associative chains regrouped with their
+//! constants folded, constants and loads recomputed where that frees a
+//! register, and many instruction orders — and keeps the one with the lowest
+//! cost under a [`CostModel`]:
+//!
+//! ```text
+//! C = α · instructions + β · peak registers + γ · critical path
+//!   + δ · memory traffic + ε · special operations
+//! ```
+//!
+//! [`Program::cost`] reports a program's terms, and [`Builder::build_with`]
+//! takes the model and the [`Algebra`]. Plans are cached per thread by the
+//! program's structure with its constants as placeholders, so a program
+//! rebuilt every step with new constants is optimized once.
+//!
 //! # Exactness
 //!
-//! A program performs, for every element, exactly the operations — in the
-//! program's own element type — the unfused chain would, in the same order. On the [`Host`] backend its result is
-//! therefore identical to the unfused one bit for bit — [`Mode::Unfused`]
-//! exists to check that, and the tests do. (The one gap is the sign of a zero
-//! from `Min`/`Max` when `−0.0` meets `+0.0`, which the unfused kernels do not
-//! pin down either; see [`Compare`].)
+//! A program performs, for every element, exactly the operations of its own
+//! instructions — in the program's own element type — in order. On the
+//! [`Host`] backend a program fused is therefore identical to the same program
+//! unfused bit for bit — [`Mode::Unfused`] exists to check that, and the tests
+//! do. (The one gap is the sign of a zero from `Min`/`Max` when `−0.0` meets
+//! `+0.0`, which the unfused kernels do not pin down either; see [`Compare`].)
+//!
+//! Against the operations as *built*, that holds under [`Algebra::Exact`],
+//! whose rewrites are all exact. Under [`Algebra::Reassociate`], the default,
+//! the optimizer may also regroup `(a + b) + c` as `a + (b + c)`, which can
+//! round differently.
 //!
 //! Metal builds its shaders with the compiler's fast-math defaults, fused ones
 //! included, and inside one kernel the compiler may contract `a·b + c` into a
 //! fused multiply-add across what used to be separate kernels. Metal results
 //! therefore agree with the host within the usual tolerance rather than
-//! exactly — the same promise the unfused Metal kernels make.
+//! exactly — the same promise the unfused Metal kernels make. A program run
+//! more than once on Metal is compiled into a kernel of its own rather than
+//! interpreted; it calls the interpreter's own functions, so the two agree.
 //!
 //! # Debugging
 //!
@@ -352,6 +378,12 @@ pub struct Program<T = f32> {
     outputs: Vec<DType>,
     updated: usize,
     registers: usize,
+    /// How many uniforms the program has: the first entries of `named`.
+    uniforms: usize,
+    /// The value of every named constant the optimizer saw, uniforms first.
+    named: Vec<T>,
+    /// The instructions whose constants are computed from uniforms, and how.
+    bound: Vec<(usize, optimizer::Scalar)>,
 }
 
 impl<T: Real> Program<T> {
@@ -443,7 +475,36 @@ impl<T: Real> Program<T> {
             outputs,
             updated,
             registers,
+            uniforms: 0,
+            named: Vec::new(),
+            bound: Vec::new(),
         })
+    }
+
+    /// The current value of every uniform, in declaration order (see
+    /// [`Builder::uniform`]). Empty for a hand-written program.
+    pub fn uniforms(&self) -> &[T] {
+        &self.named[..self.uniforms]
+    }
+
+    /// Set uniform `index` to `value`, and every constant computed from it.
+    ///
+    /// # Panics
+    ///
+    /// If the program has no uniform `index`.
+    #[track_caller]
+    pub fn set_uniform(&mut self, index: usize, value: T) {
+        assert!(
+            index < self.uniforms,
+            "fused program: uniform {index} out of {}",
+            self.uniforms
+        );
+        self.named[index] = value;
+        for (at, scalar) in &self.bound {
+            if let Instr::Const { value, .. } = &mut self.code[*at] {
+                *value = evaluate(scalar, &self.named);
+            }
+        }
     }
 
     /// The instructions.
@@ -883,6 +944,8 @@ pub struct Value(usize);
 enum Node<T> {
     Load(u8, Remap),
     Const(T),
+    /// Uniform number `k`, in declaration order.
+    Uniform(usize),
     Binary(BinaryOp, Value, Value),
     Unary(Analytic, Value),
     Cmp(Compare, Value, Value),
@@ -905,6 +968,8 @@ pub struct Builder<T = f32> {
     updates: Vec<(DType, Option<Value>)>,
     outputs: Vec<(DType, Value)>,
     loads: Vec<((u8, Remap), Value)>,
+    /// Each uniform's initial value, in declaration order.
+    uniforms: Vec<T>,
 }
 
 impl<T: Real> Default for Builder<T> {
@@ -915,6 +980,7 @@ impl<T: Real> Default for Builder<T> {
             updates: Vec::new(),
             outputs: Vec::new(),
             loads: Vec::new(),
+            uniforms: Vec::new(),
         }
     }
 }
@@ -978,6 +1044,23 @@ impl<T: Real> Builder<T> {
         self.push(Node::Const(value))
     }
 
+    /// A constant that can be changed after the program is built: the same for
+    /// every element, like [`constant`](Self::constant), but set again with
+    /// [`Program::set_uniform`] at the index this is (uniforms are numbered in
+    /// declaration order) without building the program again.
+    ///
+    /// This is what lets a program be built once and run with new scalars every
+    /// time — an optimizer's step size, or a bias correction that changes with
+    /// the step count. Arithmetic on uniforms and constants alone is folded
+    /// into the program's constants, so it runs once per
+    /// [`set_uniform`](Program::set_uniform), in the program's element type,
+    /// rather than once per element.
+    pub fn uniform(&mut self, value: T) -> Value {
+        self.uniforms.push(value);
+        let index = self.uniforms.len() - 1;
+        self.push(Node::Uniform(index))
+    }
+
     pub fn binary(&mut self, op: BinaryOp, a: Value, b: Value) -> Value {
         self.push(Node::Binary(op, a, b))
     }
@@ -1018,11 +1101,34 @@ impl<T: Real> Builder<T> {
         self.push(Node::Cmp(op, a, b))
     }
 
-    /// Allocate registers and validate.
+    /// Optimize, allocate registers and validate, with this thread's
+    /// [`Algebra`] and the [`CostModel::BALANCED`] cost model — a program is
+    /// built before anyone knows which backend will run it.
     ///
-    /// A register is freed after the last instruction that reads its value, so
-    /// a long chain needs only as many registers as it has values live at once.
+    /// The values are compiled to the cheapest equivalent program the
+    /// optimizer finds (see [`build_with`](Self::build_with)), which never
+    /// costs more than the operations in the order they were built.
     pub fn build(self) -> Result<Program<T>, ProgramError> {
+        self.build_with(&CostModel::BALANCED, algebra())
+    }
+
+    /// [`build`](Self::build) under a cost model and algebra of your choosing.
+    ///
+    /// The optimizer considers equivalent programs — common subexpressions
+    /// merged, exact identities applied, associative chains regrouped when
+    /// `algebra` allows, constants and loads recomputed rather than held, and
+    /// many instruction orders — and keeps the one with the lowest
+    ///
+    /// ```text
+    /// C = α · instructions + β · peak registers + γ · critical path
+    ///   + δ · memory traffic + ε · special operations
+    /// ```
+    ///
+    /// under `model`, among those that fit [`REGISTERS`] and
+    /// [`MAX_INSTRUCTIONS`]. Plans are cached per thread by the program's
+    /// structure, with constants as placeholders, so a program rebuilt every
+    /// step with new constants — an optimizer's — is optimized once.
+    pub fn build_with(self, model: &CostModel, algebra: Algebra) -> Result<Program<T>, ProgramError> {
         let fresh_inputs = self.inputs.len();
         let slot_of = |slot: u8| -> u8 {
             if usize::from(slot) >= MAX_INPUTS {
@@ -1035,102 +1141,340 @@ impl<T: Real> Builder<T> {
         // Stores, in-place tensors first.
         let mut stores: Vec<(Value, u8)> = Vec::new();
         for (index, (_, value)) in self.updates.iter().enumerate() {
-            let value = value.unwrap_or(Value(usize::MAX));
-            if value.0 == usize::MAX {
+            let Some(value) = *value else {
                 return Err(ProgramError::OutputNotStoredOnce {
                     output: index as u8,
                 });
-            }
+            };
             stores.push((value, index as u8));
         }
         for (index, &(_, value)) in self.outputs.iter().enumerate() {
             stores.push((value, (self.updates.len() + index) as u8));
         }
 
-        // The last node reading each value; a stored value lives to the end.
-        let end = self.nodes.len();
-        let mut last_use = vec![None::<usize>; self.nodes.len()];
-        for (at, node) in self.nodes.iter().enumerate() {
-            let operands: &[Value] = match node {
-                Node::Binary(_, a, b) | Node::Cmp(_, a, b) => &[*a, *b],
-                Node::Unary(_, a) => &[*a],
-                Node::Load(..) | Node::Const(_) => &[],
-            };
-            for operand in operands {
-                last_use[operand.0] = Some(at);
-            }
-        }
-        for &(value, _) in &stores {
-            last_use[value.0] = Some(end);
-        }
-
-        let mut free: Vec<Reg> = (0..REGISTERS as u8).rev().collect();
-        let mut assigned: Vec<Option<Reg>> = vec![None; self.nodes.len()];
-        let mut code = Vec::with_capacity(self.nodes.len() + stores.len());
-        for (at, node) in self.nodes.iter().enumerate() {
-            // Dead code: nothing reads it and it is not stored.
-            if last_use[at].is_none() {
-                continue;
-            }
-            let reg = |value: Value| assigned[value.0].expect("operands precede their uses");
-            let instr = |dst| match *node {
-                Node::Load(slot, remap) => Instr::Load {
-                    dst,
-                    input: slot_of(slot),
-                    remap,
-                },
-                Node::Const(value) => Instr::Const { dst, value },
-                Node::Binary(op, a, b) => Instr::Binary {
-                    dst,
-                    op,
-                    a: reg(a),
-                    b: reg(b),
-                },
-                Node::Unary(op, a) => Instr::Unary { dst, op, a: reg(a) },
-                Node::Cmp(op, a, b) => Instr::Cmp {
-                    dst,
-                    op,
-                    a: reg(a),
-                    b: reg(b),
-                },
-            };
-            // Operands whose last use is here can hand their register to the
-            // result: every backend reads an instruction's operands before it
-            // writes the destination.
-            let operands: Vec<Value> = match *node {
-                Node::Binary(_, a, b) | Node::Cmp(_, a, b) => vec![a, b],
-                Node::Unary(_, a) => vec![a],
-                Node::Load(..) | Node::Const(_) => vec![],
-            };
-            let mut released = Vec::new();
-            for operand in operands {
-                if last_use[operand.0] == Some(at) {
-                    let reg = reg(operand);
-                    if !released.contains(&reg) {
-                        released.push(reg);
-                    }
-                }
-            }
-            let dst = match released.first() {
-                Some(&reg) => reg,
-                None => free.pop().ok_or(ProgramError::TooManyRegisters)?,
-            };
-            free.extend(released.iter().skip(1));
-            code.push(instr(dst));
-            assigned[at] = Some(dst);
-        }
-        for &(value, output) in &stores {
-            code.push(Instr::Store {
-                src: assigned[value.0].expect("stored values are live"),
-                output,
-            });
-        }
-
         let mut inputs = self.inputs;
         inputs.extend(self.updates.iter().map(|&(dtype, _)| dtype));
         let mut outputs: Vec<DType> = self.updates.iter().map(|&(dtype, _)| dtype).collect();
         outputs.extend(self.outputs.iter().map(|&(dtype, _)| dtype));
-        Program::new(code, inputs, outputs, self.updates.len())
+        if inputs.len() > MAX_INPUTS {
+            return Err(ProgramError::TooManyInputs(inputs.len()));
+        }
+
+        // Uniforms are the first named constants, each its own name whatever
+        // its value; the ordinary constants are named after them.
+        let uniforms = self.uniforms.len();
+        let mut constants: Vec<T> = self.uniforms.clone();
+        let nodes = self
+            .nodes
+            .iter()
+            .map(|node| match *node {
+                Node::Load(slot, remap) => optimizer::Node::Load {
+                    slot: slot_of(slot),
+                    remap: remap as u8,
+                },
+                Node::Const(value) => {
+                    optimizer::Node::Const(placeholder(value, &mut constants, uniforms))
+                }
+                Node::Uniform(index) => {
+                    optimizer::Node::Const(optimizer::Scalar::Named(index as u32))
+                }
+                Node::Binary(op, a, b) => optimizer::Node::Binary(bin(op), a.0, b.0),
+                Node::Unary(op, a) => optimizer::Node::Unary(optimizer::Function(op as u16), a.0),
+                Node::Cmp(op, a, b) => optimizer::Node::Cmp(cmp(op), a.0, b.0),
+            })
+            .collect();
+        let graph = optimizer::Graph {
+            nodes,
+            stores: stores
+                .iter()
+                .map(|&(value, output)| optimizer::Store {
+                    value: value.0,
+                    output,
+                })
+                .collect(),
+            input_bytes: inputs.iter().map(|dtype| dtype.size() as u8).collect(),
+            output_bytes: outputs.iter().map(|dtype| dtype.size() as u8).collect(),
+        };
+        let optimized = optimized(graph, model, algebra)?;
+        let code = optimized
+            .iter()
+            .map(|instr| lower(instr, &constants))
+            .collect();
+        let mut program = Program::new(code, inputs, outputs, self.updates.len())?;
+        // The constants that depend on a uniform, to compute again when one is set.
+        program.bound = optimized
+            .iter()
+            .enumerate()
+            .filter_map(|(at, instr)| match instr {
+                optimizer::Instr::Const { value, .. } if names_below(value, uniforms) => {
+                    Some((at, value.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        program.named = constants;
+        program.uniforms = uniforms;
+        Ok(program)
+    }
+}
+
+// ---- optimization -----------------------------------------------------------------
+
+use tensorcrate_fusion as optimizer;
+pub use tensorcrate_fusion::{Cost, CostModel, Latency};
+
+/// Which rewrites the program optimizer may make.
+///
+/// Every program built with a [`Builder`], and every kernel `math!` fuses, is
+/// optimized; this says whether results may change by rounding in exchange.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Default)]
+pub enum Algebra {
+    /// Only rewrites that leave every result bit-identical to the operations
+    /// as built: merging common subexpressions, exact identities such as
+    /// `x · 1 = x`, reordering, and register choices.
+    Exact,
+    /// Also regroup associative chains — `(a + b) + c` as `a + (b + c)`,
+    /// `a / b / c` as `a / (b · c)`, constants gathered and folded — when that
+    /// is cheaper. Results may differ from the operations as built by
+    /// rounding. The default.
+    #[default]
+    Reassociate,
+}
+
+thread_local! {
+    static ALGEBRA: Cell<Algebra> = const { Cell::new(Algebra::Reassociate) };
+    /// Optimized programs, by structure.
+    static PLANS: std::cell::RefCell<std::collections::HashMap<PlanKey, Vec<optimizer::Instr>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// This thread's [`Algebra`].
+pub fn algebra() -> Algebra {
+    ALGEBRA.with(Cell::get)
+}
+
+/// Set this thread's [`Algebra`].
+pub fn set_algebra(algebra: Algebra) {
+    ALGEBRA.with(|cell| cell.set(algebra));
+}
+
+/// Run `f` with this thread's [`Algebra`] set to `algebra`, restoring the
+/// previous one afterwards — even if `f` panics.
+pub fn with_algebra<R>(algebra: Algebra, f: impl FnOnce() -> R) -> R {
+    struct Restore(Algebra);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_algebra(self.0);
+        }
+    }
+    let _restore = Restore(self::algebra());
+    set_algebra(algebra);
+    f()
+}
+
+/// A program's structure, constants abstracted, and how it is optimized.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct PlanKey {
+    graph: optimizer::Graph,
+    reassociate: bool,
+    model: [u64; 11],
+}
+
+fn model_bits(model: &CostModel) -> [u64; 11] {
+    let l = &model.latency;
+    [
+        model.alpha,
+        model.beta,
+        model.gamma,
+        model.delta,
+        model.epsilon,
+        l.load,
+        l.constant,
+        l.arithmetic,
+        l.divide,
+        l.sqrt,
+        l.transcendental,
+    ]
+    .map(f64::to_bits)
+}
+
+/// Programs kept per thread before the cache starts over.
+const PLAN_CACHE: usize = 512;
+
+/// The optimized code for `graph`, from the cache if its structure has been
+/// seen.
+fn optimized(
+    graph: optimizer::Graph,
+    model: &CostModel,
+    algebra: Algebra,
+) -> Result<Vec<optimizer::Instr>, ProgramError> {
+    let key = PlanKey {
+        graph,
+        reassociate: algebra == Algebra::Reassociate,
+        model: model_bits(model),
+    };
+    if let Some(code) = PLANS.with(|plans| plans.borrow().get(&key).cloned()) {
+        return Ok(code);
+    }
+    let options = optimizer::Options {
+        model: *model,
+        reassociate: key.reassociate,
+        max_registers: REGISTERS,
+        max_instructions: MAX_INSTRUCTIONS,
+        ..optimizer::Options::default()
+    };
+    let plan = optimizer::optimize(&key.graph, &options).map_err(|_| ProgramError::TooManyRegisters)?;
+    PLANS.with(|plans| {
+        let mut plans = plans.borrow_mut();
+        if plans.len() >= PLAN_CACHE {
+            plans.clear();
+        }
+        plans.insert(key, plan.code.clone());
+    });
+    Ok(plan.code)
+}
+
+/// The optimizer's view of a constant. Zeros and ones are kept as literals —
+/// the identities the optimizer applies depend on them — and every other value
+/// is a placeholder numbered by its distinct bits, so programs that differ only
+/// in such constants share a plan.
+fn placeholder<T: Real>(value: T, constants: &mut Vec<T>, uniforms: usize) -> optimizer::Scalar {
+    let wide = value.into_f64();
+    if wide == 0.0 || wide == 1.0 || wide == -1.0 {
+        return optimizer::Scalar::literal(wide);
+    }
+    let bits = wide.to_bits();
+    // A uniform equal to it is not the same constant: the uniform may change.
+    let found = constants[uniforms..]
+        .iter()
+        .position(|c| c.into_f64().to_bits() == bits)
+        .map(|index| uniforms + index);
+    let index = match found {
+        Some(index) => index,
+        None => {
+            constants.push(value);
+            constants.len() - 1
+        }
+    };
+    optimizer::Scalar::Named(index as u32)
+}
+
+/// Whether `scalar` reads any named constant below `limit` — a uniform.
+fn names_below(scalar: &optimizer::Scalar, limit: usize) -> bool {
+    match scalar {
+        optimizer::Scalar::Literal(_) => false,
+        optimizer::Scalar::Named(index) => (*index as usize) < limit,
+        optimizer::Scalar::Binary(_, a, b) => names_below(a, limit) || names_below(b, limit),
+    }
+}
+
+/// A constant's value in `T`, its folds evaluated as the unfused kernels would
+/// combine them.
+fn evaluate<T: Real>(scalar: &optimizer::Scalar, constants: &[T]) -> T {
+    match scalar {
+        optimizer::Scalar::Literal(bits) => T::from_f64(f64::from_bits(*bits)),
+        optimizer::Scalar::Named(index) => constants[*index as usize],
+        optimizer::Scalar::Binary(op, a, b) => scalar_binary(
+            binary_op(*op),
+            evaluate(a, constants),
+            evaluate(b, constants),
+        ),
+    }
+}
+
+fn bin(op: BinaryOp) -> optimizer::Bin {
+    optimizer::Bin::from_code(op as u16).expect("the operation codes agree")
+}
+
+fn binary_op(op: optimizer::Bin) -> BinaryOp {
+    BinaryOp::try_from(op as u16).expect("the operation codes agree")
+}
+
+fn cmp(op: Compare) -> optimizer::Cmp {
+    optimizer::Cmp::from_code(op as u16).expect("the comparison codes agree")
+}
+
+/// An optimized instruction as one of ours.
+fn lower<T: Real>(instr: &optimizer::Instr, constants: &[T]) -> Instr<T> {
+    match *instr {
+        optimizer::Instr::Load { dst, slot, remap } => Instr::Load {
+            dst,
+            input: slot,
+            remap: match remap {
+                0 => Remap::Identity,
+                1 => Remap::Transpose,
+                2 => Remap::Row,
+                3 => Remap::Column,
+                _ => unreachable!("the remap codes agree"),
+            },
+        },
+        optimizer::Instr::Const { dst, ref value } => Instr::Const {
+            dst,
+            value: evaluate(value, constants),
+        },
+        optimizer::Instr::Binary { dst, op, a, b } => Instr::Binary {
+            dst,
+            op: binary_op(op),
+            a,
+            b,
+        },
+        optimizer::Instr::Unary { dst, function, a } => Instr::Unary {
+            dst,
+            op: Analytic::try_from(function.0).expect("the function codes agree"),
+            a,
+        },
+        optimizer::Instr::Cmp { dst, op, a, b } => Instr::Cmp {
+            dst,
+            op: Compare::try_from(op as u16).expect("the comparison codes agree"),
+            a,
+            b,
+        },
+        optimizer::Instr::Store { src, output } => Instr::Store { src, output },
+    }
+}
+
+impl<T: Real> Program<T> {
+    /// What this program costs under `model`, as it stands: its instructions
+    /// in their order and registers.
+    pub fn cost(&self, model: &CostModel) -> Cost {
+        let mut nodes = Vec::with_capacity(self.code.len());
+        let mut stores = Vec::new();
+        let mut value_of = [usize::MAX; REGISTERS];
+        for instr in &self.code {
+            let read = |reg: Reg| value_of[usize::from(reg)];
+            let node = match *instr {
+                Instr::Load { input, remap, .. } => optimizer::Node::Load {
+                    slot: input,
+                    remap: remap as u8,
+                },
+                Instr::Const { .. } => optimizer::Node::Const(optimizer::Scalar::Named(0)),
+                Instr::Binary { op, a, b, .. } => optimizer::Node::Binary(bin(op), read(a), read(b)),
+                Instr::Unary { op, a, .. } => {
+                    optimizer::Node::Unary(optimizer::Function(op as u16), read(a))
+                }
+                Instr::Cmp { op, a, b, .. } => optimizer::Node::Cmp(cmp(op), read(a), read(b)),
+                Instr::Store { src, output } => {
+                    stores.push(optimizer::Store {
+                        value: read(src),
+                        output,
+                    });
+                    continue;
+                }
+            };
+            nodes.push(node);
+            if let Some(dst) = instr.dst() {
+                value_of[usize::from(dst)] = nodes.len() - 1;
+            }
+        }
+        optimizer::cost(
+            &optimizer::Graph {
+                nodes,
+                stores,
+                input_bytes: self.inputs.iter().map(|dtype| dtype.size() as u8).collect(),
+                output_bytes: self.outputs.iter().map(|dtype| dtype.size() as u8).collect(),
+            },
+            model,
+        )
     }
 }
 

@@ -25,6 +25,7 @@
 //! `Vector`/`Matrix` types do not fit.
 
 mod buffer;
+mod codegen;
 mod device;
 mod encode;
 mod fused;
@@ -40,6 +41,8 @@ use half::{bf16, f16};
 use crate::numbers::Real;
 
 pub use buffer::MetalBuffer;
+#[doc(hidden)]
+pub use codegen::set_fused_codegen;
 #[doc(hidden)]
 pub use device::set_tensorops;
 pub use device::{MatmulPrecision, matmul_precision, set_matmul_precision};

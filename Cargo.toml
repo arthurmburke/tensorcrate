@@ -1,5 +1,5 @@
 [workspace]
-members = ["macros"]
+members = ["macros", "fusion"]
 
 [package]
 name = "tensorcrate"
@@ -8,6 +8,7 @@ edition = "2024"
 
 [dependencies]
 tensorcrate-macros = { path = "macros" }
+tensorcrate-fusion = { path = "fusion" }
 half = { version = "2.7", features = ["num-traits"] }
 num-traits = "0.2"
 typenum = "1.20"

@@ -2,8 +2,9 @@
 //!
 //! Every block here is evaluated twice — fused, and with fusion switched off
 //! through `fused::Mode::Unfused`, which runs the block exactly as the macro
-//! wrote it before fusion existed. On the host the two must agree bit for bit;
-//! on Metal, within the tolerance the unfused kernels already have.
+//! wrote it before fusion existed. On the host the two must agree bit for bit
+//! when the block forbids reassociation, and to within rounding when it allows
+//! it; on Metal, within the tolerance the unfused kernels already have.
 
 use tensorcrate::math;
 use tensorcrate::tensors::fused::{self, Mode};
@@ -42,119 +43,160 @@ fn same_matrix<T: Copy + Into<f64> + 'static>(
     assert_bits(fused.as_slice(), unfused.as_slice(), what);
 }
 
+/// Check a host block both ways: with `reassociate = false;` its fused kernel
+/// must reproduce the unfused block bit for bit, and as written — free to
+/// regroup associative chains — to within rounding.
+macro_rules! fuses {
+    ($what:expr, $same:ident, { $($block:tt)* }) => {{
+        $same(both(|| math! { reassociate = false; $($block)* }), $what);
+        close(both(|| math! { $($block)* }), $what);
+    }};
+}
+
+/// Values of a vector or matrix, widened.
+trait Values {
+    fn values(&self) -> Vec<f64>;
+    fn tolerance(&self) -> f64;
+}
+
+impl<T: Copy + Into<f64> + 'static> Values for Vector<T> {
+    fn values(&self) -> Vec<f64> {
+        self.as_slice().iter().map(|&x| x.into()).collect()
+    }
+    fn tolerance(&self) -> f64 {
+        tolerance::<T>()
+    }
+}
+
+impl<T: Copy + Into<f64> + 'static> Values for Matrix<T> {
+    fn values(&self) -> Vec<f64> {
+        self.as_slice().iter().map(|&x| x.into()).collect()
+    }
+    fn tolerance(&self) -> f64 {
+        tolerance::<T>()
+    }
+}
+
+/// A few rounding steps of `T`.
+fn tolerance<T>() -> f64 {
+    if size_of::<T>() <= 2 { 3e-2 } else { 1e-5 }
+}
+
+/// Fused and unfused within the rounding a regrouped chain may introduce.
+fn close<V: Values>((fused, unfused): (V, V), what: &str) {
+    let tolerance = unfused.tolerance();
+    let (fused, unfused) = (fused.values(), unfused.values());
+    assert_eq!(fused.len(), unfused.len(), "{what}");
+    for (i, (f, u)) in fused.iter().zip(&unfused).enumerate() {
+        assert!(
+            (f - u).abs() <= tolerance * (1.0 + u.abs()) || (f.is_nan() && u.is_nan()),
+            "{what}, reassociated: element {i} is {f} fused, {u} unfused"
+        );
+    }
+}
+
 #[test]
 fn arithmetic_chains_fuse_exactly() {
     let t = 0.3;
-    same_vector(
-        both(|| {
-            math! {
+    fuses!("arithmetic", same_vector, {
                 let a = [1.5, -2.25, 3.0, 0.125, -7.5];
                 let b = [0.5, 4.0, -1.0, 9.0, 2.0];
                 (a + b * 2 - t) / (b .* b + 1) - -a % 2
-            }
-        }),
-        "arithmetic",
-    );
-    same_matrix(
-        both(|| {
-            math! {
+    });
+    fuses!("matrix arithmetic", same_matrix, {
                 let m = [[1, 2, 3], [4, 5, 6]];
                 let n = [[0.5, -1, 2], [3, -4, 0.25]];
                 2 - m .* n / 3 + n
-            }
-        }),
-        "matrix arithmetic",
-    );
+    });
 }
 
 #[test]
 fn every_analytic_function_fuses_exactly() {
-    same_vector(
-        both(|| {
-            math! {
+    fuses!("analytic", same_vector, {
                 let x = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7];
                 sin(x) + cos(x) * tan(x) - sec(x) + csc(x) / 7
                     + arcsin(x) - arccos(x) + arctan(x)
                     + exp(x) * ln(x) + sinh(x) - cosh(x) + tanh(x) * sqrt(x)
-            }
-        }),
-        "analytic",
-    );
+    });
 }
 
 #[test]
 fn ordering_functions_fuse_exactly() {
-    same_vector(
-        both(|| {
-            math! {
+    fuses!("ordering", same_vector, {
                 let x = [-3, -1.5, 0, 0.5, 2, 4];
                 let y = [1, -2, 0.25, 0.5, 3, -4];
                 clamp(max(x, y) * 2 - min(x, 0.5), -1, 3) + max(1, y)
-            }
-        }),
-        "ordering",
-    );
+    });
+}
+
+/// The same kernels in every float type: without reassociation, bit for bit
+/// what the unfused block computes in that type, through every kind of
+/// operation a kernel holds, horizontal fusion, a transpose and a product.
+#[test]
+fn every_float_type_fuses_exactly() {
+    macro_rules! in_type {
+        ($dtype:ident) => {{
+            fuses!(concat!(stringify!($dtype), " vector"), same_vector, {
+                dtype = $dtype;
+                let x = [0.1, 0.7, 1.3, 2.9, -0.4];
+                let y = [2, -1, 0.5, 3, 1.5];
+                clamp(exp(x) * 0.5 + sqrt(y .* y + 1) - x .* y / 3, -2, 4) + max(tanh(x), y / 4)
+            });
+            fuses!(concat!(stringify!($dtype), " matrix"), same_matrix, {
+                dtype = $dtype;
+                let m = [[1, 2, 3], [4, 5, 6]];
+                let n = [[0.5, -1, 2], [3, -4, 0.25]];
+                let a = m .* n - 1;
+                let b = sin(m) / 2;
+                transpose(a + b) @ (a - b) * 2 + 1
+            });
+        }};
+    }
+    in_type!(f64);
+    in_type!(f32);
+    in_type!(f16);
+    in_type!(bf16);
 }
 
 #[test]
 fn single_precision_blocks_fuse_exactly() {
-    same_vector(
-        both(|| {
-            math! {
+    fuses!("f32", same_vector, {
                 dtype = f32;
                 let x = [0.1, 0.7, 1.3, 2.9];
                 exp(x) * 0.5 + sqrt(x) - x .* x
-            }
-        }),
-        "f32",
-    );
+    });
 }
 
 #[test]
 fn bindings_are_inlined_recomputed_or_materialized() {
-    same_vector(
-        both(|| {
-            math! {
+    fuses!("bindings", same_vector, {
                 let x = [1, 2, 3, 4];
                 let cheap = x * 3 + 1;          // two uses, recomputed in each
                 let costly = exp(x) - 1;        // two uses, computed once
                 let once = cheap .* costly;     // one use, never materialized
                 once + cheap - costly
-            }
-        }),
-        "bindings",
-    );
+    });
 }
 
 #[test]
 fn transposes_inside_a_group_become_transposed_reads() {
-    same_matrix(
-        both(|| {
-            math! {
+    fuses!("transpose", same_matrix, {
                 let a = [[1, 2, 3], [4, 5, 6]];
                 let b = [[1, 0], [0, 1], [2, 2]];
                 transpose(a * 2 + 1) - b + transpose(transpose(b))
-            }
-        }),
-        "transpose",
-    );
+    });
 }
 
 #[test]
 fn groups_feed_and_follow_products() {
-    same_matrix(
-        both(|| {
-            math! {
+    fuses!("products", same_matrix, {
                 let x = [[1, 2], [3, 4]];
                 let w = [[0.5, -1], [2, 0.25]];
                 let h = max(x @ w + 1, 0);       // a relu after a product
                 let a = h * 2 - 1;
                 let b = exp(h) / 10;             // independent of `a`: fused with it
                 sin(a @ b) + 1
-            }
-        }),
-        "products",
-    );
+    });
 }
 
 #[test]
@@ -259,6 +301,45 @@ mod metal {
                 "{what}: element {i} is {a}, expected {e}"
             );
         }
+    }
+
+    /// `f16` and `bf16` blocks stay on the GPU in their own type and agree
+    /// with the same block on the host, fused or not.
+    #[test]
+    fn compact_metal_blocks_fuse_and_agree_with_the_host() {
+        macro_rules! in_type {
+            ($dtype:ident, $tolerance:expr) => {{
+                let block = || {
+                    math! {
+                        backend = Metal;
+                        dtype = $dtype;
+                        let x = [[0.1, 0.7], [1.3, -0.4]];
+                        let y = [[2, -1], [0.5, 3]];
+                        clamp(exp(x) * 0.5 + sqrt(y .* y + 1) - (x @ y) / 3, -2, 4)
+                    }
+                };
+                let fused = fused::with_mode(Mode::Fused, block).to_backend::<Host>();
+                let unfused = fused::with_mode(Mode::Unfused, block).to_backend::<Host>();
+                let host = math! {
+                    dtype = $dtype;
+                    let x = [[0.1, 0.7], [1.3, -0.4]];
+                    let y = [[2, -1], [0.5, 3]];
+                    clamp(exp(x) * 0.5 + sqrt(y .* y + 1) - (x @ y) / 3, -2, 4)
+                };
+                let widen = |m: &Matrix<_>| m.as_slice().iter().map(|&v| f64::from(v)).collect::<Vec<f64>>();
+                for (against, expected) in [("unfused", widen(&unfused)), ("the host", widen(&host))] {
+                    for (i, (a, e)) in widen(&fused).iter().zip(&expected).enumerate() {
+                        assert!(
+                            (a - e).abs() <= $tolerance * (1.0 + e.abs()),
+                            "{} against {against}: element {i} is {a}, expected {e}",
+                            stringify!($dtype)
+                        );
+                    }
+                }
+            }};
+        }
+        in_type!(f16, 2e-2);
+        in_type!(bf16, 8e-2);
     }
 
     #[test]

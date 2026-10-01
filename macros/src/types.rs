@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use proc_macro2::{Span, TokenStream};
+use proc_macro2::{Literal, Span, TokenStream};
 use quote::quote;
 
 use crate::ast::{Arith, Binding, Block, Builtin, Expr, ExprKind, LitKind};
@@ -35,35 +35,90 @@ pub(crate) struct Ty {
     pub(crate) shape: Shape,
 }
 
-/// Where tensor literals and operations emitted by a block live.
-///
-/// Host computes in `f64` unless a `dtype = f32;` directive asks for `f32`
-/// (`HostF32`). Metal shaders are `f32`, so selecting Metal also selects `f32`
-/// coefficients.
+/// The floating-point type a block computes in.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
-pub(crate) enum BackendChoice {
+pub(crate) enum Dtype {
     #[default]
-    Host,
-    HostF32,
-    Metal,
+    F64,
+    F32,
+    F16,
+    Bf16,
+}
+
+impl Dtype {
+    /// The 16-bit types, which have real arithmetic but no complex or dual
+    /// coefficients.
+    pub(crate) fn is_compact(self) -> bool {
+        matches!(self, Dtype::F16 | Dtype::Bf16)
+    }
+
+    /// The element type's spelling.
+    pub(crate) fn rust_type(self) -> TokenStream {
+        match self {
+            Dtype::F64 => quote!(f64),
+            Dtype::F32 => quote!(f32),
+            Dtype::F16 => quote!(::tensorcrate::numbers::f16),
+            Dtype::Bf16 => quote!(::tensorcrate::numbers::bf16),
+        }
+    }
+
+    /// The `fused::DType` stored in this type.
+    pub(crate) fn fused_dtype(self) -> TokenStream {
+        match self {
+            Dtype::F64 => quote!(::tensorcrate::tensors::fused::DType::F64),
+            Dtype::F32 => quote!(::tensorcrate::tensors::fused::DType::F32),
+            Dtype::F16 => quote!(::tensorcrate::tensors::fused::DType::F16),
+            Dtype::Bf16 => quote!(::tensorcrate::tensors::fused::DType::Bf16),
+        }
+    }
+
+    /// Bytes per element.
+    pub(crate) fn size(self) -> u8 {
+        match self {
+            Dtype::F64 => 8,
+            Dtype::F32 => 4,
+            Dtype::F16 | Dtype::Bf16 => 2,
+        }
+    }
+
+    /// `value` as a constant of this type, rounded once, at compile time.
+    pub(crate) fn literal(self, value: f64) -> TokenStream {
+        match self {
+            Dtype::F64 => {
+                let value = Literal::f64_suffixed(value);
+                quote!(#value)
+            }
+            Dtype::F32 => {
+                let value = Literal::f32_suffixed(value as f32);
+                quote!(#value)
+            }
+            Dtype::F16 | Dtype::Bf16 => {
+                let ty = self.rust_type();
+                let value = Literal::f64_suffixed(value);
+                quote!(#ty::from_f64_const(#value))
+            }
+        }
+    }
+}
+
+/// Where tensor literals and operations emitted by a block live, and the type
+/// they compute in.
+///
+/// Host computes in `f64` unless a `dtype` directive says otherwise; Metal's
+/// shaders compute in `f32`, `f16` or `bf16`, `f32` by default.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub(crate) struct BackendChoice {
+    pub(crate) metal: bool,
+    pub(crate) dtype: Dtype,
 }
 
 impl BackendChoice {
     pub(crate) fn is_metal(self) -> bool {
-        self == BackendChoice::Metal
-    }
-
-    /// Whether coefficients are `f32` rather than `f64`.
-    fn is_single(self) -> bool {
-        self != BackendChoice::Host
+        self.metal
     }
 
     pub(crate) fn coefficient_type(self) -> TokenStream {
-        if self.is_single() {
-            quote!(f32)
-        } else {
-            quote!(f64)
-        }
+        self.dtype.rust_type()
     }
 
     fn tensor_backend_type(self) -> TokenStream {
@@ -191,7 +246,13 @@ fn check_value(expr: &Expr, scope: &Scope, backend: BackendChoice) -> syn::Resul
     if backend.is_metal() && !typed.ty.is_real() {
         return Err(syn::Error::new(
             expr.span,
-            "the Metal backend supports real f32 values only (no `i` or `d` literals)",
+            "the Metal backend supports real values only (no `i` or `d` literals)",
+        ));
+    }
+    if backend.dtype.is_compact() && !typed.ty.is_real() {
+        return Err(syn::Error::new(
+            expr.span,
+            "complex and dual values need `dtype = f32;` or `dtype = f64;`",
         ));
     }
     Ok(typed)

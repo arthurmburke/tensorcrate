@@ -438,28 +438,31 @@ pub trait Rule<P> {
 ///
 /// The step size is the whole algorithm, and it has to respect the curvature:
 /// descent diverges above `2/λmax` of the loss's Hessian.
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct Sgd<T = f32> {
-    pub rate: T,
+    program: Program<T>,
 }
 
-impl<T> Sgd<T> {
+impl<T> Sgd<T>
+where
+    T: Element + Real,
+{
     pub fn new(rate: T) -> Self {
-        Sgd { rate }
+        let dtype = T::DTYPE;
+        let mut b = Builder::new();
+        let g = b.input(dtype);
+        let p = b.update(dtype);
+        let step = b.scale(g, rate);
+        let p = b.sub(p, step);
+        b.set(0, p);
+        let program = b.build().expect("the rule's program is valid");
+        Sgd { program }
     }
 }
 
 impl<P: Parameter> Rule<P> for Sgd<P::Elem> {
     fn update(&mut self, parameters: &mut P, gradient: &P) {
-        let dtype = <P::Elem as Element>::DTYPE;
-        let mut b = Builder::new();
-        let g = b.input(dtype);
-        let p = b.update(dtype);
-        let step = b.scale(g, self.rate);
-        let p = b.sub(p, step);
-        b.set(0, p);
-        let program = b.build().expect("the rule's program is valid");
-        P::fused(&program, &[gradient], &mut [parameters]);
+        P::fused(&self.program, &[gradient], &mut [parameters]);
     }
 
     fn reset(&mut self) {}
@@ -677,6 +680,14 @@ impl<P: Parameter> Rule<P> for RmsProp<P> {
 ///
 /// `m ← β₁m + (1−β₁)g`, `v ← β₂v + (1−β₂)g⊙g`, and after correcting both for
 /// their zero initialization, `p ← p − rate·m̂/(√v̂ + ε)`.
+///
+/// Its two fused programs — the first step's, which creates the moments, and
+/// every later step's, which updates them in place — are built once, by
+/// [`new`](Self::new). The coefficients and the bias corrections are their
+/// [uniforms](crate::tensors::fused::Builder::uniform), set before each run, so
+/// an update builds nothing; changing a coefficient field between updates
+/// takes effect at the next one. The programs are optimized under the thread's
+/// [`Algebra`](crate::tensors::fused::Algebra) when the rule is created.
 #[derive(Clone, Debug)]
 pub struct Adam<P: Parameter> {
     pub rate: P::Elem,
@@ -686,6 +697,22 @@ pub struct Adam<P: Parameter> {
     first: Option<P>,
     second: Option<P>,
     steps: u32,
+    /// The first step: the moments are fresh outputs.
+    start: Program<P::Elem>,
+    /// Every later step: the moments are updated in place.
+    resume: Program<P::Elem>,
+}
+
+/// The uniforms of Adam's programs, by index.
+mod adam {
+    pub const RATE: usize = 0;
+    pub const FIRST_DECAY: usize = 1;
+    pub const SECOND_DECAY: usize = 2;
+    pub const EPSILON: usize = 3;
+    /// `1 / (1 − β₁ᵗ)`.
+    pub const FIRST_CORRECTION: usize = 4;
+    /// `1 / (1 − β₂ᵗ)`.
+    pub const SECOND_CORRECTION: usize = 5;
 }
 
 impl<P: Parameter> Adam<P> {
@@ -699,7 +726,67 @@ impl<P: Parameter> Adam<P> {
             first: None,
             second: None,
             steps: 0,
+            start: Self::program(false),
+            resume: Self::program(true),
         }
+    }
+
+    /// One step as a program over the gradient (input 0) and the parameters
+    /// (updated 0), with the moments updated in place when `resumed` and
+    /// returned as fresh outputs otherwise. Every coefficient is a uniform, its
+    /// placeholder value one, so the program's structure is the same whatever
+    /// the coefficients turn out to be.
+    fn program(resumed: bool) -> Program<P::Elem> {
+        let dtype = <P::Elem as Element>::DTYPE;
+        let one = <P::Elem as num_traits::One>::one();
+        let mut b = Builder::new();
+        // In the order of the indices in `adam`.
+        let rate = b.uniform(one);
+        let first_decay = b.uniform(one);
+        let second_decay = b.uniform(one);
+        let epsilon = b.uniform(one);
+        let first_correction = b.uniform(one);
+        let second_correction = b.uniform(one);
+        let g = b.input(dtype);
+        let p = b.update(dtype);
+        // `1 − β` involves only a constant and a uniform, so it is folded into
+        // the program's constants and computed once per run, in the element
+        // type, exactly as `one - decay` was.
+        let unit = b.constant(one);
+        let first_share = b.sub(unit, first_decay);
+        let second_share = b.sub(unit, second_decay);
+
+        let fresh_first = b.mul(g, first_share);
+        let squared = b.mul(g, g);
+        let fresh_second = b.mul(squared, second_share);
+        let (first, second) = if resumed {
+            let (m, v) = (b.update(dtype), b.update(dtype));
+            let m = b.mul(m, first_decay);
+            let v = b.mul(v, second_decay);
+            (b.add(m, fresh_first), b.add(v, fresh_second))
+        } else {
+            (fresh_first, fresh_second)
+        };
+
+        // Both moments start at zero, so early estimates are biased toward it;
+        // dividing by `1 − βᵗ` undoes exactly that.
+        let corrected_first = b.mul(first, first_correction);
+        let corrected_second = b.mul(second, second_correction);
+
+        let root = b.unary(Analytic::Sqrt, corrected_second);
+        let denominator = b.add(root, epsilon);
+        let step = b.div(corrected_first, denominator);
+        let step = b.mul(step, rate);
+        let p = b.sub(p, step);
+        b.set(0, p);
+        if resumed {
+            b.set(1, first);
+            b.set(2, second);
+        } else {
+            b.output(first, dtype);
+            b.output(second, dtype);
+        }
+        b.build().expect("the rule's program is valid")
     }
 }
 
@@ -710,53 +797,28 @@ impl<P: Parameter> Rule<P> for Adam<P> {
     fn update(&mut self, parameters: &mut P, gradient: &P) {
         self.steps += 1;
 
-        let dtype = <P::Elem as Element>::DTYPE;
         let one = <P::Elem as num_traits::One>::one();
-        let mut b = Builder::new();
-        let g = b.input(dtype);
-        let p = b.update(dtype);
-        let resumed = self.first.is_some() && self.second.is_some();
-
-        let fresh_first = b.scale(g, one - self.first_decay);
-        let squared = b.mul(g, g);
-        let fresh_second = b.scale(squared, one - self.second_decay);
-        let (first, second) = if resumed {
-            let (m, v) = (b.update(dtype), b.update(dtype));
-            let m = b.scale(m, self.first_decay);
-            let v = b.scale(v, self.second_decay);
-            (b.add(m, fresh_first), b.add(v, fresh_second))
-        } else {
-            (fresh_first, fresh_second)
-        };
-
-        // Both moments start at zero, so early estimates are biased toward it;
-        // dividing by `1 − βᵗ` undoes exactly that.
         let first_correction = one - self.first_decay.powi(self.steps as i32);
         let second_correction = one - self.second_decay.powi(self.steps as i32);
-        let corrected_first = b.scale(first, first_correction.recip());
-        let corrected_second = b.scale(second, second_correction.recip());
-
-        let root = b.unary(Analytic::Sqrt, corrected_second);
-        let denominator = b.shift(root, self.epsilon);
-        let step = b.div(corrected_first, denominator);
-        let step = b.scale(step, self.rate);
-        let p = b.sub(p, step);
-        b.set(0, p);
-        if resumed {
-            b.set(1, first);
-            b.set(2, second);
+        let resumed = self.first.is_some() && self.second.is_some();
+        let program = if resumed {
+            &mut self.resume
         } else {
-            b.output(first, dtype);
-            b.output(second, dtype);
-        }
-        let program = b.build().expect("the rule's program is valid");
+            &mut self.start
+        };
+        program.set_uniform(adam::RATE, self.rate);
+        program.set_uniform(adam::FIRST_DECAY, self.first_decay);
+        program.set_uniform(adam::SECOND_DECAY, self.second_decay);
+        program.set_uniform(adam::EPSILON, self.epsilon);
+        program.set_uniform(adam::FIRST_CORRECTION, first_correction.recip());
+        program.set_uniform(adam::SECOND_CORRECTION, second_correction.recip());
 
         match (&mut self.first, &mut self.second) {
             (Some(first), Some(second)) => {
-                P::fused(&program, &[gradient], &mut [parameters, first, second]);
+                P::fused(program, &[gradient], &mut [parameters, first, second]);
             }
             _ => {
-                let mut moments = P::fused(&program, &[gradient], &mut [parameters]).into_iter();
+                let mut moments = P::fused(program, &[gradient], &mut [parameters]).into_iter();
                 self.first = moments.next();
                 self.second = moments.next();
             }

@@ -173,9 +173,14 @@ dependencies = [
  "objc2",
  "objc2-foundation",
  "objc2-metal",
+ "tensorcrate-fusion",
  "tensorcrate-macros",
  "typenum",
 ]
+
+[[package]]
+name = "tensorcrate-fusion"
+version = "0.1.0"
 
 [[package]]
 name = "tensorcrate-macros"
@@ -184,6 +189,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+ "tensorcrate-fusion",
 ]
 
 [[package]]

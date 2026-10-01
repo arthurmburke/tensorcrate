@@ -17,7 +17,7 @@ use syn::spanned::Spanned;
 use syn::{BinOp, Lit, Pat, Stmt, UnOp};
 
 use crate::ast::{Arith, Binding, Block, Builtin, Expr, ExprKind, LitKind, Literal};
-use crate::types::BackendChoice;
+use crate::types::{BackendChoice, Dtype};
 
 const MATMUL_MARKER: &str = "__tensorcrate_matmul_operator__";
 const ELEMENTWISE_MUL_MARKER: &str = "__tensorcrate_elementwise_mul_operator__";
@@ -86,6 +86,8 @@ fn marked_operands<'a>(
 pub(crate) struct Directives {
     pub(crate) backend: BackendChoice,
     pub(crate) fuse: bool,
+    /// Whether fused kernels may regroup associative chains.
+    pub(crate) reassociate: bool,
 }
 
 /// Parse a whole block, its operators already rewritten.
@@ -109,20 +111,26 @@ pub(crate) fn block(input: TokenStream) -> syn::Result<(Directives, Block)> {
     Ok((directives, Block { bindings, result }))
 }
 
-/// Remove the optional leading `backend = Host;` / `backend = Metal;`,
-/// `dtype = f32;` / `dtype = f64;` and `fuse = true;` / `fuse = false;`
-/// directives, in any order.
+/// Remove the optional leading directives, in any order: `backend = Host;` /
+/// `backend = Metal;`, `dtype = f64;` / `f32` / `f16` / `bf16`, `fuse = true;`
+/// / `fuse = false;` and `reassociate = true;` / `reassociate = false;`.
 fn take_directives(stmts: &mut Vec<Stmt>) -> syn::Result<Directives> {
     let mut metal: Option<bool> = None;
-    let mut dtype: Option<(bool, Span)> = None;
+    let mut dtype: Option<(Dtype, Span)> = None;
     let mut fuse: Option<bool> = None;
+    let mut reassociate: Option<bool> = None;
     while let Some(Stmt::Expr(syn::Expr::Assign(assign), Some(_))) = stmts.first() {
         let syn::Expr::Path(left) = &*assign.left else {
             break;
         };
-        let is_backend = left.path.is_ident("backend");
-        let is_dtype = left.path.is_ident("dtype");
-        if left.path.is_ident("fuse") {
+        let flag = if left.path.is_ident("fuse") {
+            Some(("fuse", &mut fuse))
+        } else if left.path.is_ident("reassociate") {
+            Some(("reassociate", &mut reassociate))
+        } else {
+            None
+        };
+        if let Some((name, slot)) = flag {
             let syn::Expr::Lit(syn::ExprLit {
                 lit: Lit::Bool(value),
                 ..
@@ -130,23 +138,28 @@ fn take_directives(stmts: &mut Vec<Stmt>) -> syn::Result<Directives> {
             else {
                 return Err(syn::Error::new(
                     assign.right.span(),
-                    "math! fuse must be `true` or `false`",
+                    format!("math! {name} must be `true` or `false`"),
                 ));
             };
-            if fuse.is_some() {
-                return Err(syn::Error::new(value.span(), "math! fuse is set twice"));
+            if slot.is_some() {
+                return Err(syn::Error::new(
+                    value.span(),
+                    format!("math! {name} is set twice"),
+                ));
             }
-            fuse = Some(value.value);
+            *slot = Some(value.value);
             stmts.remove(0);
             continue;
         }
+        let is_backend = left.path.is_ident("backend");
+        let is_dtype = left.path.is_ident("dtype");
         if !is_backend && !is_dtype {
             break;
         }
         let message = if is_backend {
             "math! backend must be `Host` or `Metal`"
         } else {
-            "math! dtype must be `f32` or `f64`"
+            "math! dtype must be `f64`, `f32`, `f16` or `bf16`"
         };
         let syn::Expr::Path(right) = &*assign.right else {
             return Err(syn::Error::new(assign.right.span(), message));
@@ -166,30 +179,36 @@ fn take_directives(stmts: &mut Vec<Stmt>) -> syn::Result<Directives> {
             if dtype.is_some() {
                 return Err(syn::Error::new(right.span(), "math! dtype is set twice"));
             }
-            dtype = Some(if right.path.is_ident("f32") {
-                (true, right.span())
-            } else if right.path.is_ident("f64") {
-                (false, right.span())
-            } else {
-                return Err(syn::Error::new(right.span(), message));
-            });
+            let chosen = [
+                ("f64", Dtype::F64),
+                ("f32", Dtype::F32),
+                ("f16", Dtype::F16),
+                ("bf16", Dtype::Bf16),
+            ]
+            .into_iter()
+            .find(|(name, _)| right.path.is_ident(name))
+            .map(|(_, dtype)| dtype)
+            .ok_or_else(|| syn::Error::new(right.span(), message))?;
+            dtype = Some((chosen, right.span()));
         }
         stmts.remove(0);
     }
-    let backend = match (metal, dtype) {
-        (Some(true), Some((false, span))) => {
+    let metal = metal.unwrap_or(false);
+    let dtype = match (metal, dtype) {
+        (true, Some((Dtype::F64, span))) => {
             return Err(syn::Error::new(
                 span,
-                "the Metal backend computes in f32; use `dtype = f32;` or the Host backend",
+                "the Metal backend computes in f32, f16 or bf16; use one of those or the Host backend",
             ));
         }
-        (Some(true), _) => BackendChoice::Metal,
-        (_, Some((true, _))) => BackendChoice::HostF32,
-        _ => BackendChoice::Host,
+        (_, Some((dtype, _))) => dtype,
+        (true, None) => Dtype::F32,
+        (false, None) => Dtype::F64,
     };
     Ok(Directives {
-        backend,
+        backend: BackendChoice { metal, dtype },
         fuse: fuse.unwrap_or(true),
+        reassociate: reassociate.unwrap_or(true),
     })
 }
 

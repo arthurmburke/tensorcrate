@@ -1,0 +1,7 @@
+[package]
+name = "tensorcrate-fusion"
+version = "0.1.0"
+edition = "2024"
+description = "The fused-kernel optimizer shared by tensorcrate and its math! macro."
+
+[dependencies]

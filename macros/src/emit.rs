@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use proc_macro2::{Ident, Literal, TokenStream};
+use proc_macro2::{Ident, TokenStream};
 use quote::quote;
 
 use crate::ast::{Arith, Binding, Block, Builtin, Expr, ExprKind, LitKind};
@@ -22,6 +22,8 @@ pub(crate) struct Env {
     /// Elementwise bindings that are never materialized: fused lowering
     /// substitutes their value wherever they are read.
     pub(crate) inline: HashMap<String, Expr<Ty>>,
+    /// Whether fused kernels may regroup associative chains.
+    pub(crate) reassociate: bool,
 }
 
 /// Lower the bindings and the result as one block expression, fused when
@@ -31,10 +33,12 @@ pub(crate) fn block(
     block: &Block<Ty>,
     backend: BackendChoice,
     inline: Option<HashMap<String, Expr<Ty>>>,
+    reassociate: bool,
 ) -> syn::Result<TokenStream> {
     let env = Env {
         fuse: inline.is_some(),
         inline: inline.unwrap_or_default(),
+        reassociate,
     };
     let bindings = &block.bindings;
     let mut out = Vec::new();
@@ -138,11 +142,10 @@ pub(crate) fn lower(
                 let values = &rows[0];
                 quote!(::tensorcrate::tensors::Vector::<#element_type, ::tensorcrate::tensors::Host>::new([#(#values),*]))
             };
-            Ok(match backend {
-                BackendChoice::Host | BackendChoice::HostF32 => host,
-                BackendChoice::Metal => {
-                    quote!((#host).to_backend::<::tensorcrate::tensors::Metal>())
-                }
+            Ok(if backend.is_metal() {
+                quote!((#host).to_backend::<::tensorcrate::tensors::Metal>())
+            } else {
+                host
             })
         }
         ExprKind::Var(ident) => {
@@ -186,12 +189,7 @@ pub(crate) fn lower(
 }
 
 fn literal(literal: &crate::ast::Literal, target: Ty, backend: BackendChoice) -> TokenStream {
-    let value = match backend {
-        BackendChoice::Host => Literal::f64_suffixed(literal.value),
-        BackendChoice::HostF32 | BackendChoice::Metal => {
-            Literal::f32_suffixed(literal.value as f32)
-        }
-    };
+    let value = backend.dtype.literal(literal.value);
 
     // Build the coefficient first: `2i` is `0 + 2i`, anything else is purely
     // real.
@@ -531,10 +529,7 @@ fn elementwise(function: TokenStream, value: TokenStream, target: Ty) -> TokenSt
 
 /// Zero of the coefficient type.
 fn zero_of(complex: bool, backend: BackendChoice) -> TokenStream {
-    let zero = match backend {
-        BackendChoice::Host => quote!(0f64),
-        BackendChoice::HostF32 | BackendChoice::Metal => quote!(0f32),
-    };
+    let zero = backend.dtype.literal(0.0);
     if complex {
         quote!(::tensorcrate::numbers::Complex::constant(#zero))
     } else {
@@ -554,12 +549,8 @@ fn widen(value: TokenStream, from: Ty, to: Ty, backend: BackendChoice) -> TokenS
         return if converted.to_string() == "__x" {
             value
         } else {
-            match backend {
-                BackendChoice::Host | BackendChoice::HostF32 => {
-                    quote!((#value).map(|&__x| #converted))
-                }
-                BackendChoice::Metal => unreachable!("Metal values cannot require widening"),
-            }
+            assert!(!backend.is_metal(), "Metal values cannot require widening");
+            quote!((#value).map(|&__x| #converted))
         };
     }
     widen_scalar(value, from, to)

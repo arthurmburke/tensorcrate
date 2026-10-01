@@ -56,7 +56,21 @@ pub(super) struct Gpu {
     /// The command buffer operations are being encoded into, not yet committed
     /// — see [`compute`](super::sync::compute).
     pub(super) open: RefCell<Option<super::sync::Batch>>,
+    /// Specialized kernels for fused programs, by [`codegen::key`](super::codegen::key).
+    pub(super) specialized: RefCell<std::collections::HashMap<Vec<u64>, Specialized>>,
 }
+
+/// A fused program's specialized kernel, as far as it has got.
+pub(super) enum Specialized {
+    /// Run on the interpreter this many times so far.
+    Seen(u32),
+    Ready(Pipeline),
+    /// The generator or the compiler turned it down; the interpreter runs it.
+    Failed,
+}
+
+/// Programs whose kernels a thread keeps before the cache starts over.
+const SPECIALIZED_CACHE: usize = 256;
 
 /// Command buffers kept queued ahead of the GPU before an allocation waits for
 /// an old one to finish rather than making a new one.
@@ -305,6 +319,7 @@ pub(super) fn build_gpu() -> Option<Gpu> {
         waits: Cell::new(0),
         operations: Cell::new(0),
         open: RefCell::new(None),
+        specialized: RefCell::new(std::collections::HashMap::new()),
         device,
         queue,
     })
@@ -344,6 +359,58 @@ impl Gpu {
             return Some(buffer);
         }
         Pool::allocate(&self.device, len)
+    }
+
+    /// The specialized kernel for the fused program `code` over `T`, compiling
+    /// it on the program's [`COMPILE_AFTER`](super::codegen::COMPILE_AFTER)th
+    /// appearance; `None` until then, or if it cannot be compiled.
+    pub(super) fn specialized<T: MetalElement>(
+        &self,
+        code: &[crate::tensors::fused::Encoded],
+    ) -> Option<Pipeline> {
+        use super::codegen;
+        let key = codegen::key::<T>(code);
+        let mut cache = self.specialized.borrow_mut();
+        let seen = match cache.get_mut(&key) {
+            Some(Specialized::Ready(pipeline)) => return Some(pipeline.clone()),
+            Some(Specialized::Failed) => return None,
+            Some(Specialized::Seen(count)) => {
+                *count += 1;
+                *count
+            }
+            None => {
+                if cache.len() >= SPECIALIZED_CACHE {
+                    cache.clear();
+                }
+                cache.insert(key.clone(), Specialized::Seen(1));
+                1
+            }
+        };
+        if seen < codegen::COMPILE_AFTER {
+            return None;
+        }
+        let compiled = codegen::source::<T>(code).and_then(|source| self.compile(&source));
+        let entry = match &compiled {
+            Some(pipeline) => Specialized::Ready(pipeline.clone()),
+            None => Specialized::Failed,
+        };
+        cache.insert(key, entry);
+        compiled
+    }
+
+    fn compile(&self, source: &str) -> Option<Pipeline> {
+        let library = self
+            .device
+            .newLibraryWithSource_options_error(&NSString::from_str(source), None)
+            .map_err(|_error| {
+                #[cfg(test)]
+                eprintln!("a fused kernel failed to compile: {_error}");
+            })
+            .ok()?;
+        let function = library.newFunctionWithName(&NSString::from_str("fused_program"))?;
+        self.device
+            .newComputePipelineStateWithFunction_error(&function)
+            .ok()
     }
 
     /// The fence for an allocation released now: the last command buffer that

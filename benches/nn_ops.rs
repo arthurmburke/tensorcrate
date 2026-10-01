@@ -433,7 +433,23 @@ fn fusion_rows<R>(case: &mut Case, backend: &str, drains: &[Drain], mut run: imp
                 fused::with_mode(mode, &mut run)
             });
         }
+        interpreted_row(case, backend, drain, &mut run);
     }
+}
+
+/// On Metal, the fused program once more on the bytecode interpreter instead
+/// of its specialized kernel, to show what compiling it buys.
+fn interpreted_row<R>(case: &mut Case, backend: &str, drain: Drain, run: &mut impl FnMut() -> R) {
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    if backend == "metal" && drain == Drain::PerBatch {
+        use tensorcrate::metal::set_fused_codegen;
+        set_fused_codegen(false);
+        case.row("metal fused, interpreted (pipelined)", drain, || {
+            fused::with_mode(Mode::Fused, &mut *run)
+        });
+        set_fused_codegen(true);
+    }
+    let _ = (case, backend, drain, run);
 }
 
 /// A fused-versus-unfused case. `$build` is an expression that builds the
@@ -662,6 +678,9 @@ fn activation_rows<B: Kernels>(
                 fused::with_mode(mode, || program.run_vectors(&[&x]).remove(0))
             });
         }
+        interpreted_row(case, backend, drain, &mut || {
+            program.run_vectors(&[&x]).remove(0)
+        });
     }
 }
 
@@ -679,13 +698,17 @@ fn activation_case(bench: &mut Bench, activation: Activation, len: usize) {
 
     let host = vector::<Host>(len, 1);
     let direct = activation.direct(&host).flat();
-    for mode in [Mode::Unfused, Mode::Fused] {
-        let got = fused::with_mode(mode, || program.run_vectors(&[&host]).remove(0)).flat();
-        assert_eq!(
-            got, direct,
-            "{title}: {mode:?} program differs from direct kernels"
-        );
-    }
+    // The program is optimized, and may be reassociated, so it agrees with the
+    // direct kernels to rounding — and with itself, fused or not, exactly.
+    let unfused =
+        fused::with_mode(Mode::Unfused, || program.run_vectors(&[&host]).remove(0)).flat();
+    let fused_result =
+        fused::with_mode(Mode::Fused, || program.run_vectors(&[&host]).remove(0)).flat();
+    assert_eq!(
+        fused_result, unfused,
+        "{title}: fused differs from unfused on the host"
+    );
+    assert_close(&title, &fused_result, &direct, 1e-5);
     activation_rows::<Host>(&mut case, "host", &[Drain::None], activation, &program, len);
 
     #[cfg(all(feature = "metal", target_os = "macos"))]
