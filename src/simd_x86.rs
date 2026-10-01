@@ -14,7 +14,7 @@ macro_rules! x86_kernels {
         avx_set1 = $avx_set1:ident, avx_zero = $avx_zero:ident,
         avx_add = $avx_add:ident, avx_sub = $avx_sub:ident,
         avx_mul = $avx_mul:ident, avx_div = $avx_div:ident,
-        avx_fma = $avx_fma:ident,
+        avx_fma = $avx_fma:ident, avx_sqrt = $avx_sqrt:ident,
         avx_min = $avx_min:ident, avx_max = $avx_max:ident,
         avx_and = $avx_and:ident, avx_andnot = $avx_andnot:ident, avx_or = $avx_or:ident,
         avx_cmp = $avx_cmp:ident,
@@ -22,7 +22,7 @@ macro_rules! x86_kernels {
         sse_load = $sse_load:ident, sse_store = $sse_store:ident,
         sse_set1 = $sse_set1:ident, sse_zero = $sse_zero:ident,
         sse_add = $sse_add:ident, sse_sub = $sse_sub:ident,
-        sse_mul = $sse_mul:ident, sse_div = $sse_div:ident,
+        sse_mul = $sse_mul:ident, sse_div = $sse_div:ident, sse_sqrt = $sse_sqrt:ident,
         sse_min = $sse_min:ident, sse_max = $sse_max:ident,
         sse_and = $sse_and:ident, sse_andnot = $sse_andnot:ident, sse_or = $sse_or:ident,
         sse_cmplt = $sse_cmplt:ident, sse_cmple = $sse_cmple:ident,
@@ -552,6 +552,44 @@ macro_rules! x86_kernels {
                 }
             }
 
+            /// Elementwise square root. `sqrtps`/`sqrtpd` are correctly
+            /// rounded, so every lane agrees with the scalar `sqrt` bit for bit.
+            #[inline]
+            pub fn sqrt(values: &[$t], out: &mut [$t]) {
+                debug_assert_eq!(values.len(), out.len());
+                if has_avx2() {
+                    unsafe { sqrt_avx(values, out) };
+                } else {
+                    unsafe { sqrt_sse(values, out) };
+                }
+            }
+
+            #[target_feature(enable = "avx2")]
+            unsafe fn sqrt_avx(values: &[$t], out: &mut [$t]) {
+                let mut i = 0;
+                while i + $avx_lanes <= values.len() {
+                    let value = $avx_load(values.as_ptr().add(i));
+                    $avx_store(out.as_mut_ptr().add(i), $avx_sqrt(value));
+                    i += $avx_lanes;
+                }
+                for i in i..values.len() {
+                    out[i] = values[i].sqrt();
+                }
+            }
+
+            #[target_feature(enable = "sse2")]
+            unsafe fn sqrt_sse(values: &[$t], out: &mut [$t]) {
+                let mut i = 0;
+                while i + $sse_lanes <= values.len() {
+                    let value = $sse_load(values.as_ptr().add(i));
+                    $sse_store(out.as_mut_ptr().add(i), $sse_sqrt(value));
+                    i += $sse_lanes;
+                }
+                for i in i..values.len() {
+                    out[i] = values[i].sqrt();
+                }
+            }
+
             /// Confine every element to `[low, high]`, in one pass.
             #[inline]
             pub fn clamp(values: &[$t], low: $t, high: $t, out: &mut [$t]) {
@@ -1021,7 +1059,7 @@ x86_kernels! {
     avx_set1 = _mm256_set1_ps, avx_zero = _mm256_setzero_ps,
     avx_add = _mm256_add_ps, avx_sub = _mm256_sub_ps,
     avx_mul = _mm256_mul_ps, avx_div = _mm256_div_ps,
-    avx_fma = _mm256_fmadd_ps,
+    avx_fma = _mm256_fmadd_ps, avx_sqrt = _mm256_sqrt_ps,
     avx_min = _mm256_min_ps, avx_max = _mm256_max_ps,
     avx_and = _mm256_and_ps, avx_andnot = _mm256_andnot_ps, avx_or = _mm256_or_ps,
     avx_cmp = _mm256_cmp_ps,
@@ -1029,7 +1067,7 @@ x86_kernels! {
     sse_load = _mm_loadu_ps, sse_store = _mm_storeu_ps,
     sse_set1 = _mm_set1_ps, sse_zero = _mm_setzero_ps,
     sse_add = _mm_add_ps, sse_sub = _mm_sub_ps,
-    sse_mul = _mm_mul_ps, sse_div = _mm_div_ps,
+    sse_mul = _mm_mul_ps, sse_div = _mm_div_ps, sse_sqrt = _mm_sqrt_ps,
     sse_min = _mm_min_ps, sse_max = _mm_max_ps,
     sse_and = _mm_and_ps, sse_andnot = _mm_andnot_ps, sse_or = _mm_or_ps,
     sse_cmplt = _mm_cmplt_ps, sse_cmple = _mm_cmple_ps,
@@ -1043,7 +1081,7 @@ x86_kernels! {
     avx_set1 = _mm256_set1_pd, avx_zero = _mm256_setzero_pd,
     avx_add = _mm256_add_pd, avx_sub = _mm256_sub_pd,
     avx_mul = _mm256_mul_pd, avx_div = _mm256_div_pd,
-    avx_fma = _mm256_fmadd_pd,
+    avx_fma = _mm256_fmadd_pd, avx_sqrt = _mm256_sqrt_pd,
     avx_min = _mm256_min_pd, avx_max = _mm256_max_pd,
     avx_and = _mm256_and_pd, avx_andnot = _mm256_andnot_pd, avx_or = _mm256_or_pd,
     avx_cmp = _mm256_cmp_pd,
@@ -1051,7 +1089,7 @@ x86_kernels! {
     sse_load = _mm_loadu_pd, sse_store = _mm_storeu_pd,
     sse_set1 = _mm_set1_pd, sse_zero = _mm_setzero_pd,
     sse_add = _mm_add_pd, sse_sub = _mm_sub_pd,
-    sse_mul = _mm_mul_pd, sse_div = _mm_div_pd,
+    sse_mul = _mm_mul_pd, sse_div = _mm_div_pd, sse_sqrt = _mm_sqrt_pd,
     sse_min = _mm_min_pd, sse_max = _mm_max_pd,
     sse_and = _mm_and_pd, sse_andnot = _mm_andnot_pd, sse_or = _mm_or_pd,
     sse_cmplt = _mm_cmplt_pd, sse_cmple = _mm_cmple_pd,

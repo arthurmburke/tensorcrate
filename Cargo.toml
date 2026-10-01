@@ -18,6 +18,13 @@ default = ["metal", "simd"]
 metal = ["dep:dispatch2", "dep:objc2", "dep:objc2-metal", "dep:objc2-foundation"]
 # NEON on aarch64; runtime-selected AVX2/FMA or SSE2 on x86_64.
 simd = []
+# Per-thread counts of kernels launched, bytes moved and allocations made, for
+# measuring fusion. Off by default: without it the recording calls compile away.
+counters = []
+
+[[example]]
+name = "fusion_baseline"
+required-features = ["counters"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
 dispatch2 = { version = "0.3", optional = true }

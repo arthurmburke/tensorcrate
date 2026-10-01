@@ -902,3 +902,148 @@ kernel void axis_distribution(
     uint along = axis == AxisOp::Rows ? i / cols : i % cols;
     output[i] = distribution_value(family, stat, input[i], first[along], second[along]);
 }
+
+// ---- fused elementwise programs ----------------------------------------------
+//
+// One thread runs a whole register program for one element; see
+// `tensors::fused`. Every thread runs the same instructions in the same order,
+// so the `switch` on each opcode never diverges within a SIMD group, and the
+// intermediates stay in the `r` array rather than going back to memory.
+
+#define FUSED_REGISTERS 16
+
+// Must match `fused::Encoded`: twelve bytes, four-aligned.
+struct FusedInstr {
+    ushort kind;   // 0 load, 1 const, 2 binary, 3 unary, 4 compare, 5 store
+    ushort op;     // remap, BinaryOp, AnalyticOp or CompareOp
+    uchar dst;
+    uchar a;       // load: input slot; others: register
+    uchar b;       // load/store: storage type; binary/compare: register
+    uchar aux;     // store: output slot
+    float value;   // const
+};
+
+struct FusedShape {
+    uint rows;
+    uint cols;
+    uint count;    // instructions
+};
+
+// Storage types, matching `fused::DType`.
+inline float fused_load(device const uchar* base, uint dtype, uint index) {
+    switch (dtype) {
+        case 1: return float(((device const half*)base)[index]);
+        // bf16 is the top half of an f32, so widening is a shift.
+        case 2: return as_type<float>(uint(((device const ushort*)base)[index]) << 16);
+        default: return ((device const float*)base)[index];
+    }
+}
+
+// Round to nearest, ties to even, quieting NaNs — the same rule as
+// `half::bf16::from_f32`, so both backends narrow a given f32 identically.
+inline ushort fused_to_bf16(float value) {
+    uint x = as_type<uint>(value);
+    if ((x & 0x7fffffffu) > 0x7f800000u) {
+        return ushort((x >> 16) | 0x0040u);
+    }
+    uint round_bit = 0x00008000u;
+    if ((x & round_bit) != 0 && (x & (3u * round_bit - 1u)) != 0) {
+        return ushort(x >> 16) + 1;
+    }
+    return ushort(x >> 16);
+}
+
+inline void fused_store(device uchar* base, uint dtype, uint index, float value) {
+    switch (dtype) {
+        case 1: ((device half*)base)[index] = half(value); break;
+        case 2: ((device ushort*)base)[index] = fused_to_bf16(value); break;
+        default: ((device float*)base)[index] = value; break;
+    }
+}
+
+// Which input element feeds output element `i`, matching `fused::Remap`.
+inline uint fused_remap(ushort remap, uint i, uint rows, uint cols) {
+    switch (remap) {
+        case 1: return (i % cols) * rows + i / cols;  // transpose
+        case 2: return i % cols;                      // row vector, down every row
+        case 3: return i / cols;                      // column vector, across every column
+        default: return i;
+    }
+}
+
+inline float fused_binary(BinaryOp op, float a, float b) {
+    switch (op) {
+        case BinaryOp::Add: return a + b;
+        case BinaryOp::Sub: return a - b;
+        case BinaryOp::Mul: return a * b;
+        default: return a / b;
+    }
+}
+
+// Sixteen input and eight output slots, plus the program and its shape: 26 of
+// Metal's 31 buffer arguments. Unused slots are bound to a used buffer, which is
+// never touched because no instruction names them. A tensor updated in place is
+// bound to both an input and an output slot; the program reads it before it
+// stores it, and each thread touches only its own element.
+kernel void fused_elementwise(
+    constant FusedInstr* code   [[buffer(0)]],
+    constant FusedShape& shape  [[buffer(1)]],
+    device const uchar* in0  [[buffer(2)]],
+    device const uchar* in1  [[buffer(3)]],
+    device const uchar* in2  [[buffer(4)]],
+    device const uchar* in3  [[buffer(5)]],
+    device const uchar* in4  [[buffer(6)]],
+    device const uchar* in5  [[buffer(7)]],
+    device const uchar* in6  [[buffer(8)]],
+    device const uchar* in7  [[buffer(9)]],
+    device const uchar* in8  [[buffer(10)]],
+    device const uchar* in9  [[buffer(11)]],
+    device const uchar* in10 [[buffer(12)]],
+    device const uchar* in11 [[buffer(13)]],
+    device const uchar* in12 [[buffer(14)]],
+    device const uchar* in13 [[buffer(15)]],
+    device const uchar* in14 [[buffer(16)]],
+    device const uchar* in15 [[buffer(17)]],
+    device uchar* out0 [[buffer(18)]],
+    device uchar* out1 [[buffer(19)]],
+    device uchar* out2 [[buffer(20)]],
+    device uchar* out3 [[buffer(21)]],
+    device uchar* out4 [[buffer(22)]],
+    device uchar* out5 [[buffer(23)]],
+    device uchar* out6 [[buffer(24)]],
+    device uchar* out7 [[buffer(25)]],
+    uint i [[thread_position_in_grid]])
+{
+    device const uchar* inputs[16] = {
+        in0, in1, in2, in3, in4, in5, in6, in7,
+        in8, in9, in10, in11, in12, in13, in14, in15
+    };
+    device uchar* outputs[8] = { out0, out1, out2, out3, out4, out5, out6, out7 };
+
+    float r[FUSED_REGISTERS];
+    for (uint pc = 0; pc < shape.count; pc++) {
+        FusedInstr instr = code[pc];
+        switch (instr.kind) {
+            case 0:
+                r[instr.dst] = fused_load(
+                    inputs[instr.a], instr.b,
+                    fused_remap(instr.op, i, shape.rows, shape.cols));
+                break;
+            case 1:
+                r[instr.dst] = instr.value;
+                break;
+            case 2:
+                r[instr.dst] = fused_binary(BinaryOp(instr.op), r[instr.a], r[instr.b]);
+                break;
+            case 3:
+                r[instr.dst] = analytic_value(AnalyticOp(instr.op), r[instr.a]);
+                break;
+            case 4:
+                r[instr.dst] = compare_values(CompareOp(instr.op), r[instr.a], r[instr.b]);
+                break;
+            default:
+                fused_store(outputs[instr.aux], instr.b, i, r[instr.a]);
+                break;
+        }
+    }
+}

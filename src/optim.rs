@@ -49,6 +49,7 @@
 
 use std::sync::Arc;
 
+use crate::tensors::fused::{Builder, DType, Fusable, Instr, Output, Program, Remap};
 use crate::tensors::tape::Adjoint;
 use crate::tensors::{Analytic, BinaryOp, Host, Kernels, Matrix, ScalarVar, Tape, Var, Vector};
 
@@ -88,6 +89,129 @@ pub trait Parameter: Sized + 'static {
     fn record<'t>(&self, tape: &'t Tape<Self::Backend>) -> Var<'t, Self, Self::Backend>
     where
         Self: Adjoint<Self::Backend>;
+
+    /// Run a fused elementwise [`Program`] over tensors of this parameter's
+    /// shape: `inputs` are read, `updated` are overwritten in place, and the
+    /// program's fresh outputs are returned. Every slot is `f32` and read
+    /// unremapped.
+    ///
+    /// This is how the rules below take a whole update in one kernel. The
+    /// provided implementation is for parameter types of your own: it runs the
+    /// program one operation at a time through the methods above, so it
+    /// supports exactly the operations they spell — `+ − × ÷`, `sqrt`, and
+    /// constants — and panics on anything else.
+    fn fused(program: &Program, inputs: &[&Self], updated: &mut [&mut Self]) -> Vec<Self> {
+        unfused_parameter(program, inputs, updated)
+    }
+}
+
+/// [`Parameter::fused`] through the trait's own elementwise methods.
+fn unfused_parameter<P: Parameter>(
+    program: &Program,
+    inputs: &[&P],
+    updated: &mut [&mut P],
+) -> Vec<P> {
+    enum Value<P> {
+        Scalar(f32),
+        Tensor(P),
+    }
+    // Any operand fixes the shape a constant has to be filled out to.
+    let like = inputs
+        .first()
+        .map(|p| p.zeros_like())
+        .or_else(|| updated.first().map(|p| p.zeros_like()))
+        .expect("a parameter program has at least one tensor operand");
+    let fill = |value: f32| like.shift(value);
+    let tensor = |value: &Value<P>| match value {
+        Value::Scalar(value) => fill(*value),
+        Value::Tensor(tensor) => tensor.duplicate(),
+    };
+
+    let fresh = program.fresh_inputs();
+    let mut registers: Vec<Option<Value<P>>> = (0..16).map(|_| None).collect();
+    let mut outputs: Vec<Option<P>> = (0..program.outputs().len()).map(|_| None).collect();
+    for instr in program.code() {
+        let get = |reg: u8| registers[usize::from(reg)].as_ref().expect("validated");
+        let (dst, value) = match *instr {
+            Instr::Load { dst, input, remap } => {
+                assert_eq!(remap, Remap::Identity, "parameter programs read unremapped");
+                let slot = usize::from(input);
+                let source: &P = if slot < fresh {
+                    inputs[slot]
+                } else {
+                    &*updated[slot - fresh]
+                };
+                (dst, Value::Tensor(source.duplicate()))
+            }
+            Instr::Const { dst, value } => (dst, Value::Scalar(value)),
+            Instr::Binary { dst, op, a, b } => {
+                let value = match (get(a), get(b), op) {
+                    (Value::Scalar(a), Value::Scalar(b), _) => Value::Scalar(match op {
+                        BinaryOp::Add => a + b,
+                        BinaryOp::Sub => a - b,
+                        BinaryOp::Mul => a * b,
+                        BinaryOp::Div => a / b,
+                        BinaryOp::Rem => a % b,
+                    }),
+                    // The two forms `scale` and `shift` are exactly.
+                    (Value::Tensor(a), Value::Scalar(b), BinaryOp::Mul) => Value::Tensor(a.scale(*b)),
+                    (Value::Scalar(a), Value::Tensor(b), BinaryOp::Mul) => Value::Tensor(b.scale(*a)),
+                    (Value::Tensor(a), Value::Scalar(b), BinaryOp::Add) => Value::Tensor(a.shift(*b)),
+                    (Value::Scalar(a), Value::Tensor(b), BinaryOp::Add) => Value::Tensor(b.shift(*a)),
+                    (a, b, op) => {
+                        let (a, b) = (tensor(a), tensor(b));
+                        Value::Tensor(match op {
+                            BinaryOp::Add => a.add(&b),
+                            BinaryOp::Sub => a.subtract(&b),
+                            BinaryOp::Mul => a.multiply(&b),
+                            BinaryOp::Div => a.divide(&b),
+                            BinaryOp::Rem => panic!("Parameter has no remainder"),
+                        })
+                    }
+                };
+                (dst, value)
+            }
+            Instr::Unary {
+                dst,
+                op: Analytic::Sqrt,
+                a,
+            } => (
+                dst,
+                match get(a) {
+                    Value::Scalar(a) => Value::Scalar(a.sqrt()),
+                    Value::Tensor(a) => Value::Tensor(a.sqrt()),
+                },
+            ),
+            Instr::Unary { op, .. } => panic!("Parameter has no {op:?}"),
+            Instr::Cmp { op, .. } => panic!("Parameter has no {op:?} comparison"),
+            Instr::Store { src, output } => {
+                outputs[usize::from(output)] = Some(tensor(get(src)));
+                continue;
+            }
+        };
+        registers[usize::from(dst)] = Some(value);
+    }
+
+    let mut outputs = outputs.into_iter().map(|output| output.expect("validated"));
+    for target in updated.iter_mut() {
+        **target = outputs.next().expect("validated");
+    }
+    outputs.collect()
+}
+
+/// Run `program` over same-shaped tensors, which is every parameter program.
+fn run_fused<B: Kernels, T: Fusable<B>>(
+    program: &Program,
+    shape: (usize, usize),
+    inputs: &[&T],
+    updated: &mut [&mut T],
+) -> Vec<Output<B>> {
+    let inputs: Vec<&dyn Fusable<B>> = inputs.iter().map(|&input| input as &dyn Fusable<B>).collect();
+    let mut updated: Vec<&mut dyn Fusable<B>> = updated
+        .iter_mut()
+        .map(|target| &mut **target as &mut dyn Fusable<B>)
+        .collect();
+    program.run(shape, &inputs, &mut updated)
 }
 
 /// A scalar parameter — a learned temperature, or a log-variance. It carries no
@@ -135,6 +259,23 @@ impl Parameter for f32 {
     fn record<'t>(&self, tape: &'t Tape<Host>) -> Var<'t, Self, Host> {
         tape.scalar(*self)
     }
+
+    fn fused(program: &Program, inputs: &[&Self], updated: &mut [&mut Self]) -> Vec<Self> {
+        let inputs: Vec<Vector<f32>> = inputs.iter().map(|&&x| Vector::new([x])).collect();
+        let mut targets: Vec<Vector<f32>> = updated.iter().map(|x| Vector::new([**x])).collect();
+        let outputs = {
+            let inputs: Vec<&Vector<f32>> = inputs.iter().collect();
+            let mut targets: Vec<&mut Vector<f32>> = targets.iter_mut().collect();
+            run_fused(program, (1, 1), &inputs, &mut targets)
+        };
+        for (target, value) in updated.iter_mut().zip(&targets) {
+            **target = value[0];
+        }
+        outputs
+            .into_iter()
+            .map(|output| output.into_vector::<f32>().as_slice()[0])
+            .collect()
+    }
 }
 
 impl<B: Kernels> Parameter for Vector<f32, B> {
@@ -178,6 +319,18 @@ impl<B: Kernels> Parameter for Vector<f32, B> {
 
     fn record<'t>(&self, tape: &'t Tape<B>) -> Var<'t, Self, B> {
         tape.vector(self.to_backend::<B>())
+    }
+
+    fn fused(program: &Program, inputs: &[&Self], updated: &mut [&mut Self]) -> Vec<Self> {
+        let len = inputs
+            .first()
+            .map(|v| v.len())
+            .or_else(|| updated.first().map(|v| v.len()))
+            .unwrap_or(0);
+        run_fused(program, (1, len), inputs, updated)
+            .into_iter()
+            .map(Output::into_vector)
+            .collect()
     }
 }
 
@@ -224,6 +377,18 @@ impl<B: Kernels> Parameter for Matrix<f32, B> {
     fn record<'t>(&self, tape: &'t Tape<B>) -> Var<'t, Self, B> {
         tape.matrix(self.to_backend::<B>())
     }
+
+    fn fused(program: &Program, inputs: &[&Self], updated: &mut [&mut Self]) -> Vec<Self> {
+        let shape = inputs
+            .first()
+            .map(|m| m.shape())
+            .or_else(|| updated.first().map(|m| m.shape()))
+            .unwrap_or((0, 0));
+        run_fused(program, shape, inputs, updated)
+            .into_iter()
+            .map(Output::into_matrix)
+            .collect()
+    }
 }
 
 /// How a gradient becomes a parameter update.
@@ -257,7 +422,14 @@ impl Sgd {
 
 impl<P: Parameter> Rule<P> for Sgd {
     fn update(&mut self, parameters: &mut P, gradient: &P) {
-        *parameters = parameters.subtract(&gradient.scale(self.rate));
+        let mut b = Builder::new();
+        let g = b.input(DType::F32);
+        let p = b.update(DType::F32);
+        let step = b.scale(g, self.rate);
+        let p = b.sub(p, step);
+        b.set(0, p);
+        let program = b.build().expect("the rule's program is valid");
+        P::fused(&program, &[gradient], &mut [parameters]);
     }
 
     fn reset(&mut self) {}
@@ -303,18 +475,43 @@ impl<P> Momentum<P> {
 }
 
 impl<P: Parameter> Rule<P> for Momentum<P> {
+    /// One fused kernel: the velocity and parameters are updated in place.
     fn update(&mut self, parameters: &mut P, gradient: &P) {
-        let velocity = match self.velocity.take() {
-            Some(previous) => previous.scale(self.momentum).add(gradient),
-            None => gradient.duplicate(),
+        let mut b = Builder::new();
+        let g = b.input(DType::F32);
+        let p = b.update(DType::F32);
+        let resumed = self.velocity.is_some();
+        let velocity = if resumed {
+            let previous = b.update(DType::F32);
+            let decayed = b.scale(previous, self.momentum);
+            b.add(decayed, g)
+        } else {
+            g
         };
         let step = if self.nesterov {
-            gradient.add(&velocity.scale(self.momentum))
+            let ahead = b.scale(velocity, self.momentum);
+            b.add(g, ahead)
         } else {
-            velocity.duplicate()
+            velocity
         };
-        *parameters = parameters.subtract(&step.scale(self.rate));
-        self.velocity = Some(velocity);
+        let step = b.scale(step, self.rate);
+        let p = b.sub(p, step);
+        b.set(0, p);
+        if resumed {
+            b.set(1, velocity);
+        } else {
+            b.output(velocity, DType::F32);
+        }
+        let program = b.build().expect("the rule's program is valid");
+
+        match &mut self.velocity {
+            Some(velocity) => {
+                P::fused(&program, &[gradient], &mut [parameters, velocity]);
+            }
+            None => {
+                self.velocity = P::fused(&program, &[gradient], &mut [parameters]).pop();
+            }
+        }
     }
 
     fn reset(&mut self) {
@@ -345,15 +542,34 @@ impl<P> AdaGrad<P> {
 }
 
 impl<P: Parameter> Rule<P> for AdaGrad<P> {
+    /// One fused kernel, updating the parameters and the running total in place.
     fn update(&mut self, parameters: &mut P, gradient: &P) {
-        let squared = gradient.multiply(gradient);
-        let total = match self.total.take() {
-            Some(previous) => previous.add(&squared),
-            None => squared,
+        let mut b = Builder::new();
+        let g = b.input(DType::F32);
+        let p = b.update(DType::F32);
+        let resumed = self.total.is_some();
+        let squared = b.mul(g, g);
+        let total = if resumed {
+            let previous = b.update(DType::F32);
+            b.add(previous, squared)
+        } else {
+            squared
         };
-        let step = gradient.divide(&total.sqrt().shift(self.epsilon));
-        *parameters = parameters.subtract(&step.scale(self.rate));
-        self.total = Some(total);
+        let p = descend(&mut b, p, g, total, self.epsilon, self.rate);
+        b.set(0, p);
+        if resumed {
+            b.set(1, total);
+        } else {
+            b.output(total, DType::F32);
+        }
+        let program = b.build().expect("the rule's program is valid");
+
+        match &mut self.total {
+            Some(total) => {
+                P::fused(&program, &[gradient], &mut [parameters, total]);
+            }
+            None => self.total = P::fused(&program, &[gradient], &mut [parameters]).pop(),
+        }
     }
 
     fn reset(&mut self) {
@@ -386,15 +602,36 @@ impl<P> RmsProp<P> {
 }
 
 impl<P: Parameter> Rule<P> for RmsProp<P> {
+    /// One fused kernel, updating the parameters and the mean square in place.
     fn update(&mut self, parameters: &mut P, gradient: &P) {
-        let squared = gradient.multiply(gradient).scale(1.0 - self.decay);
-        let mean_square = match self.mean_square.take() {
-            Some(previous) => previous.scale(self.decay).add(&squared),
-            None => squared,
+        let mut b = Builder::new();
+        let g = b.input(DType::F32);
+        let p = b.update(DType::F32);
+        let resumed = self.mean_square.is_some();
+        let squared = b.mul(g, g);
+        let squared = b.scale(squared, 1.0 - self.decay);
+        let mean_square = if resumed {
+            let previous = b.update(DType::F32);
+            let decayed = b.scale(previous, self.decay);
+            b.add(decayed, squared)
+        } else {
+            squared
         };
-        let step = gradient.divide(&mean_square.sqrt().shift(self.epsilon));
-        *parameters = parameters.subtract(&step.scale(self.rate));
-        self.mean_square = Some(mean_square);
+        let p = descend(&mut b, p, g, mean_square, self.epsilon, self.rate);
+        b.set(0, p);
+        if resumed {
+            b.set(1, mean_square);
+        } else {
+            b.output(mean_square, DType::F32);
+        }
+        let program = b.build().expect("the rule's program is valid");
+
+        match &mut self.mean_square {
+            Some(mean_square) => {
+                P::fused(&program, &[gradient], &mut [parameters, mean_square]);
+            }
+            None => self.mean_square = P::fused(&program, &[gradient], &mut [parameters]).pop(),
+        }
     }
 
     fn reset(&mut self) {
@@ -434,35 +671,61 @@ impl<P> Adam<P> {
 }
 
 impl<P: Parameter> Rule<P> for Adam<P> {
+    /// One fused kernel: parameters and both moments are read once and
+    /// overwritten in place. Unfused, this was fourteen kernels and eleven
+    /// intermediate tensors.
     fn update(&mut self, parameters: &mut P, gradient: &P) {
         self.steps += 1;
 
-        let first = match self.first.take() {
-            Some(previous) => previous
-                .scale(self.first_decay)
-                .add(&gradient.scale(1.0 - self.first_decay)),
-            None => gradient.scale(1.0 - self.first_decay),
-        };
-        let squared = gradient.multiply(gradient);
-        let second = match self.second.take() {
-            Some(previous) => previous
-                .scale(self.second_decay)
-                .add(&squared.scale(1.0 - self.second_decay)),
-            None => squared.scale(1.0 - self.second_decay),
+        let mut b = Builder::new();
+        let g = b.input(DType::F32);
+        let p = b.update(DType::F32);
+        let resumed = self.first.is_some() && self.second.is_some();
+
+        let fresh_first = b.scale(g, 1.0 - self.first_decay);
+        let squared = b.mul(g, g);
+        let fresh_second = b.scale(squared, 1.0 - self.second_decay);
+        let (first, second) = if resumed {
+            let (m, v) = (b.update(DType::F32), b.update(DType::F32));
+            let m = b.scale(m, self.first_decay);
+            let v = b.scale(v, self.second_decay);
+            (b.add(m, fresh_first), b.add(v, fresh_second))
+        } else {
+            (fresh_first, fresh_second)
         };
 
         // Both moments start at zero, so early estimates are biased toward it;
         // dividing by `1 − βᵗ` undoes exactly that.
         let first_correction = 1.0 - self.first_decay.powi(self.steps as i32);
         let second_correction = 1.0 - self.second_decay.powi(self.steps as i32);
-        let corrected_first = first.scale(first_correction.recip());
-        let corrected_second = second.scale(second_correction.recip());
+        let corrected_first = b.scale(first, first_correction.recip());
+        let corrected_second = b.scale(second, second_correction.recip());
 
-        let step = corrected_first.divide(&corrected_second.sqrt().shift(self.epsilon));
-        *parameters = parameters.subtract(&step.scale(self.rate));
+        let root = b.unary(Analytic::Sqrt, corrected_second);
+        let denominator = b.shift(root, self.epsilon);
+        let step = b.div(corrected_first, denominator);
+        let step = b.scale(step, self.rate);
+        let p = b.sub(p, step);
+        b.set(0, p);
+        if resumed {
+            b.set(1, first);
+            b.set(2, second);
+        } else {
+            b.output(first, DType::F32);
+            b.output(second, DType::F32);
+        }
+        let program = b.build().expect("the rule's program is valid");
 
-        self.first = Some(first);
-        self.second = Some(second);
+        match (&mut self.first, &mut self.second) {
+            (Some(first), Some(second)) => {
+                P::fused(&program, &[gradient], &mut [parameters, first, second]);
+            }
+            _ => {
+                let mut moments = P::fused(&program, &[gradient], &mut [parameters]).into_iter();
+                self.first = moments.next();
+                self.second = moments.next();
+            }
+        }
     }
 
     fn reset(&mut self) {
@@ -470,6 +733,22 @@ impl<P: Parameter> Rule<P> for Adam<P> {
         self.second = None;
         self.steps = 0;
     }
+}
+
+/// `p − rate · g / (√s + ε)`, the step the adaptive rules share.
+fn descend(
+    b: &mut Builder,
+    p: crate::tensors::fused::Value,
+    g: crate::tensors::fused::Value,
+    scale: crate::tensors::fused::Value,
+    epsilon: f32,
+    rate: f32,
+) -> crate::tensors::fused::Value {
+    let root = b.unary(Analytic::Sqrt, scale);
+    let denominator = b.shift(root, epsilon);
+    let step = b.div(g, denominator);
+    let step = b.scale(step, rate);
+    b.sub(p, step)
 }
 
 /// A simple wrapper around a function that allows us
@@ -561,4 +840,45 @@ where
         rule.update(parameters, &recorded.grad());
     }
     last
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The provided [`Parameter::fused`], for parameter types without a
+    /// program runner, has to give the same answers as the real one.
+    #[test]
+    fn the_provided_parameter_runner_matches_the_fused_one() {
+        let mut b = Builder::new();
+        let g = b.input(DType::F32);
+        let p = b.update(DType::F32);
+        let m = b.update(DType::F32);
+        let decayed = b.scale(m, 0.9);
+        let m = b.add(decayed, g);
+        let root = b.unary(Analytic::Sqrt, m);
+        let lifted = b.shift(root, 1e-3);
+        let three = b.constant(3.0);
+        let thirds = b.div(lifted, three);
+        let step = b.div(g, thirds);
+        let p = b.sub(p, step);
+        b.set(0, p);
+        b.set(1, m);
+        b.output(thirds, DType::F32);
+        let program = b.build().unwrap();
+
+        let g = Vector::new((0..100).map(|i| (i as f32 * 0.37).sin()).collect::<Vec<_>>());
+        let start = Vector::new((0..100).map(|i| i as f32 * 0.01).collect::<Vec<_>>());
+        let moment = Vector::new(vec![0.5f32; 100]);
+
+        let (mut p1, mut m1) = (start.clone(), moment.clone());
+        let fresh1 = Parameter::fused(&program, &[&g], &mut [&mut p1, &mut m1]);
+        let (mut p2, mut m2) = (start, moment);
+        let fresh2 = unfused_parameter(&program, &[&g], &mut [&mut p2, &mut m2]);
+
+        let bits = |v: &Vector<f32>| v.as_slice().iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&p1), bits(&p2));
+        assert_eq!(bits(&m1), bits(&m2));
+        assert_eq!(bits(&fresh1[0]), bits(&fresh2[0]));
+    }
 }

@@ -24,6 +24,7 @@
 /// tensors; `Host`/`f64` is the default.
 pub use tensorcrate_macros::math;
 
+pub mod counters;
 pub mod errors;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal;

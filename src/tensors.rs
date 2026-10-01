@@ -41,6 +41,7 @@ use crate::numbers::{Coefficient, Complex};
 pub mod analytic;
 pub mod backend;
 pub mod dual;
+pub mod fused;
 pub mod kernels;
 pub mod tape;
 

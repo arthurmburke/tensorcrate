@@ -148,6 +148,7 @@ struct Gpu {
     axis_distribution: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     fft_bit_reverse: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     fft_stage: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    fused: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pool: RefCell<Pool>,
     /// Command buffers committed but not yet waited on — see [`commit`].
     pending: RefCell<Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>>,
@@ -243,6 +244,7 @@ fn build_gpu() -> Option<Gpu> {
         axis_distribution: pipeline("axis_distribution")?,
         fft_bit_reverse: pipeline("fft_bit_reverse")?,
         fft_stage: pipeline("fft_stage")?,
+        fused: pipeline("fused_elementwise")?,
         pool: RefCell::new(Pool::default()),
         pending: RefCell::new(Vec::new()),
         device,
@@ -292,7 +294,7 @@ impl<T: Copy + 'static> MetalBuffer<T> {
     /// Allocate `len` values of shared storage, recycling a pooled allocation
     /// when one is big enough. The contents are unspecified, so every caller
     /// either uploads into it or has a kernel write every element.
-    fn allocate(len: usize) -> Option<Self> {
+    pub(crate) fn allocate(len: usize) -> Option<Self> {
         let bytes = len.checked_mul(size_of::<T>())?.max(1);
         with_gpu(|gpu| {
             let raw = gpu.pool.borrow_mut().acquire(&gpu.device, bytes)?;
@@ -344,6 +346,26 @@ impl<T: Copy + 'static> MetalBuffer<T> {
     /// Copy the shared allocation into an ordinary CPU vector.
     pub fn to_vec(&self) -> Vec<T> {
         self.as_slice().to_vec()
+    }
+
+    /// The Metal allocation, for binding to a kernel.
+    pub(crate) fn raw(&self) -> &ProtocolObject<dyn MTLBuffer> {
+        &self.raw
+    }
+
+    /// Borrow the shared allocation mutably, after waiting for every queued
+    /// command buffer — any of which may still be reading or writing it.
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [T] {
+        with_gpu(|gpu| {
+            sync_or_panic(gpu);
+            Some(())
+        })
+        .expect("a Metal buffer cannot outlive its thread-local device");
+        // SAFETY: as for `as_slice`, and the exclusive borrow of `self` rules out
+        // any other view of this allocation for as long as the slice lives.
+        unsafe {
+            std::slice::from_raw_parts_mut(self.raw.contents().as_ptr().cast::<T>(), self.len)
+        }
     }
 }
 
@@ -1883,6 +1905,77 @@ fn encode_fft(
     commit(gpu, command)
 }
 
+/// The iteration space and length of a fused program, as the shader's
+/// `FusedShape` reads them.
+#[repr(C)]
+struct FusedShape {
+    rows: u32,
+    cols: u32,
+    count: u32,
+}
+
+/// Input slots in the `fused_elementwise` shader.
+const FUSED_INPUT_SLOTS: usize = 16;
+/// Output slots in the `fused_elementwise` shader.
+const FUSED_OUTPUT_SLOTS: usize = 8;
+
+/// Encode one fused elementwise program over a `rows × cols` space.
+///
+/// `inputs` and `outputs` are bound in slot order. A tensor updated in place
+/// appears in both lists. Unused slots are bound to a buffer that is in use —
+/// the program never names them, so they are never read or written.
+pub(crate) fn fused_elementwise(
+    code: &[crate::tensors::fused::Encoded],
+    (rows, cols): (usize, usize),
+    inputs: &[&ProtocolObject<dyn MTLBuffer>],
+    outputs: &[&ProtocolObject<dyn MTLBuffer>],
+) -> Option<()> {
+    let len = rows.checked_mul(cols)?;
+    if len == 0
+        || code.is_empty()
+        || outputs.is_empty()
+        || inputs.len() > FUSED_INPUT_SLOTS
+        || outputs.len() > FUSED_OUTPUT_SLOTS
+    {
+        return None;
+    }
+    let shape = FusedShape {
+        rows: u32::try_from(rows).ok()?,
+        cols: u32::try_from(cols).ok()?,
+        count: u32::try_from(code.len()).ok()?,
+    };
+    // `setBytes` is limited to 4 KB, which bounds the program length.
+    let code_bytes = std::mem::size_of_val(code);
+    if code_bytes > 4096 {
+        return None;
+    }
+    let filler = inputs.first().copied().unwrap_or(outputs[0]);
+    with_gpu(|gpu| {
+        let command = gpu.queue.commandBuffer()?;
+        let encoder = command.computeCommandEncoder()?;
+        encoder.setComputePipelineState(&gpu.fused);
+        unsafe {
+            encoder.setBytes_length_atIndex(NonNull::from(&code[0]).cast(), code_bytes, 0);
+            encoder.setBytes_length_atIndex(
+                NonNull::from(&shape).cast(),
+                size_of::<FusedShape>(),
+                1,
+            );
+            for slot in 0..FUSED_INPUT_SLOTS {
+                let buffer = inputs.get(slot).copied().unwrap_or(filler);
+                encoder.setBuffer_offset_atIndex(Some(buffer), 0, 2 + slot);
+            }
+            for slot in 0..FUSED_OUTPUT_SLOTS {
+                let buffer = outputs.get(slot).copied().unwrap_or(outputs[0]);
+                encoder.setBuffer_offset_atIndex(Some(buffer), 0, 2 + FUSED_INPUT_SLOTS + slot);
+            }
+        }
+        dispatch_1d(&encoder, len);
+        encoder.endEncoding();
+        commit(gpu, command)
+    })
+}
+
 /// Submit `command` and return without waiting for the GPU.
 ///
 /// Blocking here is what made a chain of resident operations cost a full round
@@ -1905,6 +1998,7 @@ fn encode_fft(
 /// [`Metal`]: crate::tensors::Metal
 fn commit(gpu: &Gpu, command: Retained<ProtocolObject<dyn MTLCommandBuffer>>) -> Option<()> {
     command.commit();
+    crate::counters::command_buffer();
     let mut pending = gpu.pending.borrow_mut();
     pending.push(command);
     // Cap the backlog so a long run of un-read operations cannot retain command
@@ -1925,6 +2019,9 @@ fn sync(gpu: &Gpu) -> Option<()> {
     // Taken by value so a re-entrant call cannot see a half-drained list, and so
     // the buffers are released once they have been waited on.
     let pending = std::mem::take(&mut *gpu.pending.borrow_mut());
+    if !pending.is_empty() {
+        crate::counters::sync();
+    }
     let mut ok = true;
     for command in &pending {
         command.waitUntilCompleted();

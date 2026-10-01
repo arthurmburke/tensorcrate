@@ -25,7 +25,7 @@ macro_rules! neon_kernels {
         mod $modname:ident, ty = $t:ty, vec = $v:ty, lanes = $lanes:expr,
         load = $load:ident, store = $store:ident, dup = $dup:ident,
         add = $add:ident, sub = $sub:ident, mul = $mul:ident, div = $div:ident,
-        fma = $fma:ident, addv = $addv:ident,
+        fma = $fma:ident, addv = $addv:ident, sqrt = $sqrt:ident,
         min = $min:ident, max = $max:ident, bsl = $bsl:ident,
         cgt = $cgt:ident, clt = $clt:ident, cge = $cge:ident, cle = $cle:ident
     ) => {
@@ -301,6 +301,27 @@ macro_rules! neon_kernels {
                 }
             }
 
+            /// Elementwise square root. `fsqrt` is correctly rounded, as IEEE
+            /// requires of a square root, so every lane agrees with the scalar
+            /// `sqrt` bit for bit — including `−0.0`, which stays `−0.0`.
+            #[inline]
+            pub fn sqrt(values: &[$t], out: &mut [$t]) {
+                let n = values.len();
+                debug_assert_eq!(out.len(), n);
+                let mut i = 0;
+                unsafe {
+                    while i + LANES <= n {
+                        let vx = $load(values.as_ptr().add(i));
+                        $store(out.as_mut_ptr().add(i), $sqrt(vx));
+                        i += LANES;
+                    }
+                }
+                while i < n {
+                    out[i] = values[i].sqrt();
+                    i += 1;
+                }
+            }
+
             /// Confine every element to `[low, high]`, in one pass.
             ///
             /// Two `compare_scalar` calls would stream the data twice; the pair
@@ -563,7 +584,7 @@ neon_kernels! {
     mod f32k, ty = f32, vec = float32x4_t, lanes = 4,
     load = vld1q_f32, store = vst1q_f32, dup = vdupq_n_f32,
     add = vaddq_f32, sub = vsubq_f32, mul = vmulq_f32, div = vdivq_f32,
-    fma = vfmaq_f32, addv = vaddvq_f32,
+    fma = vfmaq_f32, addv = vaddvq_f32, sqrt = vsqrtq_f32,
     min = vminnmq_f32, max = vmaxnmq_f32, bsl = vbslq_f32,
     cgt = vcgtq_f32, clt = vcltq_f32, cge = vcgeq_f32, cle = vcleq_f32
 }
@@ -573,7 +594,7 @@ neon_kernels! {
     mod f64k, ty = f64, vec = float64x2_t, lanes = 2,
     load = vld1q_f64, store = vst1q_f64, dup = vdupq_n_f64,
     add = vaddq_f64, sub = vsubq_f64, mul = vmulq_f64, div = vdivq_f64,
-    fma = vfmaq_f64, addv = vaddvq_f64,
+    fma = vfmaq_f64, addv = vaddvq_f64, sqrt = vsqrtq_f64,
     min = vminnmq_f64, max = vmaxnmq_f64, bsl = vbslq_f64,
     cgt = vcgtq_f64, clt = vcltq_f64, cge = vcgeq_f64, cle = vcleq_f64
 }

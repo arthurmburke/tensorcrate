@@ -16,7 +16,9 @@
 
 use std::cmp::Ordering;
 
+use super::fused::{self, Fresh, Program, Sink, Source};
 use super::{Backend, Host, Matrix, Vector};
+use crate::counters;
 use crate::statistics::{Distribution, Moments};
 
 /// An elementwise binary operation.
@@ -968,6 +970,17 @@ pub trait Kernels: Backend {
         first: &Vector<f32, Self>,
         second: &Vector<f32, Self>,
     ) -> Matrix<f32, Self>;
+
+    /// Run a fused elementwise program as one kernel. Reach this through
+    /// [`Program::run`](super::fused::Program::run), which checks the operands
+    /// against the program first.
+    #[doc(hidden)]
+    fn fused(
+        program: &Program,
+        shape: (usize, usize),
+        inputs: &[Source<'_, Self>],
+        updated: &mut [Sink<'_, Self>],
+    ) -> Vec<Fresh<Self>>;
 }
 
 /// Every operation here already exists as an inherent method or an operator on
@@ -978,6 +991,7 @@ impl Kernels for Host {
         b: &Vector<f32, Self>,
         op: BinaryOp,
     ) -> Vector<f32, Self> {
+        counters::elementwise(a.len(), 2);
         match op {
             BinaryOp::Add => a + b,
             BinaryOp::Sub => a - b,
@@ -993,6 +1007,7 @@ impl Kernels for Host {
         op: BinaryOp,
         scalar_left: bool,
     ) -> Vector<f32, Self> {
+        counters::elementwise(a.len(), 1);
         if scalar_left {
             a.broadcast_left(scalar, op)
         } else {
@@ -1005,6 +1020,7 @@ impl Kernels for Host {
         b: &Vector<f32, Self>,
         op: Compare,
     ) -> Vector<f32, Self> {
+        counters::elementwise(a.len(), 2);
         a.compare(b, op)
     }
 
@@ -1014,30 +1030,37 @@ impl Kernels for Host {
         op: Compare,
         scalar_left: bool,
     ) -> Vector<f32, Self> {
+        counters::elementwise(a.len(), 1);
         a.compare_scalar(scalar, op, scalar_left)
     }
 
     fn vector_clamp(a: &Vector<f32, Self>, low: f32, high: f32) -> Vector<f32, Self> {
+        counters::elementwise(a.len(), 1);
         a.clamp(low, high)
     }
 
     fn vector_reduce(a: &Vector<f32, Self>, op: Reduce) -> f32 {
+        counters::kernel(a.len() * 4, 0);
         a.reduce(op)
     }
 
     fn vector_prefix_sum(a: &Vector<f32, Self>) -> Vector<f32, Self> {
+        counters::elementwise(a.len(), 1);
         a.prefix_sum()
     }
 
     fn vector_sort(a: &Vector<f32, Self>, order: SortOrder) -> Vector<f32, Self> {
+        counters::elementwise(a.len(), 1);
         a.sorted(order)
     }
 
     fn vector_unary(a: &Vector<f32, Self>, f: Analytic) -> Vector<f32, Self> {
+        counters::elementwise(a.len(), 1);
         a.map(|&x| f.value(x))
     }
 
     fn vector_power(a: &Vector<f32, Self>, b: &Vector<f32, Self>) -> Vector<f32, Self> {
+        counters::elementwise(a.len(), 2);
         a.pow_elementwise(b)
     }
 
@@ -1046,6 +1069,7 @@ impl Kernels for Host {
         scalar: f32,
         scalar_left: bool,
     ) -> Vector<f32, Self> {
+        counters::elementwise(a.len(), 1);
         if scalar_left {
             a.map(|&x| scalar.powf(x))
         } else {
@@ -1058,6 +1082,7 @@ impl Kernels for Host {
         tangent: &Vector<f32, Self>,
         f: Analytic,
     ) -> (Vector<f32, Self>, Vector<f32, Self>) {
+        counters::kernel(4 * value.len() * 4, 2);
         assert_eq!(
             value.len(),
             tangent.len(),
@@ -1073,14 +1098,17 @@ impl Kernels for Host {
     }
 
     fn dot(a: &Vector<f32, Self>, b: &Vector<f32, Self>) -> f32 {
+        counters::kernel(2 * a.len() * 4, 0);
         a.dot(b)
     }
 
     fn vecmat(v: &Vector<f32, Self>, m: &Matrix<f32, Self>) -> Vector<f32, Self> {
+        counters::kernel((v.len() + m.rows() * m.cols() + m.cols()) * 4, 1);
         v.vecmat(m)
     }
 
     fn matvec(m: &Matrix<f32, Self>, v: &Vector<f32, Self>) -> Vector<f32, Self> {
+        counters::kernel((v.len() + m.rows() * m.cols() + m.rows()) * 4, 1);
         m.matvec(v)
     }
 
@@ -1089,6 +1117,7 @@ impl Kernels for Host {
         v: &Vector<f32, Self>,
         addend: Vector<f32, Self>,
     ) -> Vector<f32, Self> {
+        counters::kernel((v.len() + m.rows() * m.cols() + 2 * m.rows()) * 4, 0);
         m.matvec_add(v, addend)
     }
 
@@ -1097,6 +1126,7 @@ impl Kernels for Host {
         b: &Matrix<f32, Self>,
         op: BinaryOp,
     ) -> Matrix<f32, Self> {
+        counters::elementwise(a.rows() * a.cols(), 2);
         match op {
             BinaryOp::Add => a + b,
             BinaryOp::Sub => a - b,
@@ -1112,6 +1142,7 @@ impl Kernels for Host {
         op: BinaryOp,
         scalar_left: bool,
     ) -> Matrix<f32, Self> {
+        counters::elementwise(a.rows() * a.cols(), 1);
         if scalar_left {
             a.broadcast_left(scalar, op)
         } else {
@@ -1124,6 +1155,7 @@ impl Kernels for Host {
         b: &Matrix<f32, Self>,
         op: Compare,
     ) -> Matrix<f32, Self> {
+        counters::elementwise(a.rows() * a.cols(), 2);
         a.compare(b, op)
     }
 
@@ -1133,18 +1165,22 @@ impl Kernels for Host {
         op: Compare,
         scalar_left: bool,
     ) -> Matrix<f32, Self> {
+        counters::elementwise(a.rows() * a.cols(), 1);
         a.compare_scalar(scalar, op, scalar_left)
     }
 
     fn matrix_clamp(a: &Matrix<f32, Self>, low: f32, high: f32) -> Matrix<f32, Self> {
+        counters::elementwise(a.rows() * a.cols(), 1);
         a.clamp(low, high)
     }
 
     fn matrix_unary(a: &Matrix<f32, Self>, f: Analytic) -> Matrix<f32, Self> {
+        counters::elementwise(a.rows() * a.cols(), 1);
         a.map(|&x| f.value(x))
     }
 
     fn matrix_power(a: &Matrix<f32, Self>, b: &Matrix<f32, Self>) -> Matrix<f32, Self> {
+        counters::elementwise(a.rows() * a.cols(), 2);
         a.pow_elementwise(b)
     }
 
@@ -1153,6 +1189,7 @@ impl Kernels for Host {
         scalar: f32,
         scalar_left: bool,
     ) -> Matrix<f32, Self> {
+        counters::elementwise(a.rows() * a.cols(), 1);
         if scalar_left {
             a.map(|&x| scalar.powf(x))
         } else {
@@ -1165,6 +1202,7 @@ impl Kernels for Host {
         tangent: &Matrix<f32, Self>,
         f: Analytic,
     ) -> (Matrix<f32, Self>, Matrix<f32, Self>) {
+        counters::kernel(4 * value.rows() * value.cols() * 4, 2);
         assert_eq!(
             value.shape(),
             tangent.shape(),
@@ -1184,6 +1222,7 @@ impl Kernels for Host {
     }
 
     fn matmul(a: &Matrix<f32, Self>, b: &Matrix<f32, Self>) -> Matrix<f32, Self> {
+        counters::kernel((a.rows() * a.cols() + b.rows() * b.cols() + a.rows() * b.cols()) * 4, 1);
         a.matmul(b)
     }
 
@@ -1192,10 +1231,12 @@ impl Kernels for Host {
         b: &Matrix<f32, Self>,
         addend: Matrix<f32, Self>,
     ) -> Matrix<f32, Self> {
+        counters::kernel((a.rows() * a.cols() + b.rows() * b.cols() + 2 * a.rows() * b.cols()) * 4, 0);
         a.matmul_add(b, addend)
     }
 
     fn transpose(m: &Matrix<f32, Self>) -> Matrix<f32, Self> {
+        counters::elementwise(m.rows() * m.cols(), 1);
         m.transpose()
     }
 
@@ -1204,6 +1245,7 @@ impl Kernels for Host {
         window: &Matrix<f32, Self>,
         flip: bool,
     ) -> Matrix<f32, Self> {
+        counters::kernel((input.rows() * input.cols() + window.rows() * window.cols() + correlation_shape(input.shape(), window.shape()).0 * correlation_shape(input.shape(), window.shape()).1) * 4, 1);
         let cols = input.cols();
         let (window_rows, window_cols) = window.shape();
         let (out_rows, out_cols) = correlation_shape(input.shape(), window.shape());
@@ -1231,6 +1273,7 @@ impl Kernels for Host {
     }
 
     fn flip(input: &Matrix<f32, Self>) -> Matrix<f32, Self> {
+        counters::elementwise(input.rows() * input.cols(), 1);
         let (rows, cols) = input.shape();
         let values = input.data();
         let mut out = Vec::with_capacity(rows * cols);
@@ -1256,6 +1299,7 @@ impl Kernels for Host {
         window: &Matrix<f32, Self>,
         forward_flip: bool,
     ) -> Matrix<f32, Self> {
+        counters::kernel((adjoint.rows() * adjoint.cols() + window.rows() * window.cols() + (adjoint.rows() + window.rows() - 1) * (adjoint.cols() + window.cols() - 1)) * 4, 1);
         // X̄[p][q] = Σᵤᵥ Ȳ[p−u][q−v]·K[u][v], with the taps reversed when the
         // forward pass reversed them. Out-of-range adjoint indices are the zeros
         // a full correlation pads with.
@@ -1293,6 +1337,7 @@ impl Kernels for Host {
     }
 
     fn pad(input: &Matrix<f32, Self>, pad_rows: usize, pad_cols: usize) -> Matrix<f32, Self> {
+        counters::kernel((input.rows() * input.cols() + (input.rows() + 2 * pad_rows) * (input.cols() + 2 * pad_cols)) * 4, 1);
         let (rows, cols) = input.shape();
         let (padded_rows, padded_cols) = (rows + 2 * pad_rows, cols + 2 * pad_cols);
         let values = input.data();
@@ -1315,10 +1360,12 @@ impl Kernels for Host {
     }
 
     fn vector_moments(a: &Vector<f32, Self>) -> (f32, f32) {
+        counters::kernel(2 * a.len() * 4, 0);
         moments_pair(&a.moments())
     }
 
     fn matrix_moments(a: &Matrix<f32, Self>) -> (f32, f32) {
+        counters::kernel(2 * a.rows() * a.cols() * 4, 0);
         moments_pair(&a.moments())
     }
 
@@ -1326,6 +1373,7 @@ impl Kernels for Host {
         a: &Matrix<f32, Self>,
         axis: Axis,
     ) -> (Vector<f32, Self>, Vector<f32, Self>) {
+        counters::kernel((2 * a.rows() * a.cols() + 2 * axis.extent(a.shape())) * 4, 2);
         let moments = a.moments_axis(axis);
         (moments.means, moments.sum_squared_deviations)
     }
@@ -1336,6 +1384,7 @@ impl Kernels for Host {
         statistic: Statistic,
         parameters: (f32, f32),
     ) -> Vector<f32, Self> {
+        counters::elementwise(a.len(), 1);
         a.distribution(
             statistic,
             &Distribution::from_parameters(family, parameters),
@@ -1348,6 +1397,7 @@ impl Kernels for Host {
         statistic: Statistic,
         parameters: (f32, f32),
     ) -> Matrix<f32, Self> {
+        counters::elementwise(a.rows() * a.cols(), 1);
         a.distribution(
             statistic,
             &Distribution::from_parameters(family, parameters),
@@ -1362,7 +1412,17 @@ impl Kernels for Host {
         first: &Vector<f32, Self>,
         second: &Vector<f32, Self>,
     ) -> Matrix<f32, Self> {
+        counters::kernel((2 * a.rows() * a.cols() + 2 * axis.extent(a.shape())) * 4, 1);
         a.distribution_axis(axis, statistic, &axis_distributions(family, first, second))
+    }
+
+    fn fused(
+        program: &Program,
+        shape: (usize, usize),
+        inputs: &[Source<'_, Self>],
+        updated: &mut [Sink<'_, Self>],
+    ) -> Vec<Fresh<Self>> {
+        fused::host(program, shape, inputs, updated)
     }
 }
 
@@ -1405,9 +1465,10 @@ pub(crate) fn correlation_shape(input: (usize, usize), window: (usize, usize)) -
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod gpu {
     use super::{
-        Analytic, Axis, BinaryOp, Compare, Family, Kernels, Matrix, Reduce, SortOrder, Statistic,
-        Vector, correlation_shape,
+        Analytic, Axis, BinaryOp, Compare, Family, Fresh, Kernels, Matrix, Program, Reduce, Sink,
+        SortOrder, Source, Statistic, Vector, correlation_shape, fused,
     };
+    use crate::counters;
     use crate::tensors::metal_backend::{matrix_elementwise, vector_elementwise};
     use crate::tensors::{Host, Metal, MetalStorage};
 
@@ -1419,6 +1480,7 @@ mod gpu {
             b: &Vector<f32, Self>,
             op: BinaryOp,
         ) -> Vector<f32, Self> {
+            counters::elementwise(a.len(), 2);
             vector_elementwise(a, b, op)
         }
 
@@ -1428,6 +1490,7 @@ mod gpu {
             op: BinaryOp,
             scalar_left: bool,
         ) -> Vector<f32, Self> {
+            counters::elementwise(a.len(), 1);
             if scalar_left {
                 a.broadcast_left(scalar, op)
             } else {
@@ -1440,6 +1503,7 @@ mod gpu {
             b: &Vector<f32, Self>,
             op: Compare,
         ) -> Vector<f32, Self> {
+            counters::elementwise(a.len(), 2);
             a.compare(b, op)
         }
 
@@ -1449,30 +1513,37 @@ mod gpu {
             op: Compare,
             scalar_left: bool,
         ) -> Vector<f32, Self> {
+            counters::elementwise(a.len(), 1);
             a.compare_scalar(scalar, op, scalar_left)
         }
 
         fn vector_clamp(a: &Vector<f32, Self>, low: f32, high: f32) -> Vector<f32, Self> {
+            counters::elementwise(a.len(), 1);
             a.clamp(low, high)
         }
 
         fn vector_reduce(a: &Vector<f32, Self>, op: Reduce) -> f32 {
+            counters::kernel(a.len() * 4, 0);
             a.reduce(op)
         }
 
         fn vector_prefix_sum(a: &Vector<f32, Self>) -> Vector<f32, Self> {
+            counters::elementwise(a.len(), 1);
             a.prefix_sum()
         }
 
         fn vector_sort(a: &Vector<f32, Self>, order: SortOrder) -> Vector<f32, Self> {
+            counters::elementwise(a.len(), 1);
             a.sorted(order)
         }
 
         fn vector_unary(a: &Vector<f32, Self>, f: Analytic) -> Vector<f32, Self> {
+            counters::elementwise(a.len(), 1);
             a.analytic(f)
         }
 
         fn vector_power(a: &Vector<f32, Self>, b: &Vector<f32, Self>) -> Vector<f32, Self> {
+            counters::elementwise(a.len(), 2);
             a.pow_elementwise(b)
         }
 
@@ -1481,6 +1552,7 @@ mod gpu {
             scalar: f32,
             scalar_left: bool,
         ) -> Vector<f32, Self> {
+            counters::elementwise(a.len(), 1);
             a.power_scalar(scalar, scalar_left)
         }
 
@@ -1489,6 +1561,7 @@ mod gpu {
             tangent: &Vector<f32, Self>,
             f: Analytic,
         ) -> (Vector<f32, Self>, Vector<f32, Self>) {
+            counters::kernel(4 * value.len() * 4, 2);
             match value.storage().unary_dual(tangent.storage(), f) {
                 Some((v, t)) => (
                     Vector::from_storage(value.len(), v),
@@ -1506,14 +1579,17 @@ mod gpu {
         }
 
         fn dot(a: &Vector<f32, Self>, b: &Vector<f32, Self>) -> f32 {
+            counters::kernel(2 * a.len() * 4, 0);
             a.dot(b)
         }
 
         fn vecmat(v: &Vector<f32, Self>, m: &Matrix<f32, Self>) -> Vector<f32, Self> {
+            counters::kernel((v.len() + m.rows() * m.cols() + m.cols()) * 4, 1);
             v.vecmat(m)
         }
 
         fn matvec(m: &Matrix<f32, Self>, v: &Vector<f32, Self>) -> Vector<f32, Self> {
+            counters::kernel((v.len() + m.rows() * m.cols() + m.rows()) * 4, 1);
             m.matvec(v)
         }
 
@@ -1522,6 +1598,7 @@ mod gpu {
             v: &Vector<f32, Self>,
             addend: Vector<f32, Self>,
         ) -> Vector<f32, Self> {
+            counters::kernel((v.len() + m.rows() * m.cols() + 2 * m.rows()) * 4, 0);
             m.matvec_add(v, addend)
         }
 
@@ -1530,6 +1607,7 @@ mod gpu {
             b: &Matrix<f32, Self>,
             op: BinaryOp,
         ) -> Matrix<f32, Self> {
+            counters::elementwise(a.rows() * a.cols(), 2);
             matrix_elementwise(a, b, op)
         }
 
@@ -1539,6 +1617,7 @@ mod gpu {
             op: BinaryOp,
             scalar_left: bool,
         ) -> Matrix<f32, Self> {
+            counters::elementwise(a.rows() * a.cols(), 1);
             if scalar_left {
                 a.broadcast_left(scalar, op)
             } else {
@@ -1551,6 +1630,7 @@ mod gpu {
             b: &Matrix<f32, Self>,
             op: Compare,
         ) -> Matrix<f32, Self> {
+            counters::elementwise(a.rows() * a.cols(), 2);
             a.compare(b, op)
         }
 
@@ -1560,18 +1640,22 @@ mod gpu {
             op: Compare,
             scalar_left: bool,
         ) -> Matrix<f32, Self> {
+            counters::elementwise(a.rows() * a.cols(), 1);
             a.compare_scalar(scalar, op, scalar_left)
         }
 
         fn matrix_clamp(a: &Matrix<f32, Self>, low: f32, high: f32) -> Matrix<f32, Self> {
+            counters::elementwise(a.rows() * a.cols(), 1);
             a.clamp(low, high)
         }
 
         fn matrix_unary(a: &Matrix<f32, Self>, f: Analytic) -> Matrix<f32, Self> {
+            counters::elementwise(a.rows() * a.cols(), 1);
             a.analytic(f)
         }
 
         fn matrix_power(a: &Matrix<f32, Self>, b: &Matrix<f32, Self>) -> Matrix<f32, Self> {
+            counters::elementwise(a.rows() * a.cols(), 2);
             a.pow_elementwise(b)
         }
 
@@ -1580,6 +1664,7 @@ mod gpu {
             scalar: f32,
             scalar_left: bool,
         ) -> Matrix<f32, Self> {
+            counters::elementwise(a.rows() * a.cols(), 1);
             a.power_scalar(scalar, scalar_left)
         }
 
@@ -1588,6 +1673,7 @@ mod gpu {
             tangent: &Matrix<f32, Self>,
             f: Analytic,
         ) -> (Matrix<f32, Self>, Matrix<f32, Self>) {
+            counters::kernel(4 * value.rows() * value.cols() * 4, 2);
             let (rows, cols) = value.shape();
             match value.storage().unary_dual(tangent.storage(), f) {
                 Some((v, t)) => (
@@ -1606,6 +1692,7 @@ mod gpu {
         }
 
         fn matmul(a: &Matrix<f32, Self>, b: &Matrix<f32, Self>) -> Matrix<f32, Self> {
+            counters::kernel((a.rows() * a.cols() + b.rows() * b.cols() + a.rows() * b.cols()) * 4, 1);
             a.matmul(b)
         }
 
@@ -1614,10 +1701,12 @@ mod gpu {
             b: &Matrix<f32, Self>,
             addend: Matrix<f32, Self>,
         ) -> Matrix<f32, Self> {
+            counters::kernel((a.rows() * a.cols() + b.rows() * b.cols() + 2 * a.rows() * b.cols()) * 4, 0);
             a.matmul_add(b, addend)
         }
 
         fn transpose(m: &Matrix<f32, Self>) -> Matrix<f32, Self> {
+            counters::elementwise(m.rows() * m.cols(), 1);
             m.transpose()
         }
 
@@ -1626,6 +1715,7 @@ mod gpu {
             window: &Matrix<f32, Self>,
             flip: bool,
         ) -> Matrix<f32, Self> {
+            counters::kernel((input.rows() * input.cols() + window.rows() * window.cols() + correlation_shape(input.shape(), window.shape()).0 * correlation_shape(input.shape(), window.shape()).1) * 4, 1);
             let (rows, cols) = input.shape();
             let (window_rows, window_cols) = window.shape();
             let (out_rows, out_cols) = correlation_shape(input.shape(), window.shape());
@@ -1648,6 +1738,7 @@ mod gpu {
         }
 
         fn flip(input: &Matrix<f32, Self>) -> Matrix<f32, Self> {
+            counters::elementwise(input.rows() * input.cols(), 1);
             let (rows, cols) = input.shape();
             match input.storage().flip(rows, cols) {
                 Some(data) => Matrix::from_storage(rows, cols, data),
@@ -1670,6 +1761,7 @@ mod gpu {
             window: &Matrix<f32, Self>,
             forward_flip: bool,
         ) -> Matrix<f32, Self> {
+            counters::kernel((adjoint.rows() * adjoint.cols() + window.rows() * window.cols() + (adjoint.rows() + window.rows() - 1) * (adjoint.cols() + window.cols() - 1)) * 4, 1);
             let (out_rows, out_cols) = adjoint.shape();
             let (window_rows, window_cols) = window.shape();
             let (rows, cols) = (out_rows + window_rows - 1, out_cols + window_cols - 1);
@@ -1700,6 +1792,7 @@ mod gpu {
         }
 
         fn pad(input: &Matrix<f32, Self>, pad_rows: usize, pad_cols: usize) -> Matrix<f32, Self> {
+            counters::kernel((input.rows() * input.cols() + (input.rows() + 2 * pad_rows) * (input.cols() + 2 * pad_cols)) * 4, 1);
             let (rows, cols) = input.shape();
             let (padded_rows, padded_cols) = (rows + 2 * pad_rows, cols + 2 * pad_cols);
             match input.storage().pad(rows, cols, pad_rows, pad_cols) {
@@ -1709,11 +1802,13 @@ mod gpu {
         }
 
         fn vector_moments(a: &Vector<f32, Self>) -> (f32, f32) {
+            counters::kernel(2 * a.len() * 4, 0);
             resident_moments(a.storage(), a.len())
                 .unwrap_or_else(|| Host::vector_moments(&a.to_backend::<Host>()))
         }
 
         fn matrix_moments(a: &Matrix<f32, Self>) -> (f32, f32) {
+            counters::kernel(2 * a.rows() * a.cols() * 4, 0);
             resident_moments(a.storage(), a.rows() * a.cols())
                 .unwrap_or_else(|| Host::matrix_moments(&a.to_backend::<Host>()))
         }
@@ -1722,6 +1817,7 @@ mod gpu {
             a: &Matrix<f32, Self>,
             axis: Axis,
         ) -> (Vector<f32, Self>, Vector<f32, Self>) {
+            counters::kernel((2 * a.rows() * a.cols() + 2 * axis.extent(a.shape())) * 4, 2);
             let (rows, cols) = a.shape();
             let extent = axis.extent((rows, cols));
             // An empty fold has no mean, and the shader has no thread to write
@@ -1748,6 +1844,7 @@ mod gpu {
             statistic: Statistic,
             parameters: (f32, f32),
         ) -> Vector<f32, Self> {
+            counters::elementwise(a.len(), 1);
             match a.storage().distribution(family, statistic, parameters) {
                 Some(data) => Vector::from_storage(a.len(), data),
                 None => Host::vector_distribution(
@@ -1766,6 +1863,7 @@ mod gpu {
             statistic: Statistic,
             parameters: (f32, f32),
         ) -> Matrix<f32, Self> {
+            counters::elementwise(a.rows() * a.cols(), 1);
             let (rows, cols) = a.shape();
             match a.storage().distribution(family, statistic, parameters) {
                 Some(data) => Matrix::from_storage(rows, cols, data),
@@ -1787,6 +1885,7 @@ mod gpu {
             first: &Vector<f32, Self>,
             second: &Vector<f32, Self>,
         ) -> Matrix<f32, Self> {
+            counters::kernel((2 * a.rows() * a.cols() + 2 * axis.extent(a.shape())) * 4, 1);
             let (rows, cols) = a.shape();
             let resident = a.storage().axis_distribution(
                 first.storage(),
@@ -1808,6 +1907,15 @@ mod gpu {
                 )
                 .to_backend(),
             }
+        }
+
+        fn fused(
+            program: &Program,
+            shape: (usize, usize),
+            inputs: &[Source<'_, Self>],
+            updated: &mut [Sink<'_, Self>],
+        ) -> Vec<Fresh<Self>> {
+            fused::metal(program, shape, inputs, updated)
         }
     }
 

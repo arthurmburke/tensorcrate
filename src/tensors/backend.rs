@@ -71,6 +71,29 @@ pub trait Backend: sealed::Sealed + Sized + 'static {
     /// copying.
     fn matrix_slice<T: Copy + 'static>(storage: &Self::Matrix<T>) -> &[T];
 
+    /// Borrow vector storage mutably. For [`Metal`] this waits for queued GPU
+    /// work first, since a kernel may still be writing the allocation.
+    #[doc(hidden)]
+    fn vector_slice_mut<T: Copy + 'static>(storage: &mut Self::Vector<T>) -> &mut [T];
+
+    /// Take ownership of values as vector storage — a move on [`Host`], one
+    /// upload on [`Metal`].
+    #[doc(hidden)]
+    fn vector_from_vec<T: Copy + 'static>(values: Vec<T>) -> Self::Vector<T>;
+
+    /// View matrix storage as the vector storage of its row-major flattening,
+    /// without moving it. Both backends use one storage type for the two
+    /// shapes, so this is the identity; it lets shape-agnostic code such as
+    /// [`fused`](super::fused) take either.
+    #[doc(hidden)]
+    fn matrix_as_vector<T: Copy + 'static>(storage: &Self::Matrix<T>) -> &Self::Vector<T>;
+
+    /// The mutable counterpart of [`matrix_as_vector`](Self::matrix_as_vector).
+    #[doc(hidden)]
+    fn matrix_as_vector_mut<T: Copy + 'static>(
+        storage: &mut Self::Matrix<T>,
+    ) -> &mut Self::Vector<T>;
+
     /// Reinterpret a vector as a matrix, filling rows in order.
     ///
     /// This and [`matrix_into_flattened`](Self::matrix_into_flattened) are what
@@ -144,6 +167,22 @@ impl Backend for Host {
     }
 
     fn matrix_slice<T: Copy + 'static>(storage: &Vec<T>) -> &[T] {
+        storage
+    }
+
+    fn vector_slice_mut<T: Copy + 'static>(storage: &mut Vec<T>) -> &mut [T] {
+        storage
+    }
+
+    fn vector_from_vec<T: Copy + 'static>(values: Vec<T>) -> Vec<T> {
+        values
+    }
+
+    fn matrix_as_vector<T: Copy + 'static>(storage: &Vec<T>) -> &Vec<T> {
+        storage
+    }
+
+    fn matrix_as_vector_mut<T: Copy + 'static>(storage: &mut Vec<T>) -> &mut Vec<T> {
         storage
     }
 
@@ -271,6 +310,24 @@ mod gpu {
 
         fn matrix_slice<T: Copy + 'static>(storage: &MetalStorage<T>) -> &[T] {
             storage.as_slice()
+        }
+
+        fn vector_slice_mut<T: Copy + 'static>(storage: &mut MetalStorage<T>) -> &mut [T] {
+            storage.as_mut_slice()
+        }
+
+        fn vector_from_vec<T: Copy + 'static>(values: Vec<T>) -> MetalStorage<T> {
+            MetalStorage::from_slice(&values)
+        }
+
+        fn matrix_as_vector<T: Copy + 'static>(storage: &MetalStorage<T>) -> &MetalStorage<T> {
+            storage
+        }
+
+        fn matrix_as_vector_mut<T: Copy + 'static>(
+            storage: &mut MetalStorage<T>,
+        ) -> &mut MetalStorage<T> {
+            storage
         }
 
         // A vector and a matrix are the same shared allocation, and row-major
@@ -424,12 +481,26 @@ mod gpu {
             }
         }
 
+        /// Borrow the values mutably. A device allocation waits for queued
+        /// GPU work first.
+        pub(crate) fn as_mut_slice(&mut self) -> &mut [T] {
+            match &mut self.0 {
+                Residency::Device(buffer) => buffer.as_mut_slice(),
+                Residency::Host(values) => values,
+            }
+        }
+
         /// The shared allocation, when there is one.
-        fn device(&self) -> Option<&MetalBuffer<T>> {
+        pub(crate) fn device(&self) -> Option<&MetalBuffer<T>> {
             match &self.0 {
                 Residency::Device(buffer) => Some(buffer),
                 Residency::Host(_) => None,
             }
+        }
+
+        /// Wrap an allocation a kernel has written.
+        pub(crate) fn from_device(buffer: MetalBuffer<T>) -> Self {
+            Self(Residency::Device(buffer))
         }
     }
 
