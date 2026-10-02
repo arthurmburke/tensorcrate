@@ -186,7 +186,7 @@ fn rules_agree<P: Parameter<Elem = f32>>(start: &P, gradients: &[P], same: &dyn 
     let (mut fused, mut unfused) = (start.duplicate(), start.duplicate());
     let mut rule = Sgd::new(0.05);
     for g in gradients {
-        rule.update(&mut fused, g);
+        rule.update(&mut fused, g.as_gradient());
         reference::sgd(0.05, &mut unfused, g);
         same(&fused, &unfused, "sgd");
     }
@@ -200,7 +200,7 @@ fn rules_agree<P: Parameter<Elem = f32>>(start: &P, gradients: &[P], same: &dyn 
         };
         let mut velocity = None;
         for g in gradients {
-            rule.update(&mut fused, g);
+            rule.update(&mut fused, g.as_gradient());
             reference::momentum(0.05, 0.9, nesterov, &mut velocity, &mut unfused, g);
             same(&fused, &unfused, "momentum");
         }
@@ -210,7 +210,7 @@ fn rules_agree<P: Parameter<Elem = f32>>(start: &P, gradients: &[P], same: &dyn 
     let mut rule = AdaGrad::new(0.1);
     let mut total = None;
     for g in gradients {
-        rule.update(&mut fused, g);
+        rule.update(&mut fused, g.as_gradient());
         reference::adagrad(0.1, 1e-8, &mut total, &mut unfused, g);
         same(&fused, &unfused, "adagrad");
     }
@@ -219,7 +219,7 @@ fn rules_agree<P: Parameter<Elem = f32>>(start: &P, gradients: &[P], same: &dyn 
     let mut rule = RmsProp::new(0.01);
     let mut mean_square = None;
     for g in gradients {
-        rule.update(&mut fused, g);
+        rule.update(&mut fused, g.as_gradient());
         reference::rmsprop(0.01, 0.9, 1e-8, &mut mean_square, &mut unfused, g);
         same(&fused, &unfused, "rmsprop");
     }
@@ -232,7 +232,7 @@ fn rules_agree<P: Parameter<Elem = f32>>(start: &P, gradients: &[P], same: &dyn 
         steps: 0,
     };
     for g in gradients {
-        rule.update(&mut fused, g);
+        rule.update(&mut fused, g.as_gradient());
         reference::adam((0.001, 0.9, 0.999, 1e-8), &mut state, &mut unfused, g);
         same(&fused, &unfused, "adam");
     }
@@ -246,7 +246,7 @@ fn rules_agree<P: Parameter<Elem = f32>>(start: &P, gradients: &[P], same: &dyn 
         steps: 0,
     };
     let mut expected = start.duplicate();
-    rule.update(&mut fresh, &gradients[0]);
+    rule.update(&mut fresh, gradients[0].as_gradient());
     reference::adam(
         (0.001, 0.9, 0.999, 1e-8),
         &mut state,

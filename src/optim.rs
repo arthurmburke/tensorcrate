@@ -52,7 +52,9 @@ use std::sync::Arc;
 use num_traits::Float;
 
 use crate::numbers::Real;
-use crate::tensors::fused::{Builder, Element, Fusable, FusableMut, Instr, Output, Program, Remap};
+use crate::tensors::fused::{
+    Builder, Element, Fusable, FusableMut, FusableOf, Instr, Output, Program, Remap,
+};
 use crate::tensors::tape::Adjoint;
 use crate::tensors::{Analytic, BinaryOp, Host, Kernels, Matrix, ScalarVar, Tape, Var, Vector};
 
@@ -64,6 +66,12 @@ use crate::tensors::{Analytic, BinaryOp, Host, Kernels, Matrix, ScalarVar, Tape,
 /// so a rule is written once and applies to any of them, on either backend,
 /// without leaving it. (Metal computes in `f32`, `f16` and `bf16`, so those are
 /// the element types of a resident parameter.)
+///
+/// A rule's step is a fused [`Program`], run the way
+/// [`Program::run`](crate::tensors::fused::Program::run) runs one: the gradient
+/// is an input, only read, and the parameters and the rule's state are updated
+/// in place. So a tensor's gradient is anything a program reads — see
+/// [`Gradient`](Parameter::Gradient).
 pub trait Parameter: Sized + 'static {
     /// The element type: what the hyperparameters, the loss and the arithmetic
     /// of a step are made of.
@@ -71,6 +79,19 @@ pub trait Parameter: Sized + 'static {
 
     /// Where this parameter's elements live.
     type Backend: Kernels<Self::Elem>;
+
+    /// What a rule reads this parameter's gradient from. For a [`Vector`] or a
+    /// [`Matrix`], any tensor of [`Self::Elem`](Parameter::Elem) a fused
+    /// program reads in the parameter's shape
+    /// ([`FusableOf`](crate::tensors::fused::FusableOf)): the same type, or a
+    /// [`MatrixView`](crate::tensors::fused::MatrixView) of a larger matrix.
+    /// For a scalar, the scalar. For a parameter type of your own, usually the
+    /// type itself.
+    type Gradient<'a>: ?Sized + 'a;
+
+    /// This parameter as a gradient for one of its own type — what generic
+    /// code passes to [`Rule::update`].
+    fn as_gradient(&self) -> &Self::Gradient<'_>;
 
     /// A tensor of *this* parameter's shape, all zeros — the starting point for
     /// the moment buffers the adaptive rules keep. With runtime dimensions the
@@ -100,31 +121,94 @@ pub trait Parameter: Sized + 'static {
     where
         Self: Adjoint<Self::Backend>;
 
-    /// Run a fused elementwise [`Program`] over tensors of this parameter's
-    /// shape: `inputs` are read, `updated` are overwritten in place, and the
-    /// program's fresh outputs are returned. Every slot is read unremapped, and
-    /// the program computes in [`Self::Elem`](Parameter::Elem).
+    /// Run a fused elementwise [`Program`] over this parameter's shape, as
+    /// [`Program::run`](crate::tensors::fused::Program::run) would: `inputs`
+    /// fill the program's given inputs and are only read, `updated` are its
+    /// tensors updated in place, overwritten with their new values, and the
+    /// program's fresh outputs are returned. The parameters come first among
+    /// `updated`, and fix the shape.
     ///
-    /// This is how the rules below take a whole update in one kernel. The
-    /// provided implementation is for parameter types of your own: it runs the
-    /// program one operation at a time through the methods above, so it
-    /// supports exactly the operations they spell — `+ − × ÷`, `sqrt`, and
-    /// constants — and panics on anything else.
+    /// This is how the rules take a whole update in one kernel. A parameter
+    /// type of your own can implement it with [`run_by_parts`], which runs the
+    /// program one operation at a time through the methods above.
     fn fused(
         program: &Program<Self::Elem>,
-        inputs: &[&Self],
+        inputs: &[&Self::Gradient<'_>],
         updated: &mut [&mut Self],
-    ) -> Vec<Self> {
-        unfused_parameter(program, inputs, updated)
-    }
+    ) -> Vec<Self>;
 }
 
-/// [`Parameter::fused`] through the trait's own elementwise methods.
-fn unfused_parameter<P: Parameter>(
+/// [`Parameter::fused`] through a parameter type's own elementwise methods,
+/// for a type with no program runner of its own: it supports exactly the
+/// operations they spell — `+ − × ÷`, `sqrt`, and constants — and panics on
+/// anything else.
+///
+/// It reads its operands as [`Program::run`](crate::tensors::fused::Program::run)
+/// does: as many inputs as the program has given inputs and as many in-place
+/// tensors as it updates, every tensor updated in place read before any is
+/// overwritten. A program that remaps a load or computes row statistics needs
+/// a shape, which a parameter type of your own does not have, so it panics.
+///
+/// ```
+/// use tensorcrate::optim::{Parameter, run_by_parts};
+/// # use tensorcrate::tensors::fused::Program;
+/// # use tensorcrate::tensors::{Host, Tape, Var};
+/// # #[derive(Clone, Copy, Debug, PartialEq)]
+/// # struct Pair(f32, f32);
+/// impl Parameter for Pair {
+///     type Elem = f32;
+///     type Backend = Host;
+///     type Gradient<'a> = Pair;
+///
+///     fn as_gradient(&self) -> &Pair {
+///         self
+///     }
+///
+///     fn fused(program: &Program, inputs: &[&Pair], updated: &mut [&mut Pair]) -> Vec<Pair> {
+///         run_by_parts(program, inputs, updated)
+///     }
+///     // ...
+/// #   fn zeros_like(&self) -> Self { Pair(0.0, 0.0) }
+/// #   fn duplicate(&self) -> Self { *self }
+/// #   fn add(&self, o: &Self) -> Self { Pair(self.0 + o.0, self.1 + o.1) }
+/// #   fn subtract(&self, o: &Self) -> Self { Pair(self.0 - o.0, self.1 - o.1) }
+/// #   fn multiply(&self, o: &Self) -> Self { Pair(self.0 * o.0, self.1 * o.1) }
+/// #   fn divide(&self, o: &Self) -> Self { Pair(self.0 / o.0, self.1 / o.1) }
+/// #   fn scale(&self, f: f32) -> Self { Pair(self.0 * f, self.1 * f) }
+/// #   fn shift(&self, f: f32) -> Self { Pair(self.0 + f, self.1 + f) }
+/// #   fn sqrt(&self) -> Self { Pair(self.0.sqrt(), self.1.sqrt()) }
+/// #   fn record<'t>(&self, _: &'t Tape<Host>) -> Var<'t, Self, Host> { unreachable!() }
+/// }
+///
+/// use tensorcrate::optim::{Rule, Sgd};
+/// let mut p = Pair(1.0, 2.0);
+/// Sgd::new(0.5).update(&mut p, &Pair(2.0, -2.0));
+/// assert_eq!(p, Pair(0.0, 3.0));
+/// ```
+#[track_caller]
+pub fn run_by_parts<P: Parameter>(
     program: &Program<P::Elem>,
     inputs: &[&P],
     updated: &mut [&mut P],
 ) -> Vec<P> {
+    assert_eq!(
+        inputs.len(),
+        program.given_inputs(),
+        "fused program: expected {} inputs, got {}",
+        program.given_inputs(),
+        inputs.len()
+    );
+    assert_eq!(
+        updated.len(),
+        program.updated(),
+        "fused program: expected {} in-place tensors, got {}",
+        program.updated(),
+        updated.len()
+    );
+    assert!(
+        program.row_statistics().is_empty(),
+        "a parameter program computes no row statistics: a parameter type has no rows"
+    );
     enum Value<P, T> {
         Scalar(T),
         Tensor(P),
@@ -141,7 +225,7 @@ fn unfused_parameter<P: Parameter>(
         Value::Tensor(tensor) => tensor.duplicate(),
     };
 
-    let fresh = program.fresh_inputs();
+    let given = program.given_inputs();
     let mut registers: Vec<Option<Value<P, P::Elem>>> = (0..16).map(|_| None).collect();
     let mut outputs: Vec<Option<P>> = (0..program.outputs().len()).map(|_| None).collect();
     for instr in program.code() {
@@ -150,10 +234,10 @@ fn unfused_parameter<P: Parameter>(
             Instr::Load { dst, input, remap } => {
                 assert_eq!(remap, Remap::Identity, "parameter programs read unremapped");
                 let slot = usize::from(input);
-                let source: &P = if slot < fresh {
+                let source: &P = if slot < given {
                     inputs[slot]
                 } else {
-                    &*updated[slot - fresh]
+                    &*updated[slot - given]
                 };
                 (dst, Value::Tensor(source.duplicate()))
             }
@@ -221,11 +305,11 @@ fn unfused_parameter<P: Parameter>(
     outputs.collect()
 }
 
-/// Run `program` over same-shaped tensors, which is every parameter program.
+/// Run `program` over a `shape` space, which is every parameter program's.
 fn run_fused<E: Element, B: Kernels<E>, T: FusableMut<B>>(
     program: &Program<E>,
     shape: (usize, usize),
-    inputs: &[&T],
+    inputs: &[&(dyn FusableOf<E, B> + '_)],
     updated: &mut [&mut T],
 ) -> Vec<Output<B>> {
     let inputs: Vec<&dyn Fusable<B>> = inputs
@@ -245,6 +329,11 @@ fn run_fused<E: Element, B: Kernels<E>, T: FusableMut<B>>(
 impl<T: Element> Parameter for T {
     type Elem = T;
     type Backend = Host;
+    type Gradient<'a> = T;
+
+    fn as_gradient(&self) -> &T {
+        self
+    }
 
     fn zeros_like(&self) -> Self {
         T::zero()
@@ -290,7 +379,10 @@ impl<T: Element> Parameter for T {
         let inputs: Vec<Vector<T>> = inputs.iter().map(|&&x| Vector::new([x])).collect();
         let mut targets: Vec<Vector<T>> = updated.iter().map(|x| Vector::new([**x])).collect();
         let outputs = {
-            let inputs: Vec<&Vector<T>> = inputs.iter().collect();
+            let inputs: Vec<&dyn FusableOf<T, Host>> = inputs
+                .iter()
+                .map(|x| x as &dyn FusableOf<T, Host>)
+                .collect();
             let mut targets: Vec<&mut Vector<T>> = targets.iter_mut().collect();
             run_fused(program, (1, 1), &inputs, &mut targets)
         };
@@ -307,6 +399,11 @@ impl<T: Element> Parameter for T {
 impl<T: Element, B: Kernels<T>> Parameter for Vector<T, B> {
     type Elem = T;
     type Backend = B;
+    type Gradient<'a> = dyn FusableOf<T, B> + 'a;
+
+    fn as_gradient(&self) -> &(dyn FusableOf<T, B> + '_) {
+        self
+    }
 
     fn zeros_like(&self) -> Self {
         Vector::filled(self.len(), T::zero())
@@ -348,12 +445,27 @@ impl<T: Element, B: Kernels<T>> Parameter for Vector<T, B> {
         tape.vector(self.to_backend::<B>())
     }
 
-    fn fused(program: &Program<T>, inputs: &[&Self], updated: &mut [&mut Self]) -> Vec<Self> {
-        let len = inputs
+    /// Over a `1 × len` space. A gradient that is a matrix or a view must be
+    /// one row or one column of `len`.
+    #[track_caller]
+    fn fused(
+        program: &Program<T>,
+        inputs: &[&(dyn FusableOf<T, B> + '_)],
+        updated: &mut [&mut Self],
+    ) -> Vec<Self> {
+        let len = updated
             .first()
             .map(|v| v.len())
-            .or_else(|| updated.first().map(|v| v.len()))
+            .or_else(|| inputs.first().map(|input| input.source().len))
             .unwrap_or(0);
+        for input in inputs {
+            if let Some((rows, cols)) = input.shape() {
+                assert!(
+                    rows * cols == len && (rows == 1 || cols == 1),
+                    "a {rows}×{cols} gradient for a vector of {len}"
+                );
+            }
+        }
         run_fused(program, (1, len), inputs, updated)
             .into_iter()
             .map(Output::into_vector)
@@ -364,6 +476,11 @@ impl<T: Element, B: Kernels<T>> Parameter for Vector<T, B> {
 impl<T: Element, B: Kernels<T>> Parameter for Matrix<T, B> {
     type Elem = T;
     type Backend = B;
+    type Gradient<'a> = dyn FusableOf<T, B> + 'a;
+
+    fn as_gradient(&self) -> &(dyn FusableOf<T, B> + '_) {
+        self
+    }
 
     fn zeros_like(&self) -> Self {
         let (rows, cols) = self.shape();
@@ -406,12 +523,29 @@ impl<T: Element, B: Kernels<T>> Parameter for Matrix<T, B> {
         tape.matrix(self.to_backend::<B>())
     }
 
-    fn fused(program: &Program<T>, inputs: &[&Self], updated: &mut [&mut Self]) -> Vec<Self> {
-        let shape = inputs
+    /// Over the parameters' shape. A gradient that is a matrix or a view must
+    /// have that shape too: one with as many elements in another shape — the
+    /// transpose, say — is a mistake rather than something to read flat.
+    #[track_caller]
+    fn fused(
+        program: &Program<T>,
+        inputs: &[&(dyn FusableOf<T, B> + '_)],
+        updated: &mut [&mut Self],
+    ) -> Vec<Self> {
+        let shape = updated
             .first()
             .map(|m| m.shape())
-            .or_else(|| updated.first().map(|m| m.shape()))
+            .or_else(|| inputs.first().and_then(|input| input.shape()))
             .unwrap_or((0, 0));
+        for input in inputs {
+            if let Some(other) = input.shape() {
+                assert_eq!(
+                    other, shape,
+                    "a {}×{} gradient for {}×{} parameters",
+                    other.0, other.1, shape.0, shape.1
+                );
+            }
+        }
         run_fused(program, shape, inputs, updated)
             .into_iter()
             .map(Output::into_matrix)
@@ -424,9 +558,37 @@ impl<T: Element, B: Kernels<T>> Parameter for Matrix<T, B> {
 /// A rule instance belongs to one parameter tensor, because that is where its
 /// state lives: reusing an [`Adam`] across two different weights would mix their
 /// moment estimates.
-pub trait Rule<P> {
+pub trait Rule<P: Parameter> {
     /// Apply one update in place.
-    fn update(&mut self, parameters: &mut P, gradient: &P);
+    ///
+    /// The gradient is read the way a fused program reads an input: for a
+    /// tensor, the same tensor type or a view of a larger one, of the
+    /// parameters' element type. Generic code over `P` passes
+    /// [`gradient.as_gradient()`](Parameter::as_gradient).
+    ///
+    /// ```
+    /// use tensorcrate::optim::{Adam, Rule};
+    /// use tensorcrate::tensors::Matrix;
+    ///
+    /// // The weights' gradient is the left block of a packed one.
+    /// let mut weights = Matrix::<f32>::from_flat(2, 2, vec![1.0; 4]);
+    /// let packed = Matrix::<f32>::from_flat(2, 3, vec![0.5; 6]);
+    /// Adam::new(0.1).update(&mut weights, &packed.view(.., 0..2));
+    /// ```
+    ///
+    /// The element type is part of the gradient's type, so a gradient of
+    /// another one does not compile:
+    ///
+    /// ```compile_fail
+    /// use tensorcrate::numbers::f16;
+    /// use tensorcrate::optim::{Rule, Sgd};
+    /// use tensorcrate::tensors::Vector;
+    ///
+    /// let mut parameters = Vector::new(vec![0.0f32; 4]);
+    /// let gradient: Vector<f16> = Vector::new(vec![f16::ONE; 4]);
+    /// Sgd::new(0.1).update(&mut parameters, &gradient);
+    /// ```
+    fn update(&mut self, parameters: &mut P, gradient: &P::Gradient<'_>);
 
     /// Forget accumulated state, keeping the hyperparameters — for restarting a
     /// fit without rebuilding the rule.
@@ -460,7 +622,7 @@ where
 }
 
 impl<P: Parameter> Rule<P> for Sgd<P::Elem> {
-    fn update(&mut self, parameters: &mut P, gradient: &P) {
+    fn update(&mut self, parameters: &mut P, gradient: &P::Gradient<'_>) {
         P::fused(&self.program, &[gradient], &mut [parameters]);
     }
 
@@ -530,7 +692,7 @@ impl<P: Parameter> Momentum<P> {
 
 impl<P: Parameter> Rule<P> for Momentum<P> {
     /// One fused kernel: the velocity and parameters are updated in place.
-    fn update(&mut self, parameters: &mut P, gradient: &P) {
+    fn update(&mut self, parameters: &mut P, gradient: &P::Gradient<'_>) {
         let velocity = if let Some(velocity) = &mut self.velocity {
             velocity
         } else {
@@ -580,7 +742,7 @@ impl<P: Parameter> AdaGrad<P> {
 
 impl<P: Parameter> Rule<P> for AdaGrad<P> {
     /// One fused kernel, updating the parameters and the running total in place.
-    fn update(&mut self, parameters: &mut P, gradient: &P) {
+    fn update(&mut self, parameters: &mut P, gradient: &P::Gradient<'_>) {
         let total = if let Some(total) = &mut self.total {
             total
         } else {
@@ -632,7 +794,7 @@ impl<P: Parameter> RmsProp<P> {
 
 impl<P: Parameter> Rule<P> for RmsProp<P> {
     /// One fused kernel, updating the parameters and the mean square in place.
-    fn update(&mut self, parameters: &mut P, gradient: &P) {
+    fn update(&mut self, parameters: &mut P, gradient: &P::Gradient<'_>) {
         let mean_square = if let Some(mean_square) = &mut self.mean_square {
             mean_square
         } else {
@@ -765,7 +927,7 @@ impl<P: Parameter> Rule<P> for Adam<P> {
     /// One fused kernel: parameters and both moments are read once and
     /// overwritten in place. Unfused, this was fourteen kernels and eleven
     /// intermediate tensors.
-    fn update(&mut self, parameters: &mut P, gradient: &P) {
+    fn update(&mut self, parameters: &mut P, gradient: &P::Gradient<'_>) {
         self.steps += 1;
 
         let one = <P::Elem as num_traits::One>::one();
@@ -871,7 +1033,7 @@ where
 }
 
 impl<'a, P: Parameter, R: Rule<P>> Rule<P> for Constrained<'a, P, R> {
-    fn update(&mut self, parameters: &mut P, gradient: &P) {
+    fn update(&mut self, parameters: &mut P, gradient: &P::Gradient<'_>) {
         self.rule.update(parameters, gradient);
         (self.projection.apply)(parameters);
     }
@@ -908,7 +1070,7 @@ where
         let loss = objective(&recorded, step);
         loss.backward();
         last = *loss.value();
-        rule.update(parameters, &recorded.grad());
+        rule.update(parameters, recorded.grad().as_gradient());
     }
     last
 }
@@ -918,8 +1080,8 @@ mod tests {
     use super::*;
     use crate::tensors::fused::DType;
 
-    /// The provided [`Parameter::fused`], for parameter types without a
-    /// program runner, has to give the same answers as the real one.
+    /// [`run_by_parts`], for parameter types without a program runner, has to
+    /// give the same answers as the real one.
     #[test]
     fn the_provided_parameter_runner_matches_the_fused_one() {
         let mut b = Builder::new();
@@ -948,9 +1110,9 @@ mod tests {
         let moment = Vector::new(vec![0.5f32; 100]);
 
         let (mut p1, mut m1) = (start.clone(), moment.clone());
-        let fresh1 = Parameter::fused(&program, &[&g], &mut [&mut p1, &mut m1]);
+        let fresh1 = Parameter::fused(&program, &[g.as_gradient()], &mut [&mut p1, &mut m1]);
         let (mut p2, mut m2) = (start, moment);
-        let fresh2 = unfused_parameter(&program, &[&g], &mut [&mut p2, &mut m2]);
+        let fresh2 = run_by_parts(&program, &[&g], &mut [&mut p2, &mut m2]);
 
         let bits = |v: &Vector<f32>| v.as_slice().iter().map(|x| x.to_bits()).collect::<Vec<_>>();
         assert_eq!(bits(&p1), bits(&p2));

@@ -437,14 +437,14 @@ where
     let mut fused_parameters = start.clone();
     let mut fused_rule = Adam::<Vector<T, Host>>::new(rate);
     for round in 0..rounds {
-        fused_rule.update(&mut fused_parameters, &gradient(round));
+        fused_rule.update(&mut fused_parameters, gradient(round).as_gradient());
     }
 
     let mut plain_parameters = start;
     let mut plain_rule = Adam::<Vector<T, Host>>::new(rate);
     fused::with_mode(Mode::Unfused, || {
         for round in 0..rounds {
-            plain_rule.update(&mut plain_parameters, &gradient(round));
+            plain_rule.update(&mut plain_parameters, gradient(round).as_gradient());
         }
     });
 

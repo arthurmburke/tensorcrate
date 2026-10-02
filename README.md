@@ -417,6 +417,13 @@ for _step in 0..1_000 {
 }
 ```
 
+Each rule's update is one fused program, built when the rule is made and run the way
+`Program::run` runs one: the gradient is an input, only read, and the parameters and the rule's
+state are updated in place. So a tensor gradient can be anything of the parameters' element type a
+program reads — the parameters' own type, or a view of a larger matrix (`&grads.view(.., 0..d)`, or
+`&grads.column_view(j)` for a vector). A matrix gradient must have the parameters' shape. Code
+generic over the parameter type passes `gradient.as_gradient()`.
+
 See `examples/gradient_descent.rs` for larger linear and nonlinear fits and
 `examples/optimizers.rs` for mini-batches and multi-parameter training.
 

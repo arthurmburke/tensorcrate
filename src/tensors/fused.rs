@@ -953,7 +953,12 @@ impl<T: Real> Program<T> {
                 if let Some(v) = view {
                     let (rows, cols) = shape;
                     let fits = match remap {
-                        Remap::Identity => (v.rows, v.cols) == (rows, cols),
+                        // A one-row or one-column view read as a vector, in a
+                        // space that is one: in order along it.
+                        Remap::Identity => {
+                            (v.rows, v.cols) == (rows, cols)
+                                || ((rows == 1 || cols == 1) && v.along().is_some())
+                        }
                         Remap::Transpose => (v.rows, v.cols) == (cols, rows),
                         Remap::Row | Remap::Column => v.along().is_some() || len <= 1,
                     };
@@ -1947,6 +1952,13 @@ impl<B: Backend> Sink<'_, B> {
 pub trait Fusable<B: Backend> {
     #[doc(hidden)]
     fn source(&self) -> Source<'_, B>;
+
+    /// The tensor's shape, if it has one beyond its length — a matrix's or a
+    /// view's.
+    #[doc(hidden)]
+    fn shape(&self) -> Option<(usize, usize)> {
+        None
+    }
 }
 
 /// A tensor a [`Program`] can also update in place: a [`Vector`] or a
@@ -1955,6 +1967,16 @@ pub trait FusableMut<B: Backend>: Fusable<B> {
     #[doc(hidden)]
     fn sink(&mut self) -> Sink<'_, B>;
 }
+
+/// A tensor of elements `T` a [`Program`] can read: a [`Vector`], a [`Matrix`]
+/// or a [`MatrixView`] of `T`. It is [`Fusable`] with the element type in the
+/// type, for an interface that needs a particular one — an optimizer's
+/// gradient, which must be of the parameters' type.
+pub trait FusableOf<T, B: Backend>: Fusable<B> {}
+
+impl<T: Element, B: Backend> FusableOf<T, B> for Vector<T, B> {}
+impl<T: Element, B: Backend> FusableOf<T, B> for Matrix<T, B> {}
+impl<T: Element, B: Backend> FusableOf<T, B> for MatrixView<'_, T, B> {}
 
 impl<T: Element, B: Backend> Fusable<B> for Vector<T, B> {
     fn source(&self) -> Source<'_, B> {
@@ -1983,6 +2005,10 @@ impl<T: Element, B: Backend> Fusable<B> for Matrix<T, B> {
             len: self.rows() * self.cols(),
             view: None,
         }
+    }
+
+    fn shape(&self) -> Option<(usize, usize)> {
+        Some(Matrix::shape(self))
     }
 }
 
@@ -2201,6 +2227,10 @@ impl<T: Element, B: Backend> Fusable<B> for MatrixView<'_, T, B> {
             view: Some(self.view),
         }
     }
+
+    fn shape(&self) -> Option<(usize, usize)> {
+        Some((self.view.rows, self.view.cols))
+    }
 }
 
 /// Where element `(row, col)` of an iteration space reads a source through a
@@ -2245,6 +2275,10 @@ impl Place {
             Some(v) => {
                 let along = v.along().unwrap_or(0);
                 let (row, col) = match remap {
+                    // A vector view read in a vector space of another
+                    // orientation steps along itself.
+                    Remap::Identity if (v.rows, v.cols) != (rows, cols) && rows == 1 => (0, along),
+                    Remap::Identity if (v.rows, v.cols) != (rows, cols) => (along, 0),
                     Remap::Identity => (v.row_stride, v.col_stride),
                     Remap::Transpose => (v.col_stride, v.row_stride),
                     Remap::Row => (0, along),

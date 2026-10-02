@@ -425,7 +425,7 @@ fn optimizing_a_resident_parameter_stays_on_the_backend() {
 fn rules_are_generic_over_the_parameter_shape() {
     // `Parameter` is what lets one rule serve a scalar, a vector and a matrix.
     fn takes_any<P: Parameter>(rule: &mut impl Rule<P>, parameters: &mut P, gradient: &P) {
-        rule.update(parameters, gradient);
+        rule.update(parameters, gradient.as_gradient());
     }
 
     let mut scalar = 1.0f32;
@@ -468,4 +468,132 @@ fn the_driver_and_a_hand_written_loop_agree() {
     }
 
     assert_eq!(driven.to_vec(), manual.to_vec());
+}
+
+// ---- gradients read like program inputs ---------------------------------------------
+
+/// Every rule, freshly made, for parameters of type `P`.
+fn every_rule<P: Parameter<Elem = f32>>() -> Vec<(&'static str, Box<dyn Rule<P>>)> {
+    vec![
+        ("sgd", Box::new(Sgd::new(0.05))),
+        ("momentum", Box::new(Momentum::new(0.05, 0.9))),
+        ("nesterov", Box::new(Momentum::nesterov(0.05, 0.9))),
+        ("adagrad", Box::new(AdaGrad::new(0.1))),
+        ("rmsprop", Box::new(RmsProp::new(0.01))),
+        ("adam", Box::new(Adam::new(0.01))),
+    ]
+}
+
+fn bits(values: &[f32]) -> Vec<u32> {
+    values.iter().map(|x| x.to_bits()).collect()
+}
+
+/// Gradient `step` for a parameter of `len`, as `f32`s that `f16` holds
+/// exactly, so a gradient stored either way has the same values.
+fn halvable(step: usize, len: usize) -> Vec<f32> {
+    (0..len)
+        .map(|i| {
+            tensorcrate::numbers::f16::from_f32(((i * 7 + step * 3) % 11) as f32 * 0.125 - 0.6)
+                .to_f32()
+        })
+        .collect()
+}
+
+#[test]
+fn a_view_of_a_larger_gradient_updates_like_a_copy_of_it() {
+    use tensorcrate::tensors::Host;
+    for (name, mut viewed) in every_rule::<Matrix<f32>>() {
+        let (_, mut copied) = every_rule::<Matrix<f32>>()
+            .into_iter()
+            .find(|(other, _)| *other == name)
+            .unwrap();
+        let start = Matrix::from_flat(3, 4, (0..12).map(|i| i as f32 * 0.1).collect::<Vec<_>>());
+        let (mut a, mut b) = (start.clone(), start);
+        for step in 0..5 {
+            // The parameters' gradient is the middle of a larger matrix.
+            let packed = Matrix::<f32, Host>::from_flat(5, 7, halvable(step, 35));
+            let view = packed.view(1..4, 2..6);
+            viewed.update(&mut a, &view);
+            copied.update(&mut b, &view.to_matrix());
+            assert_eq!(
+                bits(a.as_slice()),
+                bits(b.as_slice()),
+                "{name}, step {step}"
+            );
+        }
+    }
+
+    // A vector's gradient can be a column of a matrix.
+    for (name, mut viewed) in every_rule::<Vector<f32>>() {
+        let (_, mut copied) = every_rule::<Vector<f32>>()
+            .into_iter()
+            .find(|(other, _)| *other == name)
+            .unwrap();
+        let (mut a, mut b) = (Vector::new(vec![0.5f32; 6]), Vector::new(vec![0.5f32; 6]));
+        for step in 0..5 {
+            let packed = Matrix::<f32>::from_flat(6, 3, halvable(step, 18));
+            let column = packed.column_view(1);
+            viewed.update(&mut a, &column);
+            copied.update(&mut b, &Vector::new(column.to_matrix().as_slice().to_vec()));
+            assert_eq!(
+                bits(a.as_slice()),
+                bits(b.as_slice()),
+                "{name}, step {step}"
+            );
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "a 4×3 gradient for 3×4 parameters")]
+fn a_matrix_gradient_must_have_the_parameters_shape() {
+    let mut parameters = Matrix::<f32>::from_flat(3, 4, vec![0.0; 12]);
+    let transposed = Matrix::<f32>::from_flat(4, 3, vec![1.0; 12]);
+    Sgd::new(0.1).update(&mut parameters, &transposed);
+}
+
+#[test]
+#[should_panic(expected = "expected 1 inputs, got 2")]
+fn a_parameter_program_run_by_parts_counts_its_operands() {
+    use tensorcrate::optim::run_by_parts;
+    use tensorcrate::tensors::fused::{Builder, DType};
+    let mut b = Builder::<f32>::new();
+    let g = b.input(DType::F32);
+    let p = b.update(DType::F32);
+    let p = b.sub(p, g);
+    b.set(0, p);
+    let program = b.build().unwrap();
+    let mut parameter = 1.0f32;
+    let _ = run_by_parts(&program, &[&1.0f32, &2.0f32], &mut [&mut parameter]);
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+fn metal_rules_read_views() {
+    use tensorcrate::tensors::Host;
+    for (name, mut gpu_rule) in every_rule::<Matrix<f32, Metal>>() {
+        let (_, mut host_rule) = every_rule::<Matrix<f32>>()
+            .into_iter()
+            .find(|(other, _)| *other == name)
+            .unwrap();
+        let start = Matrix::from_flat(3, 4, (0..12).map(|i| i as f32 * 0.1).collect::<Vec<_>>());
+        let (mut gpu, mut host) = (start.to_backend::<Metal>(), start);
+        for step in 0..5 {
+            let packed = Matrix::<f32, Host>::from_flat(5, 7, halvable(step, 35));
+            let resident = packed.to_backend::<Metal>();
+            gpu_rule.update(&mut gpu, &resident.view(1..4, 2..6));
+            host_rule.update(&mut host, &packed.view(1..4, 2..6));
+            for (g, h) in gpu
+                .to_backend::<Host>()
+                .as_slice()
+                .iter()
+                .zip(host.as_slice())
+            {
+                assert!(
+                    close(*g, *h),
+                    "{name}, step {step}: {g} on Metal, {h} on the host"
+                );
+            }
+        }
+    }
 }
