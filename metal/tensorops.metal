@@ -180,6 +180,7 @@ kernel void NAME(                                                            \
     device uchar* out5 [[buffer(25)]],                                        \
     device uchar* out6 [[buffer(26)]],                                        \
     device uchar* out7 [[buffer(27)]],                                        \
+    constant FusedPlace* places [[buffer(28)]],                               \
     uint2 group [[threadgroup_position_in_grid]],                             \
     uint2 lane [[thread_position_in_threadgroup]],                            \
     uint2 threads [[threads_per_threadgroup]])                                \
@@ -188,7 +189,8 @@ kernel void NAME(                                                            \
     FusedBuffers buffers = {                                                 \
         { (device const uchar*)A, in1, in2, in3, in4, in5, in6, in7,         \
           in8, in9, in10, in11, in12, in13, in14, in15 },                    \
-        { out0, out1, out2, out3, out4, out5, out6, out7 }                   \
+        { out0, out1, out2, out3, out4, out5, out6, out7 },                  \
+        places                                                               \
     };                                                                       \
     tensorcrate_matmul_epilogue<T, RELAXED>(                                 \
         code, shape, A, B, K, buffers, group, lane.x, threads.x, staging);   \

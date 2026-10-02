@@ -45,6 +45,8 @@
 //! do depend on the extents, like [`concat`](Backend::concat), take them as
 //! ordinary parameters.
 
+use super::fused::Place;
+
 /// A tensor storage backend.
 ///
 /// The trait is sealed: [`Host`] and [`Metal`] are the only implementations,
@@ -112,6 +114,16 @@ pub trait Backend: sealed::Sealed + Sized + 'static {
 
     /// Reinterpret a matrix as its row-major flattening.
     fn matrix_into_flattened<T: Copy + 'static>(matrix: Self::Matrix<T>) -> Self::Vector<T>;
+
+    /// The `rows × cols` matrix whose element `(r, c)` is element
+    /// `place.at(r, c)` of `storage`: a view, a broadcast or a transpose of it,
+    /// copied into order. Every element is copied exactly.
+    #[doc(hidden)]
+    fn gather<T: Copy + 'static>(
+        storage: &Self::Vector<T>,
+        place: Place,
+        shape: (usize, usize),
+    ) -> Self::Matrix<T>;
 
     /// Build a matrix from vectors stacked along the vertical axis (the vectors
     /// are rows), each of length `len`.
@@ -181,6 +193,24 @@ pub struct Host;
 
 impl sealed::Sealed for Host {}
 
+/// [`Backend::gather`] over a slice.
+pub(crate) fn gather_slice<T: Copy>(
+    values: &[T],
+    place: Place,
+    (rows, cols): (usize, usize),
+) -> Vec<T> {
+    let mut out = Vec::with_capacity(rows * cols);
+    for row in 0..rows {
+        let start = place.at(row, 0);
+        match place.col {
+            1 => out.extend_from_slice(&values[start..start + cols]),
+            0 => out.extend(std::iter::repeat_n(values[start], cols)),
+            step => out.extend((0..cols).map(|col| values[start + col * step])),
+        }
+    }
+    out
+}
+
 impl Backend for Host {
     type Vector<T> = Vec<T>;
     type Matrix<T> = Vec<T>;
@@ -229,6 +259,10 @@ impl Backend for Host {
 
     fn matrix_into_flattened<T: Copy + 'static>(matrix: Vec<T>) -> Vec<T> {
         matrix
+    }
+
+    fn gather<T: Copy + 'static>(storage: &Vec<T>, place: Place, shape: (usize, usize)) -> Vec<T> {
+        gather_slice(storage, place, shape)
     }
 
     fn vstack<T: Copy + 'static>(vectors: &[Vec<T>], len: usize) -> Vec<T> {
@@ -308,7 +342,7 @@ mod gpu {
 
     use half::{bf16, f16};
 
-    use super::{Backend, sealed};
+    use super::{Backend, Place, gather_slice, sealed};
     use crate::metal::{MetalBuffer, MetalElement};
 
     /// `Some($body)` with `$E` naming the [`MetalElement`] that `$T` is — the
@@ -406,6 +440,19 @@ mod gpu {
         // The resident kernels exist for every `MetalElement`; any other
         // element type takes the host path over the shared memory, which gives
         // the same values.
+        fn gather<T: Copy + 'static>(
+            storage: &MetalStorage<T>,
+            place: Place,
+            shape: (usize, usize),
+        ) -> MetalStorage<T> {
+            if let Some(storage) =
+                resident!(T, E => MetalStorage::<E>::gather(cast_ref(storage), place, shape))
+            {
+                return storage;
+            }
+            MetalStorage::from_slice(&gather_slice(storage.as_slice(), place, shape))
+        }
+
         fn vstack<T: Copy + 'static>(vectors: &[MetalStorage<T>], len: usize) -> MetalStorage<T> {
             if let Some(storage) =
                 resident!(T, E => MetalStorage::<E>::vstack(cast_slice(vectors), len))
@@ -643,6 +690,12 @@ mod gpu {
     /// for. Scalars and results are in `T`; the folds that end on the CPU
     /// return their unrounded `f32` accumulator.
     impl<T: MetalElement> MetalStorage<T> {
+        fn gather(&self, place: Place, shape: (usize, usize)) -> Option<Self> {
+            Some(Self(Residency::Device(
+                self.device()?.gather(place, shape)?,
+            )))
+        }
+
         fn vstack(inputs: &[Self], vector_len: usize) -> Option<Self> {
             let buffers = inputs
                 .iter()

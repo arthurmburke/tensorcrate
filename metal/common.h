@@ -170,14 +170,19 @@ inline void fused_store(device uchar* base, uint dtype, uint index, float value)
     }
 }
 
-// Which input element feeds output element `i`, matching `fused::Remap`.
-inline uint fused_remap(ushort remap, uint i, uint rows, uint cols) {
-    switch (remap) {
-        case 1: return (i % cols) * rows + i / cols;  // transpose
-        case 2: return i % cols;                      // row vector, down every row
-        case 3: return i / cols;                      // column vector, across every column
-        default: return i;
-    }
+// Where element `(row, col)` of the space reads an input through one remap:
+// storage element `offset + row·row_step + col·col_step`, matching
+// `fused::Place`. A transpose, a broadcast and a strided view of a matrix are
+// all one of these. Programs find one per input slot and remap, at
+// `places[slot * 4 + remap]`.
+struct FusedPlace {
+    uint offset;
+    uint row_step;
+    uint col_step;
+};
+
+inline uint fused_at(FusedPlace place, uint row, uint col) {
+    return place.offset + row * place.row_step + col * place.col_step;
 }
 
 
@@ -185,6 +190,7 @@ inline uint fused_remap(ushort remap, uint i, uint rows, uint cols) {
 struct FusedBuffers {
     device const uchar* inputs[16];
     device uchar* outputs[8];
+    constant FusedPlace* places;
 };
 
 // Run a program for element `i` of a `rows × cols` space. With `has_product`,
@@ -203,6 +209,9 @@ inline void fused_run(
     float product)
 {
     T r[FUSED_REGISTERS];
+    const uint row = i / cols;
+    const uint col = i - row * cols;
+    (void)rows;
     for (uint pc = 0; pc < count; pc++) {
         FusedInstr instr = code[pc];
         switch (instr.kind) {
@@ -214,7 +223,7 @@ inline void fused_run(
                     // one rounding, to `T`.
                     r[instr.dst] = T(fused_load(
                         buffers.inputs[instr.a], instr.b,
-                        fused_remap(instr.op, i, rows, cols)));
+                        fused_at(buffers.places[instr.a * 4 + instr.op], row, col)));
                 }
                 break;
             case 1:

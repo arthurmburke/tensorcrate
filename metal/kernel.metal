@@ -195,6 +195,25 @@ template [[host_name("vecmat_finish_" #S)]] kernel void vecmat_finish<T>(      \
     constant uint&, uint);
 FOR_EACH_ELEMENT(INSTANTIATE_GEMV)
 
+// `out[r][c] = in[offset + r·row + c·col]`: a strided view, a broadcast or a
+// transpose of `in`, copied into order. A copy, so exact in every type.
+template <typename T>
+kernel void gather_place(
+    device const T* input   [[buffer(0)]],
+    device T* output        [[buffer(1)]],
+    constant uint4& place   [[buffer(2)]],   // offset, row step, column step, cols
+    uint i [[thread_position_in_grid]])
+{
+    uint row = i / place.w;
+    uint col = i - row * place.w;
+    output[i] = input[place.x + row * place.y + col * place.z];
+}
+
+#define INSTANTIATE_GATHER(T, S)                                               \
+template [[host_name("gather_place_" #S)]] kernel void gather_place<T>(        \
+    device const T*, device T*, constant uint4&, uint);
+FOR_EACH_ELEMENT(INSTANTIATE_GATHER)
+
 // `+ - * /` in the element type. There is no remainder kernel; the host keeps
 // `BinaryOp::Rem` for itself.
 template <typename T>
@@ -1252,12 +1271,14 @@ kernel void fused_elementwise(
     device uchar* out5 [[buffer(23)]],
     device uchar* out6 [[buffer(24)]],
     device uchar* out7 [[buffer(25)]],
+    constant FusedPlace* places [[buffer(26)]],
     uint i [[thread_position_in_grid]])
 {
     FusedBuffers buffers = {
         { in0, in1, in2, in3, in4, in5, in6, in7,
           in8, in9, in10, in11, in12, in13, in14, in15 },
-        { out0, out1, out2, out3, out4, out5, out6, out7 }
+        { out0, out1, out2, out3, out4, out5, out6, out7 },
+        places
     };
     fused_run<T>(code, shape.count, buffers, i, shape.rows, shape.cols, false, 0.0f);
 }
@@ -1272,7 +1293,8 @@ template [[host_name("fused_elementwise_" #S)]] kernel void fused_elementwise<T>
     device const uchar*, device const uchar*, device const uchar*,             \
     device const uchar*,                                                       \
     device uchar*, device uchar*, device uchar*, device uchar*,                \
-    device uchar*, device uchar*, device uchar*, device uchar*, uint);
+    device uchar*, device uchar*, device uchar*, device uchar*,                \
+    constant FusedPlace*, uint);
 FOR_EACH_ELEMENT(INSTANTIATE_FUSED)
 
 // ---- matrix products with an epilogue -----------------------------------------
@@ -1313,6 +1335,7 @@ kernel void matmul_epilogue(
     device uchar* out5 [[buffer(25)]],
     device uchar* out6 [[buffer(26)]],
     device uchar* out7 [[buffer(27)]],
+    constant FusedPlace* places [[buffer(28)]],
     uint2 tid [[thread_position_in_threadgroup]],
     uint2 gid [[thread_position_in_grid]])
 {
@@ -1328,7 +1351,8 @@ kernel void matmul_epilogue(
         FusedBuffers buffers = {
             { (device const uchar*)A, in1, in2, in3, in4, in5, in6, in7,
               in8, in9, in10, in11, in12, in13, in14, in15 },
-            { out0, out1, out2, out3, out4, out5, out6, out7 }
+            { out0, out1, out2, out3, out4, out5, out6, out7 },
+            places
         };
         fused_run<T>(code, shape.count, buffers, row * N + col, M, N, true, acc);
     }
@@ -1344,5 +1368,6 @@ template [[host_name("matmul_epilogue_" #S)]] kernel void matmul_epilogue<T>(  \
     device const uchar*, device const uchar*, device const uchar*,             \
     device const uchar*, device const uchar*, device const uchar*,             \
     device uchar*, device uchar*, device uchar*, device uchar*,                \
-    device uchar*, device uchar*, device uchar*, device uchar*, uint2, uint2);
+    device uchar*, device uchar*, device uchar*, device uchar*,                \
+    constant FusedPlace*, uint2, uint2);
 FOR_EACH_ELEMENT(INSTANTIATE_MATMUL_EPILOGUE)

@@ -115,6 +115,8 @@ pub(super) struct Typed {
     pub(super) concat_horizontal: Pipeline,
     pub(super) merge_horizontal: Pipeline,
     pub(super) transpose: Pipeline,
+    /// A strided read of a buffer, copied into order.
+    pub(super) gather: Pipeline,
     pub(super) correlate: Pipeline,
     pub(super) pad_zeros: Pipeline,
     pub(super) flip_both: Pipeline,
@@ -390,6 +392,7 @@ pub(super) fn build_gpu() -> Option<Gpu> {
             concat_horizontal: kernel("concat_horizontal")?,
             merge_horizontal: kernel("merge_horizontal")?,
             transpose: kernel("transpose_tiled")?,
+            gather: kernel("gather_place")?,
             correlate: kernel("correlate")?,
             pad_zeros: kernel("pad_zeros")?,
             flip_both: kernel("flip_both")?,

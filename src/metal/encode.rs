@@ -282,6 +282,25 @@ pub(super) fn encode_gemm(
     queued(gpu, m.saturating_mul(k).saturating_mul(n) / 128)
 }
 
+/// `output[r][c] = input[place.at(r, c)]` over a `rows × cols` space.
+pub(super) fn encode_gather<T: MetalElement>(
+    gpu: &Gpu,
+    input: &ProtocolObject<dyn MTLBuffer>,
+    output: &ProtocolObject<dyn MTLBuffer>,
+    place: [u32; 4],
+    len: usize,
+) -> Option<()> {
+    let encoder = compute(gpu)?;
+    encoder.setComputePipelineState(&gpu.kernels::<T>().gather);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
+        encoder.setBytes_length_atIndex(NonNull::from(&place).cast(), 16, 2);
+    }
+    dispatch_1d(&encoder, len);
+    queued(gpu, len)
+}
+
 pub(super) fn encode_transpose<T: MetalElement>(
     gpu: &Gpu,
     input: &ProtocolObject<dyn MTLBuffer>,

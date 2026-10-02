@@ -2,7 +2,7 @@
 //!
 //! The `fused_elementwise` shader interprets a program: for every element it
 //! loops over the instructions, switches on each opcode, and keeps its values
-//! in a register array indexed at run time — which the GPU cannot keep in
+//! in a register array indexed at run time, which the GPU cannot keep in
 //! registers, so every operand is a trip to thread-private memory. A program
 //! that runs more than once is instead compiled into a kernel of its own:
 //! straight-line code, one local per value, every opcode and storage type a
@@ -205,12 +205,14 @@ pub(super) fn source<T: MetalElement>(code: &[Encoded], kernel: Kernel) -> Optio
                 )
                 .ok()?;
             }
+            source.push_str("    constant FusedPlace* places [[buffer(26)]],\n");
             source.push_str("    uint i [[thread_position_in_grid]])\n{\n");
             source
                 .push_str("    const uint rows = shape.rows;\n    const uint cols = shape.cols;\n");
             // One division for the element, shared by every remapped load.
-            source.push_str("    const uint row = i / cols;\n    const uint col = i - row * cols;\n");
-            source.push_str("    (void)rows; (void)row; (void)col; (void)k;\n");
+            source
+                .push_str("    const uint row = i / cols;\n    const uint col = i - row * cols;\n");
+            source.push_str("    (void)rows; (void)row; (void)col; (void)k; (void)places;\n");
             source.push_str(&body);
             source.push_str("}\n");
         }
@@ -256,7 +258,8 @@ kernel void fused_program(
             }
             write!(
                 source,
-                r#"    uint row [[threadgroup_position_in_grid]],
+                r#"    constant FusedPlace* places [[buffer(26)]],
+    uint row [[threadgroup_position_in_grid]],
     uint t [[thread_position_in_threadgroup]],
     uint n [[threads_per_threadgroup]],
     uint simd [[simdgroup_index_in_threadgroup]],
@@ -284,17 +287,19 @@ kernel void fused_program(
                 }
             }
             for &(of, dtype, deviations) in &inputs {
+                // The input read in order, as statistics are of it.
+                let at = usize::from(of) * 4;
                 write!(
                     source,
                     r#"    float cache{of}[{ROW_CACHE}];
     float total{of} = 0.0f;
     for (uint j = 0; j < {ROW_CACHE}; j++) {{
         const uint col = t + j * n;
-        cache{of}[j] = col < cols ? fused_load(in{of}, {dtype}u, first + col) : 0.0f;
+        cache{of}[j] = col < cols ? fused_load(in{of}, {dtype}u, fused_at(places[{at}], row, col)) : 0.0f;
         total{of} += cache{of}[j];
     }}
     for (uint col = t + {ROW_CACHE} * n; col < cols; col += n) {{
-        total{of} += fused_load(in{of}, {dtype}u, first + col);
+        total{of} += fused_load(in{of}, {dtype}u, fused_at(places[{at}], row, col));
     }}
     const float mean{of} = row_total(total{of}, shared, simd, simds, lane) / float(cols);
 "#
@@ -311,7 +316,7 @@ kernel void fused_program(
         }}
     }}
     for (uint col = t + {ROW_CACHE} * n; col < cols; col += n) {{
-        const float d = fused_load(in{of}, {dtype}u, first + col) - mean{of};
+        const float d = fused_load(in{of}, {dtype}u, fused_at(places[{at}], row, col)) - mean{of};
         squares{of} += d * d;
     }}
     const float deviations{of} = row_total(squares{of}, shared, simd, simds, lane);
@@ -356,6 +361,7 @@ kernel void fused_program(
                 write!(
                     source,
                     r#"    device {t}* y [[buffer(18)]],
+    constant FusedPlace* places [[buffer(26)]],
     uint group [[threadgroup_position_in_grid]],
     uint simd [[simdgroup_index_in_threadgroup]],
     uint simds [[simdgroups_per_threadgroup]],
@@ -385,6 +391,7 @@ kernel void fused_program(
                 source.push_str(
                     r#"    device float* partial [[buffer(18)]],
     constant uint& band [[buffer(19)]],
+    constant FusedPlace* places [[buffer(26)]],
     uint2 gid [[thread_position_in_grid]])
 {
     const uint rows = shape.rows;
@@ -436,7 +443,8 @@ kernel void fused_program(
             }
             write!(
                 source,
-                r#"    uint2 group [[threadgroup_position_in_grid]],
+                r#"    constant FusedPlace* places [[buffer(28)]],
+    uint2 group [[threadgroup_position_in_grid]],
     uint2 lane [[thread_position_in_threadgroup]],
     uint2 threads [[threads_per_threadgroup]])
 {{
@@ -509,17 +517,14 @@ fn body<T: MetalElement>(
             // A row statistic, computed above, and read through a column
             // broadcast: the same for the whole row.
             0 if statistics.contains(&instr.a) => format!("stat{}", instr.a),
-            // The index a remap reads, from the element's row and column,
+            // Where the input is read, from the element's row and column,
             // which every kernel knows without dividing again per load.
-            0 => {
-                let index = match instr.op {
-                    1 => "col * rows + row",
-                    2 => "col",
-                    3 => "row",
-                    _ => "i",
-                };
-                format!("{t}(fused_load(in{}, {}u, {index}))", instr.a, instr.b)
-            }
+            0 => format!(
+                "{t}(fused_load(in{}, {}u, fused_at(places[{}], row, col)))",
+                instr.a,
+                instr.b,
+                usize::from(instr.a) * 4 + usize::from(instr.op)
+            ),
             1 => {
                 constants += 1;
                 format!("{t}(k[{}])", constants - 1)

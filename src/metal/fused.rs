@@ -28,6 +28,32 @@ pub(super) const FUSED_INPUT_SLOTS: usize = 16;
 /// Output slots in the `fused_elementwise` shader.
 pub(super) const FUSED_OUTPUT_SLOTS: usize = 8;
 
+/// The buffer slot of the place table (see `FusedPlace` in `common.h`) in
+/// the elementwise, row and sum kernels, and in the product epilogues.
+const PLACES: usize = 26;
+const EPILOGUE_PLACES: usize = 28;
+
+/// Bind the table of where each input slot is read through each remap.
+fn bind_places(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    places: &[[u32; 3]],
+    index: usize,
+) {
+    assert_eq!(
+        places.len(),
+        FUSED_INPUT_SLOTS * 4,
+        "one place per slot and remap"
+    );
+    // SAFETY: the table is `FusedPlace[64]`, twelve bytes each.
+    unsafe {
+        encoder.setBytes_length_atIndex(
+            NonNull::from(&places[0]).cast(),
+            std::mem::size_of_val(places),
+            index,
+        );
+    }
+}
+
 /// Encode one fused elementwise program over a `rows × cols` space.
 ///
 /// `inputs` and `outputs` are bound in slot order. A tensor updated in place
@@ -38,6 +64,7 @@ pub(crate) fn fused_elementwise<T: MetalElement>(
     (rows, cols): (usize, usize),
     inputs: &[&ProtocolObject<dyn MTLBuffer>],
     outputs: &[&ProtocolObject<dyn MTLBuffer>],
+    places: &[[u32; 3]],
 ) -> Option<()> {
     let len = rows.checked_mul(cols)?;
     if len == 0
@@ -97,6 +124,7 @@ pub(crate) fn fused_elementwise<T: MetalElement>(
                 let buffer = outputs.get(slot).copied().unwrap_or(outputs[0]);
                 encoder.setBuffer_offset_atIndex(Some(buffer), 0, 2 + FUSED_INPUT_SLOTS + slot);
             }
+            bind_places(&encoder, places, PLACES);
         }
         dispatch_1d(&encoder, len);
         queued(gpu, len)
@@ -117,6 +145,7 @@ pub(crate) fn matmul_epilogue<T: MetalElement>(
     b: &ProtocolObject<dyn MTLBuffer>,
     inputs: &[&ProtocolObject<dyn MTLBuffer>],
     outputs: &[&ProtocolObject<dyn MTLBuffer>],
+    places: &[[u32; 3]],
 ) -> Option<()> {
     if m == 0
         || n == 0
@@ -184,6 +213,7 @@ pub(crate) fn matmul_epilogue<T: MetalElement>(
                 let buffer = outputs.get(slot).copied().unwrap_or(outputs[0]);
                 encoder.setBuffer_offset_atIndex(Some(buffer), 0, 4 + FUSED_INPUT_SLOTS + slot);
             }
+            bind_places(&encoder, places, EPILOGUE_PLACES);
         }
         match (&specialized, tensorops) {
             (Some((pipeline, (rows, cols, groups))), _) => encoder
@@ -236,6 +266,7 @@ pub(crate) fn fused_sum<T: MetalElement>(
     code: &[crate::tensors::fused::Encoded],
     (rows, cols): (usize, usize),
     inputs: &[&ProtocolObject<dyn MTLBuffer>],
+    places: &[[u32; 3]],
     rows_axis: bool,
     y: &ProtocolObject<dyn MTLBuffer>,
 ) -> Option<()> {
@@ -271,6 +302,7 @@ pub(crate) fn fused_sum<T: MetalElement>(
                 let buffer = inputs.get(slot).copied().unwrap_or(filler);
                 encoder.setBuffer_offset_atIndex(Some(buffer), 0, 2 + slot);
             }
+            bind_places(encoder, places, PLACES);
         };
         let work = rows.saturating_mul(cols);
         if rows_axis {
@@ -334,6 +366,7 @@ pub(crate) fn fused_rows<T: MetalElement>(
     (rows, cols): (usize, usize),
     inputs: &[&ProtocolObject<dyn MTLBuffer>],
     outputs: &[&ProtocolObject<dyn MTLBuffer>],
+    places: &[[u32; 3]],
     statistics: codegen::RowStatistics,
 ) -> Option<()> {
     if rows == 0
@@ -375,6 +408,7 @@ pub(crate) fn fused_rows<T: MetalElement>(
                 let buffer = outputs.get(slot).copied().unwrap_or(outputs[0]);
                 encoder.setBuffer_offset_atIndex(Some(buffer), 0, 2 + FUSED_INPUT_SLOTS + slot);
             }
+            bind_places(&encoder, places, PLACES);
         }
         // One threadgroup per row.
         let threads = codegen::row_threads(

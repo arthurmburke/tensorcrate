@@ -52,7 +52,7 @@ use std::sync::Arc;
 use num_traits::Float;
 
 use crate::numbers::Real;
-use crate::tensors::fused::{Builder, Element, Fusable, Instr, Output, Program, Remap};
+use crate::tensors::fused::{Builder, Element, Fusable, FusableMut, Instr, Output, Program, Remap};
 use crate::tensors::tape::Adjoint;
 use crate::tensors::{Analytic, BinaryOp, Host, Kernels, Matrix, ScalarVar, Tape, Var, Vector};
 
@@ -222,7 +222,7 @@ fn unfused_parameter<P: Parameter>(
 }
 
 /// Run `program` over same-shaped tensors, which is every parameter program.
-fn run_fused<E: Element, B: Kernels<E>, T: Fusable<B>>(
+fn run_fused<E: Element, B: Kernels<E>, T: FusableMut<B>>(
     program: &Program<E>,
     shape: (usize, usize),
     inputs: &[&T],
@@ -232,9 +232,9 @@ fn run_fused<E: Element, B: Kernels<E>, T: Fusable<B>>(
         .iter()
         .map(|&input| input as &dyn Fusable<B>)
         .collect();
-    let mut updated: Vec<&mut dyn Fusable<B>> = updated
+    let mut updated: Vec<&mut dyn FusableMut<B>> = updated
         .iter_mut()
-        .map(|target| &mut **target as &mut dyn Fusable<B>)
+        .map(|target| &mut **target as &mut dyn FusableMut<B>)
         .collect();
     program.run(shape, &inputs, &mut updated)
 }

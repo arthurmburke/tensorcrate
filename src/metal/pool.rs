@@ -19,6 +19,13 @@ const CAP: usize = 512;
 /// [`Gpu::acquire`](super::device::Gpu) waiting for the oldest of them.
 const IDLE_BYTES: usize = 128 << 20;
 
+/// How many idle allocations of the size last released are kept, whatever
+/// their bytes: as many as the work queued ahead of the GPU holds (see
+/// `QUEUE_DEPTH` in `device.rs`), and a couple more. Fewer, and work on
+/// tensors of a few tens of megabytes evicts what it will ask for next, then
+/// waits for Metal to zero-fill a new allocation.
+const IDLE_ALLOCATIONS: usize = 10;
+
 /// A pool of reusable Metal buffers (recycled across calls to avoid repeated
 /// allocation). A request takes the smallest free buffer that holds it, as long
 /// as that buffer is not wastefully larger.
@@ -103,7 +110,10 @@ impl Pool {
     fn release_free(&mut self, length: usize, buffer: Buffer) {
         self.free.push((length, buffer));
         self.free_bytes += length;
-        while self.free.len() > CAP || (self.free_bytes > IDLE_BYTES && self.free.len() > 1) {
+        // Room for a queue's worth of allocations the size of this one, which
+        // work on tensors that size will ask for again — whatever their size.
+        let room = IDLE_BYTES.max(length.saturating_mul(IDLE_ALLOCATIONS));
+        while self.free.len() > CAP || (self.free_bytes > room && self.free.len() > 1) {
             let (length, _) = self.free.remove(0);
             self.free_bytes -= length;
         }

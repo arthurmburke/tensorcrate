@@ -816,6 +816,16 @@ assert_eq!(y[0].as_slice(), [2.0, 1.0]);
   11 µs that way on an M5 Max, against 158 µs interpreted. Like the other shaders these use fast
   math, so Metal agrees with the host within tolerance rather than exactly.
 - Loads can read a transposed matrix or broadcast a row or column vector without materializing it.
+  Inputs can also be views, read in place through their strides: `m.view(rows, cols)` for a block,
+  `m.row_view(i)` and `m.column_view(j)`, `m.transposed_view()`, and `.t()` and `.view(..)` of any
+  view. A column of a matrix can be broadcast across the columns, a padded or offset layout read
+  without a copy, and on Metal a view costs what a tensor of its size would. Views are read-only:
+  in-place tensors (`FusableMut`) are whole vectors and matrices.
+- `Builder::row_statistic(x, RowStatistic::Mean | Deviations)` gives a program each row's mean or
+  sum of squared deviations of an input, which it computes itself. On the host that is
+  `matrix_axis_moments` followed by the program, bit for bit; on `Metal` it is one kernel, a
+  threadgroup per row, so a layer norm reads its input once — 11 µs for 1024×1024 on an M5 Max,
+  what a single elementwise pass over it costs.
   Each input and output can be stored as `f32`, `f16`, `bf16` or `f64`, independently of the
   arithmetic, which runs in the program's element type: `Program<T>` and `Builder<T>` default to
   `f32`, and `Builder::<f16>::new()` builds one that computes in `f16`. The Metal shader is

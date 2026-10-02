@@ -1691,3 +1691,281 @@ fn metal_row_statistics_match_the_host() {
     }
     tensorcrate::metal::set_fused_codegen(true);
 }
+
+// ---- views ------------------------------------------------------------------------
+
+/// `a + bᵀ·w − c + r·s + h`: a block, a view read transposed, a transposed
+/// view, a column broadcast across rows from a matrix's column, a row broadcast
+/// from a matrix's row, a row broadcast from a column, and an `f16` block.
+fn view_program() -> Program {
+    let mut b = Builder::<f32>::new();
+    let a = b.input(DType::F32);
+    let bt = b.input_remapped(DType::F32, Remap::Transpose);
+    let w = b.input(DType::F32);
+    let c = b.input_remapped(DType::F32, Remap::Column);
+    let r = b.input_remapped(DType::F32, Remap::Row);
+    let s = b.input_remapped(DType::F32, Remap::Row);
+    let h = b.input(DType::F16);
+    let bw = b.mul(bt, w);
+    let sum = b.add(a, bw);
+    let less = b.sub(sum, c);
+    let rs = b.mul(r, s);
+    let more = b.add(less, rs);
+    let y = b.add(more, h);
+    b.output(y, DType::F32);
+    b.build_with(&fused::CostModel::BALANCED, Algebra::Exact)
+        .unwrap()
+}
+
+/// Matrices larger than the views taken of them, so every view starts at an
+/// offset and steps over elements it does not read.
+struct ViewParents {
+    big: Matrix<f32>,
+    tall: Matrix<f32>,
+    halves: Matrix<f16>,
+}
+
+fn view_parents(rng: &mut Lcg, (rows, cols): (usize, usize)) -> ViewParents {
+    let (big_rows, big_cols) = (rows + cols + 6, rows + cols + 5);
+    let halves: Vec<f16> = rng
+        .vector((rows + 2) * (cols + 3), -1.0, 1.0)
+        .into_iter()
+        .map(f16::from_f32)
+        .collect();
+    ViewParents {
+        big: Matrix::from_flat(
+            big_rows,
+            big_cols,
+            rng.vector(big_rows * big_cols, -2.0, 2.0),
+        ),
+        tall: Matrix::from_flat(rows + cols, 4, rng.vector((rows + cols) * 4, -1.0, 1.0)),
+        halves: Matrix::from_flat(rows + 2, cols + 3, halves),
+    }
+}
+
+/// Run `view_program` on views of the parents, or (`copied`) on copies of
+/// those views.
+fn run_views<B: Kernels>(p: &ViewParents, (rows, cols): (usize, usize), copied: bool) -> Vec<f32> {
+    let (big, tall, halves) = (
+        p.big.to_backend::<B>(),
+        p.tall.to_backend::<B>(),
+        p.halves.to_backend::<B>(),
+    );
+    let program = view_program();
+    let a = big.view(1..1 + rows, 2..2 + cols);
+    // Read transposed: stored cols × rows.
+    let bt = big.view(3..3 + cols, 1..1 + rows);
+    // A transposed view, read in order.
+    let w = big.view(2..2 + cols, 4..4 + rows).t();
+    let c = big.view(0..rows, 0..1);
+    let r = big.row_view(5).view(.., 3..3 + cols);
+    let s = tall.column_view(2).view(0..cols, ..);
+    let h = halves.view(2..2 + rows, 1..1 + cols);
+    let run = |inputs: &[&dyn Fusable<B>]| {
+        program
+            .run((rows, cols), inputs, &mut [])
+            .remove(0)
+            .into_matrix::<f32>()
+            .to_backend::<Host>()
+            .as_slice()
+            .to_vec()
+    };
+    if copied {
+        let (a, bt, w, c, r, s, h) = (
+            a.to_matrix(),
+            bt.to_matrix(),
+            w.to_matrix(),
+            c.to_matrix(),
+            r.to_matrix(),
+            s.to_matrix(),
+            h.to_matrix(),
+        );
+        run(&[&a, &bt, &w, &c, &r, &s, &h])
+    } else {
+        run(&[&a, &bt, &w, &c, &r, &s, &h])
+    }
+}
+
+const VIEW_SHAPES: [(usize, usize); 5] = [(1, 1), (3, 5), (17, 33), (64, 7), (700, 600)];
+
+#[test]
+fn views_read_in_place_match_their_copies_bit_for_bit() {
+    let mut rng = Lcg(2027);
+    for shape in VIEW_SHAPES {
+        let parents = view_parents(&mut rng, shape);
+        let viewed = run_views::<Host>(&parents, shape, false);
+        let copied = run_views::<Host>(&parents, shape, true);
+        let unfused = fused::with_mode(Mode::Unfused, || run_views::<Host>(&parents, shape, false));
+        let one = on_threads(1, || run_views::<Host>(&parents, shape, false));
+        assert_bits_eq(&viewed, &copied, &format!("{shape:?}, against copies"));
+        assert_bits_eq(&viewed, &unfused, &format!("{shape:?}, against unfused"));
+        assert_bits_eq(&viewed, &one, &format!("{shape:?}, against one thread"));
+
+        // And element by element, from the parents.
+        let (rows, cols) = shape;
+        let at = |m: &Matrix<f32>, r: usize, c: usize| m.as_slice()[r * m.cols() + c];
+        for i in (0..rows).step_by(rows.div_ceil(7)) {
+            for j in (0..cols).step_by(cols.div_ceil(7)) {
+                let (big, tall) = (&parents.big, &parents.tall);
+                let want = at(big, 1 + i, 2 + j) + at(big, 3 + j, 1 + i) * at(big, 2 + j, 4 + i)
+                    - at(big, i, 0)
+                    + at(big, 5, 3 + j) * at(tall, j, 2)
+                    + parents.halves.as_slice()[(2 + i) * (cols + 3) + 1 + j].to_f32();
+                let got = viewed[i * cols + j];
+                assert_eq!(got.to_bits(), want.to_bits(), "{shape:?} at ({i}, {j})");
+            }
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "cannot read through Identity")]
+fn a_view_of_the_wrong_shape_is_refused() {
+    let m = Matrix::from_flat(4, 4, vec![0.0f32; 16]);
+    let program = program_adding_one();
+    // 2×3 holds six elements, as a 3×2 space needs, but is not 3×2.
+    let _ = program.run((3, 2), &[&m.view(0..2, 0..3)], &mut []);
+}
+
+fn program_adding_one() -> Program {
+    let mut b = Builder::<f32>::new();
+    let x = b.input(DType::F32);
+    let y = b.shift(x, 1.0);
+    b.output(y, DType::F32);
+    b.build().unwrap()
+}
+
+#[test]
+#[should_panic(expected = "reaches past an extent of 4")]
+fn a_view_past_the_matrix_is_refused() {
+    let m = Matrix::from_flat(4, 4, vec![0.0f32; 16]);
+    let _ = m.view(1..5, ..);
+}
+
+#[test]
+fn views_feed_sums_epilogues_and_row_statistics() {
+    use tensorcrate::tensors::Axis;
+    use tensorcrate::tensors::fused::RowStatistic;
+    let mut rng = Lcg(31337);
+    let big = Matrix::from_flat(40, 50, rng.vector(2000, -1.0, 1.0));
+    let (block, copy) = (big.view(3..23, 5..35), big.view(3..23, 5..35).to_matrix());
+
+    let sum = program_adding_one();
+    for axis in [Axis::Rows, Axis::Columns] {
+        let viewed = sum.run_sum((20, 30), &[&block], axis);
+        let copied = sum.run_sum((20, 30), &[&copy], axis);
+        assert_bits_eq(
+            viewed.as_slice(),
+            copied.as_slice(),
+            &format!("sum {axis:?}"),
+        );
+    }
+
+    let mut b = Builder::<f32>::new();
+    let x = b.input(DType::F32);
+    let mean = b.row_statistic(x, RowStatistic::Mean);
+    let deviations = b.row_statistic(x, RowStatistic::Deviations);
+    let centered = b.sub(x, mean);
+    let y = b.mul(centered, deviations);
+    b.output(y, DType::F32);
+    let norm = b.build().unwrap();
+    let viewed = norm
+        .run((20, 30), &[&block], &mut [])
+        .remove(0)
+        .into_vector::<f32>();
+    let copied = norm
+        .run((20, 30), &[&copy], &mut [])
+        .remove(0)
+        .into_vector::<f32>();
+    assert_bits_eq(viewed.as_slice(), copied.as_slice(), "row statistics");
+
+    // An epilogue's bias, one row of a matrix.
+    let x = Matrix::from_flat(9, 12, rng.vector(108, -1.0, 1.0));
+    let w = Matrix::from_flat(12, 30, rng.vector(360, -1.0, 1.0));
+    let mut b = Builder::<f32>::new();
+    let product = b.input(DType::F32);
+    let bias = b.input_remapped(DType::F32, Remap::Row);
+    let y = b.add(product, bias);
+    b.output(y, DType::F32);
+    let dense = b.build().unwrap();
+    let row = big.row_view(7).view(.., 10..40);
+    let viewed = dense
+        .run_matmul(&x, &w, &[&row])
+        .remove(0)
+        .into_vector::<f32>();
+    let copied = dense
+        .run_matmul(&x, &w, &[&row.to_matrix()])
+        .remove(0)
+        .into_vector::<f32>();
+    assert_bits_eq(viewed.as_slice(), copied.as_slice(), "epilogue bias");
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+fn metal_views_match_the_host() {
+    let mut rng = Lcg(2028);
+    for codegen in [false, true] {
+        tensorcrate::metal::set_fused_codegen(codegen);
+        for shape in VIEW_SHAPES {
+            let parents = view_parents(&mut rng, shape);
+            let want = run_views::<Host>(&parents, shape, false);
+            for round in 0..3 {
+                let got = run_views::<Metal>(&parents, shape, false);
+                assert_close(
+                    &got,
+                    &want,
+                    &format!("codegen {codegen}, {shape:?}, round {round}"),
+                );
+            }
+            let unfused =
+                fused::with_mode(Mode::Unfused, || run_views::<Metal>(&parents, shape, false));
+            assert_close(&unfused, &want, &format!("unfused, {shape:?}"));
+        }
+    }
+    tensorcrate::metal::set_fused_codegen(true);
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+fn metal_views_feed_sums_epilogues_and_row_statistics() {
+    use tensorcrate::tensors::Axis;
+    use tensorcrate::tensors::fused::RowStatistic;
+    let mut rng = Lcg(31338);
+    let host = Matrix::from_flat(40, 50, rng.vector(2000, -1.0, 1.0));
+    let big = host.to_backend::<Metal>();
+    let shape = (20, 30);
+    let sum = program_adding_one();
+    let mut b = Builder::<f32>::new();
+    let x = b.input(DType::F32);
+    let mean = b.row_statistic(x, RowStatistic::Mean);
+    let centered = b.sub(x, mean);
+    b.output(centered, DType::F32);
+    let norm = b.build().unwrap();
+    for round in 0..3 {
+        let block = big.view(3..23, 5..35);
+        let host_block = host.view(3..23, 5..35);
+        for axis in [Axis::Rows, Axis::Columns] {
+            let got = sum.run_sum(shape, &[&block], axis).to_backend::<Host>();
+            let want = sum.run_sum(shape, &[&host_block], axis);
+            assert_close(
+                got.as_slice(),
+                want.as_slice(),
+                &format!("sum {axis:?}, round {round}"),
+            );
+        }
+        let got = norm
+            .run(shape, &[&block], &mut [])
+            .remove(0)
+            .into_vector::<f32>()
+            .to_backend::<Host>();
+        let want = norm
+            .run(shape, &[&host_block], &mut [])
+            .remove(0)
+            .into_vector::<f32>();
+        assert_close(
+            got.as_slice(),
+            want.as_slice(),
+            &format!("row statistics, round {round}"),
+        );
+    }
+}

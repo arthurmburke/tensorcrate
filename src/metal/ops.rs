@@ -15,10 +15,10 @@ use super::encode::{
     REDUCE_GROUP, encode_axis_distribution, encode_axis_moments, encode_bitonic_stage,
     encode_broadcast, encode_clamp, encode_compare, encode_compare_scalar, encode_concat,
     encode_convert, encode_correlate, encode_deviation, encode_distribution, encode_elementwise,
-    encode_fft, encode_flip, encode_gemm, encode_hmerge, encode_matmul, encode_matrix_stack,
-    encode_matvec, encode_pad, encode_power, encode_power_scalar, encode_reduce, encode_scan,
-    encode_sort_prepare, encode_stack, encode_transpose, encode_unary, encode_unary_dual,
-    encode_vecmat, encode_vmerge, vecmat_bands,
+    encode_fft, encode_flip, encode_gather, encode_gemm, encode_hmerge, encode_matmul,
+    encode_matrix_stack, encode_matvec, encode_pad, encode_power, encode_power_scalar,
+    encode_reduce, encode_scan, encode_sort_prepare, encode_stack, encode_transpose, encode_unary,
+    encode_unary_dual, encode_vecmat, encode_vmerge, vecmat_bands,
 };
 
 impl<T: MetalElement> MetalBuffer<T> {
@@ -75,6 +75,31 @@ impl<T: MetalElement> MetalBuffer<T> {
         with_gpu(|gpu| {
             encode_matmul::<T>(gpu, &self.raw, &rhs.raw, &target.raw, m, k, n, accumulate)
         })
+    }
+
+    /// The `rows × cols` matrix whose element `(r, c)` is this buffer's
+    /// element `place.at(r, c)`, copied on the GPU. `None` if the place reads
+    /// past the buffer or does not fit the shader's 32-bit indices.
+    pub(crate) fn gather(
+        &self,
+        place: crate::tensors::fused::Place,
+        (rows, cols): (usize, usize),
+    ) -> Option<Self> {
+        let len = rows.checked_mul(cols)?;
+        if len != 0 && place.end((rows, cols)) > self.len {
+            return None;
+        }
+        let output = Self::allocate(len)?;
+        if len != 0 {
+            let place = [
+                u32::try_from(place.offset).ok()?,
+                u32::try_from(place.row).ok()?,
+                u32::try_from(place.col).ok()?,
+                u32::try_from(cols).ok()?,
+            ];
+            with_gpu(|gpu| encode_gather::<T>(gpu, &self.raw, &output.raw, place, len))?;
+        }
+        Some(output)
     }
 
     /// Transpose a row-major `rows × cols` matrix into a new shared buffer.
