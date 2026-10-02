@@ -16,6 +16,8 @@ API to use for model training, dynamic data, and GPU execution.
 - Dynamically shaped `Vector<T>` and row-major `Matrix<T>` values.
 - N-dimensional `Tensor<T>` (up to six axes) with strided `TensorView`s: permute, transpose,
   slice, split, concatenate and stack, copied by one strided kernel on the host or the GPU.
+- Numpy-style broadcasting for tensor arithmetic and comparisons, and axis reductions (`sum`,
+  `max`, `min`, `mean`, `var` over any axes, `argmax`/`argmin`), each one kernel on Host or Metal.
 - Real, complex, dual, and complex-dual arithmetic.
 - A `math!` macro with tensor literals, broadcasting, analytic functions, and `@` products.
 - Reverse-mode autodiff with a tape and forward-mode autodiff with dual tensors.
@@ -136,12 +138,53 @@ let merged: Vec<Tensor<f32>> = parts
 assert_eq!(Tensor::concat(&merged, -1), qkv);
 ```
 
-Same-shape elementwise arithmetic (`+ - * /`, `elementwise`, `with_scalar`, `unary`,
-`power`, `compare`, `min`/`max`, `clamp`) runs on tensors and views through the existing vector
-kernels, so it works for every float on `Host` and for `f32`, `f16` and `bf16` on `Metal`; a view
-that is not its tensor's whole storage in order is copied into order first. A tensor, or a view
-whose leading axes fold into one strided axis, is also an input to a fused program, read as the
-`(prod(leading), last)` matrix of its rows.
+Elementwise arithmetic (`+ - * /`, `elementwise`, `with_scalar`, `unary`, `power`, `compare`,
+`min`/`max`, `clamp`) runs on tensors and views for every float on `Host` and for `f32`, `f16` and
+`bf16` on `Metal`. The operations of two operands broadcast numpy-style: shapes align at their last
+axes, and an axis of extent 1 — or a missing leading axis — repeats to match the other operand, so
+a `[D]` bias adds to `[B, T, D]` activations, a `[T, T]` mask to `[B, H, T, T]` scores, and a
+rank-0 tensor to anything. Two whole tensors of one shape run the vector kernel; any other pair
+runs one strided kernel that reads both operands in place (a repeated axis through a stride of
+zero), so neither a broadcast operand nor a non-contiguous view is copied first. Shapes that do not
+broadcast panic, naming the operation and both shapes. `broadcast_to(&shape)` returns the
+repeated view itself.
+
+Reductions fold any set of axes: `sum_axes`, `max_axes`, `min_axes`, `mean_axes`,
+`var_axes(axes, Correction::Population | Correction::Sample, keep_dims)` and the general
+`reduce_axes(Reduce, axes, keep_dims)`. Axes are one axis, an array, slice or `Vec` of them, or
+`..` for all; negative axes count from the last, and `keep_dims` keeps the folded axes at extent 1.
+`argmax(axis, keep_dims)` and `argmin` return the positions as a `Tensor<u32, B>` (ties go to the
+first position). Each is one strided kernel on the tensor's backend — on Metal one dispatch,
+with a SIMD group per result for long slices — reading views in place; `f16` and `bf16` accumulate
+in `f32`. Like `Reduce`, the extremes pass over NaNs (a slice of only NaNs gives `−∞` for a
+maximum and position `0` for an argmax); an empty slice sums to 0, has extremes `∓∞` and a NaN
+mean and variance.
+
+```rust
+use tensorcrate::statistics::Correction;
+use tensorcrate::tensors::Tensor;
+
+let (batch, heads, time) = (2, 2, 3);
+let scores = Tensor::<f32>::ones(&[batch, heads, time, time]);
+let causal = Tensor::from_vec(
+    &[time, time],
+    vec![0.0, f32::NEG_INFINITY, f32::NEG_INFINITY, 0.0, 0.0, f32::NEG_INFINITY, 0.0, 0.0, 0.0],
+);
+let masked = &scores + &causal; // [T, T] broadcasts over [B, H, T, T]
+let largest = masked.max_axes(-1, true); // [B, H, T, 1]
+let shifted = &masked - &largest; // and back over the last axis
+assert_eq!(shifted.shape(), [batch, heads, time, time]);
+
+let x = Tensor::from_vec(&[2, 3], vec![1.0f32, 5.0, 3.0, 4.0, 2.0, 6.0]);
+assert_eq!(x.sum_axes(.., false).to_vec(), [21.0]);
+assert_eq!(x.mean_axes([0], false).to_vec(), [2.5, 3.5, 4.5]);
+assert_eq!(x.var_axes(-1, Correction::Sample, false).to_vec(), [4.0, 4.0]);
+assert_eq!(x.argmax(1, false).to_vec(), [1, 2]);
+```
+
+A tensor, or a view whose leading axes fold into one strided axis — a bias broadcast over leading
+axes among them — is also an input to a fused program, read as the `(prod(leading), last)` matrix
+of its rows.
 
 ## The `math!` macro
 
