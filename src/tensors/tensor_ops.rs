@@ -1,12 +1,25 @@
 //! Elementwise arithmetic, analytic functions and comparisons on [`Tensor`]s
 //! and [`TensorView`]s, and their use as fused-program inputs.
 //!
-//! An elementwise operation does not care about shape beyond requiring both
-//! operands to have the same one, so each runs as the [`Kernels`] vector
-//! operation over the flat row-major storage — the same kernel, SIMD or GPU,
-//! a [`Vector`] of that many elements would run. A view that is not its
-//! tensor's whole storage in order is first copied into order with one strided
-//! copy; the result is always a new, contiguous tensor.
+//! An operation of one tensor does not care about its shape, so it runs as the
+//! [`Kernels`] vector operation over the flat row-major storage — the same
+//! kernel, SIMD or GPU, a [`Vector`] of that many elements would run. A view
+//! that is not its tensor's whole storage in order is first copied into order
+//! with one strided copy.
+//!
+//! An operation of two — `+ - * /`, [`elementwise`](Tensor::elementwise),
+//! [`power`](Tensor::power), [`compare`](Tensor::compare),
+//! [`min`](Tensor::min) and [`max`](Tensor::max) — broadcasts its operands
+//! numpy-style: the shapes align at their last axes, a missing leading axis
+//! counts as `1`, and an axis of `1` repeats to match the other operand's.
+//! `[D]` against `[B, T, D]` adds a bias to every position, `[T, T]` against
+//! `[B, H, T, T]` masks every head, and a rank-0 tensor is a scalar against
+//! anything. Two whole tensors of one shape run the vector kernel; any other
+//! pair runs one strided kernel that reads both operands in place, a repeated
+//! axis through a stride of zero, so neither a broadcast operand nor a
+//! non-contiguous view is copied first. Shapes that do not broadcast panic,
+//! naming the operation and both shapes. The result is always a new,
+//! contiguous tensor.
 //!
 //! The operations are defined for every element type and backend that
 //! implements [`Kernels`]: every float on `Host`, and `f32`, `f16` and `bf16`
@@ -15,7 +28,8 @@
 use std::ops::{Add, Deref, Div, Mul, Neg, Sub};
 
 use super::fused::{Element, Fusable, FusableOf, Source, View};
-use super::shape::assert_same_tensor_shape;
+use super::kernels::Pairwise;
+use super::layout::broadcast_shape;
 use super::{Analytic, Backend, BinaryOp, Compare, Kernels, Tensor, TensorView, Vector};
 use crate::numbers::Real;
 
@@ -50,31 +64,47 @@ impl<'a, T: Real, B: Kernels<T>> TensorView<'a, T, B> {
         Tensor::from_parts(*self.dims(), f(&self.flat()))
     }
 
+    /// `op(self, rhs)` with the shapes broadcast: the vector kernel `same`
+    /// for two whole tensors of one shape, and otherwise one strided kernel
+    /// over the views broadcast to their common shape.
     #[track_caller]
     fn zip<'b>(
         &self,
         rhs: impl Into<TensorView<'b, T, B>>,
-        operation: &str,
-        f: impl FnOnce(&Vector<T, B>, &Vector<T, B>) -> Vector<T, B>,
+        op: Pairwise,
+        same: impl FnOnce(&Vector<T, B>, &Vector<T, B>) -> Vector<T, B>,
     ) -> Tensor<T, B> {
         let rhs = rhs.into();
-        assert_same_tensor_shape(self.shape(), rhs.shape(), operation);
-        Tensor::from_parts(*self.dims(), f(&self.flat(), &rhs.flat()))
+        if self.shape() == rhs.shape() && self.is_whole() && rhs.is_whole() {
+            return Tensor::from_parts(*self.dims(), same(self.data(), rhs.data()));
+        }
+        let shape = broadcast_shape(self.shape(), rhs.shape()).unwrap_or_else(|| {
+            panic!(
+                "{}: tensor shapes differ, {:?} and {:?}, and do not broadcast",
+                op.name(),
+                self.shape(),
+                rhs.shape()
+            )
+        });
+        let (a, b) = (self.broadcast_to(&shape), rhs.broadcast_to(&shape));
+        Tensor::from_parts(shape, B::strided_binary(a, b, op))
     }
 
-    /// `self op rhs`, elementwise: the operation behind `+ - * /`, and `%`
-    /// besides.
+    /// `self op rhs`, elementwise with the shapes broadcast: the operation
+    /// behind `+ - * /`, and `%` besides.
     ///
     /// # Panics
     ///
-    /// If the shapes differ.
+    /// If the shapes do not broadcast.
     #[track_caller]
     pub fn elementwise<'b>(
         &self,
         rhs: impl Into<TensorView<'b, T, B>>,
         op: BinaryOp,
     ) -> Tensor<T, B> {
-        self.zip(rhs, op.name(), |a, b| B::vector_elementwise(a, b, op))
+        self.zip(rhs, Pairwise::Arithmetic(op), |a, b| {
+            B::vector_elementwise(a, b, op)
+        })
     }
 
     /// Every element combined with `scalar` by `op`: `x op scalar`, or
@@ -93,14 +123,14 @@ impl<'a, T: Real, B: Kernels<T>> TensorView<'a, T, B> {
         self.map(|a| B::vector_unary(a, f))
     }
 
-    /// Elementwise `self^rhs`.
+    /// Elementwise `self^rhs`, with the shapes broadcast.
     ///
     /// # Panics
     ///
-    /// If the shapes differ.
+    /// If the shapes do not broadcast.
     #[track_caller]
     pub fn power<'b>(&self, rhs: impl Into<TensorView<'b, T, B>>) -> Tensor<T, B> {
-        self.zip(rhs, "power", |a, b| B::vector_power(a, b))
+        self.zip(rhs, Pairwise::Power, |a, b| B::vector_power(a, b))
     }
 
     /// `x^scalar` for every element, or `scalar^x` if `scalar_left`.
@@ -108,14 +138,17 @@ impl<'a, T: Real, B: Kernels<T>> TensorView<'a, T, B> {
         self.map(|a| B::vector_power_scalar(a, scalar, scalar_left))
     }
 
-    /// Elementwise comparison: the [`Compare`] operation of each pair.
+    /// Elementwise comparison, with the shapes broadcast: the [`Compare`]
+    /// operation of each pair.
     ///
     /// # Panics
     ///
-    /// If the shapes differ.
+    /// If the shapes do not broadcast.
     #[track_caller]
     pub fn compare<'b>(&self, rhs: impl Into<TensorView<'b, T, B>>, op: Compare) -> Tensor<T, B> {
-        self.zip(rhs, "compare", |a, b| B::vector_compare(a, b, op))
+        self.zip(rhs, Pairwise::Compare(op), |a, b| {
+            B::vector_compare(a, b, op)
+        })
     }
 
     /// Every element compared with `scalar`, which `scalar_left` puts on the
@@ -124,24 +157,24 @@ impl<'a, T: Real, B: Kernels<T>> TensorView<'a, T, B> {
         self.map(|a| B::vector_compare_scalar(a, scalar, op, scalar_left))
     }
 
-    /// Elementwise minimum.
+    /// Elementwise minimum, with the shapes broadcast.
     ///
     /// # Panics
     ///
-    /// If the shapes differ.
+    /// If the shapes do not broadcast.
     #[track_caller]
     pub fn min<'b>(&self, rhs: impl Into<TensorView<'b, T, B>>) -> Tensor<T, B> {
-        self.zip(rhs, "min", |a, b| B::vector_compare(a, b, Compare::Min))
+        self.compare(rhs, Compare::Min)
     }
 
-    /// Elementwise maximum.
+    /// Elementwise maximum, with the shapes broadcast.
     ///
     /// # Panics
     ///
-    /// If the shapes differ.
+    /// If the shapes do not broadcast.
     #[track_caller]
     pub fn max<'b>(&self, rhs: impl Into<TensorView<'b, T, B>>) -> Tensor<T, B> {
-        self.zip(rhs, "max", |a, b| B::vector_compare(a, b, Compare::Max))
+        self.compare(rhs, Compare::Max)
     }
 
     /// The lesser of each element and `scalar`.

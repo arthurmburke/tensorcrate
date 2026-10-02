@@ -313,6 +313,32 @@ pub(crate) fn reshape_strides(
     Some(new_strides)
 }
 
+/// The extent two broadcast axes take: their common extent, or the other's
+/// where one of them is `1`. `None` if they differ and neither is `1`.
+fn broadcast_extent(left: usize, right: usize) -> Option<usize> {
+    match (left, right) {
+        _ if left == right => Some(left),
+        (1, other) | (other, 1) => Some(other),
+        _ => None,
+    }
+}
+
+/// The shape `left` and `right` broadcast to, numpy-style: the shapes are
+/// aligned at their last axes, a missing leading axis counts as an extent of
+/// `1`, and each aligned pair of extents must agree unless one of them is `1`,
+/// which repeats to match the other. `None` if some pair cannot.
+pub(crate) fn broadcast_shape(left: &[usize], right: &[usize]) -> Option<Dims> {
+    let rank = left.len().max(right.len());
+    let mut shape = vec![0; rank];
+    for (axis, extent) in shape.iter_mut().enumerate() {
+        // Axis `axis` of the result is `rank - axis` axes from the end of each.
+        let from_end = rank - axis;
+        let pick = |dims: &[usize]| dims.len().checked_sub(from_end).map_or(1, |k| dims[k]);
+        *extent = broadcast_extent(pick(left), pick(right))?;
+    }
+    Some(Dims::new(&shape, "broadcast"))
+}
+
 /// The strides that read a layout of `shape` with `strides` as the larger
 /// `target` it broadcasts to: an axis of `1` the target repeats, and every
 /// leading axis the target adds, steps by zero. `None` unless `shape`
@@ -527,7 +553,19 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_strides_repeat_unit_and_added_axes() {
+    fn shapes_broadcast_from_the_last_axis() {
+        let shape = |left: &[usize], right: &[usize]| {
+            broadcast_shape(left, right).map(|dims| dims.to_vec())
+        };
+        assert_eq!(shape(&[2, 3, 4], &[4]), Some(vec![2, 3, 4]));
+        assert_eq!(shape(&[4], &[2, 3, 4]), Some(vec![2, 3, 4]));
+        assert_eq!(shape(&[5, 5], &[2, 3, 5, 5]), Some(vec![2, 3, 5, 5]));
+        assert_eq!(shape(&[2, 1, 4], &[3, 1]), Some(vec![2, 3, 4]));
+        assert_eq!(shape(&[], &[2, 3]), Some(vec![2, 3]));
+        assert_eq!(shape(&[1, 0], &[3, 1]), Some(vec![3, 0]));
+        assert_eq!(shape(&[3, 4], &[4, 3]), None);
+        assert_eq!(shape(&[0], &[2]), None);
+
         let strides = broadcast_strides(&[3, 1], &[1, 1], &[2, 3, 4]).unwrap();
         assert_eq!(strides.as_slice(), [0, 1, 0]);
         let strides = broadcast_strides(&[4], &[2], &[3, 4]).unwrap();

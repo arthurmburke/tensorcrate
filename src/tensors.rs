@@ -51,8 +51,19 @@
 //! part of an existing tensor in place.
 //!
 //! The elementwise arithmetic, analytic functions and comparisons of
-//! [`Kernels`] apply to tensors and views of one shape, and a tensor or a view
-//! whose leading axes fold together is an input to a
+//! [`Kernels`] apply to tensors and views, and those of two operands
+//! broadcast numpy-style: shapes align at their last axes and an axis of `1`
+//! — or a missing leading one — repeats, so a `[D]` bias adds to a
+//! `[B, T, D]` activation and a `[T, T]` mask to `[B, H, T, T]` scores. A
+//! broadcast operand is read through zero strides, never copied;
+//! [`TensorView::broadcast_to`] gives the repeated view itself. Reductions
+//! fold any set of axes — [`Tensor::sum_axes`], `max_axes`, `min_axes`,
+//! `mean_axes`, `var_axes` — named by an [`Axes`] value, with negative axes
+//! counting from the last and `keep_dims` keeping the folded axes at extent
+//! `1`; [`Tensor::argmax`] and [`Tensor::argmin`] give positions along one
+//! axis as a `Tensor<u32, B>`. Each of these is one strided kernel on the
+//! tensor's backend, and the reductions accumulate `f16` and `bf16` in `f32`.
+//! A tensor or a view whose leading axes fold together is an input to a
 //! [fused program](fused::Program). Shape errors panic, naming the operation
 //! and the shapes, as everywhere in this module.
 //!
@@ -62,8 +73,13 @@
 //! let x = Tensor::from_vec(&[2, 3], vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
 //! let xt = x.transpose(0, 1); // a [3, 2] view: nothing copied
 //! assert_eq!(xt.get(&[2, 1]), Some(6.0));
-//! let y = &xt.contiguous() + xt; // the view is read in order for the kernel
+//! let y = &xt.contiguous() + xt; // the view is read in place by the kernel
 //! assert_eq!(y.to_vec(), [2.0, 8.0, 4.0, 10.0, 6.0, 12.0]);
+//!
+//! let bias = Tensor::from_vec(&[2], vec![10.0f32, 20.0]);
+//! let shifted = &y + &bias; // [3, 2] + [2] broadcasts over the rows
+//! assert_eq!(shifted.sum_axes(0, false).to_vec(), [42.0, 90.0]);
+//! assert_eq!(shifted.argmax(-1, true).shape(), [3, 1]);
 //! ```
 
 pub mod analytic;
@@ -79,6 +95,7 @@ pub(crate) mod layout;
 mod matrix;
 mod ops;
 mod order;
+mod reduction;
 mod shape;
 mod strided;
 mod tensor;
@@ -112,6 +129,7 @@ pub use kernels::{
 };
 pub use layout::{AxisIndex, MAX_RANK};
 pub use matrix::Matrix;
+pub use reduction::Axes;
 pub use tape::{MatrixVar, ScalarVar, Tape, Var, VectorVar};
 pub use tensor::Tensor;
 pub use vector::Vector;
