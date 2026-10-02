@@ -261,15 +261,6 @@ fn symbolic_products_are_deduced_from_operand_shapes() {
         a @ b
     };
 
-    let sin_t = math! {
-        let a = [
-            [1, 2, 3],
-            [2, 3, 4],
-            [3, 4, 5]
-        ];
-        cos(a)
-    };
-
     assert_eq!(matrix_product.to_rows(), [[58.0, 64.0], [139.0, 154.0]]);
 
     let matrix_vector: Vector<f64> = math! {

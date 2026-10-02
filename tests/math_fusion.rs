@@ -113,19 +113,22 @@ fn arithmetic_chains_fuse_exactly() {
 #[test]
 fn every_analytic_function_fuses_exactly() {
     fuses!("analytic", same_vector, {
-                let x = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7];
-                sin(x) + cos(x) * tan(x) - sec(x) + csc(x) / 7
-                    + arcsin(x) - arccos(x) + arctan(x)
-                    + exp(x) * ln(x) + sinh(x) - cosh(x) + tanh(x) * sqrt(x)
+        let x = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7];
+        sin(x) + cos(x) * tan(x) - sec(x) + csc(x) / 7 + arcsin(x) - arccos(x)
+            + arctan(x)
+            + exp(x) * ln(x)
+            + sinh(x)
+            - cosh(x)
+            + tanh(x) * sqrt(x)
     });
 }
 
 #[test]
 fn ordering_functions_fuse_exactly() {
     fuses!("ordering", same_vector, {
-                let x = [-3, -1.5, 0, 0.5, 2, 4];
-                let y = [1, -2, 0.25, 0.5, 3, -4];
-                clamp(max(x, y) * 2 - min(x, 0.5), -1, 3) + max(1, y)
+        let x = [-3, -1.5, 0, 0.5, 2, 4];
+        let y = [1, -2, 0.25, 0.5, 3, -4];
+        clamp(max(x, y) * 2 - min(x, 0.5), -1, 3) + max(1, y)
     });
 }
 
@@ -181,9 +184,9 @@ fn bindings_are_inlined_recomputed_or_materialized() {
 #[test]
 fn transposes_inside_a_group_become_transposed_reads() {
     fuses!("transpose", same_matrix, {
-                let a = [[1, 2, 3], [4, 5, 6]];
-                let b = [[1, 0], [0, 1], [2, 2]];
-                transpose(a * 2 + 1) - b + transpose(transpose(b))
+        let a = [[1, 2, 3], [4, 5, 6]];
+        let b = [[1, 0], [0, 1], [2, 2]];
+        transpose(a * 2 + 1) - b + transpose(transpose(b))
     });
 }
 
@@ -326,8 +329,15 @@ mod metal {
                     let y = [[2, -1], [0.5, 3]];
                     clamp(exp(x) * 0.5 + sqrt(y .* y + 1) - (x @ y) / 3, -2, 4)
                 };
-                let widen = |m: &Matrix<_>| m.as_slice().iter().map(|&v| f64::from(v)).collect::<Vec<f64>>();
-                for (against, expected) in [("unfused", widen(&unfused)), ("the host", widen(&host))] {
+                let widen = |m: &Matrix<_>| {
+                    m.as_slice()
+                        .iter()
+                        .map(|&v| f64::from(v))
+                        .collect::<Vec<f64>>()
+                };
+                for (against, expected) in
+                    [("unfused", widen(&unfused)), ("the host", widen(&host))]
+                {
                     for (i, (a, e)) in widen(&fused).iter().zip(&expected).enumerate() {
                         assert!(
                             (a - e).abs() <= $tolerance * (1.0 + e.abs()),
@@ -403,8 +413,16 @@ mod metal {
                 transpose(x @ w) * 2 + (x @ w)
             },
         );
-        close(metal.0.to_backend::<Host>().as_slice(), host.0.as_slice(), "epilogue");
-        close(metal.1.to_backend::<Host>().as_slice(), host.1.as_slice(), "transposed too");
+        close(
+            metal.0.to_backend::<Host>().as_slice(),
+            host.0.as_slice(),
+            "epilogue",
+        );
+        close(
+            metal.1.to_backend::<Host>().as_slice(),
+            host.1.as_slice(),
+            "transposed too",
+        );
     }
 
     #[test]

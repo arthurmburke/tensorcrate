@@ -24,7 +24,10 @@ fn main() {
     let tensorops_library = out_dir.join("tensorcrate_tensorops.metallib");
 
     let include = manifest_dir.join("metal");
-    run_xcrun("metal", &["-I", path(&include), "-c", path(&source), "-o", path(&air)]);
+    run_xcrun(
+        "metal",
+        &["-I", path(&include), "-c", path(&source), "-o", path(&air)],
+    );
     run_xcrun("metallib", &[path(&air), "-o", path(&library)]);
     run_xcrun(
         "metal",

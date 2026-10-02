@@ -736,12 +736,7 @@ mod gpu {
 
         /// Scalar broadcast on the GPU, with `op` encoded as in
         /// [`elementwise`](Self::elementwise).
-        pub(crate) fn broadcast(
-            &self,
-            scalar: T,
-            op: BinaryOp,
-            scalar_left: bool,
-        ) -> Option<Self> {
+        pub(crate) fn broadcast(&self, scalar: T, op: BinaryOp, scalar_left: bool) -> Option<Self> {
             let output = self.device()?.broadcast(scalar, op, scalar_left)?;
             Some(Self(Residency::Device(output)))
         }

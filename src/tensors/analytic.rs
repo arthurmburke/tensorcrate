@@ -52,12 +52,12 @@
 //! [`Vector<T, Host>`]: Vector
 //! [`Matrix<T, Host>`]: Matrix
 
+#[cfg(all(feature = "metal", target_os = "macos"))]
+use crate::metal::MetalElement;
 use crate::numbers::{
     Arccos, Arcsin, Arctan, Cos, Cosh, Csc, Exp, Ln, Power, Real, Sec, Sin, Sinh, Sqrt, Tan, Tanh,
     bf16, f16,
 };
-#[cfg(all(feature = "metal", target_os = "macos"))]
-use crate::metal::MetalElement;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use crate::tensors::Metal;
 use crate::tensors::kernels::{Analytic, Kernels};
@@ -393,7 +393,11 @@ macro_rules! fast_power_impl {
                 FastExponent::Root => out.extend(values.iter().map(|&x| {
                     // `pow(−∞, ½) = +∞`, where `sqrt(−∞)` is NaN.
                     let root = x.sqrt() + 0.0;
-                    if x == <$t>::NEG_INFINITY { <$t>::INFINITY } else { root }
+                    if x == <$t>::NEG_INFINITY {
+                        <$t>::INFINITY
+                    } else {
+                        root
+                    }
                 })),
                 FastExponent::Reciprocal => out.extend(values.iter().map(|&x| 1.0 / x)),
             }

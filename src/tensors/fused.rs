@@ -676,7 +676,10 @@ impl<T: Real> Program<T> {
             a.cols(),
             b.rows()
         );
-        assert_eq!(self.updated, 0, "fused matmul: the epilogue cannot update tensors in place");
+        assert_eq!(
+            self.updated, 0,
+            "fused matmul: the epilogue cannot update tensors in place"
+        );
         assert!(
             !self.inputs.is_empty(),
             "fused matmul: the epilogue must read the product as input 0"
@@ -689,8 +692,15 @@ impl<T: Real> Program<T> {
             inputs.len()
         );
         for instr in &self.code {
-            if let Instr::Load { input: 0, remap, .. } = *instr {
-                assert_eq!(remap, Remap::Identity, "fused matmul: the product is read through {remap:?}");
+            if let Instr::Load {
+                input: 0, remap, ..
+            } = *instr
+            {
+                assert_eq!(
+                    remap,
+                    Remap::Identity,
+                    "fused matmul: the product is read through {remap:?}"
+                );
             }
         }
         let shape = (a.rows(), b.cols());
@@ -1128,7 +1138,11 @@ impl<T: Real> Builder<T> {
     /// [`MAX_INSTRUCTIONS`]. Plans are cached per thread by the program's
     /// structure, with constants as placeholders, so a program rebuilt every
     /// step with new constants — an optimizer's — is optimized once.
-    pub fn build_with(self, model: &CostModel, algebra: Algebra) -> Result<Program<T>, ProgramError> {
+    pub fn build_with(
+        self,
+        model: &CostModel,
+        algebra: Algebra,
+    ) -> Result<Program<T>, ProgramError> {
         let fresh_inputs = self.inputs.len();
         let slot_of = |slot: u8| -> u8 {
             if usize::from(slot) >= MAX_INPUTS {
@@ -1323,7 +1337,8 @@ fn optimized(
         max_instructions: MAX_INSTRUCTIONS,
         ..optimizer::Options::default()
     };
-    let plan = optimizer::optimize(&key.graph, &options).map_err(|_| ProgramError::TooManyRegisters)?;
+    let plan =
+        optimizer::optimize(&key.graph, &options).map_err(|_| ProgramError::TooManyRegisters)?;
     PLANS.with(|plans| {
         let mut plans = plans.borrow_mut();
         if plans.len() >= PLAN_CACHE {
@@ -1448,7 +1463,9 @@ impl<T: Real> Program<T> {
                     remap: remap as u8,
                 },
                 Instr::Const { .. } => optimizer::Node::Const(optimizer::Scalar::Named(0)),
-                Instr::Binary { op, a, b, .. } => optimizer::Node::Binary(bin(op), read(a), read(b)),
+                Instr::Binary { op, a, b, .. } => {
+                    optimizer::Node::Binary(bin(op), read(a), read(b))
+                }
                 Instr::Unary { op, a, .. } => {
                     optimizer::Node::Unary(optimizer::Function(op as u16), read(a))
                 }
@@ -1471,7 +1488,11 @@ impl<T: Real> Program<T> {
                 nodes,
                 stores,
                 input_bytes: self.inputs.iter().map(|dtype| dtype.size() as u8).collect(),
-                output_bytes: self.outputs.iter().map(|dtype| dtype.size() as u8).collect(),
+                output_bytes: self
+                    .outputs
+                    .iter()
+                    .map(|dtype| dtype.size() as u8)
+                    .collect(),
             },
             model,
         )
@@ -2922,7 +2943,12 @@ fn resident<T: crate::metal::MetalElement>(
     written.extend(fresh.iter().map(device::Allocation::raw));
 
     crate::metal::fused_elementwise::<T>(&program.encode(), shape, &read, &written)?;
-    Some(fresh.into_iter().map(device::Allocation::into_fresh).collect())
+    Some(
+        fresh
+            .into_iter()
+            .map(device::Allocation::into_fresh)
+            .collect(),
+    )
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -2945,5 +2971,10 @@ fn resident_matmul<T: crate::metal::MetalElement>(
     let written: Vec<&device::Raw> = fresh.iter().map(device::Allocation::raw).collect();
 
     crate::metal::matmul_epilogue::<T>(&program.encode(), (m, k, n), left, right, &read, &written)?;
-    Some(fresh.into_iter().map(device::Allocation::into_fresh).collect())
+    Some(
+        fresh
+            .into_iter()
+            .map(device::Allocation::into_fresh)
+            .collect(),
+    )
 }

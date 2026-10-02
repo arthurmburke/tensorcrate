@@ -1339,7 +1339,11 @@ impl<T: Real> Kernels<T> for Host {
             1,
         );
         if let (Some(adjoint), Some(window)) = (widened(adjoint), widened(window)) {
-            return narrowed(correlate_input_gradient_values(&adjoint, &window, forward_flip));
+            return narrowed(correlate_input_gradient_values(
+                &adjoint,
+                &window,
+                forward_flip,
+            ));
         }
         correlate_input_gradient_values(adjoint, window, forward_flip)
     }
@@ -1455,32 +1459,36 @@ impl<T: Real> Kernels<T> for Host {
 }
 
 /// The values of a valid correlation; the host kernel without its bookkeeping.
-fn correlate_values<T: Real>(input: &Matrix<T, Host>, window: &Matrix<T, Host>, flip: bool) -> Matrix<T, Host> {
-        let cols = input.cols();
-        let (window_rows, window_cols) = window.shape();
-        let (out_rows, out_cols) = correlation_shape(input.shape(), window.shape());
-        let (values, taps) = (input.data(), window.data());
+fn correlate_values<T: Real>(
+    input: &Matrix<T, Host>,
+    window: &Matrix<T, Host>,
+    flip: bool,
+) -> Matrix<T, Host> {
+    let cols = input.cols();
+    let (window_rows, window_cols) = window.shape();
+    let (out_rows, out_cols) = correlation_shape(input.shape(), window.shape());
+    let (values, taps) = (input.data(), window.data());
 
-        let mut out = Vec::with_capacity(out_rows * out_cols);
-        for row in 0..out_rows {
-            for col in 0..out_cols {
-                let mut sum = T::zero();
-                for window_row in 0..window_rows {
-                    for window_col in 0..window_cols {
-                        let (tap_row, tap_col) = if flip {
-                            (window_rows - 1 - window_row, window_cols - 1 - window_col)
-                        } else {
-                            (window_row, window_col)
-                        };
-                        sum = sum
-                            + values[(row + window_row) * cols + col + window_col]
-                                * taps[tap_row * window_cols + tap_col];
-                    }
+    let mut out = Vec::with_capacity(out_rows * out_cols);
+    for row in 0..out_rows {
+        for col in 0..out_cols {
+            let mut sum = T::zero();
+            for window_row in 0..window_rows {
+                for window_col in 0..window_cols {
+                    let (tap_row, tap_col) = if flip {
+                        (window_rows - 1 - window_row, window_cols - 1 - window_col)
+                    } else {
+                        (window_row, window_col)
+                    };
+                    sum = sum
+                        + values[(row + window_row) * cols + col + window_col]
+                            * taps[tap_row * window_cols + tap_col];
                 }
-                out.push(sum);
             }
+            out.push(sum);
         }
-        Matrix::from_flat(out_rows, out_cols, out)
+    }
+    Matrix::from_flat(out_rows, out_cols, out)
 }
 
 /// The values of a correlation's input gradient — the full correlation of the
@@ -1490,48 +1498,52 @@ fn correlate_input_gradient_values<T: Real>(
     window: &Matrix<T, Host>,
     forward_flip: bool,
 ) -> Matrix<T, Host> {
-        // X̄[p][q] = Σᵤᵥ Ȳ[p−u][q−v]·K[u][v], with the taps reversed when the
-        // forward pass reversed them. Out-of-range adjoint indices are the zeros
-        // a full correlation pads with.
-        let (out_rows, out_cols) = adjoint.shape();
-        let (window_rows, window_cols) = window.shape();
-        let (rows, cols) = (out_rows + window_rows - 1, out_cols + window_cols - 1);
-        let (upstream, taps) = (adjoint.data(), window.data());
+    // X̄[p][q] = Σᵤᵥ Ȳ[p−u][q−v]·K[u][v], with the taps reversed when the
+    // forward pass reversed them. Out-of-range adjoint indices are the zeros
+    // a full correlation pads with.
+    let (out_rows, out_cols) = adjoint.shape();
+    let (window_rows, window_cols) = window.shape();
+    let (rows, cols) = (out_rows + window_rows - 1, out_cols + window_cols - 1);
+    let (upstream, taps) = (adjoint.data(), window.data());
 
-        let mut out = Vec::with_capacity(rows * cols);
-        for row in 0..rows {
-            for col in 0..cols {
-                let mut sum = T::zero();
-                for window_row in 0..window_rows {
-                    for window_col in 0..window_cols {
-                        if row < window_row || col < window_col {
-                            continue;
-                        }
-                        let (source_row, source_col) = (row - window_row, col - window_col);
-                        if source_row >= out_rows || source_col >= out_cols {
-                            continue;
-                        }
-                        let (tap_row, tap_col) = if forward_flip {
-                            (window_rows - 1 - window_row, window_cols - 1 - window_col)
-                        } else {
-                            (window_row, window_col)
-                        };
-                        sum = sum
-                            + upstream[source_row * out_cols + source_col]
-                                * taps[tap_row * window_cols + tap_col];
+    let mut out = Vec::with_capacity(rows * cols);
+    for row in 0..rows {
+        for col in 0..cols {
+            let mut sum = T::zero();
+            for window_row in 0..window_rows {
+                for window_col in 0..window_cols {
+                    if row < window_row || col < window_col {
+                        continue;
                     }
+                    let (source_row, source_col) = (row - window_row, col - window_col);
+                    if source_row >= out_rows || source_col >= out_cols {
+                        continue;
+                    }
+                    let (tap_row, tap_col) = if forward_flip {
+                        (window_rows - 1 - window_row, window_cols - 1 - window_col)
+                    } else {
+                        (window_row, window_col)
+                    };
+                    sum = sum
+                        + upstream[source_row * out_cols + source_col]
+                            * taps[tap_row * window_cols + tap_col];
                 }
-                out.push(sum);
             }
+            out.push(sum);
         }
-        Matrix::from_flat(rows, cols, out)
+    }
+    Matrix::from_flat(rows, cols, out)
 }
 
 /// A compact (`f16` or `bf16`) matrix widened to `f32`, exactly; `None` for
 /// every other element type.
 fn widened<T: Real>(m: &Matrix<T, Host>) -> Option<Matrix<f32, Host>> {
     let (rows, cols) = m.shape();
-    Some(Matrix::from_flat(rows, cols, crate::compact::widen(m.data())?))
+    Some(Matrix::from_flat(
+        rows,
+        cols,
+        crate::compact::widen(m.data())?,
+    ))
 }
 
 /// An `f32` result rounded back to the compact type [`widened`] came from.
@@ -1705,12 +1717,18 @@ mod gpu {
         }
 
         fn vecmat(v: &Vector<T, Self>, m: &Matrix<T, Self>) -> Vector<T, Self> {
-            counters::kernel((v.len() + m.rows() * m.cols() + m.cols()) * size_of::<T>(), 1);
+            counters::kernel(
+                (v.len() + m.rows() * m.cols() + m.cols()) * size_of::<T>(),
+                1,
+            );
             v.vecmat(m)
         }
 
         fn matvec(m: &Matrix<T, Self>, v: &Vector<T, Self>) -> Vector<T, Self> {
-            counters::kernel((v.len() + m.rows() * m.cols() + m.rows()) * size_of::<T>(), 1);
+            counters::kernel(
+                (v.len() + m.rows() * m.cols() + m.rows()) * size_of::<T>(),
+                1,
+            );
             m.matvec(v)
         }
 
@@ -1719,7 +1737,10 @@ mod gpu {
             v: &Vector<T, Self>,
             addend: Vector<T, Self>,
         ) -> Vector<T, Self> {
-            counters::kernel((v.len() + m.rows() * m.cols() + 2 * m.rows()) * size_of::<T>(), 0);
+            counters::kernel(
+                (v.len() + m.rows() * m.cols() + 2 * m.rows()) * size_of::<T>(),
+                0,
+            );
             m.matvec_add(v, addend)
         }
 
@@ -1826,7 +1847,8 @@ mod gpu {
             addend: Matrix<T, Self>,
         ) -> Matrix<T, Self> {
             counters::kernel(
-                (a.rows() * a.cols() + b.rows() * b.cols() + 2 * a.rows() * b.cols()) * size_of::<T>(),
+                (a.rows() * a.cols() + b.rows() * b.cols() + 2 * a.rows() * b.cols())
+                    * size_of::<T>(),
                 0,
             );
             a.matmul_add(b, addend)
@@ -1993,7 +2015,10 @@ mod gpu {
             parameters: (T, T),
         ) -> Vector<T, Self> {
             counters::elementwise_of::<T>(a.len(), 1);
-            match a.storage().distribution(family, statistic, widen_pair(parameters)) {
+            match a
+                .storage()
+                .distribution(family, statistic, widen_pair(parameters))
+            {
                 Some(data) => Vector::from_storage(a.len(), data),
                 None => Host::vector_distribution(
                     &a.to_backend::<Host>(),
@@ -2013,7 +2038,10 @@ mod gpu {
         ) -> Matrix<T, Self> {
             counters::elementwise_of::<T>(a.rows() * a.cols(), 1);
             let (rows, cols) = a.shape();
-            match a.storage().distribution(family, statistic, widen_pair(parameters)) {
+            match a
+                .storage()
+                .distribution(family, statistic, widen_pair(parameters))
+            {
                 Some(data) => Matrix::from_storage(rows, cols, data),
                 None => Host::matrix_distribution(
                     &a.to_backend::<Host>(),
@@ -2098,7 +2126,10 @@ mod gpu {
         }
         let mean = storage.reduce(Reduce::Sum)? / len as f32;
         let deviations = storage.sum_squared_deviations(mean)?;
-        Some((T::from_f64(f64::from(mean)), T::from_f64(f64::from(deviations))))
+        Some((
+            T::from_f64(f64::from(mean)),
+            T::from_f64(f64::from(deviations)),
+        ))
     }
 
     /// A distribution's parameters as the shader takes them. They are values

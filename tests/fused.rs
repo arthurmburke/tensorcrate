@@ -182,11 +182,7 @@ fn rules_match_their_references<P: Parameter<Elem = f32>>(
     });
 }
 
-fn rules_agree<P: Parameter<Elem = f32>>(
-    start: &P,
-    gradients: &[P],
-    same: &dyn Fn(&P, &P, &str),
-) {
+fn rules_agree<P: Parameter<Elem = f32>>(start: &P, gradients: &[P], same: &dyn Fn(&P, &P, &str)) {
     let (mut fused, mut unfused) = (start.duplicate(), start.duplicate());
     let mut rule = Sgd::new(0.05);
     for g in gradients {
@@ -974,7 +970,10 @@ fn epilogues() -> Vec<(Program, Vec<Remap>)> {
 
     vec![
         (layer.build().unwrap(), vec![Remap::Row]),
-        (gated.build().unwrap(), vec![Remap::Column, Remap::Transpose]),
+        (
+            gated.build().unwrap(),
+            vec![Remap::Column, Remap::Transpose],
+        ),
         (bump.build().unwrap(), vec![Remap::Identity]),
     ]
 }
@@ -990,7 +989,11 @@ const PRODUCTS: [(usize, usize, usize); 7] = [
     (128, 7, 200),
 ];
 
-fn epilogue_operands(rng: &mut Lcg, (m, k, n): (usize, usize, usize), remaps: &[Remap]) -> (Matrix<f32>, Matrix<f32>, Vec<Vector<f32>>) {
+fn epilogue_operands(
+    rng: &mut Lcg,
+    (m, k, n): (usize, usize, usize),
+    remaps: &[Remap],
+) -> (Matrix<f32>, Matrix<f32>, Vec<Vector<f32>>) {
     let a = Matrix::from_flat(m, k, rng.vector(m * k, -1.0, 1.0));
     let b = Matrix::from_flat(k, n, rng.vector(k * n, -1.0, 1.0));
     let inputs = remaps
@@ -1000,7 +1003,12 @@ fn epilogue_operands(rng: &mut Lcg, (m, k, n): (usize, usize, usize), remaps: &[
     (a, b, inputs)
 }
 
-fn run_matmul_on<B: Kernels>(program: &Program, a: &Matrix<f32>, b: &Matrix<f32>, inputs: &[Vector<f32>]) -> Vec<Vec<f32>> {
+fn run_matmul_on<B: Kernels>(
+    program: &Program,
+    a: &Matrix<f32>,
+    b: &Matrix<f32>,
+    inputs: &[Vector<f32>],
+) -> Vec<Vec<f32>> {
     let inputs: Vec<Vector<f32, B>> = inputs.iter().map(|v| v.to_backend::<B>()).collect();
     let refs: Vec<&dyn Fusable<B>> = inputs.iter().map(|v| v as &dyn Fusable<B>).collect();
     program
@@ -1017,7 +1025,9 @@ fn a_matmul_epilogue_is_the_product_then_the_program_bit_for_bit() {
         for shape in PRODUCTS {
             let (a, b, inputs) = epilogue_operands(&mut rng, shape, &remaps);
             let fused = run_matmul_on::<Host>(&program, &a, &b, &inputs);
-            let unfused = fused::with_mode(Mode::Unfused, || run_matmul_on::<Host>(&program, &a, &b, &inputs));
+            let unfused = fused::with_mode(Mode::Unfused, || {
+                run_matmul_on::<Host>(&program, &a, &b, &inputs)
+            });
             // And by hand: the product materialized, then the program over it.
             let product = Vector::new(a.matmul(&b).data().to_vec());
             let mut operands = vec![product];
@@ -1069,14 +1079,19 @@ fn metal_matmul_epilogues_agree_with_the_host_on_both_product_kernels() {
                 let (a, b, inputs) = epilogue_operands(&mut rng, (m, k, n), &remaps);
                 let host = run_matmul_on::<Host>(&program, &a, &b, &inputs);
                 let metal = run_matmul_on::<Metal>(&program, &a, &b, &inputs);
-                let unfused = fused::with_mode(Mode::Unfused, || run_matmul_on::<Metal>(&program, &a, &b, &inputs));
+                let unfused = fused::with_mode(Mode::Unfused, || {
+                    run_matmul_on::<Metal>(&program, &a, &b, &inputs)
+                });
                 // A sum of k products in a different order: scale the tolerance
                 // with k.
                 let tolerance = 1e-6 * (k as f32).sqrt() * 4.0;
-                for (out, ((m_out, u_out), h_out)) in metal.iter().zip(&unfused).zip(&host).enumerate() {
+                for (out, ((m_out, u_out), h_out)) in
+                    metal.iter().zip(&unfused).zip(&host).enumerate()
+                {
                     for (i, ((&x, &u), &h)) in m_out.iter().zip(u_out).zip(h_out).enumerate() {
                         assert!(
-                            (x - u).abs() <= tolerance * (1.0 + u.abs()) && (x - h).abs() <= tolerance * (1.0 + h.abs()),
+                            (x - u).abs() <= tolerance * (1.0 + u.abs())
+                                && (x - h).abs() <= tolerance * (1.0 + h.abs()),
                             "tensorops {tensorops}, {m}×{k}×{n}, output {out}, element {i}: fused {x}, \
                              unfused {u}, host {h}\n{program}"
                         );
@@ -1134,7 +1149,9 @@ fn setting_a_missing_uniform_panics() {
 #[test]
 fn adam_coefficients_set_after_creation_take_effect() {
     let mut rng = Lcg(5);
-    let gradients: Vec<_> = (0..3).map(|_| Vector::new(rng.vector(64, -1.0, 1.0))).collect();
+    let gradients: Vec<_> = (0..3)
+        .map(|_| Vector::new(rng.vector(64, -1.0, 1.0)))
+        .collect();
     let start = Vector::new(rng.vector(64, -1.0, 1.0));
 
     let mut direct = Adam::new(0.01);
@@ -1146,7 +1163,11 @@ fn adam_coefficients_set_after_creation_take_effect() {
     for g in &gradients {
         direct.update(&mut a, g);
         changed.update(&mut b, g);
-        assert_bits_eq(a.as_slice(), b.as_slice(), "coefficients changed after creation");
+        assert_bits_eq(
+            a.as_slice(),
+            b.as_slice(),
+            "coefficients changed after creation",
+        );
     }
 }
 

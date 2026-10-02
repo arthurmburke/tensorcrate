@@ -367,11 +367,10 @@ impl<T: MetalElement> Matrix<T, Metal> {
         }
     }
 
-
     /// Matrix exponentiation using efficient integer powers.
-    /// 
-    /// # Panics 
-    /// 
+    ///
+    /// # Panics
+    ///
     /// If this matrix is non-square.
     #[track_caller]
     pub fn powi<I: PrimInt>(&self, power: I) -> Self {

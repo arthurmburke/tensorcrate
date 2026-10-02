@@ -307,7 +307,13 @@ fn the_fast_exponents_are_correctly_rounded() {
         (0.0, |_| 1.0),
         (1.0, |x| x),
         (2.0, |x| x * x),
-        (0.5, |x| if x == f64::NEG_INFINITY { f64::INFINITY } else { x.sqrt() + 0.0 }),
+        (0.5, |x| {
+            if x == f64::NEG_INFINITY {
+                f64::INFINITY
+            } else {
+                x.sqrt() + 0.0
+            }
+        }),
         (-1.0, |x| 1.0 / x),
     ];
     for (exponent, expected) in exact {
@@ -387,10 +393,7 @@ fn a_power_is_reachable_through_the_scalar_trait() {
 
     assert_eq!(square(3.0f64), 9.0);
     assert_eq!(square(&Vector::new([3.0f64, 4.0])).data(), [9.0, 16.0]);
-    assert_eq!(
-        square(&Matrix::from_rows([[3.0f64]])).to_rows(),
-        [[9.0f64]]
-    );
+    assert_eq!(square(&Matrix::from_rows([[3.0f64]])).to_rows(), [[9.0f64]]);
 
     // Both tensor operands, and a scalar base with a tensor exponent.
     let bases = Vector::new([2.0f64, 3.0]);

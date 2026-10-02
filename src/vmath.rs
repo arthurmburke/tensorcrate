@@ -214,17 +214,29 @@ fn in_trig_range(x: f32) -> bool {
 
 #[inline]
 pub(crate) fn sin(x: f32) -> f32 {
-    if in_trig_range(x) { sin_core(x) } else { x.sin() }
+    if in_trig_range(x) {
+        sin_core(x)
+    } else {
+        x.sin()
+    }
 }
 
 #[inline]
 pub(crate) fn cos(x: f32) -> f32 {
-    if in_trig_range(x) { cos_core(x) } else { x.cos() }
+    if in_trig_range(x) {
+        cos_core(x)
+    } else {
+        x.cos()
+    }
 }
 
 #[inline]
 pub(crate) fn tan(x: f32) -> f32 {
-    if in_trig_range(x) { tan_core(x) } else { x.tan() }
+    if in_trig_range(x) {
+        tan_core(x)
+    } else {
+        x.tan()
+    }
 }
 
 // ---- arctan, arcsin, arccos --------------------------------------------------------
@@ -423,7 +435,12 @@ fn unary_loops(op: Analytic, values: &[f32], out: &mut [f32]) {
     // The trigonometric loops run without their range check, then patch the
     // elements outside the range with the same `libm` call `value` makes.
     #[inline(always)]
-    fn trig(values: &[f32], out: &mut [f32], core: impl Fn(f32) -> f32, exact: impl Fn(f32) -> f32) {
+    fn trig(
+        values: &[f32],
+        out: &mut [f32],
+        core: impl Fn(f32) -> f32,
+        exact: impl Fn(f32) -> f32,
+    ) {
         each(values, out, core);
         for (out, &x) in out.iter_mut().zip(values) {
             if !in_trig_range(x) {
@@ -497,7 +514,8 @@ pub(crate) fn unary_slice<T: Real>(op: Analytic, values: &[T], out: &mut [T]) {
     if let (Some(values), Some(out)) = (slice_as::<T, f32>(values), slice_as_mut::<T, f32>(out)) {
         return unary(op, values, out);
     }
-    let compact = TypeId::of::<T>() == TypeId::of::<f16>() || TypeId::of::<T>() == TypeId::of::<bf16>();
+    let compact =
+        TypeId::of::<T>() == TypeId::of::<f16>() || TypeId::of::<T>() == TypeId::of::<bf16>();
     if compact && !matches!(op, Analytic::Sec | Analytic::Csc | Analytic::Sqrt) {
         // Widen a block, evaluate it in f32, round it back: what `value` does
         // one element at a time.
@@ -646,7 +664,11 @@ mod tests {
     fn ulps(got: f32, want: f64) -> u32 {
         let want = want as f32;
         if got.is_nan() || want.is_nan() {
-            return if got.is_nan() && want.is_nan() { 0 } else { u32::MAX };
+            return if got.is_nan() && want.is_nan() {
+                0
+            } else {
+                u32::MAX
+            };
         }
         if got == want {
             return 0;
@@ -775,8 +797,13 @@ mod tests {
         for op in Analytic::ALL {
             let at = |x: f32| value(op, x);
             match op {
-                Analytic::Sin | Analytic::Tan | Analytic::Arcsin | Analytic::Arctan
-                | Analytic::Sinh | Analytic::Tanh | Analytic::Sqrt => {
+                Analytic::Sin
+                | Analytic::Tan
+                | Analytic::Arcsin
+                | Analytic::Arctan
+                | Analytic::Sinh
+                | Analytic::Tanh
+                | Analytic::Sqrt => {
                     assert_eq!(at(-0.0).to_bits(), (-0.0f32).to_bits(), "{op:?}(-0)");
                 }
                 _ => {}
@@ -803,7 +830,9 @@ mod speed {
     #[test]
     #[ignore = "timing, run by hand"]
     fn against_libm() {
-        let xs: Vec<f32> = (0..1 << 20).map(|i| (i as f32 * 0.37).sin() * 20.0).collect();
+        let xs: Vec<f32> = (0..1 << 20)
+            .map(|i| (i as f32 * 0.37).sin() * 20.0)
+            .collect();
         let mut out = vec![0.0f32; xs.len()];
         for op in Analytic::ALL {
             let start = std::time::Instant::now();
@@ -835,7 +864,10 @@ mod speed {
                 std::hint::black_box(&mut out);
             }
             let slow = start.elapsed() / 10;
-            println!("{op:?}: {fast:?} vs libm {slow:?} ({:.1}x)", slow.as_secs_f64() / fast.as_secs_f64());
+            println!(
+                "{op:?}: {fast:?} vs libm {slow:?} ({:.1}x)",
+                slow.as_secs_f64() / fast.as_secs_f64()
+            );
         }
     }
 }

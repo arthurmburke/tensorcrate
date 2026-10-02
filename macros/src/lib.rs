@@ -161,10 +161,15 @@ mod tests {
         // `x · 2 · 3` multiplies by one folded constant when chains may be
         // regrouped, and twice when they may not.
         // Counted among the program's instructions, not the unfused fallback.
-        let multiplies = |code: &str| code.matches("op : :: tensorcrate :: tensors :: BinaryOp :: Mul").count();
+        let multiplies = |code: &str| {
+            code.matches("op : :: tensorcrate :: tensors :: BinaryOp :: Mul")
+                .count()
+        };
         let folded = expansion(quote! { backend = Metal; let x = [1, 2]; x * 2 * 3 + x });
         assert_eq!(multiplies(&folded), 1, "{folded}");
-        let exact = expansion(quote! { backend = Metal; reassociate = false; let x = [1, 2]; x * 2 * 3 + x });
+        let exact = expansion(
+            quote! { backend = Metal; reassociate = false; let x = [1, 2]; x * 2 * 3 + x },
+        );
         assert_eq!(multiplies(&exact), 2, "{exact}");
 
         // On the host the folded constant is computed once, before the loop.
@@ -191,7 +196,9 @@ mod tests {
             expansion(quote! { dtype = #dtype; let a = [1, 2]; sin(a * 2 + 1) - a });
         }
         for dtype in [quote!(f32), quote!(f16), quote!(bf16)] {
-            let metal = expansion(quote! { backend = Metal; dtype = #dtype; let a = [1, 2]; sin(a * 2 + 1) - a });
+            let metal = expansion(
+                quote! { backend = Metal; dtype = #dtype; let a = [1, 2]; sin(a * 2 + 1) - a },
+            );
             assert!(metal.contains("Program"), "{metal}");
         }
         assert!(expansion_error(quote! { dtype = f32; dtype = f64; [1, 2] }).contains("set twice"));

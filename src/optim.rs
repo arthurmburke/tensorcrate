@@ -50,7 +50,6 @@
 use std::sync::Arc;
 
 use num_traits::Float;
-use tensorcrate_macros::math;
 
 use crate::numbers::Real;
 use crate::tensors::fused::{Builder, Element, Fusable, Instr, Output, Program, Remap};
@@ -479,29 +478,51 @@ impl<P: Parameter> Rule<P> for Sgd<P::Elem> {
 /// be rather than where they are.
 #[derive(Clone, Debug)]
 pub struct Momentum<P: Parameter> {
-    pub rate: P::Elem,
-    pub momentum: P::Elem,
-    pub nesterov: bool,
+    program: Program<P::Elem>,
     velocity: Option<P>,
 }
 
 impl<P: Parameter> Momentum<P> {
     /// Classical momentum; `0.9` is the usual coefficient.
     pub fn new(rate: P::Elem, momentum: P::Elem) -> Self {
+        let dtype = <P::Elem as Element>::DTYPE;
+        let mut b = Builder::new();
+        let g = b.input(dtype);
+        let p = b.update(dtype);
+        let previous = b.update(dtype);
+        let decayed = b.scale(previous, momentum);
+        let velocity = b.add(decayed, g);
+        let step = b.scale(velocity, rate);
+        let p = b.sub(p, step);
+        b.set(0, p);
+        b.set(1, velocity);
+        let program = b.build().expect("the rule's program is valid");
+
         Momentum {
-            rate,
-            momentum,
-            nesterov: false,
+            program,
             velocity: None,
         }
     }
 
     /// The look-ahead variant.
     pub fn nesterov(rate: P::Elem, momentum: P::Elem) -> Self {
+        let dtype = <P::Elem as Element>::DTYPE;
+        let mut b = Builder::new();
+        let g = b.input(dtype);
+        let p = b.update(dtype);
+        let previous = b.update(dtype);
+        let decayed = b.scale(previous, momentum);
+        let velocity = b.add(decayed, g);
+        let ahead = b.scale(velocity, momentum);
+        let step = b.add(g, ahead);
+        let step = b.scale(step, rate);
+        let p = b.sub(p, step);
+        b.set(0, p);
+        b.set(1, velocity);
+        let program = b.build().expect("the rule's program is valid");
+
         Momentum {
-            rate,
-            momentum,
-            nesterov: true,
+            program,
             velocity: None,
         }
     }
@@ -510,42 +531,13 @@ impl<P: Parameter> Momentum<P> {
 impl<P: Parameter> Rule<P> for Momentum<P> {
     /// One fused kernel: the velocity and parameters are updated in place.
     fn update(&mut self, parameters: &mut P, gradient: &P) {
-        let dtype = <P::Elem as Element>::DTYPE;
-        let mut b = Builder::new();
-        let g = b.input(dtype);
-        let p = b.update(dtype);
-        let resumed = self.velocity.is_some();
-        let velocity = if resumed {
-            let previous = b.update(dtype);
-            let decayed = b.scale(previous, self.momentum);
-            b.add(decayed, g)
-        } else {
-            g
-        };
-        let step = if self.nesterov {
-            let ahead = b.scale(velocity, self.momentum);
-            b.add(g, ahead)
-        } else {
+        let velocity = if let Some(velocity) = &mut self.velocity {
             velocity
-        };
-        let step = b.scale(step, self.rate);
-        let p = b.sub(p, step);
-        b.set(0, p);
-        if resumed {
-            b.set(1, velocity);
         } else {
-            b.output(velocity, dtype);
-        }
-        let program = b.build().expect("the rule's program is valid");
+            self.velocity.insert(parameters.zeros_like())
+        };
 
-        match &mut self.velocity {
-            Some(velocity) => {
-                P::fused(&program, &[gradient], &mut [parameters, velocity]);
-            }
-            None => {
-                self.velocity = P::fused(&program, &[gradient], &mut [parameters]).pop();
-            }
-        }
+        P::fused(&self.program, &[gradient], &mut [parameters, velocity]);
     }
 
     fn reset(&mut self) {
@@ -560,16 +552,27 @@ impl<P: Parameter> Rule<P> for Momentum<P> {
 /// grows, so the steps only shrink — which is why [`RmsProp`] exists.
 #[derive(Clone, Debug)]
 pub struct AdaGrad<P: Parameter> {
-    pub rate: P::Elem,
-    pub epsilon: P::Elem,
+    program: Program<P::Elem>,
     total: Option<P>,
 }
 
 impl<P: Parameter> AdaGrad<P> {
     pub fn new(rate: P::Elem) -> Self {
+        let dtype = <P::Elem as Element>::DTYPE;
+        let mut b = Builder::new();
+        let g = b.input(dtype);
+        let p = b.update(dtype);
+        let squared = b.mul(g, g);
+        let previous = b.update(dtype);
+        let total = b.add(previous, squared);
+        let epsilon = <P::Elem as Real>::from_f64(1e-8);
+        let p = descend(&mut b, p, g, total, epsilon, rate);
+        b.set(0, p);
+        b.set(1, total);
+        let program = b.build().expect("the rule's program is valid");
+
         AdaGrad {
-            rate,
-            epsilon: <P::Elem as Real>::from_f64(1e-8),
+            program,
             total: None,
         }
     }
@@ -578,33 +581,12 @@ impl<P: Parameter> AdaGrad<P> {
 impl<P: Parameter> Rule<P> for AdaGrad<P> {
     /// One fused kernel, updating the parameters and the running total in place.
     fn update(&mut self, parameters: &mut P, gradient: &P) {
-        let dtype = <P::Elem as Element>::DTYPE;
-        let mut b = Builder::new();
-        let g = b.input(dtype);
-        let p = b.update(dtype);
-        let resumed = self.total.is_some();
-        let squared = b.mul(g, g);
-        let total = if resumed {
-            let previous = b.update(dtype);
-            b.add(previous, squared)
+        let total = if let Some(total) = &mut self.total {
+            total
         } else {
-            squared
+            self.total.insert(parameters.zeros_like())
         };
-        let p = descend(&mut b, p, g, total, self.epsilon, self.rate);
-        b.set(0, p);
-        if resumed {
-            b.set(1, total);
-        } else {
-            b.output(total, dtype);
-        }
-        let program = b.build().expect("the rule's program is valid");
-
-        match &mut self.total {
-            Some(total) => {
-                P::fused(&program, &[gradient], &mut [parameters, total]);
-            }
-            None => self.total = P::fused(&program, &[gradient], &mut [parameters]).pop(),
-        }
+        P::fused(&self.program, &[gradient], &mut [parameters, total]);
     }
 
     fn reset(&mut self) {
@@ -619,18 +601,30 @@ impl<P: Parameter> Rule<P> for AdaGrad<P> {
 /// the effective step size adapts instead of decaying to nothing.
 #[derive(Clone, Debug)]
 pub struct RmsProp<P: Parameter> {
-    pub rate: P::Elem,
-    pub decay: P::Elem,
-    pub epsilon: P::Elem,
+    program: Program<P::Elem>,
     mean_square: Option<P>,
 }
 
 impl<P: Parameter> RmsProp<P> {
     pub fn new(rate: P::Elem) -> Self {
+        let dtype = <P::Elem as Element>::DTYPE;
+        let mut b = Builder::new();
+        let g = b.input(dtype);
+        let p = b.update(dtype);
+        let squared = b.mul(g, g);
+        let decay = <P::Elem as Real>::from_f64(0.9);
+        let epsilon = <P::Elem as Real>::from_f64(1e-8);
+        let squared = b.scale(squared, <P::Elem as num_traits::One>::one() - decay);
+        let previous = b.update(dtype);
+        let decayed = b.scale(previous, decay);
+        let mean_square = b.add(decayed, squared);
+        let p = descend(&mut b, p, g, mean_square, epsilon, rate);
+        b.set(0, p);
+        b.set(1, mean_square);
+        let program = b.build().expect("the rule's program is valid");
+
         RmsProp {
-            rate,
-            decay: <P::Elem as Real>::from_f64(0.9),
-            epsilon: <P::Elem as Real>::from_f64(1e-8),
+            program,
             mean_square: None,
         }
     }
@@ -639,35 +633,12 @@ impl<P: Parameter> RmsProp<P> {
 impl<P: Parameter> Rule<P> for RmsProp<P> {
     /// One fused kernel, updating the parameters and the mean square in place.
     fn update(&mut self, parameters: &mut P, gradient: &P) {
-        let dtype = <P::Elem as Element>::DTYPE;
-        let mut b = Builder::new();
-        let g = b.input(dtype);
-        let p = b.update(dtype);
-        let resumed = self.mean_square.is_some();
-        let squared = b.mul(g, g);
-        let squared = b.scale(squared, <P::Elem as num_traits::One>::one() - self.decay);
-        let mean_square = if resumed {
-            let previous = b.update(dtype);
-            let decayed = b.scale(previous, self.decay);
-            b.add(decayed, squared)
+        let mean_square = if let Some(mean_square) = &mut self.mean_square {
+            mean_square
         } else {
-            squared
+            self.mean_square.insert(parameters.zeros_like())
         };
-        let p = descend(&mut b, p, g, mean_square, self.epsilon, self.rate);
-        b.set(0, p);
-        if resumed {
-            b.set(1, mean_square);
-        } else {
-            b.output(mean_square, dtype);
-        }
-        let program = b.build().expect("the rule's program is valid");
-
-        match &mut self.mean_square {
-            Some(mean_square) => {
-                P::fused(&program, &[gradient], &mut [parameters, mean_square]);
-            }
-            None => self.mean_square = P::fused(&program, &[gradient], &mut [parameters]).pop(),
-        }
+        P::fused(&self.program, &[gradient], &mut [parameters, mean_square]);
     }
 
     fn reset(&mut self) {

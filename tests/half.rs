@@ -33,7 +33,9 @@ impl Lcg {
     }
 
     fn vector<T: Real>(&mut self, len: usize, low: f64, high: f64) -> Vec<T> {
-        (0..len).map(|_| T::from_f64(self.uniform(low, high))).collect()
+        (0..len)
+            .map(|_| T::from_f64(self.uniform(low, high)))
+            .collect()
     }
 }
 
@@ -79,7 +81,8 @@ fn products_and_moments_accumulate_in_f32() {
                 // One rounding to f16, plus the f32 accumulator's own error.
                 let got = product[(i, j)].to_f64();
                 assert!(
-                    (got - exact).abs() <= f64::from(f16::EPSILON) * exact.abs().max(1.0) / 2.0 + 1e-5,
+                    (got - exact).abs()
+                        <= f64::from(f16::EPSILON) * exact.abs().max(1.0) / 2.0 + 1e-5,
                     "n = {n}: {got} vs {exact}"
                 );
             }
@@ -122,7 +125,11 @@ fn host_elementwise_is_exact<T: Real>() {
             let s = b[0];
             let got = <Host as Kernels<T>>::vector_broadcast(&a, s, op, true);
             let want = a.map(|&x| scalar_binary(op, s, x));
-            assert_eq!(bits(got.data()), bits(want.data()), "{op:?} broadcast, len {len}");
+            assert_eq!(
+                bits(got.data()),
+                bits(want.data()),
+                "{op:?} broadcast, len {len}"
+            );
         }
         for op in Compare::ALL {
             let got = <Host as Kernels<T>>::vector_compare(&a, &b, op);
@@ -130,7 +137,11 @@ fn host_elementwise_is_exact<T: Real>() {
             assert_eq!(bits(got.data()), bits(want.data()), "{op:?}, len {len}");
             let got = <Host as Kernels<T>>::vector_compare_scalar(&a, b[0], op, false);
             let want = a.map(|&x| op.value(x, b[0]));
-            assert_eq!(bits(got.data()), bits(want.data()), "{op:?} scalar, len {len}");
+            assert_eq!(
+                bits(got.data()),
+                bits(want.data()),
+                "{op:?} scalar, len {len}"
+            );
         }
         let (low, high) = (T::from_f64(-2.0), T::from_f64(3.0));
         let got = <Host as Kernels<T>>::vector_clamp(&a, low, high);
@@ -224,8 +235,10 @@ mod metal {
         let host = <Host as Kernels<T>>::vector_elementwise(&a_host, &b_host, BinaryOp::Div);
         close(gpu.as_slice(), host.data(), 1.0, "div");
 
-        let gpu = <Metal as Kernels<T>>::vector_broadcast(&a, T::from_f64(1.5), BinaryOp::Mul, false);
-        let host = <Host as Kernels<T>>::vector_broadcast(&a_host, T::from_f64(1.5), BinaryOp::Mul, false);
+        let gpu =
+            <Metal as Kernels<T>>::vector_broadcast(&a, T::from_f64(1.5), BinaryOp::Mul, false);
+        let host =
+            <Host as Kernels<T>>::vector_broadcast(&a_host, T::from_f64(1.5), BinaryOp::Mul, false);
         assert_eq!(bits(gpu.as_slice()), bits(host.data()), "broadcast");
 
         // Comparisons, clamps, sorts and data movement are exact.
@@ -248,7 +261,12 @@ mod metal {
         assert_eq!(a.reduce(Reduce::Min), a_host.reduce(Reduce::Min));
         assert_eq!(a.reduce(Reduce::Max), a_host.reduce(Reduce::Max));
         close(&[a.dot(&b)], &[a_host.dot(&b_host)], 1.0, "dot");
-        close(a.prefix_sum().as_slice(), a_host.prefix_sum().data(), 1.0, "prefix sum");
+        close(
+            a.prefix_sum().as_slice(),
+            a_host.prefix_sum().data(),
+            1.0,
+            "prefix sum",
+        );
 
         // The analytic functions: the GPU's half-precision library against the
         // host's f32-then-round.
@@ -299,7 +317,12 @@ mod metal {
             let product = ga.matmul(&gb);
             close(product.as_slice(), a.matmul(&b).data(), 1.0, "matmul");
             let fused = ga.matmul_add(&gb, c.to_backend::<Metal>());
-            close(fused.as_slice(), a.matmul_add(&b, c.clone()).data(), 1.0, "matmul_add");
+            close(
+                fused.as_slice(),
+                a.matmul_add(&b, c.clone()).data(),
+                1.0,
+                "matmul_add",
+            );
 
             let v = Vector::new(rng.vector::<T>(k, -1.0, 1.0));
             close(
@@ -388,7 +411,10 @@ mod metal {
         let program = b.build().unwrap();
 
         let mut rng = Lcg(5);
-        let (a, w) = (rng.vector::<f16>(777, -2.0, 2.0), rng.vector::<f16>(777, -2.0, 2.0));
+        let (a, w) = (
+            rng.vector::<f16>(777, -2.0, 2.0),
+            rng.vector::<f16>(777, -2.0, 2.0),
+        );
         let (ha, hw) = (Vector::new(a.clone()), Vector::new(w.clone()));
         let host = program.run_vectors(&[&ha, &hw]).remove(0);
         let gpu = program
@@ -450,7 +476,12 @@ mod metal {
         let mapped = ha.matvec(&hx).tanh();
         mapped.dot(&mapped).backward();
         close(rx.grad().as_slice(), hx.grad().data(), 4.0, "gradient");
-        close(ra.grad().as_slice(), ha.grad().data(), 4.0, "matrix gradient");
+        close(
+            ra.grad().as_slice(),
+            ha.grad().data(),
+            4.0,
+            "matrix gradient",
+        );
     }
 
     #[test]
@@ -464,10 +495,16 @@ mod metal {
         ];
         let stacked = Metal::vstack(&rows, 2);
         assert!(stacked.is_device_resident());
-        assert_eq!(Metal::matrix_slice(&stacked), [1.0, 2.0, 3.0, 4.0].map(value));
+        assert_eq!(
+            Metal::matrix_slice(&stacked),
+            [1.0, 2.0, 3.0, 4.0].map(value)
+        );
         let columns = Metal::hstack(&rows, 2);
         assert!(columns.is_device_resident());
-        assert_eq!(Metal::matrix_slice(&columns), [1.0, 3.0, 2.0, 4.0].map(value));
+        assert_eq!(
+            Metal::matrix_slice(&columns),
+            [1.0, 3.0, 2.0, 4.0].map(value)
+        );
     }
 
     /// The resident results above could in principle have been computed on the
@@ -484,7 +521,8 @@ mod metal {
             let mut rng = Lcg(9);
             let a = resident(&rng.vector::<T>(4096, -1.0, 1.0));
             let b = resident(&rng.vector::<T>(4096, 0.5, 1.0));
-            let m = Matrix::from_flat(64, 64, rng.vector::<T>(4096, -1.0, 1.0)).to_backend::<Metal>();
+            let m =
+                Matrix::from_flat(64, 64, rng.vector::<T>(4096, -1.0, 1.0)).to_backend::<Metal>();
             tensorcrate::metal::synchronize();
 
             let (_, counts) = counters::measure(|| {
@@ -505,8 +543,8 @@ mod metal {
         dtype: DType,
         ulps: f64,
     ) {
-        use tensorcrate::tensors::fused::{Fusable, Remap};
         use tensorcrate::tensors::Compare;
+        use tensorcrate::tensors::fused::{Fusable, Remap};
 
         let mut b = Builder::<T>::new();
         let product = b.input(dtype);
@@ -528,13 +566,22 @@ mod metal {
                     .run_matmul(&a, &w, &[&bias as &dyn Fusable<Host>])
                     .remove(0)
                     .into_vector::<T>();
-                let (ga, gw, gb) = (a.to_backend::<Metal>(), w.to_backend::<Metal>(), bias.to_backend::<Metal>());
+                let (ga, gw, gb) = (
+                    a.to_backend::<Metal>(),
+                    w.to_backend::<Metal>(),
+                    bias.to_backend::<Metal>(),
+                );
                 let gpu = program
                     .run_matmul(&ga, &gw, &[&gb as &dyn Fusable<Metal>])
                     .remove(0)
                     .into_vector::<T>();
                 assert!(gpu.is_device_resident());
-                close(&gpu.to_vec(), &host.to_vec(), ulps, &format!("{m}×{k}×{n}, tensorops {tensorops}"));
+                close(
+                    &gpu.to_vec(),
+                    &host.to_vec(),
+                    ulps,
+                    &format!("{m}×{k}×{n}, tensorops {tensorops}"),
+                );
             }
         }
         tensorcrate::metal::set_tensorops(true);

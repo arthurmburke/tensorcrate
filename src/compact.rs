@@ -85,7 +85,13 @@ fn cast_vec<T: 'static, U: 'static>(values: Vec<T>) -> Vec<U> {
     assert!(same::<T, U>());
     let mut values = std::mem::ManuallyDrop::new(values);
     // SAFETY: one type, so the allocation and its layout carry over unchanged.
-    unsafe { Vec::from_raw_parts(values.as_mut_ptr().cast::<U>(), values.len(), values.capacity()) }
+    unsafe {
+        Vec::from_raw_parts(
+            values.as_mut_ptr().cast::<U>(),
+            values.len(),
+            values.capacity(),
+        )
+    }
 }
 
 /// Evaluate `$body` with `$C` bound to the compact type `$T` is, or give
@@ -188,9 +194,9 @@ pub(crate) fn fold<T: Copy + 'static>(values: &[T], op: Reduce) -> Option<T> {
 }
 
 fn fold_f32<C: Compact>(values: &[C], op: Reduce) -> f32 {
-    values
-        .iter()
-        .fold(op.identity::<f32>(), |total, &x| op.combine(total, x.widen()))
+    values.iter().fold(op.identity::<f32>(), |total, &x| {
+        op.combine(total, x.widen())
+    })
 }
 
 /// Inclusive prefix sum with an `f32` running total, each output rounded once.
@@ -583,88 +589,99 @@ mod neon {
             mod $module {
                 use super::*;
 
-        #[target_feature(enable = $features)]
-        pub(super) unsafe fn narrow_bf16(values: &[f32], out: &mut [u16]) {
-            for i in (0..values.len()).step_by(LANES) {
-                let (lo, hi) = unsafe { load_f32(values, i) };
-                unsafe { store(out, i, $narrow(lo, hi)) };
-            }
-        }
-
-        #[target_feature(enable = $features)]
-        pub(super) unsafe fn binary_bf16(a: &[u16], b: &[u16], op: BinaryOp, out: &mut [u16]) {
-            for i in (0..out.len()).step_by(LANES) {
-                let ((x_lo, x_hi), (y_lo, y_hi)) =
-                    unsafe { (bf16_widen(load(a, i)), bf16_widen(load(b, i))) };
-                let z = unsafe { $narrow(f32_op(op, x_lo, y_lo), f32_op(op, x_hi, y_hi)) };
-                unsafe { store(out, i, z) };
-            }
-        }
-
-        #[target_feature(enable = $features)]
-        pub(super) unsafe fn broadcast_bf16(
-            values: &[u16],
-            scalar: u16,
-            op: BinaryOp,
-            scalar_left: bool,
-            out: &mut [u16],
-        ) {
-            let s = vreinterpretq_f32_u32(vdupq_n_u32(u32::from(scalar) << 16));
-            for i in (0..out.len()).step_by(LANES) {
-                let (x_lo, x_hi) = unsafe { bf16_widen(load(values, i)) };
-                let (lo, hi) = if scalar_left {
-                    (f32_op(op, s, x_lo), f32_op(op, s, x_hi))
-                } else {
-                    (f32_op(op, x_lo, s), f32_op(op, x_hi, s))
-                };
-                unsafe { store(out, i, $narrow(lo, hi)) };
-            }
-        }
-
-        #[target_feature(enable = $features)]
-        pub(super) unsafe fn compare_bf16(
-            a: &[u16],
-            b: &[u16],
-            scalar: Option<u16>,
-            op: Compare,
-            scalar_left: bool,
-            out: &mut [u16],
-        ) {
-            let s = scalar.map(|s| vreinterpretq_f32_u32(vdupq_n_u32(u32::from(s) << 16)));
-            for i in (0..out.len()).step_by(LANES) {
-                let (x_lo, x_hi) = unsafe { bf16_widen(load(a, i)) };
-                let (lo, hi) = match s {
-                    None => {
-                        let (y_lo, y_hi) = unsafe { bf16_widen(load(b, i)) };
-                        (f32_compare(op, x_lo, y_lo), f32_compare(op, x_hi, y_hi))
+                #[target_feature(enable = $features)]
+                pub(super) unsafe fn narrow_bf16(values: &[f32], out: &mut [u16]) {
+                    for i in (0..values.len()).step_by(LANES) {
+                        let (lo, hi) = unsafe { load_f32(values, i) };
+                        unsafe { store(out, i, $narrow(lo, hi)) };
                     }
-                    Some(s) if scalar_left => (f32_compare(op, s, x_lo), f32_compare(op, s, x_hi)),
-                    Some(s) => (f32_compare(op, x_lo, s), f32_compare(op, x_hi, s)),
-                };
-                unsafe { store(out, i, $narrow(lo, hi)) };
-            }
-        }
+                }
 
-        #[target_feature(enable = $features)]
-        pub(super) unsafe fn clamp_bf16(values: &[u16], low: u16, high: u16, out: &mut [u16]) {
-            let widen = |s: u16| vreinterpretq_f32_u32(vdupq_n_u32(u32::from(s) << 16));
-            let (low, high) = (widen(low), widen(high));
-            for i in (0..out.len()).step_by(LANES) {
-                let (lo, hi) = unsafe { bf16_widen(load(values, i)) };
-                let lo = vminnmq_f32(vmaxnmq_f32(lo, low), high);
-                let hi = vminnmq_f32(vmaxnmq_f32(hi, low), high);
-                unsafe { store(out, i, $narrow(lo, hi)) };
-            }
-        }
+                #[target_feature(enable = $features)]
+                pub(super) unsafe fn binary_bf16(
+                    a: &[u16],
+                    b: &[u16],
+                    op: BinaryOp,
+                    out: &mut [u16],
+                ) {
+                    for i in (0..out.len()).step_by(LANES) {
+                        let ((x_lo, x_hi), (y_lo, y_hi)) =
+                            unsafe { (bf16_widen(load(a, i)), bf16_widen(load(b, i))) };
+                        let z = unsafe { $narrow(f32_op(op, x_lo, y_lo), f32_op(op, x_hi, y_hi)) };
+                        unsafe { store(out, i, z) };
+                    }
+                }
 
-        #[target_feature(enable = $features)]
-        pub(super) unsafe fn sqrt_bf16(values: &[u16], out: &mut [u16]) {
-            for i in (0..out.len()).step_by(LANES) {
-                let (lo, hi) = unsafe { bf16_widen(load(values, i)) };
-                unsafe { store(out, i, $narrow(vsqrtq_f32(lo), vsqrtq_f32(hi))) };
-            }
-        }
+                #[target_feature(enable = $features)]
+                pub(super) unsafe fn broadcast_bf16(
+                    values: &[u16],
+                    scalar: u16,
+                    op: BinaryOp,
+                    scalar_left: bool,
+                    out: &mut [u16],
+                ) {
+                    let s = vreinterpretq_f32_u32(vdupq_n_u32(u32::from(scalar) << 16));
+                    for i in (0..out.len()).step_by(LANES) {
+                        let (x_lo, x_hi) = unsafe { bf16_widen(load(values, i)) };
+                        let (lo, hi) = if scalar_left {
+                            (f32_op(op, s, x_lo), f32_op(op, s, x_hi))
+                        } else {
+                            (f32_op(op, x_lo, s), f32_op(op, x_hi, s))
+                        };
+                        unsafe { store(out, i, $narrow(lo, hi)) };
+                    }
+                }
 
+                #[target_feature(enable = $features)]
+                pub(super) unsafe fn compare_bf16(
+                    a: &[u16],
+                    b: &[u16],
+                    scalar: Option<u16>,
+                    op: Compare,
+                    scalar_left: bool,
+                    out: &mut [u16],
+                ) {
+                    let s = scalar.map(|s| vreinterpretq_f32_u32(vdupq_n_u32(u32::from(s) << 16)));
+                    for i in (0..out.len()).step_by(LANES) {
+                        let (x_lo, x_hi) = unsafe { bf16_widen(load(a, i)) };
+                        let (lo, hi) = match s {
+                            None => {
+                                let (y_lo, y_hi) = unsafe { bf16_widen(load(b, i)) };
+                                (f32_compare(op, x_lo, y_lo), f32_compare(op, x_hi, y_hi))
+                            }
+                            Some(s) if scalar_left => {
+                                (f32_compare(op, s, x_lo), f32_compare(op, s, x_hi))
+                            }
+                            Some(s) => (f32_compare(op, x_lo, s), f32_compare(op, x_hi, s)),
+                        };
+                        unsafe { store(out, i, $narrow(lo, hi)) };
+                    }
+                }
+
+                #[target_feature(enable = $features)]
+                pub(super) unsafe fn clamp_bf16(
+                    values: &[u16],
+                    low: u16,
+                    high: u16,
+                    out: &mut [u16],
+                ) {
+                    let widen = |s: u16| vreinterpretq_f32_u32(vdupq_n_u32(u32::from(s) << 16));
+                    let (low, high) = (widen(low), widen(high));
+                    for i in (0..out.len()).step_by(LANES) {
+                        let (lo, hi) = unsafe { bf16_widen(load(values, i)) };
+                        let lo = vminnmq_f32(vmaxnmq_f32(lo, low), high);
+                        let hi = vminnmq_f32(vmaxnmq_f32(hi, low), high);
+                        unsafe { store(out, i, $narrow(lo, hi)) };
+                    }
+                }
+
+                #[target_feature(enable = $features)]
+                pub(super) unsafe fn sqrt_bf16(values: &[u16], out: &mut [u16]) {
+                    for i in (0..out.len()).step_by(LANES) {
+                        let (lo, hi) = unsafe { bf16_widen(load(values, i)) };
+                        unsafe { store(out, i, $narrow(vsqrtq_f32(lo), vsqrtq_f32(hi))) };
+                    }
+                }
             }
         };
     }
@@ -717,11 +734,21 @@ mod neon {
     #[inline]
     unsafe fn load_f32(values: &[f32], i: usize) -> (float32x4_t, float32x4_t) {
         if i + LANES <= values.len() {
-            unsafe { (vld1q_f32(values.as_ptr().add(i)), vld1q_f32(values.as_ptr().add(i + 4))) }
+            unsafe {
+                (
+                    vld1q_f32(values.as_ptr().add(i)),
+                    vld1q_f32(values.as_ptr().add(i + 4)),
+                )
+            }
         } else {
             let mut padded = [0.0f32; LANES];
             padded[..values.len() - i].copy_from_slice(&values[i..]);
-            unsafe { (vld1q_f32(padded.as_ptr()), vld1q_f32(padded.as_ptr().add(4))) }
+            unsafe {
+                (
+                    vld1q_f32(padded.as_ptr()),
+                    vld1q_f32(padded.as_ptr().add(4)),
+                )
+            }
         }
     }
 
@@ -788,7 +815,6 @@ mod neon {
         }
     }
 
-
     // ---- accumulations -------------------------------------------------------------
 
     pub(super) fn dot<C: Compact>(a: &[C], b: &[C]) -> Option<f32> {
@@ -849,7 +875,10 @@ mod neon {
     #[inline]
     fn sum_pairs(acc: [(float32x4_t, float32x4_t); 4]) -> f32 {
         let pairs = acc.map(|(lo, hi)| vaddq_f32(lo, hi));
-        vaddvq_f32(vaddq_f32(vaddq_f32(pairs[0], pairs[1]), vaddq_f32(pairs[2], pairs[3])))
+        vaddvq_f32(vaddq_f32(
+            vaddq_f32(pairs[0], pairs[1]),
+            vaddq_f32(pairs[2], pairs[3]),
+        ))
     }
 
     #[target_feature(enable = "neon,bf16")]
@@ -992,7 +1021,6 @@ mod neon {
         }
     }
 
-
     pub(super) fn broadcast<C: Compact>(
         values: &[C],
         scalar: C,
@@ -1038,7 +1066,6 @@ mod neon {
         }
     }
 
-
     pub(super) fn compare<C: Compact>(a: &[C], b: &[C], op: Compare, out: &mut [C]) -> bool {
         let (a, b, out) = (lanes(a), lanes(b), lanes_mut(out));
         if same::<C, f16>() {
@@ -1067,7 +1094,14 @@ mod neon {
             }
             unsafe { compare_f16(values, &[], Some(scalar), op, scalar_left, out) };
         } else {
-            bf16!(compare_bf16(values, &[], Some(scalar), op, scalar_left, out));
+            bf16!(compare_bf16(
+                values,
+                &[],
+                Some(scalar),
+                op,
+                scalar_left,
+                out
+            ));
         }
         true
     }
@@ -1143,7 +1177,6 @@ mod neon {
         }
     }
 
-
     pub(super) fn clamp<C: Compact>(values: &[C], low: C, high: C, out: &mut [C]) -> bool {
         let (low, high) = (bits(low), bits(high));
         let (values, out) = (lanes(values), lanes_mut(out));
@@ -1167,7 +1200,6 @@ mod neon {
         }
     }
 
-
     pub(super) fn sqrt<C: Compact>(values: &[C], out: &mut [C]) -> bool {
         let (values, out) = (lanes(values), lanes_mut(out));
         if same::<C, f16>() {
@@ -1187,7 +1219,6 @@ mod neon {
             unsafe { store(out, i, f16_sqrt(load(values, i))) };
         }
     }
-
 
     #[cfg(test)]
     mod tests {
@@ -1224,7 +1255,10 @@ mod neon {
                 state ^= state << 5;
                 inputs.push(f32::from_bits(state));
             }
-            let expected: Vec<u16> = inputs.iter().map(|&x| bf16::from_f32(x).to_bits()).collect();
+            let expected: Vec<u16> = inputs
+                .iter()
+                .map(|&x| bf16::from_f32(x).to_bits())
+                .collect();
             for software in [true, false] {
                 if !software && !bf16_instructions() {
                     continue;
