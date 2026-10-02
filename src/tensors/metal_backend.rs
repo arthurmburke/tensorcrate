@@ -120,15 +120,18 @@ macro_rules! low_precision_tensors {
 low_precision_tensors!(f16);
 low_precision_tensors!(bf16);
 
-impl<T: MetalElement> Vector<T, Metal> {
-    /// Whether the elements really are in GPU-shared memory.
+impl<T: Copy + 'static> Vector<T, Metal> {
+    /// Whether the elements really are in GPU-shared memory — for any element
+    /// type, so an index vector answers too.
     ///
     /// `false` means the process has no Metal device, so this vector fell back
     /// to CPU storage and CPU kernels. Results are unaffected.
     pub fn is_device_resident(&self) -> bool {
         self.storage().is_device_resident()
     }
+}
 
+impl<T: MetalElement> Vector<T, Metal> {
     /// Dot product with a vector of the same length.
     ///
     /// The reduction runs on the CPU, reading both shared allocations in place —

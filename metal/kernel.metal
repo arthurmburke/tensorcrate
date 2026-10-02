@@ -1396,3 +1396,234 @@ template [[host_name("matmul_epilogue_" #S)]] kernel void matmul_epilogue<T>(  \
     device uchar*, device uchar*, device uchar*, device uchar*,                \
     constant FusedPlace*, uint2, uint2);
 FOR_EACH_ELEMENT(INSTANTIATE_MATMUL_EPILOGUE)
+
+// ---- broadcasting and axis reductions ---------------------------------------
+
+// The layout of a broadcast binary operation, matching `BinaryLayout` in
+// `encode.rs`: output element `i` counts `shape` in row-major order, and reads
+// `A[a_offset + Σ iₖ·a_strides[k]]` and `B[b_offset + Σ iₖ·b_strides[k]]`. A
+// zero stride is an axis the operand is repeated along.
+struct BinaryLayout {
+    uint rank;
+    uint kind;      // 0 `BinaryOp`, 1 `CompareOp`, 2 power
+    uint op;
+    uint a_offset;
+    uint b_offset;
+    uint shape[6];
+    uint a_strides[6];
+    uint b_strides[6];
+};
+
+// One output element per thread, each operand read in place through its
+// strides — so a broadcast operand is never materialized, and a strided view
+// is never copied into order first. The arithmetic is the same-shape kernels'.
+template <typename T>
+kernel void strided_binary(
+    device const T* A              [[buffer(0)]],
+    device const T* B              [[buffer(1)]],
+    device T* C                    [[buffer(2)]],
+    constant BinaryLayout& layout  [[buffer(3)]],
+    uint i [[thread_position_in_grid]])
+{
+    uint a = layout.a_offset;
+    uint b = layout.b_offset;
+    uint rest = i;
+    for (uint k = layout.rank; k-- > 0;) {
+        uint extent = layout.shape[k];
+        uint coordinate = rest % extent;
+        rest /= extent;
+        a += coordinate * layout.a_strides[k];
+        b += coordinate * layout.b_strides[k];
+    }
+    T x = A[a];
+    T y = B[b];
+    switch (layout.kind) {
+        case 0: C[i] = binary_values(static_cast<BinaryOp>(layout.op), x, y); break;
+        case 1: C[i] = compare_values(static_cast<CompareOp>(layout.op), x, y); break;
+        default: C[i] = T(pow(x, y)); break;
+    }
+}
+
+#define INSTANTIATE_STRIDED_BINARY(T, S)                                       \
+template [[host_name("strided_binary_" #S)]] kernel void strided_binary<T>(    \
+    device const T*, device const T*, device T*, constant BinaryLayout&, uint);
+FOR_EACH_ELEMENT(INSTANTIATE_STRIDED_BINARY)
+
+// The layout of an axis reduction, matching `ReduceLayout` in `encode.rs`:
+// result `r` counts the kept axes (`outer`) in row-major order, and folds
+// `input[offset + Σ rₖ·outer_strides[k] + Σ fⱼ·inner_strides[j]]` over every
+// index `f` of the folded axes (`inner`), `inner_count` of them.
+struct ReduceLayout {
+    uint outer_rank;
+    uint inner_rank;
+    uint offset;
+    uint inner_count;
+    uint outer_shape[6];
+    uint outer_strides[6];
+    uint inner_shape[6];
+    uint inner_strides[6];
+    uint kind;      // 0 fold by `op`, 1 mean, 2 variance
+    uint op;        // `ReduceOp`
+    uint lanes;     // threads per result: 1, or the 32 of a SIMD group
+    float divisor;  // the variance's
+};
+
+inline uint outer_position(constant ReduceLayout& layout, uint index) {
+    uint at = layout.offset;
+    for (uint k = layout.outer_rank; k-- > 0;) {
+        uint extent = layout.outer_shape[k];
+        at += (index % extent) * layout.outer_strides[k];
+        index /= extent;
+    }
+    return at;
+}
+
+inline uint inner_position(constant ReduceLayout& layout, uint index) {
+    uint at = 0;
+    for (uint k = layout.inner_rank; k-- > 0;) {
+        uint extent = layout.inner_shape[k];
+        at += (index % extent) * layout.inner_strides[k];
+        index /= extent;
+    }
+    return at;
+}
+
+// A NaN test by the bits, which fast math cannot fold away.
+inline bool is_nan_bits(float x) {
+    return (as_type<uint>(x) & 0x7fffffffu) > 0x7f800000u;
+}
+
+// `reduce_values` with the NaN rule of `Reduce::combine` spelled out rather
+// than left to `fmin`/`fmax` under fast math: a NaN loses to a number.
+inline float fold_values(ReduceOp op, float total, float x) {
+    switch (op) {
+        case ReduceOp::Sum: return total + x;
+        case ReduceOp::Min:
+            return is_nan_bits(x) ? total : (is_nan_bits(total) ? x : min(total, x));
+        default:
+            return is_nan_bits(x) ? total : (is_nan_bits(total) ? x : max(total, x));
+    }
+}
+
+// Combine the partial results of the `lanes` threads of one result. With one
+// lane per result there is nothing to combine; with 32 the lanes are one SIMD
+// group, and the butterfly leaves the total in every lane.
+inline float lanes_fold(ReduceOp op, float value, uint lanes) {
+    if (lanes > 1) {
+        for (ushort offset = 16; offset > 0; offset >>= 1) {
+            value = fold_values(op, value, simd_shuffle_xor(value, offset));
+        }
+    }
+    return value;
+}
+
+// One result per `lanes` threads. A lane folds every `lanes`th element of its
+// result's slice in `float`, the lanes combine, and the result rounds to `T`
+// once. A mean divides the sum by the count; a variance then takes a second
+// pass over the slice for the squared deviations from that unrounded mean.
+//
+// One thread per result reads a slice down a leading axis with neighbouring
+// threads on neighbouring elements; a SIMD group per result reads an inner
+// slice with its lanes on neighbouring elements. Either way the reads
+// coalesce, and the host picks whichever the layout suits.
+template <typename T>
+kernel void axis_reduce(
+    device const T* input          [[buffer(0)]],
+    device T* output               [[buffer(1)]],
+    constant ReduceLayout& layout  [[buffer(2)]],
+    uint i [[thread_position_in_grid]])
+{
+    uint lanes = layout.lanes;
+    uint result = i / lanes;
+    uint lane = i - result * lanes;
+    uint base = outer_position(layout, result);
+    ReduceOp op = layout.kind == 0 ? static_cast<ReduceOp>(layout.op) : ReduceOp::Sum;
+
+    float total = reduce_identity(op);
+    for (uint k = lane; k < layout.inner_count; k += lanes) {
+        total = fold_values(op, total, float(input[base + inner_position(layout, k)]));
+    }
+    float value = lanes_fold(op, total, lanes);
+    if (layout.kind != 0) {
+        float mean = value / float(layout.inner_count);
+        value = mean;
+        if (layout.kind == 2) {
+            float deviations = 0.0f;
+            for (uint k = lane; k < layout.inner_count; k += lanes) {
+                float d = float(input[base + inner_position(layout, k)]) - mean;
+                deviations += d * d;
+            }
+            value = lanes_fold(ReduceOp::Sum, deviations, lanes) / layout.divisor;
+        }
+    }
+    if (lane == 0) {
+        output[result] = T(value);
+    }
+}
+
+#define INSTANTIATE_AXIS_REDUCE(T, S)                                          \
+template [[host_name("axis_reduce_" #S)]] kernel void axis_reduce<T>(          \
+    device const T*, device T*, constant ReduceLayout&, uint);
+FOR_EACH_ELEMENT(INSTANTIATE_AXIS_REDUCE)
+
+// Whether candidate `(x, xi)` beats `(best, bi)` for an argmax (`op` is `Max`)
+// or an argmin: a number beats a NaN, a strictly larger (smaller) number beats
+// a number, and a tie — of numbers or of NaNs — goes to the smaller position.
+inline bool arg_beats(ReduceOp op, float x, uint xi, float best, uint bi) {
+    bool x_nan = is_nan_bits(x);
+    bool best_nan = is_nan_bits(best);
+    if (x_nan || best_nan) {
+        return x_nan == best_nan ? xi < bi : best_nan;
+    }
+    if (x == best) {
+        return xi < bi;
+    }
+    return op == ReduceOp::Min ? x < best : x > best;
+}
+
+// The position along the one folded axis of each slice's extreme element, by
+// `lanes` threads per slice as in `axis_reduce`. Each lane scans its elements
+// in order; the lanes then combine by `arg_beats`, so the result is the first
+// position of the extreme whatever lane found it. A slice of only NaNs
+// answers its first position.
+template <typename T>
+kernel void axis_arg_reduce(
+    device const T* input          [[buffer(0)]],
+    device uint* output            [[buffer(1)]],
+    constant ReduceLayout& layout  [[buffer(2)]],
+    uint i [[thread_position_in_grid]])
+{
+    uint lanes = layout.lanes;
+    uint result = i / lanes;
+    uint lane = i - result * lanes;
+    uint base = outer_position(layout, result);
+    ReduceOp op = static_cast<ReduceOp>(layout.op);
+
+    float best = as_type<float>(0x7fc00000u);
+    uint position = 0xffffffffu;
+    for (uint k = lane; k < layout.inner_count; k += lanes) {
+        float x = float(input[base + inner_position(layout, k)]);
+        if (arg_beats(op, x, k, best, position)) {
+            best = x;
+            position = k;
+        }
+    }
+    if (lanes > 1) {
+        for (ushort offset = 16; offset > 0; offset >>= 1) {
+            float other = simd_shuffle_xor(best, offset);
+            uint other_position = simd_shuffle_xor(position, offset);
+            if (arg_beats(op, other, other_position, best, position)) {
+                best = other;
+                position = other_position;
+            }
+        }
+    }
+    if (lane == 0) {
+        output[result] = position;
+    }
+}
+
+#define INSTANTIATE_AXIS_ARG_REDUCE(T, S)                                      \
+template [[host_name("axis_arg_reduce_" #S)]] kernel void axis_arg_reduce<T>(  \
+    device const T*, device uint*, constant ReduceLayout&, uint);
+FOR_EACH_ELEMENT(INSTANTIATE_AXIS_ARG_REDUCE)

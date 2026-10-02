@@ -17,7 +17,8 @@
 use std::cmp::Ordering;
 
 use super::fused::{self, Fresh, Program, Sink, Source};
-use super::{Backend, Host, Matrix, Vector};
+use super::strided;
+use super::{Backend, Host, Matrix, TensorView, Vector};
 use crate::counters;
 use crate::numbers::Real;
 use crate::statistics::{Distribution, Moments};
@@ -398,6 +399,61 @@ impl TryFrom<u16> for Analytic {
     fn try_from(value: u16) -> Result<Self, Self::Error> {
         Self::ALL.get(value as usize).copied().ok_or(value)
     }
+}
+
+/// An elementwise operation of two tensors, as a broadcast runs it: an
+/// arithmetic operator, a comparison, or a power. Reach it through the tensor
+/// operations — [`Tensor::elementwise`](super::Tensor::elementwise),
+/// [`compare`](super::Tensor::compare), [`power`](super::Tensor::power) and
+/// the rest — which check and broadcast the shapes first.
+#[doc(hidden)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Pairwise {
+    Arithmetic(BinaryOp),
+    Compare(Compare),
+    Power,
+}
+
+impl Pairwise {
+    /// The operation's name, for the shape-mismatch messages.
+    pub fn name(self) -> &'static str {
+        match self {
+            Pairwise::Arithmetic(op) => op.name(),
+            Pairwise::Compare(Compare::Min) => "min",
+            Pairwise::Compare(Compare::Max) => "max",
+            Pairwise::Compare(_) => "compare",
+            Pairwise::Power => "power",
+        }
+    }
+
+    /// Apply the operation to a pair of values: the scalar definition every
+    /// backend computes, element by element.
+    pub fn value<T: Real>(self, a: T, b: T) -> T {
+        match self {
+            Pairwise::Arithmetic(BinaryOp::Add) => a + b,
+            Pairwise::Arithmetic(BinaryOp::Sub) => a - b,
+            Pairwise::Arithmetic(BinaryOp::Mul) => a * b,
+            Pairwise::Arithmetic(BinaryOp::Div) => a / b,
+            Pairwise::Arithmetic(BinaryOp::Rem) => a % b,
+            Pairwise::Compare(op) => op.value(a, b),
+            Pairwise::Power => a.power(b),
+        }
+    }
+}
+
+/// What an axis reduction computes for each slice it folds — see
+/// [`Kernels::reduce_axes`]. The tensor methods
+/// ([`Tensor::sum_axes`](super::Tensor::sum_axes) and the rest) are the way in.
+#[doc(hidden)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum AxisReduction {
+    /// The [`Reduce`] fold of the slice.
+    Fold(Reduce),
+    /// Its sum divided by its length.
+    Mean,
+    /// `Σ(xᵢ − mean)² / divisor`, in two passes: the mean first, then the
+    /// squared deviations from it.
+    Variance { divisor: usize },
 }
 
 /// Which operand of a product is read transposed — see
@@ -1084,6 +1140,43 @@ pub trait Kernels<T: Real = f32>: Backend {
     ) -> Vec<Fresh<Self>>
     where
         T: fused::Element;
+
+    /// `op(a, b)` for every element of the two views' common shape, into a
+    /// new row-major vector. Each operand is read in place through its
+    /// strides, so a zero stride — an axis a broadcast repeats — reads one
+    /// element again rather than a copy of it. Reach this through the tensor
+    /// operations, which broadcast the shapes first.
+    ///
+    /// # Panics
+    ///
+    /// If the shapes differ.
+    #[doc(hidden)]
+    fn strided_binary(
+        a: TensorView<'_, T, Self>,
+        b: TensorView<'_, T, Self>,
+        op: Pairwise,
+    ) -> Vector<T, Self>;
+
+    /// `input` folded over `axes` — distinct and ascending — by `op`: one
+    /// result per index of the remaining axes, in row-major order. Each slice
+    /// folds in the accumulator type (`f32` for `f32`, `f16` and `bf16`) and
+    /// rounds to `T` once. Every slice holds at least one element. Reach this
+    /// through the tensor reductions, such as
+    /// [`Tensor::sum_axes`](super::Tensor::sum_axes).
+    #[doc(hidden)]
+    fn reduce_axes(
+        input: TensorView<'_, T, Self>,
+        axes: &[usize],
+        op: AxisReduction,
+    ) -> Vector<T, Self>;
+
+    /// The position along `axis` of each slice's largest element (`op` is
+    /// [`Reduce::Max`]) or smallest ([`Reduce::Min`]), one per index of the
+    /// other axes in row-major order. A tie goes to the first position, NaNs
+    /// are passed over, and a slice of only NaNs answers `0`. The axis is not
+    /// empty and its extent fits a `u32`.
+    #[doc(hidden)]
+    fn arg_reduce(input: TensorView<'_, T, Self>, axis: usize, op: Reduce) -> Vector<u32, Self>;
 }
 
 /// Every operation here already exists as an inherent method or an operator on
@@ -1586,6 +1679,31 @@ impl<T: Real> Kernels<T> for Host {
     ) -> (Vector<T, Self>, Vector<T, Self>) {
         fused::host_row_moments(input, shape)
     }
+
+    fn strided_binary(
+        a: TensorView<'_, T, Self>,
+        b: TensorView<'_, T, Self>,
+        op: Pairwise,
+    ) -> Vector<T, Self> {
+        counters::elementwise_of::<T>(a.len(), 2);
+        Vector::new(strided::binary(a.strided(), b.strided(), op))
+    }
+
+    fn reduce_axes(
+        input: TensorView<'_, T, Self>,
+        axes: &[usize],
+        op: AxisReduction,
+    ) -> Vector<T, Self> {
+        let split = input.split_for(axes);
+        counters::kernel((input.len() + split.results()) * size_of::<T>(), 1);
+        Vector::new(strided::reduce(input.strided(), axes, op))
+    }
+
+    fn arg_reduce(input: TensorView<'_, T, Self>, axis: usize, op: Reduce) -> Vector<u32, Self> {
+        let results = input.len() / input.shape()[axis];
+        counters::kernel(input.len() * size_of::<T>() + results * size_of::<u32>(), 1);
+        Vector::new(strided::arg_reduce(input.strided(), axis, op))
+    }
 }
 
 /// The values of a valid correlation; the host kernel without its bookkeeping.
@@ -1725,12 +1843,14 @@ pub(crate) fn correlation_shape(input: (usize, usize), window: (usize, usize)) -
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod gpu {
     use super::{
-        Analytic, Axis, BinaryOp, Compare, Family, Fresh, Kernels, Matrix, Program, Reduce, Sink,
-        SortOrder, Source, Statistic, Transposed, Vector, correlation_shape, fused,
+        Analytic, Axis, AxisReduction, BinaryOp, Compare, Family, Fresh, Kernels, Matrix, Pairwise,
+        Program, Reduce, Sink, SortOrder, Source, Statistic, TensorView, Transposed, Vector,
+        correlation_shape, fused, strided,
     };
     use crate::counters;
     use crate::metal::MetalElement;
     use crate::numbers::Real;
+    use crate::tensors::backend::Strided;
     use crate::tensors::metal_backend::{matrix_elementwise, vector_elementwise};
     use crate::tensors::{Host, Metal, MetalStorage};
 
@@ -2307,6 +2427,68 @@ mod gpu {
             updated: &mut [Sink<'_, Self>],
         ) -> Vec<Fresh<Self>> {
             fused::metal_with_statistics(program, shape, inputs, updated)
+        }
+
+        // The three strided operations run one GPU dispatch each, reading the
+        // views in place. Without a device — or for the remainder, which has
+        // no shader — they run the host kernel over the shared memory.
+        fn strided_binary(
+            a: TensorView<'_, T, Self>,
+            b: TensorView<'_, T, Self>,
+            op: Pairwise,
+        ) -> Vector<T, Self> {
+            assert_eq!(
+                a.shape(),
+                b.shape(),
+                "strided binary: the operands' shapes differ"
+            );
+            counters::elementwise_of::<T>(a.len(), 2);
+            let resident = a.data().storage().strided_binary(
+                Strided {
+                    offset: a.offset(),
+                    strides: a.strides(),
+                },
+                b.data().storage(),
+                Strided {
+                    offset: b.offset(),
+                    strides: b.strides(),
+                },
+                a.shape(),
+                op,
+            );
+            match resident {
+                Some(data) => Vector::from_storage(a.len(), data),
+                None => Vector::build(&strided::binary(a.strided(), b.strided(), op)),
+            }
+        }
+
+        fn reduce_axes(
+            input: TensorView<'_, T, Self>,
+            axes: &[usize],
+            op: AxisReduction,
+        ) -> Vector<T, Self> {
+            let split = input.split_for(axes);
+            counters::kernel((input.len() + split.results()) * size_of::<T>(), 1);
+            match input.data().storage().reduce_axes(&split, op) {
+                Some(data) => Vector::from_storage(split.results(), data),
+                None => Vector::build(&strided::reduce(input.strided(), axes, op)),
+            }
+        }
+
+        fn arg_reduce(
+            input: TensorView<'_, T, Self>,
+            axis: usize,
+            op: Reduce,
+        ) -> Vector<u32, Self> {
+            let split = input.split_for(&[axis]);
+            counters::kernel(
+                input.len() * size_of::<T>() + split.results() * size_of::<u32>(),
+                1,
+            );
+            match input.data().storage().arg_reduce(&split, op) {
+                Some(data) => Vector::from_storage(split.results(), data),
+                None => Vector::build(&strided::arg_reduce(input.strided(), axis, op)),
+            }
         }
     }
 

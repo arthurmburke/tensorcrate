@@ -1165,6 +1165,45 @@ mod gpu {
             Some(Self(Residency::Device(output)))
         }
 
+        /// `op(a, b)` over `shape`, each operand read in place through its
+        /// layout, on the GPU.
+        pub(crate) fn strided_binary(
+            &self,
+            a: Strided<'_>,
+            rhs: &Self,
+            b: Strided<'_>,
+            shape: &[usize],
+            op: crate::tensors::kernels::Pairwise,
+        ) -> Option<Self> {
+            let output = self
+                .device()?
+                .strided_binary(a, rhs.device()?, b, shape, op)?;
+            Some(Self(Residency::Device(output)))
+        }
+
+        /// The fold, mean or variance of each slice of `split`, on the GPU.
+        pub(crate) fn reduce_axes(
+            &self,
+            split: &crate::tensors::layout::Split,
+            op: crate::tensors::kernels::AxisReduction,
+        ) -> Option<Self> {
+            Some(Self(Residency::Device(
+                self.device()?.reduce_axes(split, op)?,
+            )))
+        }
+
+        /// The position of each slice's extreme along its one folded axis,
+        /// on the GPU.
+        pub(crate) fn arg_reduce(
+            &self,
+            split: &crate::tensors::layout::Split,
+            op: Reduce,
+        ) -> Option<MetalStorage<u32>> {
+            Some(MetalStorage(Residency::Device(
+                self.device()?.arg_reduce(split, op)?,
+            )))
+        }
+
         /// Elementwise comparison with another shared allocation.
         pub(crate) fn compare(&self, rhs: &Self, op: Compare) -> Option<Self> {
             let output = self.device()?.compare(rhs.device()?, op)?;

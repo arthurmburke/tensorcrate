@@ -313,6 +313,78 @@ pub(crate) fn reshape_strides(
     Some(new_strides)
 }
 
+/// The strides that read a layout of `shape` with `strides` as the larger
+/// `target` it broadcasts to: an axis of `1` the target repeats, and every
+/// leading axis the target adds, steps by zero. `None` unless `shape`
+/// broadcasts to `target` — has no more axes, and each extent equals the
+/// target's or is `1`.
+pub(crate) fn broadcast_strides(
+    shape: &[usize],
+    strides: &[usize],
+    target: &[usize],
+) -> Option<Dims> {
+    let added = target.len().checked_sub(shape.len())?;
+    let mut out = vec![0; target.len()];
+    for axis in 0..shape.len() {
+        let wanted = target[added + axis];
+        out[added + axis] = match shape[axis] {
+            extent if extent == wanted => strides[axis],
+            1 => 0,
+            _ => return None,
+        };
+    }
+    Some(Dims::new(&out, "broadcast"))
+}
+
+/// A layout split for a reduction: the axes it keeps and the ones it folds
+/// together, each with its strides, from one offset. Element `[k…]` of the
+/// result folds storage elements `offset + Σ kᵢ·kept_strides[i] +
+/// Σ fⱼ·folded_strides[j]` over every index `[f…]` of `folded`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Split {
+    pub(crate) offset: usize,
+    pub(crate) kept: Dims,
+    pub(crate) kept_strides: Dims,
+    pub(crate) folded: Dims,
+    pub(crate) folded_strides: Dims,
+}
+
+impl Split {
+    /// A layout of `shape` with `strides` from `offset`, split so that the
+    /// axes in `axes` — distinct, ascending — fold and the rest are kept, in
+    /// order.
+    pub(crate) fn new(shape: &[usize], strides: &[usize], offset: usize, axes: &[usize]) -> Self {
+        let (mut kept, mut kept_strides) = (Vec::new(), Vec::new());
+        let (mut folded, mut folded_strides) = (Vec::new(), Vec::new());
+        for axis in 0..shape.len() {
+            if axes.contains(&axis) {
+                folded.push(shape[axis]);
+                folded_strides.push(strides[axis]);
+            } else {
+                kept.push(shape[axis]);
+                kept_strides.push(strides[axis]);
+            }
+        }
+        Split {
+            offset,
+            kept: Dims::new(&kept, "reduce"),
+            kept_strides: Dims::new(&kept_strides, "reduce"),
+            folded: Dims::new(&folded, "reduce"),
+            folded_strides: Dims::new(&folded_strides, "reduce"),
+        }
+    }
+
+    /// The number of results: one per index of the kept axes.
+    pub(crate) fn results(&self) -> usize {
+        self.kept.iter().product()
+    }
+
+    /// The number of elements each result folds together.
+    pub(crate) fn depth(&self) -> usize {
+        self.folded.iter().product()
+    }
+}
+
 /// `shape` and the strides of `N` operands over it, simplified for a copy:
 /// axes of one element dropped, and each axis merged into the next wherever
 /// every operand steps across the pair as across one axis. A permutation of a
@@ -452,6 +524,26 @@ mod tests {
         assert_eq!((-1isize).resolve(3), Some(2));
         assert_eq!((-3i32).resolve(3), Some(0));
         assert_eq!((-4i32).resolve(3), None);
+    }
+
+    #[test]
+    fn broadcast_strides_repeat_unit_and_added_axes() {
+        let strides = broadcast_strides(&[3, 1], &[1, 1], &[2, 3, 4]).unwrap();
+        assert_eq!(strides.as_slice(), [0, 1, 0]);
+        let strides = broadcast_strides(&[4], &[2], &[3, 4]).unwrap();
+        assert_eq!(strides.as_slice(), [0, 2]);
+        assert!(broadcast_strides(&[2, 4], &[4, 1], &[4]).is_none());
+        assert!(broadcast_strides(&[3], &[1], &[4]).is_none());
+    }
+
+    #[test]
+    fn a_split_keeps_the_unreduced_axes_in_order() {
+        let split = Split::new(&[2, 3, 4, 5], &[60, 20, 5, 1], 7, &[1, 3]);
+        assert_eq!(split.kept.as_slice(), [2, 4]);
+        assert_eq!(split.kept_strides.as_slice(), [60, 5]);
+        assert_eq!(split.folded.as_slice(), [3, 5]);
+        assert_eq!(split.folded_strides.as_slice(), [20, 1]);
+        assert_eq!((split.offset, split.results(), split.depth()), (7, 8, 15));
     }
 
     #[test]

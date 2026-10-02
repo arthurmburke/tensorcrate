@@ -132,6 +132,13 @@ pub(super) struct Typed {
     pub(super) distribution: Pipeline,
     pub(super) axis_distribution: Pipeline,
     pub(super) fused: Pipeline,
+    /// A binary operation reading both operands through their strides, the
+    /// broadcast kernel.
+    pub(super) strided_binary: Pipeline,
+    /// A fold, mean or variance over any set of axes, and the position of
+    /// the extreme along one.
+    pub(super) axis_reduce: Pipeline,
+    pub(super) axis_arg_reduce: Pipeline,
     /// A product whose elements feed a fused program before any store.
     pub(super) matmul_epilogue: Pipeline,
     /// The same on TensorOps, on M5-class GPUs.
@@ -422,6 +429,9 @@ pub(super) fn build_gpu() -> Option<Gpu> {
             distribution: kernel("distribution")?,
             axis_distribution: kernel("axis_distribution")?,
             fused: kernel("fused_elementwise")?,
+            strided_binary: kernel("strided_binary")?,
+            axis_reduce: kernel("axis_reduce")?,
+            axis_arg_reduce: kernel("axis_arg_reduce")?,
             matmul_epilogue: kernel("matmul_epilogue")?,
             tensorops_epilogue: tensorops_pipeline(&format!("matmul_tensorops_epilogue_{suffix}")),
             tensorops_epilogue_relaxed: tensorops_pipeline(&format!(

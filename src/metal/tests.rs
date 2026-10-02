@@ -897,3 +897,84 @@ fn generated_kernels_compile_for_every_type_and_tile() {
     check::<f16>();
     check::<bf16>();
 }
+
+#[test]
+fn broadcasts_and_axis_reductions_are_one_dispatch_each_without_waiting() {
+    use crate::tensors::backend::Strided;
+    use crate::tensors::kernels::{AxisReduction, Pairwise};
+    use crate::tensors::layout::Split;
+    use crate::tensors::{Compare, Reduce};
+
+    // [2, 3, 4] scores plus a [3, 4] mask, read from a queued result.
+    let values = (0..24).map(|index| index as f32).collect::<Vec<_>>();
+    let Some(input) = MetalBuffer::from_slice(&values) else {
+        eprintln!("no Metal device; skipping broadcast dispatch check");
+        return;
+    };
+    let mask = MetalBuffer::from_slice(&values[..12]).unwrap();
+    synchronize();
+    let before = activity().unwrap();
+    let queued = input.broadcast(1.0, BinaryOp::Add, false).unwrap();
+    let shape = [2, 3, 4];
+    let scores = Strided {
+        offset: 0,
+        strides: &[12, 4, 1],
+    };
+    let repeated = Strided {
+        offset: 0,
+        strides: &[0, 4, 1],
+    };
+    let add = Pairwise::Arithmetic(BinaryOp::Add);
+    let sum = queued
+        .strided_binary(scores, &mask, repeated, &shape, add)
+        .unwrap();
+    let greater = Pairwise::Compare(Compare::Greater);
+    let larger = queued
+        .strided_binary(scores, &mask, repeated, &shape, greater)
+        .unwrap();
+    // Sums over the middle axis, a variance over the last two, and the
+    // position of each row's maximum.
+    let middle = Split::new(&shape, &[12, 4, 1], 0, &[1]);
+    let sums = sum
+        .reduce_axes(&middle, AxisReduction::Fold(Reduce::Sum))
+        .unwrap();
+    let inner = Split::new(&shape, &[12, 4, 1], 0, &[1, 2]);
+    let variances = queued
+        .reduce_axes(&inner, AxisReduction::Variance { divisor: 12 })
+        .unwrap();
+    let last = Split::new(&shape, &[12, 4, 1], 0, &[2]);
+    let positions = sum.arg_reduce(&last, Reduce::Max).unwrap();
+
+    let (operations, waits) = activity().unwrap();
+    assert_eq!(waits, before.1, "a broadcast or a reduction synchronized");
+    assert_eq!(
+        operations - before.0,
+        6,
+        "one scalar broadcast, two broadcasts, two reductions and one arg-reduction"
+    );
+
+    let added = (0..24)
+        .map(|i| (i as f32 + 1.0) + (i % 12) as f32)
+        .collect::<Vec<_>>();
+    assert_eq!(sum.to_vec(), added);
+    let expected = (0..24)
+        .map(|i| {
+            if i as f32 + 1.0 > (i % 12) as f32 {
+                1.0
+            } else {
+                0.0
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(larger.to_vec(), expected);
+    let column_sums = (0..2)
+        .flat_map(|b| {
+            let added = &added;
+            (0..4).map(move |d| (0..3).map(|t| added[b * 12 + t * 4 + d]).sum::<f32>())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(sums.to_vec(), column_sums);
+    // Twelve consecutive values have variance (12² − 1)/12.
+    assert_eq!(variances.to_vec(), [143.0 / 12.0; 2]);
+    assert_eq!(positions.to_vec(), [3u32; 6]);
+}

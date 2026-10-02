@@ -5,9 +5,10 @@ use std::ops::{Index, RangeBounds};
 
 use super::backend::{Region, Strided};
 use super::layout::{
-    AxisIndex, Dims, bounds, contiguous_strides, element_count, expect_position, is_contiguous,
-    position, reshape_strides, resolve_axis,
+    AxisIndex, Dims, Split, bounds, broadcast_strides, contiguous_strides, element_count,
+    expect_position, is_contiguous, position, reshape_strides, resolve_axis,
 };
+use super::strided::Layout;
 use super::{Backend, Host, Tensor, Vector};
 
 /// Part or all of a [`Tensor`]'s elements, read in place: a shape, one stride
@@ -341,6 +342,42 @@ impl<'a, T: Copy + 'static, B: Backend> TensorView<'a, T, B> {
         )
     }
 
+    /// This view repeated to `shape`, numpy-style, without copying: the two
+    /// shapes are aligned at their last axes, and an axis of one element —
+    /// or a leading axis `shape` adds — is read with a stride of zero, so
+    /// every index along it reads the same elements. `[D]` broadcasts to
+    /// `[B, T, D]`, and `[T, T]` to `[B, H, T, T]`.
+    ///
+    /// The tensor operations of two operands broadcast them this way
+    /// themselves; this is for the cases that want the repeated view, such as
+    /// a [fused program](super::fused::Program) input, whose leading axes fold
+    /// into one strided axis when only those were added.
+    ///
+    /// ```
+    /// use tensorcrate::tensors::Tensor;
+    ///
+    /// let bias = Tensor::from_vec(&[3], vec![1.0f32, 2.0, 3.0]);
+    /// let repeated = bias.broadcast_to(&[2, 3]);
+    /// assert_eq!(repeated.strides(), [0, 1]);
+    /// assert_eq!(repeated.to_vec(), [1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// If `shape` has fewer axes than the view, or an extent of the view is
+    /// neither `1` nor the matching extent of `shape`.
+    #[track_caller]
+    pub fn broadcast_to(&self, shape: &[usize]) -> Self {
+        let target = Dims::new(shape, "broadcast_to");
+        let strides = broadcast_strides(&self.shape, &self.strides, shape).unwrap_or_else(|| {
+            panic!(
+                "broadcast_to: shape {:?} does not broadcast to {shape:?}",
+                self.shape
+            )
+        });
+        self.with(target, strides, self.offset)
+    }
+
     /// The same elements in row-major order under `shape`, read in place, or
     /// `None` when the layout cannot express that without a copy — merging
     /// axes a permutation has separated, say. [`contiguous`](Self::contiguous)
@@ -407,6 +444,22 @@ impl<'a, T: Copy + 'static, B: Backend> TensorView<'a, T, B> {
                 strides: &self.strides,
             },
         )
+    }
+
+    /// This view's layout over its storage, read from the CPU — on `Metal`
+    /// after waiting for queued work, as any read does.
+    pub(crate) fn strided(&self) -> Layout<'_, T> {
+        Layout {
+            values: self.data.as_slice(),
+            shape: &self.shape,
+            strides: &self.strides,
+            offset: self.offset,
+        }
+    }
+
+    /// This view's layout split for folding `axes` — distinct, ascending.
+    pub(crate) fn split_for(&self, axes: &[usize]) -> Split {
+        Split::new(&self.shape, &self.strides, self.offset, axes)
     }
 
     /// The copy of this view's elements to `to`, for an assembly or a write.

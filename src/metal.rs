@@ -6,7 +6,10 @@
 //! [`MetalElement`] — `f32`, `f16` and `bf16` — with each kernel compiled once
 //! per type. The N-dimensional strided copy behind tensor views moves bits and
 //! is compiled once per element width instead, so it runs for any element type
-//! of 1, 2, 4, 8 or 16 bytes. Arithmetic runs in the element type; sums, products and moments
+//! of 1, 2, 4, 8 or 16 bytes. Broadcast binary operations read each operand
+//! through its strides — a repeated axis through a zero stride — and axis
+//! reductions and arg-reductions fold any strided layout, one dispatch each.
+//! Arithmetic runs in the element type; sums, products and moments
 //! accumulate in `f32` and round once. M5 GPUs additionally use Metal 4
 //! TensorOps for matrix products. Radix-2 FFTs run in `f32`; `f64`, matrix
 //! inversion, and non-radix-2 FFTs stay on the CPU.

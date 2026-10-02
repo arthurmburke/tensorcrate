@@ -10,7 +10,8 @@ use objc2_metal::{
 };
 
 use crate::tensors::backend::Strided;
-use crate::tensors::layout::{coalesce, reach};
+use crate::tensors::kernels::{AxisReduction, Pairwise};
+use crate::tensors::layout::{Split, coalesce, reach};
 use crate::tensors::{Analytic, Axis, BinaryOp, Compare, Family, MAX_RANK, Reduce, Statistic};
 
 use super::MetalElement;
@@ -356,6 +357,201 @@ pub(super) fn encode_strided_copy<T>(
     }
     dispatch_1d(&encoder, count);
     queued(gpu, count)
+}
+
+/// The layout argument of the `strided_binary` shader, field for field.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct BinaryLayout {
+    rank: u32,
+    kind: u32,
+    op: u32,
+    a_offset: u32,
+    b_offset: u32,
+    shape: [u32; MAX_RANK],
+    a_strides: [u32; MAX_RANK],
+    b_strides: [u32; MAX_RANK],
+}
+
+impl BinaryLayout {
+    /// The shader's layout for `op` over `shape`, reading the operands at `a`
+    /// and `b`, with the axes [`coalesce`]d, and the number of elements it
+    /// writes. `None` for an operation the shader does not have — the
+    /// remainder — or if an index does not fit its 32 bits.
+    pub(super) fn new(
+        shape: &[usize],
+        a: Strided<'_>,
+        b: Strided<'_>,
+        op: Pairwise,
+    ) -> Option<(Self, usize)> {
+        let (kind, op) = match op {
+            Pairwise::Arithmetic(BinaryOp::Rem) => return None,
+            Pairwise::Arithmetic(op) => (0, u16::from(op)),
+            Pairwise::Compare(op) => (1, u16::from(op)),
+            Pairwise::Power => (2, 0),
+        };
+        let count = shape
+            .iter()
+            .try_fold(1usize, |count, &extent| count.checked_mul(extent))?;
+        u32::try_from(count).ok()?;
+        u32::try_from(reach(shape, a.offset, a.strides)?).ok()?;
+        u32::try_from(reach(shape, b.offset, b.strides)?).ok()?;
+        let mut layout = BinaryLayout {
+            kind,
+            op: u32::from(op),
+            a_offset: u32::try_from(a.offset).ok()?,
+            b_offset: u32::try_from(b.offset).ok()?,
+            ..BinaryLayout::default()
+        };
+        if count != 0 {
+            // The output is row-major, which joins any two adjacent axes, so
+            // the operands alone decide which merge.
+            let (shape, [a, b]) = coalesce(shape, [a.strides, b.strides]);
+            layout.rank = shape.len() as u32;
+            for axis in 0..shape.len() {
+                layout.shape[axis] = shape[axis] as u32;
+                layout.a_strides[axis] = a[axis] as u32;
+                layout.b_strides[axis] = b[axis] as u32;
+            }
+        }
+        Some((layout, count))
+    }
+}
+
+/// `c[i] = op(a[layout.a(i)], b[layout.b(i)])` for each of `count` elements.
+pub(super) fn encode_strided_binary<T: MetalElement>(
+    gpu: &Gpu,
+    a: &ProtocolObject<dyn MTLBuffer>,
+    b: &ProtocolObject<dyn MTLBuffer>,
+    output: &ProtocolObject<dyn MTLBuffer>,
+    layout: &BinaryLayout,
+    count: usize,
+) -> Option<()> {
+    let encoder = compute(gpu)?;
+    encoder.setComputePipelineState(&gpu.kernels::<T>().strided_binary);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(a), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(b), 0, 1);
+        encoder.setBuffer_offset_atIndex(Some(output), 0, 2);
+        encoder.setBytes_length_atIndex(NonNull::from(layout).cast(), size_of::<BinaryLayout>(), 3);
+    }
+    dispatch_1d(&encoder, count);
+    queued(gpu, count)
+}
+
+/// The layout argument of the `axis_reduce` and `axis_arg_reduce` shaders,
+/// field for field.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub(super) struct ReduceLayout {
+    outer_rank: u32,
+    inner_rank: u32,
+    offset: u32,
+    inner_count: u32,
+    outer_shape: [u32; MAX_RANK],
+    outer_strides: [u32; MAX_RANK],
+    inner_shape: [u32; MAX_RANK],
+    inner_strides: [u32; MAX_RANK],
+    kind: u32,
+    op: u32,
+    lanes: u32,
+    divisor: f32,
+}
+
+/// What a reduction kernel computes for each slice.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(super) enum Folding {
+    /// `axis_reduce`, with this operation.
+    Values(AxisReduction),
+    /// `axis_arg_reduce`, for the position of the `Max` or the `Min`.
+    Position(Reduce),
+}
+
+/// The lanes of a SIMD group the reduction shaders combine across.
+pub(super) const SIMD_LANES: usize = 32;
+
+/// Fewer results than this make a SIMD group per result worthwhile even when
+/// its lanes do not read neighbouring elements: one thread each would leave
+/// most of the GPU idle.
+const FEW_RESULTS: usize = 1024;
+
+/// Slices shorter than this fold on one thread: a SIMD group would leave most
+/// of its lanes idle.
+const SHORT_SLICE: usize = 64;
+
+impl ReduceLayout {
+    /// The shader's layout for folding `split`, each side [`coalesce`]d, and
+    /// the number of results. `simd_width` is the pipeline's; a SIMD group
+    /// per result is used only when it is [`SIMD_LANES`]. `None` if an index
+    /// does not fit the shader's 32 bits. Every slice holds an element.
+    pub(super) fn new(split: &Split, folding: Folding, simd_width: usize) -> Option<(Self, usize)> {
+        let (results, depth) = (split.results(), split.depth());
+        u32::try_from(results.checked_mul(SIMD_LANES)?).ok()?;
+        let shape = split.kept.iter().chain(split.folded.iter());
+        let strides = split.kept_strides.iter().chain(split.folded_strides.iter());
+        let (shape, strides): (Vec<usize>, Vec<usize>) =
+            (shape.copied().collect(), strides.copied().collect());
+        u32::try_from(reach(&shape, split.offset, &strides)?).ok()?;
+        let (kind, op, divisor) = match folding {
+            Folding::Values(AxisReduction::Fold(op)) => (0, op, 0.0),
+            Folding::Values(AxisReduction::Mean) => (1, Reduce::Sum, 0.0),
+            Folding::Values(AxisReduction::Variance { divisor }) => {
+                (2, Reduce::Sum, divisor as f32)
+            }
+            Folding::Position(op) => (0, op, 0.0),
+        };
+        let mut layout = ReduceLayout {
+            offset: u32::try_from(split.offset).ok()?,
+            inner_count: u32::try_from(depth).ok()?,
+            kind,
+            op: u32::from(u16::from(op)),
+            divisor,
+            ..ReduceLayout::default()
+        };
+        let (outer, [outer_strides]) = coalesce(&split.kept, [&split.kept_strides]);
+        layout.outer_rank = outer.len() as u32;
+        for axis in 0..outer.len() {
+            layout.outer_shape[axis] = outer[axis] as u32;
+            layout.outer_strides[axis] = outer_strides[axis] as u32;
+        }
+        let (inner, [inner_strides]) = coalesce(&split.folded, [&split.folded_strides]);
+        layout.inner_rank = inner.len() as u32;
+        for axis in 0..inner.len() {
+            layout.inner_shape[axis] = inner[axis] as u32;
+            layout.inner_strides[axis] = inner_strides[axis] as u32;
+        }
+        // A SIMD group per result when its lanes read neighbouring elements
+        // of a long slice, or when there are too few results otherwise.
+        let unit_inner = inner.last().is_some() && inner_strides[inner.len() - 1] == 1;
+        let grouped = simd_width == SIMD_LANES
+            && depth >= SHORT_SLICE
+            && (unit_inner || results < FEW_RESULTS);
+        layout.lanes = if grouped { SIMD_LANES as u32 } else { 1 };
+        Some((layout, results))
+    }
+}
+
+/// One reduction kernel — `pipeline` is a type's `axis_reduce` or
+/// `axis_arg_reduce` — over `layout`, writing `results` results to `output`.
+pub(super) fn encode_axis_reduce(
+    gpu: &Gpu,
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    input: &ProtocolObject<dyn MTLBuffer>,
+    output: &ProtocolObject<dyn MTLBuffer>,
+    layout: &ReduceLayout,
+    results: usize,
+) -> Option<()> {
+    let encoder = compute(gpu)?;
+    encoder.setComputePipelineState(pipeline);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
+        encoder.setBytes_length_atIndex(NonNull::from(layout).cast(), size_of::<ReduceLayout>(), 2);
+    }
+    // A whole number of SIMD groups per result, and threadgroups of 256, so
+    // every group of lanes lies in one SIMD group.
+    dispatch_1d(&encoder, results * layout.lanes as usize);
+    queued(gpu, results * layout.inner_count as usize)
 }
 
 pub(super) fn encode_transpose<T: MetalElement>(

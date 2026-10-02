@@ -368,6 +368,13 @@ impl<T: Copy + 'static, B: Backend> Tensor<T, B> {
         self.view().split(axis, sizes)
     }
 
+    /// This tensor repeated to `shape` without copying. See
+    /// [`TensorView::broadcast_to`].
+    #[track_caller]
+    pub fn broadcast_to(&self, shape: &[usize]) -> TensorView<'_, T, B> {
+        self.view().broadcast_to(shape)
+    }
+
     /// `parts` equal pieces of `axis`. See [`TensorView::chunk`].
     #[track_caller]
     pub fn chunk(&self, axis: impl AxisIndex, parts: usize) -> Vec<TensorView<'_, T, B>> {

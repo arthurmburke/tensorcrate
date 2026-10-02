@@ -80,6 +80,7 @@ mod matrix;
 mod ops;
 mod order;
 mod shape;
+mod strided;
 mod tensor;
 mod tensor_ops;
 mod vector;

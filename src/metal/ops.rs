@@ -3,9 +3,11 @@
 //! run the CPU kernel instead.
 
 use half::{bf16, f16};
+use objc2_metal::MTLComputePipelineState;
 
 use crate::tensors::backend::{Region, Strided};
-use crate::tensors::layout::contiguous_strides;
+use crate::tensors::kernels::{AxisReduction, Pairwise};
+use crate::tensors::layout::{Split, contiguous_strides};
 use crate::tensors::{
     Analytic, Axis, BinaryOp, Compare, Family, Reduce, SortOrder, Statistic, Transposed,
 };
@@ -14,13 +16,14 @@ use super::MetalElement;
 use super::buffer::MetalBuffer;
 use super::device::{Gpu, Operands, Pipeline, Tile, with_gpu};
 use super::encode::{
-    REDUCE_GROUP, StridedLayout, encode_axis_distribution, encode_axis_moments,
-    encode_bitonic_stage, encode_broadcast, encode_clamp, encode_compare, encode_compare_scalar,
-    encode_concat, encode_convert, encode_correlate, encode_deviation, encode_distribution,
-    encode_elementwise, encode_fft, encode_flip, encode_gemm, encode_hmerge, encode_matmul,
-    encode_matrix_stack, encode_matvec, encode_pad, encode_power, encode_power_scalar,
-    encode_reduce, encode_scan, encode_sort_prepare, encode_stack, encode_strided_copy,
-    encode_transpose, encode_unary, encode_unary_dual, encode_vecmat, encode_vmerge, vecmat_bands,
+    BinaryLayout, Folding, REDUCE_GROUP, ReduceLayout, StridedLayout, encode_axis_distribution,
+    encode_axis_moments, encode_axis_reduce, encode_bitonic_stage, encode_broadcast, encode_clamp,
+    encode_compare, encode_compare_scalar, encode_concat, encode_convert, encode_correlate,
+    encode_deviation, encode_distribution, encode_elementwise, encode_fft, encode_flip,
+    encode_gemm, encode_hmerge, encode_matmul, encode_matrix_stack, encode_matvec, encode_pad,
+    encode_power, encode_power_scalar, encode_reduce, encode_scan, encode_sort_prepare,
+    encode_stack, encode_strided_binary, encode_strided_copy, encode_transpose, encode_unary,
+    encode_unary_dual, encode_vecmat, encode_vmerge, vecmat_bands,
 };
 
 /// The strided copies. They move bits, so they are defined for every element
@@ -79,6 +82,69 @@ impl<T: Copy + 'static> MetalBuffer<T> {
                     encode_strided_copy::<T>(gpu, &region.source.raw, &output.raw, layout, *count)
                 })?;
             }
+        }
+        Some(output)
+    }
+}
+
+/// The operations that read their operands through strided layouts: a
+/// broadcast binary operation and the axis reductions. Layouts are assumed
+/// checked against their buffers, which the views calling these guarantee.
+impl<T: MetalElement> MetalBuffer<T> {
+    /// `op(a, b)` over `shape`, reading this buffer at `a` and `rhs` at `b`,
+    /// into a new row-major buffer: one dispatch, with a broadcast operand
+    /// read through zero strides rather than copied. `None` for the remainder,
+    /// which the shader does not have, or a layout past 32-bit indices.
+    pub(crate) fn strided_binary(
+        &self,
+        a: Strided<'_>,
+        rhs: &Self,
+        b: Strided<'_>,
+        shape: &[usize],
+        op: Pairwise,
+    ) -> Option<Self> {
+        let (layout, count) = BinaryLayout::new(shape, a, b, op)?;
+        let output = Self::allocate(count)?;
+        if count != 0 {
+            with_gpu(|gpu| {
+                encode_strided_binary::<T>(gpu, &self.raw, &rhs.raw, &output.raw, &layout, count)
+            })?;
+        }
+        Some(output)
+    }
+
+    /// The fold, mean or variance of each slice of `split`, one result per
+    /// index of its kept axes, in one dispatch. Every slice holds at least
+    /// one element; each folds in `f32` and rounds to `T` once.
+    pub(crate) fn reduce_axes(&self, split: &Split, op: AxisReduction) -> Option<Self> {
+        let (layout, results) = with_gpu(|gpu| {
+            let width = gpu.kernels::<T>().axis_reduce.threadExecutionWidth();
+            ReduceLayout::new(split, Folding::Values(op), width)
+        })?;
+        let output = Self::allocate(results)?;
+        if results != 0 {
+            with_gpu(|gpu| {
+                let pipeline = &gpu.kernels::<T>().axis_reduce;
+                encode_axis_reduce(gpu, pipeline, &self.raw, &output.raw, &layout, results)
+            })?;
+        }
+        Some(output)
+    }
+
+    /// The position of each slice's extreme along the one folded axis of
+    /// `split` — see [`Kernels::arg_reduce`](crate::tensors::Kernels::arg_reduce)
+    /// — in one dispatch, as `u32` indices.
+    pub(crate) fn arg_reduce(&self, split: &Split, op: Reduce) -> Option<MetalBuffer<u32>> {
+        let (layout, results) = with_gpu(|gpu| {
+            let width = gpu.kernels::<T>().axis_arg_reduce.threadExecutionWidth();
+            ReduceLayout::new(split, Folding::Position(op), width)
+        })?;
+        let output = MetalBuffer::<u32>::allocate(results)?;
+        if results != 0 {
+            with_gpu(|gpu| {
+                let pipeline = &gpu.kernels::<T>().axis_arg_reduce;
+                encode_axis_reduce(gpu, pipeline, &self.raw, &output.raw, &layout, results)
+            })?;
         }
         Some(output)
     }
