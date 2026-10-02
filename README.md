@@ -14,6 +14,8 @@ API to use for model training, dynamic data, and GPU execution.
 ## Highlights
 
 - Dynamically shaped `Vector<T>` and row-major `Matrix<T>` values.
+- N-dimensional `Tensor<T>` (up to six axes) with strided `TensorView`s: permute, transpose,
+  slice, split, concatenate and stack, copied by one strided kernel on the host or the GPU.
 - Real, complex, dual, and complex-dual arithmetic.
 - A `math!` macro with tensor literals, broadcasting, analytic functions, and `@` products.
 - Reverse-mode autodiff with a tape and forward-mode autodiff with dual tensors.
@@ -87,6 +89,59 @@ explicit:
 - `vector.outer(&vector)` on differentiable variables
 
 Borrow operands when you want to keep using them: `&a + &b` leaves both tensors intact.
+
+## N-dimensional tensors
+
+`Tensor<T, B>` holds up to six axes (`MAX_RANK`) over the same flat row-major storage as a
+`Vector`, so `reshape`, `squeeze`/`unsqueeze` and conversions to and from `Vector` and `Matrix`
+move the storage instead of copying it. Layout operations return a `TensorView` — the tensor's
+storage read in place through a shape, strides and an offset — and are free on either backend:
+
+- `permute(&axes)`, `transpose(a, b)` (negative axes count from the end)
+- `narrow(axis, start, len)`, `slice(axis, range)`, `select(axis, index)`
+- `split(axis, &sizes)`, `chunk(axis, parts)`
+- `squeeze(axis)`, `unsqueeze(axis)`, `try_reshape(&shape)` (when the strides allow it)
+
+`view.contiguous()` copies a view into a tensor of its own; `Tensor::concat` and `Tensor::stack`
+join tensors or views along any axis; `tensor.write_slice(axis, start, &source)` overwrites part
+of a tensor in place. Each is one strided copy on the tensor's backend — on Metal a GPU dispatch,
+for any element type of 1, 2, 4, 8 or 16 bytes.
+
+```rust
+use tensorcrate::tensors::Tensor;
+
+// [batch, time, 3·model] → query, key and value as [batch, heads, time, head_dim].
+let (batch, time, model, heads) = (2, 5, 8, 2);
+let qkv = Tensor::from_vec(
+    &[batch, time, 3 * model],
+    (0..batch * time * 3 * model).map(|i| i as f32).collect::<Vec<_>>(),
+);
+let parts: Vec<Tensor<f32>> = qkv
+    .chunk(-1, 3)
+    .into_iter()
+    .map(|part| {
+        part.try_reshape(&[batch, time, heads, model / heads])
+            .unwrap() // splitting the last axis needs no copy
+            .permute(&[0, 2, 1, 3])
+            .contiguous()
+    })
+    .collect();
+assert_eq!(parts[0].shape(), [batch, heads, time, model / heads]);
+
+// And back, exactly.
+let merged: Vec<Tensor<f32>> = parts
+    .iter()
+    .map(|part| part.transpose(1, 2).contiguous().reshape(&[batch, time, model]))
+    .collect();
+assert_eq!(Tensor::concat(&merged, -1), qkv);
+```
+
+Same-shape elementwise arithmetic (`+ - * /`, `elementwise`, `with_scalar`, `unary`,
+`power`, `compare`, `min`/`max`, `clamp`) runs on tensors and views through the existing vector
+kernels, so it works for every float on `Host` and for `f32`, `f16` and `bf16` on `Metal`; a view
+that is not its tensor's whole storage in order is copied into order first. A tensor, or a view
+whose leading axes fold into one strided axis, is also an input to a fused program, read as the
+`(prod(leading), last)` matrix of its rows.
 
 ## The `math!` macro
 
@@ -881,9 +936,10 @@ fn main() -> Result<(), tensorcrate::errors::Error> {
 }
 ```
 
-Persistence is defined for host vectors and matrices whose elements implement `Storable`,
-including primitive numeric, complex, and dual values. Move a Metal tensor to `Host` before saving
-it.
+Persistence is defined for host vectors, matrices and N-dimensional tensors whose elements
+implement `Storable`, including primitive numeric, complex, and dual values. A tensor file records
+the rank and every extent, and `Tensor::read_from` also reads vector and matrix files as tensors
+of one or two axes. Move a Metal tensor to `Host` before saving it.
 
 ## Examples and development
 
