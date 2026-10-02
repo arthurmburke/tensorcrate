@@ -1,6 +1,6 @@
 //! N-dimensional tensors and views: layout operations against a naive
 //! index-arithmetic reference, elementwise operations over non-contiguous
-//! views and conversions — on `Host` for every float type, and on
+//! views, conversions and persistence — on `Host` for every float type, and on
 //! `Metal` against `Host`.
 
 use tensorcrate::numbers::{bf16, f16};
@@ -511,6 +511,49 @@ fn a_view_that_moves_the_last_axis_is_not_fusable() {
     let a = tensor(&[2, 3, 4]);
     let moved = a.permute(&[2, 0, 1]);
     program.run((8, 3), &[&moved], &mut []);
+}
+
+#[test]
+fn tensors_save_and_load_with_their_shape() {
+    let t = tensor(&[2, 1, 3, 4]);
+    let mut bytes = Vec::new();
+    t.write_to(&mut bytes).unwrap();
+    let loaded = Tensor::<f32>::read_from(&bytes[..]).unwrap();
+    assert_eq!(loaded, t);
+    assert!(Tensor::<f64>::read_from(&bytes[..]).is_err());
+    // A tensor file is not a matrix file.
+    assert!(Matrix::<f32>::read_from(&bytes[..]).is_err());
+
+    // But a matrix or vector file reads as a tensor.
+    let m = Matrix::from_rows([[1.0f32, 2.0], [3.0, 4.0], [5.0, 6.0]]);
+    let mut bytes = Vec::new();
+    m.write_to(&mut bytes).unwrap();
+    assert_eq!(
+        Tensor::<f32>::read_from(&bytes[..]).unwrap(),
+        Tensor::from(m)
+    );
+    let v = Vector::new([1.0f64, 2.0]);
+    let mut bytes = Vec::new();
+    v.write_to(&mut bytes).unwrap();
+    assert_eq!(
+        Tensor::<f64>::read_from(&bytes[..]).unwrap(),
+        Tensor::from(v)
+    );
+
+    // Scalars and empty tensors survive too.
+    for t in [
+        Tensor::from_vec(&[], vec![bf16::from_f32(1.5)]),
+        Tensor::<bf16>::zeros(&[3, 0]),
+    ] {
+        let mut bytes = Vec::new();
+        t.write_to(&mut bytes).unwrap();
+        assert_eq!(Tensor::<bf16>::read_from(&bytes[..]).unwrap(), t);
+    }
+
+    let path = std::env::temp_dir().join(format!("nd_tensor_{}.tensor", std::process::id()));
+    t.save(&path).unwrap();
+    assert_eq!(Tensor::<f32>::load(&path).unwrap(), t);
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]

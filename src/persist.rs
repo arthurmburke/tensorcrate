@@ -19,7 +19,9 @@
 //!
 //! The entry points are [`Vector::write_to`] / [`Vector::read_from`] over any
 //! [`Write`] / [`Read`], with [`Vector::save`] / [`Vector::load`] as filesystem
-//! conveniences; [`Matrix`] has the same four. They are defined for the
+//! conveniences; [`Matrix`] and [`Tensor`] have the same four. A tensor reads
+//! a vector or matrix file too, as a tensor of one or two axes. They are
+//! defined for the
 //! [`Host`](crate::tensors::Host) backend, which is where every element type
 //! lives — move a `Metal` tensor across with
 //! [`to_backend`](Matrix::to_backend) first.
@@ -50,12 +52,21 @@
 //! offset  size  field
 //! 0       4     magic, b"TCR1"
 //! 4       1     format version
-//! 5       1     kind: 0 = vector, 1 = matrix
+//! 5       1     kind: 0 = vector, 1 = matrix, 2 = tensor
 //! 6       1     element tag length, L
 //! 7       L     element tag
 //! 7+L     8     rows (u64); the length, for a vector
 //! 15+L    8     columns (u64); 1, for a vector
 //! 23+L    ..    elements, row-major
+//! ```
+//!
+//! A [`Tensor`] stores its rank in place of the rows, and its extents in place
+//! of the columns, one `u64` each:
+//!
+//! ```text
+//! 7+L     8     rank, R (u64), at most MAX_RANK
+//! 15+L    8·R   extents (u64), outermost first
+//! 15+L+8R ..    elements, row-major
 //! ```
 //!
 //! Element tags are a recursive prefix code — `Complex<Dual<f64>>` is
@@ -68,12 +79,13 @@ use std::path::Path;
 
 use crate::errors::Error;
 use crate::numbers::{Coefficient, Complex, Dual, bf16, f16};
-use crate::tensors::{Host, Matrix, Vector};
+use crate::tensors::{Host, MAX_RANK, Matrix, Tensor, Vector};
 
 const MAGIC: [u8; 4] = *b"TCR1";
 const VERSION: u8 = 1;
 const KIND_VECTOR: u8 = 0;
 const KIND_MATRIX: u8 = 1;
+const KIND_TENSOR: u8 = 2;
 
 const TAG_COMPLEX: u8 = 0x20;
 const TAG_DUAL: u8 = 0x21;
@@ -209,6 +221,14 @@ fn write_header<W: Write, T: Storable>(
     rows: usize,
     cols: usize,
 ) -> Result<(), Error> {
+    write_prefix::<W, T>(writer, kind)?;
+    writer.write_all(&(rows as u64).to_le_bytes())?;
+    writer.write_all(&(cols as u64).to_le_bytes())?;
+    Ok(())
+}
+
+/// Writes a header up to its extents: magic, version, kind and element tag.
+fn write_prefix<W: Write, T: Storable>(writer: &mut W, kind: u8) -> Result<(), Error> {
     let tag = tag_of::<T>();
     let length = u8::try_from(tag.len())
         .map_err(|_| Error::format(format!("element tag is {} bytes, limit 255", tag.len())))?;
@@ -216,14 +236,12 @@ fn write_header<W: Write, T: Storable>(
     writer.write_all(&MAGIC)?;
     writer.write_all(&[VERSION, kind, length])?;
     writer.write_all(&tag)?;
-    writer.write_all(&(rows as u64).to_le_bytes())?;
-    writer.write_all(&(cols as u64).to_le_bytes())?;
     Ok(())
 }
 
-/// Reads a header, validates everything that is not a shape, and returns the
-/// stored extents for the caller to build a tensor of.
-fn read_header<Rd: Read, T: Storable>(reader: &mut Rd, kind: u8) -> Result<(usize, usize), Error> {
+/// Reads a header up to its extents, validates everything that is not a shape,
+/// and returns the stored kind, which must be one of `kinds`.
+fn read_prefix<Rd: Read, T: Storable>(reader: &mut Rd, kinds: &[u8]) -> Result<u8, Error> {
     let mut magic = [0u8; 4];
     reader.read_exact(&mut magic)?;
     if magic != MAGIC {
@@ -243,10 +261,10 @@ fn read_header<Rd: Read, T: Storable>(reader: &mut Rd, kind: u8) -> Result<(usiz
         )));
     }
 
-    if stored_kind != kind {
+    if !kinds.contains(&stored_kind) {
         return Err(Error::format(format!(
             "expected a {}, found a {}",
-            name_of_kind(kind),
+            name_of_kind(kinds[0]),
             name_of_kind(stored_kind)
         )));
     }
@@ -261,22 +279,33 @@ fn read_header<Rd: Read, T: Storable>(reader: &mut Rd, kind: u8) -> Result<(usiz
             describe(&expected)
         )));
     }
+    Ok(stored_kind)
+}
 
-    let mut extents = [0u8; 16];
-    reader.read_exact(&mut extents)?;
-    let stored_rows = u64::from_le_bytes(extents[..8].try_into().expect("8 bytes"));
-    let stored_cols = u64::from_le_bytes(extents[8..].try_into().expect("8 bytes"));
+/// Reads one stored extent.
+fn read_extent<Rd: Read>(reader: &mut Rd) -> Result<usize, Error> {
+    let mut bytes = [0u8; 8];
+    reader.read_exact(&mut bytes)?;
+    let stored = u64::from_le_bytes(bytes);
+    usize::try_from(stored).map_err(|_| too_large(stored))
+}
 
-    let (rows, cols) = (
-        usize::try_from(stored_rows).map_err(|_| too_large(stored_rows))?,
-        usize::try_from(stored_cols).map_err(|_| too_large(stored_cols))?,
-    );
+/// Reads the rows and columns of a vector or matrix header.
+fn read_extents<Rd: Read>(reader: &mut Rd) -> Result<(usize, usize), Error> {
+    let (rows, cols) = (read_extent(reader)?, read_extent(reader)?);
     rows.checked_mul(cols).ok_or_else(|| {
         Error::format(format!(
             "stored tensor is {rows}\u{d7}{cols}, which overflows this platform's address space"
         ))
     })?;
     Ok((rows, cols))
+}
+
+/// Reads a header, validates everything that is not a shape, and returns the
+/// stored extents for the caller to build a tensor of.
+fn read_header<Rd: Read, T: Storable>(reader: &mut Rd, kind: u8) -> Result<(usize, usize), Error> {
+    read_prefix::<Rd, T>(reader, &[kind])?;
+    read_extents(reader)
 }
 
 fn too_large(extent: u64) -> Error {
@@ -289,6 +318,7 @@ fn name_of_kind(kind: u8) -> &'static str {
     match kind {
         KIND_VECTOR => "vector",
         KIND_MATRIX => "matrix",
+        KIND_TENSOR => "tensor",
         _ => "tensor of unknown kind",
     }
 }
@@ -370,6 +400,78 @@ impl<T: Storable> Matrix<T, Host> {
     }
 
     /// Reads a matrix back from a file written by [`save`](Self::save).
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, Error> {
+        Self::read_from(BufReader::new(File::open(path)?))
+    }
+}
+
+impl<T: Storable> Tensor<T, Host> {
+    /// Writes this tensor to `writer`: its shape, then its elements in
+    /// row-major order.
+    ///
+    /// As with [`Vector::write_to`], wrap an unbuffered sink.
+    pub fn write_to<W: Write>(&self, mut writer: W) -> Result<(), Error> {
+        write_prefix::<W, T>(&mut writer, KIND_TENSOR)?;
+        writer.write_all(&(self.rank() as u64).to_le_bytes())?;
+        for &extent in self.shape() {
+            writer.write_all(&(extent as u64).to_le_bytes())?;
+        }
+        for value in self.data() {
+            value.write_value(&mut writer)?;
+        }
+        Ok(())
+    }
+
+    /// Reads a tensor of this element type, taking its shape from the file.
+    ///
+    /// A file written by [`Vector::write_to`] or [`Matrix::write_to`] reads as
+    /// a tensor of one or two axes. Fails with [`Error::Format`] if the stored
+    /// element type differs, or the stored rank exceeds
+    /// [`MAX_RANK`].
+    pub fn read_from<Rd: Read>(mut reader: Rd) -> Result<Self, Error> {
+        let kind = read_prefix::<Rd, T>(&mut reader, &[KIND_TENSOR, KIND_VECTOR, KIND_MATRIX])?;
+        let shape = match kind {
+            KIND_VECTOR => vec![read_extents(&mut reader)?.0],
+            KIND_MATRIX => {
+                let (rows, cols) = read_extents(&mut reader)?;
+                vec![rows, cols]
+            }
+            _ => {
+                let rank = read_extent(&mut reader)?;
+                if rank > MAX_RANK {
+                    return Err(Error::format(format!(
+                        "stored tensor has {rank} axes; a tensor may have at most {MAX_RANK}"
+                    )));
+                }
+                (0..rank)
+                    .map(|_| read_extent(&mut reader))
+                    .collect::<Result<Vec<_>, _>>()?
+            }
+        };
+        let count = shape
+            .iter()
+            .try_fold(1usize, |count, &extent| count.checked_mul(extent))
+            .ok_or_else(|| {
+                Error::format(format!(
+                    "stored tensor of shape {shape:?} overflows this platform's address space"
+                ))
+            })?;
+        let mut data = Vec::with_capacity(count.min(1 << 20));
+        for _ in 0..count {
+            data.push(T::read_value(&mut reader)?);
+        }
+        Ok(Tensor::from_vec(&shape, data))
+    }
+
+    /// Writes this tensor to a file, replacing it if it exists.
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<(), Error> {
+        let mut writer = BufWriter::new(File::create(path)?);
+        self.write_to(&mut writer)?;
+        writer.flush()?;
+        Ok(())
+    }
+
+    /// Reads a tensor back from a file written by [`save`](Self::save).
     pub fn load(path: impl AsRef<Path>) -> Result<Self, Error> {
         Self::read_from(BufReader::new(File::open(path)?))
     }
