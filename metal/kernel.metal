@@ -103,6 +103,98 @@ template [[host_name("matmul_tiled_" #S)]] kernel void matmul_tiled<T>(        \
     constant uint&, constant uint&, constant uint&, uint2, uint2);
 FOR_EACH_ELEMENT(INSTANTIATE_MATMUL)
 
+// Matrix–vector products, which as matrix products have a single row or
+// column of output and so too few tiles to occupy the GPU.
+//
+// `y = M·x`, plus `y` if accumulating: one SIMD group per row of `M`, its
+// lanes reading the row a stride apart so that together they read whole
+// cache lines, then summing their partial results.
+template <typename T>
+kernel void matvec_rows(
+    device const T* M     [[buffer(0)]],
+    device const T* x     [[buffer(1)]],
+    device T* y           [[buffer(2)]],
+    constant uint& rows   [[buffer(3)]],
+    constant uint& cols   [[buffer(4)]],
+    constant uint& accumulate [[buffer(5)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint simd [[simdgroup_index_in_threadgroup]],
+    uint simds [[simdgroups_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    uint row = group * simds + simd;
+    if (row >= rows) {
+        return;
+    }
+    device const T* line = M + ulong(row) * cols;
+    float acc = 0.0f;
+    for (uint c = lane; c < cols; c += 32) {
+        acc += float(line[c]) * float(x[c]);
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) {
+        y[row] = T(accumulate ? float(y[row]) + acc : acc);
+    }
+}
+
+// `y = v·M` in two passes. The first sums each column over a band of rows —
+// adjacent threads take adjacent columns, so reads are whole cache lines — and
+// the second adds the bands of each column in order, so the result does not
+// depend on how the work was scheduled.
+template <typename T>
+kernel void vecmat_bands(
+    device const T* v        [[buffer(0)]],
+    device const T* M        [[buffer(1)]],
+    device float* partial    [[buffer(2)]],
+    constant uint& rows      [[buffer(3)]],
+    constant uint& cols      [[buffer(4)]],
+    constant uint& band      [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint col = gid.x;
+    if (col >= cols) {
+        return;
+    }
+    uint first = gid.y * band;
+    uint last = min(first + band, rows);
+    float acc = 0.0f;
+    for (uint r = first; r < last; r++) {
+        acc += float(v[r]) * float(M[ulong(r) * cols + col]);
+    }
+    partial[ulong(gid.y) * cols + col] = acc;
+}
+
+template <typename T>
+kernel void vecmat_finish(
+    device const float* partial [[buffer(0)]],
+    device T* y                 [[buffer(1)]],
+    constant uint& cols         [[buffer(2)]],
+    constant uint& bands        [[buffer(3)]],
+    constant uint& accumulate   [[buffer(4)]],
+    uint col [[thread_position_in_grid]])
+{
+    if (col >= cols) {
+        return;
+    }
+    float acc = 0.0f;
+    for (uint b = 0; b < bands; b++) {
+        acc += partial[ulong(b) * cols + col];
+    }
+    y[col] = T(accumulate ? float(y[col]) + acc : acc);
+}
+
+#define INSTANTIATE_GEMV(T, S)                                                 \
+template [[host_name("matvec_rows_" #S)]] kernel void matvec_rows<T>(          \
+    device const T*, device const T*, device T*, constant uint&,               \
+    constant uint&, constant uint&, uint, uint, uint, uint);                   \
+template [[host_name("vecmat_bands_" #S)]] kernel void vecmat_bands<T>(        \
+    device const T*, device const T*, device float*, constant uint&,           \
+    constant uint&, constant uint&, uint2);                                    \
+template [[host_name("vecmat_finish_" #S)]] kernel void vecmat_finish<T>(      \
+    device const float*, device T*, constant uint&, constant uint&,            \
+    constant uint&, uint);
+FOR_EACH_ELEMENT(INSTANTIATE_GEMV)
+
 // `+ - * /` in the element type. There is no remainder kernel; the host keeps
 // `BinaryOp::Rem` for itself.
 template <typename T>

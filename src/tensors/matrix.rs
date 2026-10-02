@@ -551,11 +551,7 @@ impl<T: Coefficient> Matrix<T, Host> {
     pub fn transpose(&self) -> Matrix<T, Host> {
         let (rows, cols) = (self.rows, self.cols);
         let mut out = vec![T::zero(); rows * cols];
-        for i in 0..rows {
-            for j in 0..cols {
-                out[j * rows + i] = self.data[i * cols + j];
-            }
-        }
+        transpose_into(&self.data, rows, cols, &mut out);
         Matrix::from_flat(cols, rows, out)
     }
 
@@ -859,5 +855,50 @@ impl<T: Coefficient> Matrix<T, Host> {
                 .map(|(&a, &b)| f(a, b))
                 .collect::<Vec<_>>(),
         )
+    }
+}
+
+/// Elements of a transpose worth giving a thread of their own.
+const TRANSPOSE_GRAIN: usize = 64 * 1024;
+
+/// Write the `cols × rows` transpose of the `rows × cols` matrix `data` into
+/// `out`.
+///
+/// Element by element, either the reads or the writes stride across the whole
+/// matrix and touch a fresh cache line each time. A square block at a time,
+/// the block's lines stay in cache until every element on them has been used.
+/// Bands of output rows run on separate threads when the matrix is large.
+fn transpose_into<T: Copy + 'static>(data: &[T], rows: usize, cols: usize, out: &mut [T]) {
+    const BLOCK: usize = 32;
+    assert_eq!(data.len(), rows * cols);
+    assert_eq!(out.len(), rows * cols);
+    // Output rows `band` — input columns — into `out`, which holds just them.
+    let transpose_band = |band: std::ops::Range<usize>, out: &mut [T]| {
+        for j0 in band.clone().step_by(BLOCK) {
+            let j1 = (j0 + BLOCK).min(band.end);
+            for i0 in (0..rows).step_by(BLOCK) {
+                let i1 = (i0 + BLOCK).min(rows);
+                for j in j0..j1 {
+                    let row = &mut out[(j - band.start) * rows..][i0..i1];
+                    for (slot, i) in row.iter_mut().zip(i0..i1) {
+                        *slot = data[i * cols + j];
+                    }
+                }
+            }
+        }
+    };
+    if !crate::parallel::plain_float::<T>() || rows * cols < 2 * TRANSPOSE_GRAIN || rows == 0 {
+        transpose_band(0..cols, out);
+        return;
+    }
+    let base = crate::parallel::Shared(out.as_mut_ptr());
+    let band_rows = TRANSPOSE_GRAIN.div_ceil(rows);
+    // SAFETY: `T` is a plain float, and each band writes only its own rows of
+    // `out`.
+    unsafe {
+        crate::parallel::for_ranges_unchecked(cols, band_rows, BLOCK, |band| {
+            let out = std::slice::from_raw_parts_mut(base.at(band.start * rows), band.len() * rows);
+            transpose_band(band, out);
+        });
     }
 }

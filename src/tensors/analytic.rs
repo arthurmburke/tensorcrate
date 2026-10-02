@@ -81,7 +81,7 @@ impl<T: Real> Vector<T, Host> {
     /// ```
     pub fn analytic(&self, f: Analytic) -> Self {
         let mut out = vec![T::zero(); self.len()];
-        crate::vmath::unary_slice(f, self.data(), &mut out);
+        crate::vmath::unary_parallel(f, self.data(), &mut out);
         Vector::new(out)
     }
 }
@@ -90,7 +90,7 @@ impl<T: Real> Matrix<T, Host> {
     /// Apply an analytic function to every element; see [`Vector::analytic`].
     pub fn analytic(&self, f: Analytic) -> Self {
         let mut out = vec![T::zero(); self.rows() * self.cols()];
-        crate::vmath::unary_slice(f, self.data(), &mut out);
+        crate::vmath::unary_parallel(f, self.data(), &mut out);
         Matrix::from_flat(self.rows(), self.cols(), out)
     }
 }

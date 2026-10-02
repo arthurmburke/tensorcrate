@@ -8,8 +8,10 @@ use objc2_metal::{MTLBuffer, MTLComputeCommandEncoder, MTLComputePipelineState, 
 
 use super::MetalElement;
 use super::codegen;
-use super::device::with_gpu;
-use super::encode::{TENSOROPS_TILE_COLS, TENSOROPS_TILE_ROWS, TILE, dispatch_1d};
+use super::device::{product_tile, with_gpu};
+use super::encode::{
+    TENSOROPS_TILE_COLS, TENSOROPS_TILE_ROWS, TILE, dispatch_1d, encode_vecmat_finish, vecmat_bands,
+};
 use super::sync::{compute, queued};
 
 /// The iteration space and length of a fused program, as the shader's
@@ -62,7 +64,7 @@ pub(crate) fn fused_elementwise<T: MetalElement>(
         // A program seen before runs as a kernel of its own, reading its
         // constants from slot 0; otherwise the interpreter reads the program.
         let specialized = codegen::enabled()
-            .then(|| gpu.specialized::<T>(code))
+            .then(|| gpu.specialized::<T>(code, codegen::Kernel::Elementwise))
             .flatten();
         match &specialized {
             Some(pipeline) => {
@@ -140,9 +142,32 @@ pub(crate) fn matmul_epilogue<T: MetalElement>(
         let kernels = gpu.kernels::<T>();
         let encoder = compute(gpu)?;
         let tensorops = gpu.tensorops_epilogue::<T>();
-        encoder.setComputePipelineState(tensorops.unwrap_or(&kernels.matmul_epilogue));
+        // A program seen before runs compiled into a product kernel of its own,
+        // in the tile that suits the product, reading its constants from slot 0.
+        let specialized = tensorops.filter(|_| codegen::enabled()).and_then(|_| {
+            let (relaxed, (_, tile)) = product_tile::<T>(m, n);
+            let kernel = codegen::Kernel::Epilogue { tile, relaxed };
+            Some((gpu.specialized::<T>(code, kernel)?, tile))
+        });
+        let constants;
+        match &specialized {
+            Some((pipeline, _)) => {
+                constants = codegen::constants(code);
+                let bytes = std::mem::size_of_val(constants.as_slice()).max(4);
+                encoder.setComputePipelineState(pipeline);
+                unsafe {
+                    let first = constants.first().unwrap_or(&0.0);
+                    encoder.setBytes_length_atIndex(NonNull::from(first).cast(), bytes, 0);
+                }
+            }
+            None => {
+                encoder.setComputePipelineState(tensorops.unwrap_or(&kernels.matmul_epilogue));
+                unsafe {
+                    encoder.setBytes_length_atIndex(NonNull::from(&code[0]).cast(), code_bytes, 0);
+                }
+            }
+        }
         unsafe {
-            encoder.setBytes_length_atIndex(NonNull::from(&code[0]).cast(), code_bytes, 0);
             encoder.setBytes_length_atIndex(
                 NonNull::from(&shape).cast(),
                 size_of::<FusedShape>(),
@@ -160,8 +185,21 @@ pub(crate) fn matmul_epilogue<T: MetalElement>(
                 encoder.setBuffer_offset_atIndex(Some(buffer), 0, 4 + FUSED_INPUT_SLOTS + slot);
             }
         }
-        match tensorops {
-            Some(pipeline) => encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        match (&specialized, tensorops) {
+            (Some((pipeline, (rows, cols, groups))), _) => encoder
+                .dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize {
+                        width: n.div_ceil(*cols),
+                        height: m.div_ceil(*rows),
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: pipeline.threadExecutionWidth() * groups,
+                        height: 1,
+                        depth: 1,
+                    },
+                ),
+            (None, Some(pipeline)) => encoder.dispatchThreadgroups_threadsPerThreadgroup(
                 MTLSize {
                     width: n.div_ceil(TENSOROPS_TILE_COLS),
                     height: m.div_ceil(TENSOROPS_TILE_ROWS),
@@ -173,7 +211,7 @@ pub(crate) fn matmul_epilogue<T: MetalElement>(
                     depth: 1,
                 },
             ),
-            None => encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            (None, None) => encoder.dispatchThreadgroups_threadsPerThreadgroup(
                 MTLSize {
                     width: n.div_ceil(TILE),
                     height: m.div_ceil(TILE),
@@ -187,5 +225,99 @@ pub(crate) fn matmul_epilogue<T: MetalElement>(
             ),
         }
         queued(gpu, m.saturating_mul(k).saturating_mul(n) / 128)
+    })
+}
+
+/// Encode the sums of a fused program's one output along each row (`rows`)
+/// or down each column into `y`, without storing the output — once the
+/// program has run often enough to have a kernel of its own. `None` before
+/// then, leaving the caller to run the program and sum what it stores.
+pub(crate) fn fused_sum<T: MetalElement>(
+    code: &[crate::tensors::fused::Encoded],
+    (rows, cols): (usize, usize),
+    inputs: &[&ProtocolObject<dyn MTLBuffer>],
+    rows_axis: bool,
+    y: &ProtocolObject<dyn MTLBuffer>,
+) -> Option<()> {
+    if rows == 0 || cols == 0 || code.is_empty() || inputs.len() > FUSED_INPUT_SLOTS {
+        return None;
+    }
+    let shape = FusedShape {
+        rows: u32::try_from(rows).ok()?,
+        cols: u32::try_from(cols).ok()?,
+        count: u32::try_from(code.len()).ok()?,
+    };
+    let kernel = if rows_axis {
+        codegen::Kernel::RowSums
+    } else {
+        codegen::Kernel::ColumnSums
+    };
+    let filler = inputs.first().copied().unwrap_or(y);
+    with_gpu(|gpu| {
+        let pipeline = codegen::enabled()
+            .then(|| gpu.specialized::<T>(code, kernel))
+            .flatten()?;
+        let constants = codegen::constants(code);
+        let bind = |encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>| unsafe {
+            let first = constants.first().unwrap_or(&0.0);
+            let bytes = std::mem::size_of_val(constants.as_slice()).max(4);
+            encoder.setBytes_length_atIndex(NonNull::from(first).cast(), bytes, 0);
+            encoder.setBytes_length_atIndex(
+                NonNull::from(&shape).cast(),
+                size_of::<FusedShape>(),
+                1,
+            );
+            for slot in 0..FUSED_INPUT_SLOTS {
+                let buffer = inputs.get(slot).copied().unwrap_or(filler);
+                encoder.setBuffer_offset_atIndex(Some(buffer), 0, 2 + slot);
+            }
+        };
+        let work = rows.saturating_mul(cols).saturating_mul(code.len().div_ceil(4));
+        if rows_axis {
+            const ROWS_PER_GROUP: usize = 8;
+            let encoder = compute(gpu)?;
+            encoder.setComputePipelineState(&pipeline);
+            bind(&encoder);
+            unsafe { encoder.setBuffer_offset_atIndex(Some(y), 0, 18) };
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: rows.div_ceil(ROWS_PER_GROUP),
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: pipeline.threadExecutionWidth() * ROWS_PER_GROUP,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            return queued(gpu, work);
+        }
+        // The bands of rows each thread sums, as a vector–matrix product
+        // splits them, and the same pass adding them up.
+        let (bands, band) = vecmat_bands(rows, cols);
+        let partial = super::MetalBuffer::<f32>::allocate(bands.checked_mul(cols)?)?;
+        let band_u32 = u32::try_from(band).ok()?;
+        let encoder = compute(gpu)?;
+        encoder.setComputePipelineState(&pipeline);
+        bind(&encoder);
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(partial.raw()), 0, 18);
+            encoder.setBytes_length_atIndex(NonNull::from(&band_u32).cast(), 4, 19);
+        }
+        encoder.dispatchThreads_threadsPerThreadgroup(
+            MTLSize {
+                width: cols,
+                height: bands,
+                depth: 1,
+            },
+            MTLSize {
+                width: 64.min(cols),
+                height: 1,
+                depth: 1,
+            },
+        );
+        queued(gpu, work)?;
+        encode_vecmat_finish::<T>(gpu, partial.raw(), y, cols, bands, false)
     })
 }

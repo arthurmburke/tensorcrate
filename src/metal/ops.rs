@@ -3,22 +3,22 @@
 //! run the CPU kernel instead.
 
 use half::{bf16, f16};
-use objc2::runtime::ProtocolObject;
-use objc2_metal::MTLComputePipelineState;
 
-use crate::tensors::{Analytic, Axis, BinaryOp, Compare, Family, Reduce, SortOrder, Statistic};
+use crate::tensors::{
+    Analytic, Axis, BinaryOp, Compare, Family, Reduce, SortOrder, Statistic, Transposed,
+};
 
 use super::MetalElement;
 use super::buffer::MetalBuffer;
-use super::device::{TensorOpsPipelines, with_gpu};
+use super::device::{Gpu, Operands, Pipeline, Tile, with_gpu};
 use super::encode::{
     REDUCE_GROUP, encode_axis_distribution, encode_axis_moments, encode_bitonic_stage,
     encode_broadcast, encode_clamp, encode_compare, encode_compare_scalar, encode_concat,
     encode_convert, encode_correlate, encode_deviation, encode_distribution, encode_elementwise,
-    encode_fft, encode_flip, encode_hmerge, encode_matmul, encode_matrix_stack, encode_pad,
-    encode_power, encode_power_scalar, encode_reduce, encode_scan, encode_sort_prepare,
-    encode_stack, encode_tensorops_matmul, encode_transpose, encode_unary, encode_unary_dual,
-    encode_vmerge,
+    encode_fft, encode_flip, encode_gemm, encode_hmerge, encode_matmul, encode_matrix_stack,
+    encode_matvec, encode_pad, encode_power, encode_power_scalar, encode_reduce, encode_scan,
+    encode_sort_prepare, encode_stack, encode_transpose, encode_unary, encode_unary_dual,
+    encode_vecmat, encode_vmerge, vecmat_bands,
 };
 
 impl<T: MetalElement> MetalBuffer<T> {
@@ -37,8 +37,44 @@ impl<T: MetalElement> MetalBuffer<T> {
             return Self::from_slice(&vec![T::zero(); output_len]);
         }
         let output = Self::allocate(output_len)?;
-        with_gpu(|gpu| encode_matmul::<T>(gpu, &self.raw, &rhs.raw, &output.raw, m, k, n, false))?;
+        self.product_into(rhs, &output, (m, k, n), false)?;
         Some(output)
+    }
+
+    /// Encode `target = A·B`, or `target += A·B`: a product with one column or
+    /// one row of output on the matrix–vector kernels, which spread it across
+    /// the GPU where the tiles of a product would not; any other on the
+    /// product kernels.
+    fn product_into(
+        &self,
+        rhs: &Self,
+        target: &Self,
+        (m, k, n): (usize, usize, usize),
+        accumulate: bool,
+    ) -> Option<()> {
+        if n == 1 {
+            return with_gpu(|gpu| {
+                encode_matvec::<T>(gpu, &self.raw, &rhs.raw, &target.raw, (m, k), accumulate)
+            });
+        }
+        if m == 1 {
+            let (bands, _) = vecmat_bands(k, n);
+            let partial = MetalBuffer::<f32>::allocate(bands.checked_mul(n)?)?;
+            return with_gpu(|gpu| {
+                encode_vecmat::<T>(
+                    gpu,
+                    &self.raw,
+                    &rhs.raw,
+                    &partial.raw,
+                    &target.raw,
+                    (k, n),
+                    accumulate,
+                )
+            });
+        }
+        with_gpu(|gpu| {
+            encode_matmul::<T>(gpu, &self.raw, &rhs.raw, &target.raw, m, k, n, accumulate)
+        })
     }
 
     /// Transpose a row-major `rows × cols` matrix into a new shared buffer.
@@ -77,7 +113,47 @@ impl<T: MetalElement> MetalBuffer<T> {
         if target.len == 0 || k == 0 {
             return Some(());
         }
-        with_gpu(|gpu| encode_matmul::<T>(gpu, &self.raw, &rhs.raw, &target.raw, m, k, n, true))
+        self.product_into(rhs, target, (m, k, n), true)
+    }
+
+    /// `target += op(A)·op(B)` for an `m × n` target, where `op` transposes
+    /// the operand `transposed` names, read where it lies: `A` is stored
+    /// `k × m` when it is the one transposed, `B` `n × k`.
+    ///
+    /// `None` without TensorOps, whose general product is what reads an
+    /// operand transposed; the caller then transposes it into a copy.
+    pub(crate) fn matmul_transposed_accumulate(
+        &self,
+        rhs: &Self,
+        target: &mut Self,
+        transposed: Transposed,
+        (m, k, n): (usize, usize, usize),
+    ) -> Option<()> {
+        if self.len != m.checked_mul(k)? || rhs.len != k.checked_mul(n)? {
+            return None;
+        }
+        if target.len != m.checked_mul(n)? {
+            return None;
+        }
+        if target.len == 0 || k == 0 {
+            return Some(());
+        }
+        let operands = match transposed {
+            Transposed::Left => Operands::LeftTransposed,
+            Transposed::Right => Operands::RightTransposed,
+        };
+        with_gpu(|gpu| {
+            let (pipeline, tile) = gpu.gemm::<T>(operands, true, m, n)?;
+            encode_gemm(
+                gpu,
+                &pipeline,
+                &self.raw,
+                &rhs.raw,
+                &target.raw,
+                (m, k, n),
+                tile,
+            )
+        })
     }
 
     /// Apply an analytic function elementwise.
@@ -690,7 +766,9 @@ impl MetalBuffer<f16> {
         k: usize,
         n: usize,
     ) -> Option<MetalBuffer<f32>> {
-        matmul_tensorops(self, rhs, m, k, n, 0.0, |pipelines| &pipelines.f16_f32)
+        matmul_tensorops(self, rhs, m, k, n, 0.0, |gpu| {
+            gpu.gemm_widening("f16", m, n)
+        })
     }
 }
 
@@ -703,7 +781,9 @@ impl MetalBuffer<bf16> {
         k: usize,
         n: usize,
     ) -> Option<MetalBuffer<f32>> {
-        matmul_tensorops(self, rhs, m, k, n, 0.0, |pipelines| &pipelines.bf16_f32)
+        matmul_tensorops(self, rhs, m, k, n, 0.0, |gpu| {
+            gpu.gemm_widening("bf16", m, n)
+        })
     }
 }
 
@@ -714,7 +794,7 @@ pub(super) fn matmul_tensorops<T: Copy + 'static, U: Copy + 'static>(
     k: usize,
     n: usize,
     zero: U,
-    pipeline: impl Fn(&TensorOpsPipelines) -> &ProtocolObject<dyn MTLComputePipelineState>,
+    pipeline: impl Fn(&Gpu) -> Option<(Pipeline, Tile)>,
 ) -> Option<MetalBuffer<U>> {
     if left.len != m.checked_mul(k)? || right.len != k.checked_mul(n)? {
         return None;
@@ -728,8 +808,16 @@ pub(super) fn matmul_tensorops<T: Copy + 'static, U: Copy + 'static>(
     }
     let output = MetalBuffer::<U>::allocate(output_len)?;
     with_gpu(|gpu| {
-        let state = pipeline(gpu.tensorops.as_ref()?);
-        encode_tensorops_matmul(gpu, state, &left.raw, &right.raw, &output.raw, m, k, n)
+        let (state, tile) = pipeline(gpu)?;
+        encode_gemm(
+            gpu,
+            &state,
+            &left.raw,
+            &right.raw,
+            &output.raw,
+            (m, k, n),
+            tile,
+        )
     })?;
     Some(output)
 }

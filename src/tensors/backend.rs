@@ -760,6 +760,26 @@ mod gpu {
             a.matmul_accumulate(b, target, m, k, n)
         }
 
+        /// `target += op(A)·op(B)`, reading the operand `transposed` names
+        /// transposed where it lies — see
+        /// [`MetalBuffer::matmul_transposed_accumulate`](crate::metal::MetalBuffer).
+        ///
+        /// `None` when any of the three is not device-resident, or the GPU
+        /// cannot read an operand transposed.
+        pub(crate) fn matmul_transposed_accumulate(
+            &self,
+            rhs: &Self,
+            target: &mut Self,
+            transposed: crate::tensors::Transposed,
+            shape: (usize, usize, usize),
+        ) -> Option<()> {
+            let (a, b) = (self.device()?, rhs.device()?);
+            let Residency::Device(target) = &mut target.0 else {
+                return None;
+            };
+            a.matmul_transposed_accumulate(b, target, transposed, shape)
+        }
+
         /// Analytic function applied to a value/tangent pair, in one dispatch.
         pub(crate) fn unary_dual(&self, tangent: &Self, op: Analytic) -> Option<(Self, Self)> {
             let (value, tangent) = self.device()?.unary_dual(tangent.device()?, op)?;

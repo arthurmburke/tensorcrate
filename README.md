@@ -336,7 +336,13 @@ assert_eq!(x.grad().to_vec(), [2.0, 4.0, 6.0]);
 ```
 
 Create a fresh tape for each optimizer step. A tape represents one evaluation; reusing it across
-steps keeps appending graph nodes. Forward-mode drivers and dual tensors live in
+steps keeps appending graph nodes.
+
+A scalar reduced from a tensor — a `sum`, `dot` or `frobenius_dot`, usually the loss — is not read
+until something needs its value: `loss.value()`, or a backward rule whose derivative depends on
+it. On `Metal` reading it waits for the GPU, and a step that only calls `loss.backward()` never
+does, so training steps queue back to back. Read the loss every few steps rather than every step
+when it is only for logging. Forward-mode drivers and dual tensors live in
 `tensorcrate::tensors::dual`; they are useful for directional derivatives and functions with few
 inputs and many outputs. Reverse-mode gradient and Jacobian helpers live in
 `tensorcrate::tensors::tape`.
@@ -585,6 +591,14 @@ tier of `Host`, not a separate storage type. On macOS, Host `f32` and `f64` matr
 existing 512 multiply-accumulate dispatch threshold use Accelerate SGEMM or DGEMM before the SIMD
 path is considered.
 
+Long host operations are split across the CPU's cores: elementwise arithmetic and comparisons,
+the analytic functions, transposes, fused programs and the kernels `math!` fuses. A pool of worker
+threads starts on first use; a tensor too short to be worth it — about 64K elements for cheap
+arithmetic, a few thousand for a transcendental — stays on the calling thread, where it is likely
+still in cache. Every split kernel computes each element on its own, so results are the same bit
+for bit on any number of cores. Reductions are not split, since a sum's rounding would then depend
+on the thread count. On an M5 Max a GELU over 16M `f32`s takes 2.1 ms against 20 ms on one core.
+
 ### Element types
 
 The backend-generic layers are written once over any `Real` element type, `f32`, `f64`, `f16` or
@@ -671,8 +685,13 @@ assert_eq!(result, host.matmul(&host).matmul(&host));
 
 Important backend details:
 
-- On M5/Apple10 GPUs, ordinary `f32` matrix multiplication uses Metal 4 TensorOps. Older GPUs use
-  the existing tiled `f32` kernel. Fused `matmul_add` also retains the tiled path.
+- On M5/Apple10 GPUs, `f32` matrix products use Metal 4 TensorOps: plain products, accumulating
+  ones (`matmul_add`), and the products with one operand read transposed that reverse mode's
+  backward pass needs (`Kernels::matmul_transposed_add`), so no transposed copy is made. Each
+  threadgroup computes a tile whose size depends on the output's: a product with a small output
+  gets smaller tiles so it still occupies every GPU core, which doubles the speed of a chain of
+  products from 256³ to 1024³. Matrix–vector products have kernels of their own. Older GPUs use
+  the tiled `f32` kernel.
 - Operations are queued, not waited for: they are encoded into a shared command buffer that is
   committed in batches, and the CPU blocks only when it reads a result (about 140 µs for the round
   trip). A chain that stays on the device therefore costs a few microseconds per operation; one
@@ -718,13 +737,13 @@ On a pre-M5 Mac, the compact APIs transparently convert through the Host backend
 types and numerical format stay the same.
 
 On M5 the matrix units are much faster when they are allowed to work below full `f32` accuracy.
-Large products measured on an M5 Max, in TFLOP/s:
+Large products measured on an M5 Max, queued back to back, in TFLOP/s:
 
-| product                                   | 1024³ | 2048³ | 4096³ | typical error  |
-|-------------------------------------------|------:|------:|------:|---------------:|
-| `f32`, exact (the default)                |   6.5 |  11.8 |  15.5 |           1e-6 |
-| `f32`, `MatmulPrecision::Relaxed`         |  19.7 |  23.9 |  23.7 |           3e-3 |
-| `f16` operands, `matmul_f32`              |  25.0 |  44.0 |  61.1 |           3e-3 |
+| product                                   | 1024³ | 2048³ | typical error  |
+|-------------------------------------------|------:|------:|---------------:|
+| `f32`, exact (the default)                |  14.1 |  15.0 |           1e-6 |
+| `f32`, `MatmulPrecision::Relaxed`         |  31.6 |  27.2 |           3e-3 |
+| `f16` operands, `matmul_f32`              |  43.3 |  49.9 |           3e-3 |
 
 The error column is relative to the size of the results: reduced precision errs in proportion to
 the products being summed, so an element whose terms cancel to near zero carries the same absolute
@@ -789,7 +808,9 @@ assert_eq!(y[0].as_slice(), [2.0, 1.0]);
   `fused::with_algebra(Algebra::Exact, || ...)` allows only rewrites that leave every bit as
   written. Either way a program fused and the same program run unfused agree exactly on the host.
 - On `Host`, a program runs as a tile interpreter over the existing SIMD kernels, reading inputs
-  and writing outputs in place. On `Metal`, a program seen once runs on a bytecode interpreter;
+  and writing outputs in place, with ranges of tiles on separate cores for a long tensor; a program
+  of a single operation runs as that operation's kernel. On `Metal`, a program seen once runs on a
+  bytecode interpreter;
   from its second run it is compiled into a kernel of its own — straight-line code with every
   operation and storage type fixed — and cached. A 9-operation GELU over a million elements takes
   11 µs that way on an M5 Max, against 158 µs interpreted. Like the other shaders these use fast
@@ -805,8 +826,14 @@ assert_eq!(y[0].as_slice(), [2.0, 1.0]);
   `a·b` to the program as its input 0, so a dense layer's bias and activation cost nothing beyond
   the product. On `Metal` the product and the program are one dispatch (on TensorOps where the
   GPU has it) and the product is never written to memory; on `Host` the result equals the product
-  followed by the program, bit for bit. A `relu(X·W + b)` layer of 512×1024 by 1024×1024 takes
-  0.17 ms this way on an M5 Max, against 0.3 ms for the product and a separate fused program.
+  followed by the program, bit for bit. On `Metal` the epilogue is compiled into the product's
+  kernel from a program's second run, like any other program. A `relu(X·W + b)` layer of 512×1024
+  by 1024×1024 takes 73 µs this way on an M5 Max, against 147 µs with the epilogue interpreted.
+- `program.run_sum(shape, &inputs, axis)` sums a program's one output along each row or down each
+  column without keeping it. On the host it is the program followed by the sums; on `Metal` it is
+  one kernel, so a softmax is two passes over its input — `exp(x)`'s sums, then `exp(x) / sums` —
+  with `exp(x)` never written to memory. A column softmax over 4096×512 takes 32 µs that way on an
+  M5 Max, against 188 µs as an `exp` kernel, a product with ones and a fused division.
 - For debugging: `println!("{program}")` prints a disassembly, `program.trace(...)` returns every
   intermediate, and `fused::with_mode(Mode::Unfused, || ...)` turns fusion off on the current
   thread, so a suspected fusion problem can be confirmed or ruled out without changing the code.
@@ -870,7 +897,9 @@ step — and compares the ways the crate can run each one:
 - **scalar, SIMD and Host API**: a plain loop, the architecture kernel called directly, and the
   tensor method, which dispatches through Accelerate and SIMD and allocates its result;
 - **Host and Metal**: launch latency (waiting after every call), pipelined launches (waiting once
-  per batch), and the cost of uploading and downloading around each call.
+  per batch), and the cost of uploading and downloading around each call;
+- **threads and compilation**: host rows run again on one thread, and Metal fused rows again on the
+  bytecode interpreter, to show what splitting across cores and compiling each program buy.
 
 ```console
 cargo bench --bench nn_ops                       # every size

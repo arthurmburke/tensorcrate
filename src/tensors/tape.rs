@@ -81,12 +81,12 @@
 //!
 //! Everything placed on the tape is a leaf whose gradient can be read
 
-use std::cell::RefCell;
+use std::cell::{Cell, OnceCell, RefCell};
 use std::marker::PhantomData;
 use std::ops::{Add, Div, Mul, Rem, Sub};
 use std::rc::Rc;
 
-use super::{Analytic, Backend, BinaryOp, Compare, Host, Kernels, Matrix, Vector};
+use super::{Analytic, Backend, BinaryOp, Compare, Host, Kernels, Matrix, Transposed, Vector};
 use crate::numbers::Real;
 
 // ---- what a node can hold ---------------------------------------------------
@@ -166,11 +166,52 @@ trait Backprop {
     fn clear(&self);
 }
 
+/// A node's value: computed when the node is recorded, or — for a scalar
+/// reduced from a tensor — when it is first needed.
+///
+/// Reading a reduction of a device tensor waits for the device, and nothing
+/// may need the value: a loss is usually only differentiated, and its backward
+/// pass needs its adjoint, not its value. So a reduction is recorded unread,
+/// scalar operations on an unread value are themselves unread, and the wait
+/// happens when something reads one — [`Var::value`], or a rule whose
+/// derivative depends on it.
+struct Lazy<T> {
+    value: OnceCell<T>,
+    pending: Cell<Option<Box<dyn FnOnce() -> T>>>,
+}
+
+impl<T> Lazy<T> {
+    fn ready(value: T) -> Self {
+        Lazy {
+            value: OnceCell::from(value),
+            pending: Cell::new(None),
+        }
+    }
+
+    fn deferred(compute: impl FnOnce() -> T + 'static) -> Self {
+        Lazy {
+            value: OnceCell::new(),
+            pending: Cell::new(Some(Box::new(compute))),
+        }
+    }
+
+    fn get(&self) -> &T {
+        self.value.get_or_init(|| {
+            let compute = self.pending.take().expect("a lazy value is computed once");
+            compute()
+        })
+    }
+
+    fn is_ready(&self) -> bool {
+        self.value.get().is_some()
+    }
+}
+
 struct Node<T, B: Backend> {
     /// Position in the tape, which is also this node's place in topological
     /// order.
     index: usize,
-    value: T,
+    value: Lazy<T>,
     /// `None` is a zero adjoint that has not been allocated.
     adjoint: RefCell<Option<T>>,
     /// Pushes this node's adjoint into its operands. `None` for a leaf.
@@ -179,6 +220,10 @@ struct Node<T, B: Backend> {
 }
 
 impl<T: Adjoint<B>, B: Backend> Node<T, B> {
+    fn value(&self) -> &T {
+        self.value.get()
+    }
+
     fn accumulate(&self, delta: T) {
         let mut adjoint = self.adjoint.borrow_mut();
         *adjoint = Some(match adjoint.as_ref() {
@@ -192,7 +237,7 @@ impl<T: Adjoint<B>, B: Backend> Node<T, B> {
     fn current_or_zeros(&self) -> T {
         match self.adjoint.borrow().as_ref() {
             Some(current) => current.duplicate(),
-            None => self.value.zeros_like(),
+            None => self.value().zeros_like(),
         }
     }
 }
@@ -279,6 +324,10 @@ impl<B: Backend> Tape<B> {
     }
 
     fn push<T: Adjoint<B>>(&self, value: T, rule: Option<Rule<T>>) -> Var<'_, T, B> {
+        self.push_lazy(Lazy::ready(value), rule)
+    }
+
+    fn push_lazy<T: Adjoint<B>>(&self, value: Lazy<T>, rule: Option<Rule<T>>) -> Var<'_, T, B> {
         let mut nodes = self.nodes.borrow_mut();
         let node = Rc::new(Node {
             index: nodes.len(),
@@ -321,7 +370,7 @@ pub type MatrixVar<'t, B = Host, T = f32> = Var<'t, Matrix<T, B>, B>;
 impl<'t, T: Adjoint<B>, B: Backend> Var<'t, T, B> {
     /// The value computed in the forward pass.
     pub fn value(&self) -> &T {
-        &self.node.value
+        self.node.value()
     }
 
     /// The gradient accumulated by the last backward pass — zeros of this
@@ -329,7 +378,7 @@ impl<'t, T: Adjoint<B>, B: Backend> Var<'t, T, B> {
     pub fn grad(&self) -> T {
         match self.node.adjoint.borrow().as_ref() {
             Some(adjoint) => adjoint.duplicate(),
-            None => self.node.value.zeros_like(),
+            None => self.node.value().zeros_like(),
         }
     }
 
@@ -381,6 +430,15 @@ impl<'t, T: Adjoint<B>, B: Backend> Var<'t, T, B> {
     /// Record a node whose rule pushes into this graph.
     fn record<U: Adjoint<B>>(&self, value: U, rule: impl Fn(&U) + 'static) -> Var<'t, U, B> {
         self.tape.push(value, Some(Box::new(rule)))
+    }
+
+    /// [`record`](Self::record) a value that may not be computed yet.
+    fn record_lazy<U: Adjoint<B>>(
+        &self,
+        value: Lazy<U>,
+        rule: impl Fn(&U) + 'static,
+    ) -> Var<'t, U, B> {
+        self.tape.push_lazy(value, Some(Box::new(rule)))
     }
 }
 
@@ -439,19 +497,39 @@ fn truncated_quotient<E: Real>(a: &[E], b: &[E]) -> Vec<E> {
 // ---- scalars ----------------------------------------------------------------
 
 impl<'t, B: Kernels<E>, E: Real> ScalarVar<'t, B, E> {
+    /// `f` of this value, computed now if the value is known and otherwise
+    /// when it is first needed.
+    fn map(&self, f: impl FnOnce(E) -> E + 'static) -> Lazy<E> {
+        if self.node.value.is_ready() {
+            return Lazy::ready(f(*self.node.value()));
+        }
+        let node = self.node.clone();
+        Lazy::deferred(move || f(*node.value()))
+    }
+
+    /// `f` of this value and `other`'s, likewise.
+    fn map2(&self, other: &Self, f: impl FnOnce(E, E) -> E + 'static) -> Lazy<E> {
+        if self.node.value.is_ready() && other.node.value.is_ready() {
+            return Lazy::ready(f(*self.node.value(), *other.node.value()));
+        }
+        let (left, right) = (self.node.clone(), other.node.clone());
+        Lazy::deferred(move || f(*left.value(), *right.value()))
+    }
+
     fn binary(&self, rhs: &Self, op: BinaryOp) -> Self {
         self.assert_same_tape(rhs);
-        let (x, y) = (self.node.value, rhs.node.value);
-        let value = match op {
+        let value = self.map2(rhs, move |x, y| match op {
             BinaryOp::Add => x + y,
             BinaryOp::Sub => x - y,
             BinaryOp::Mul => x * y,
             BinaryOp::Div => x / y,
             BinaryOp::Rem => x % y,
-        };
+        });
         let (left, right) = (self.node.clone(), rhs.node.clone());
-        self.record(value, move |adjoint| {
+        self.record_lazy(value, move |adjoint| {
             let adjoint = *adjoint;
+            // Only the derivatives that depend on the operands read them.
+            let operands = || (*left.value(), *right.value());
             match op {
                 BinaryOp::Add => {
                     left.accumulate(adjoint);
@@ -462,15 +540,18 @@ impl<'t, B: Kernels<E>, E: Real> ScalarVar<'t, B, E> {
                     right.accumulate(-adjoint);
                 }
                 BinaryOp::Mul => {
+                    let (x, y) = operands();
                     left.accumulate(adjoint * y);
                     right.accumulate(adjoint * x);
                 }
                 BinaryOp::Div => {
+                    let (x, y) = operands();
                     left.accumulate(adjoint / y);
                     right.accumulate(-adjoint * x / (y * y));
                 }
                 // a % b = a − trunc(a/b)·b, and the quotient is locally constant.
                 BinaryOp::Rem => {
+                    let (x, y) = operands();
                     left.accumulate(adjoint);
                     right.accumulate(-adjoint * (x / y).trunc());
                 }
@@ -480,10 +561,9 @@ impl<'t, B: Kernels<E>, E: Real> ScalarVar<'t, B, E> {
 
     /// Apply an analytic function: `dy/dx = f'(x)`.
     pub fn analytic(&self, f: Analytic) -> Self {
-        let x = self.node.value;
         let parent = self.node.clone();
-        self.record(f.value(x), move |adjoint| {
-            parent.accumulate(*adjoint * f.derivative(x));
+        self.record_lazy(self.map(move |x| f.value(x)), move |adjoint| {
+            parent.accumulate(*adjoint * f.derivative(*parent.value()));
         })
     }
 
@@ -498,19 +578,21 @@ impl<'t, B: Kernels<E>, E: Real> ScalarVar<'t, B, E> {
     }
 
     fn select(&self, other: &Self, largest: bool) -> Self {
-        let (x, y) = (self.node.value, other.node.value);
         let op = if largest { Compare::Max } else { Compare::Min };
         let (left, right) = (self.node.clone(), other.node.clone());
-        self.record(op.value(x, y), move |adjoint| {
-            let share = Compare::MaxShare.value(x, y);
-            let (mine, theirs) = if largest {
-                (share, E::one() - share)
-            } else {
-                (E::one() - share, share)
-            };
-            left.accumulate(*adjoint * mine);
-            right.accumulate(*adjoint * theirs);
-        })
+        self.record_lazy(
+            self.map2(other, move |x, y| op.value(x, y)),
+            move |adjoint| {
+                let share = Compare::MaxShare.value(*left.value(), *right.value());
+                let (mine, theirs) = if largest {
+                    (share, E::one() - share)
+                } else {
+                    (E::one() - share, share)
+                };
+                left.accumulate(*adjoint * mine);
+                right.accumulate(*adjoint * theirs);
+            },
+        )
     }
 
     /// Absolute value, differentiating to `sign(x)` with `sign(0) = 0`.
@@ -532,7 +614,7 @@ impl<'t, B: Kernels<E>, E: Real> ScalarVar<'t, B, E> {
     /// Multiply by a constant.
     pub fn scale(&self, factor: E) -> Self {
         let parent = self.node.clone();
-        self.record(self.node.value * factor, move |adjoint| {
+        self.record_lazy(self.map(move |x| x * factor), move |adjoint| {
             parent.accumulate(*adjoint * factor);
         })
     }
@@ -540,7 +622,7 @@ impl<'t, B: Kernels<E>, E: Real> ScalarVar<'t, B, E> {
     /// Add a constant, which leaves the derivative unchanged.
     pub fn shift(&self, offset: E) -> Self {
         let parent = self.node.clone();
-        self.record(self.node.value + offset, move |adjoint| {
+        self.record_lazy(self.map(move |x| x + offset), move |adjoint| {
             parent.accumulate(*adjoint);
         })
     }
@@ -549,7 +631,7 @@ impl<'t, B: Kernels<E>, E: Real> ScalarVar<'t, B, E> {
     /// sum of the vector's adjoint, since it reaches every element.
     pub fn expand(&self, len: usize) -> VectorVar<'t, B, E> {
         let parent = self.node.clone();
-        self.record(Vector::filled(len, self.node.value), move |adjoint| {
+        self.record(Vector::filled(len, *self.node.value()), move |adjoint| {
             parent.accumulate(sum_of(adjoint.as_slice()));
         })
     }
@@ -558,7 +640,7 @@ impl<'t, B: Kernels<E>, E: Real> ScalarVar<'t, B, E> {
     pub fn expand_matrix(&self, rows: usize, cols: usize) -> MatrixVar<'t, B, E> {
         let parent = self.node.clone();
         self.record(
-            Matrix::filled(rows, cols, self.node.value),
+            Matrix::filled(rows, cols, *self.node.value()),
             move |adjoint| {
                 parent.accumulate(sum_of(adjoint.as_slice()));
             },
@@ -571,12 +653,12 @@ impl<'t, B: Kernels<E>, E: Real> ScalarVar<'t, B, E> {
 impl<'t, B: Kernels<E>, E: Real> VectorVar<'t, B, E> {
     /// The number of elements.
     pub fn len(&self) -> usize {
-        self.node.value.len()
+        self.node.value().len()
     }
 
     /// Whether this vector holds no elements.
     pub fn is_empty(&self) -> bool {
-        self.node.value.is_empty()
+        self.node.value().is_empty()
     }
 
     fn binary(&self, rhs: &Self, op: BinaryOp) -> Self {
@@ -594,15 +676,15 @@ impl<'t, B: Kernels<E>, E: Real> VectorVar<'t, B, E> {
             }
             // c = a ⊙ b
             BinaryOp::Mul => {
-                left.accumulate(vector_op(adjoint, &right.value, BinaryOp::Mul));
-                right.accumulate(vector_op(adjoint, &left.value, BinaryOp::Mul));
+                left.accumulate(vector_op(adjoint, right.value(), BinaryOp::Mul));
+                right.accumulate(vector_op(adjoint, left.value(), BinaryOp::Mul));
             }
             // c = a / b: ā += c̄/b, b̄ −= c̄·a/b²
             BinaryOp::Div => {
-                left.accumulate(vector_op(adjoint, &right.value, BinaryOp::Div));
-                let squared = vector_op(&right.value, &right.value, BinaryOp::Mul);
+                left.accumulate(vector_op(adjoint, right.value(), BinaryOp::Div));
+                let squared = vector_op(right.value(), right.value(), BinaryOp::Mul);
                 let scaled = vector_op(
-                    &vector_op(adjoint, &left.value, BinaryOp::Mul),
+                    &vector_op(adjoint, left.value(), BinaryOp::Mul),
                     &squared,
                     BinaryOp::Div,
                 );
@@ -612,8 +694,8 @@ impl<'t, B: Kernels<E>, E: Real> VectorVar<'t, B, E> {
             BinaryOp::Rem => {
                 left.accumulate(adjoint.duplicate());
                 let quotient = Vector::<E, B>::build(&truncated_quotient(
-                    left.value.as_slice(),
-                    right.value.as_slice(),
+                    left.value().as_slice(),
+                    right.value().as_slice(),
                 ));
                 let scaled = vector_op(adjoint, &quotient, BinaryOp::Mul);
                 right.accumulate(negated_vector(&scaled));
@@ -640,7 +722,7 @@ impl<'t, B: Kernels<E>, E: Real> VectorVar<'t, B, E> {
         let value = B::vector_compare(self.value(), other.value(), op);
         let (left, right) = (self.node.clone(), other.node.clone());
         self.record(value, move |adjoint| {
-            let share = B::vector_compare(&left.value, &right.value, Compare::MaxShare);
+            let share = B::vector_compare(left.value(), right.value(), Compare::MaxShare);
             let complement = B::vector_broadcast(&share, E::one(), BinaryOp::Sub, true);
             let (mine, theirs) = if largest {
                 (&share, &complement)
@@ -684,7 +766,7 @@ impl<'t, B: Kernels<E>, E: Real> VectorVar<'t, B, E> {
         let value = B::vector_compare_scalar(self.value(), scalar, op, false);
         let parent = self.node.clone();
         self.record(value, move |adjoint| {
-            let share = B::vector_compare_scalar(&parent.value, scalar, Compare::MaxShare, false);
+            let share = B::vector_compare_scalar(parent.value(), scalar, Compare::MaxShare, false);
             let weight = if largest {
                 share
             } else {
@@ -702,7 +784,7 @@ impl<'t, B: Kernels<E>, E: Real> VectorVar<'t, B, E> {
         let value = B::vector_unary(self.value(), f);
         let parent = self.node.clone();
         self.record(value, move |adjoint| {
-            let (_, product) = B::vector_unary_dual(&parent.value, adjoint, f);
+            let (_, product) = B::vector_unary_dual(parent.value(), adjoint, f);
             parent.accumulate(product);
         })
     }
@@ -732,28 +814,34 @@ impl<'t, B: Kernels<E>, E: Real> VectorVar<'t, B, E> {
 
     /// Sum of the elements: every element's gradient is the scalar's adjoint.
     pub fn sum(&self) -> ScalarVar<'t, B, E> {
-        let total = sum_of(self.value().as_slice());
         let parent = self.node.clone();
-        self.record(total, move |adjoint| {
-            parent.accumulate(Vector::filled(parent.value.len(), *adjoint));
+        let total = {
+            let parent = parent.clone();
+            Lazy::deferred(move || sum_of(parent.value().as_slice()))
+        };
+        self.record_lazy(total, move |adjoint| {
+            parent.accumulate(Vector::filled(parent.value().len(), *adjoint));
         })
     }
 
     /// Dot product: `ū += s̄·v` and `v̄ += s̄·u`.
     pub fn dot(&self, other: &Self) -> ScalarVar<'t, B, E> {
         self.assert_same_tape(other);
-        let value = B::dot(self.value(), other.value());
         let (left, right) = (self.node.clone(), other.node.clone());
-        self.record(value, move |adjoint| {
+        let value = {
+            let (left, right) = (left.clone(), right.clone());
+            Lazy::deferred(move || B::dot(left.value(), right.value()))
+        };
+        self.record_lazy(value, move |adjoint| {
             let scale = *adjoint;
             left.accumulate(B::vector_broadcast(
-                &right.value,
+                right.value(),
                 scale,
                 BinaryOp::Mul,
                 false,
             ));
             right.accumulate(B::vector_broadcast(
-                &left.value,
+                left.value(),
                 scale,
                 BinaryOp::Mul,
                 false,
@@ -767,8 +855,8 @@ impl<'t, B: Kernels<E>, E: Real> VectorVar<'t, B, E> {
         let value = B::vecmat(self.value(), m.value());
         let (vector, matrix) = (self.node.clone(), m.node.clone());
         self.record(value, move |adjoint| {
-            vector.accumulate(B::matvec(&matrix.value, adjoint));
-            matrix.accumulate(outer(&vector.value, adjoint));
+            vector.accumulate(B::matvec(matrix.value(), adjoint));
+            matrix.accumulate(outer(vector.value(), adjoint));
         })
     }
 
@@ -797,8 +885,8 @@ impl<'t, B: Kernels<E>, E: Real> VectorVar<'t, B, E> {
         let value = outer(self.value(), other.value());
         let (left, right) = (self.node.clone(), other.node.clone());
         self.record(value, move |adjoint| {
-            left.accumulate(B::matvec(adjoint, &right.value));
-            right.accumulate(B::vecmat(&left.value, adjoint));
+            left.accumulate(B::matvec(adjoint, right.value()));
+            right.accumulate(B::vecmat(left.value(), adjoint));
         })
     }
 
@@ -838,17 +926,17 @@ fn outer<B: Kernels<E>, E: Real>(u: &Vector<E, B>, v: &Vector<E, B>) -> Matrix<E
 impl<'t, B: Kernels<E>, E: Real> MatrixVar<'t, B, E> {
     /// The `(rows, columns)` extents.
     pub fn shape(&self) -> (usize, usize) {
-        self.node.value.shape()
+        self.node.value().shape()
     }
 
     /// The number of rows.
     pub fn rows(&self) -> usize {
-        self.node.value.rows()
+        self.node.value().rows()
     }
 
     /// The number of columns.
     pub fn cols(&self) -> usize {
-        self.node.value.cols()
+        self.node.value().cols()
     }
 
     fn binary(&self, rhs: &Self, op: BinaryOp) -> Self {
@@ -865,14 +953,14 @@ impl<'t, B: Kernels<E>, E: Real> MatrixVar<'t, B, E> {
                 right.accumulate(negated_matrix(adjoint));
             }
             BinaryOp::Mul => {
-                left.accumulate(matrix_op(adjoint, &right.value, BinaryOp::Mul));
-                right.accumulate(matrix_op(adjoint, &left.value, BinaryOp::Mul));
+                left.accumulate(matrix_op(adjoint, right.value(), BinaryOp::Mul));
+                right.accumulate(matrix_op(adjoint, left.value(), BinaryOp::Mul));
             }
             BinaryOp::Div => {
-                left.accumulate(matrix_op(adjoint, &right.value, BinaryOp::Div));
-                let squared = matrix_op(&right.value, &right.value, BinaryOp::Mul);
+                left.accumulate(matrix_op(adjoint, right.value(), BinaryOp::Div));
+                let squared = matrix_op(right.value(), right.value(), BinaryOp::Mul);
                 let scaled = matrix_op(
-                    &matrix_op(adjoint, &left.value, BinaryOp::Mul),
+                    &matrix_op(adjoint, left.value(), BinaryOp::Mul),
                     &squared,
                     BinaryOp::Div,
                 );
@@ -880,11 +968,11 @@ impl<'t, B: Kernels<E>, E: Real> MatrixVar<'t, B, E> {
             }
             BinaryOp::Rem => {
                 left.accumulate(adjoint.duplicate());
-                let (rows, cols) = left.value.shape();
+                let (rows, cols) = left.value().shape();
                 let quotient = Matrix::<E, B>::build(
                     rows,
                     cols,
-                    &truncated_quotient(left.value.as_slice(), right.value.as_slice()),
+                    &truncated_quotient(left.value().as_slice(), right.value().as_slice()),
                 );
                 let scaled = matrix_op(adjoint, &quotient, BinaryOp::Mul);
                 right.accumulate(negated_matrix(&scaled));
@@ -907,7 +995,7 @@ impl<'t, B: Kernels<E>, E: Real> MatrixVar<'t, B, E> {
         let value = B::matrix_compare(self.value(), other.value(), op);
         let (left, right) = (self.node.clone(), other.node.clone());
         self.record(value, move |adjoint| {
-            let share = B::matrix_compare(&left.value, &right.value, Compare::MaxShare);
+            let share = B::matrix_compare(left.value(), right.value(), Compare::MaxShare);
             let complement = B::matrix_broadcast(&share, E::one(), BinaryOp::Sub, true);
             let (mine, theirs) = if largest {
                 (&share, &complement)
@@ -949,7 +1037,7 @@ impl<'t, B: Kernels<E>, E: Real> MatrixVar<'t, B, E> {
         let value = B::matrix_compare_scalar(self.value(), scalar, op, false);
         let parent = self.node.clone();
         self.record(value, move |adjoint| {
-            let share = B::matrix_compare_scalar(&parent.value, scalar, Compare::MaxShare, false);
+            let share = B::matrix_compare_scalar(parent.value(), scalar, Compare::MaxShare, false);
             let weight = if largest {
                 share
             } else {
@@ -988,7 +1076,7 @@ impl<'t, B: Kernels<E>, E: Real> MatrixVar<'t, B, E> {
         let value = B::matrix_unary(self.value(), f);
         let parent = self.node.clone();
         self.record(value, move |adjoint| {
-            let (_, product) = B::matrix_unary_dual(&parent.value, adjoint, f);
+            let (_, product) = B::matrix_unary_dual(parent.value(), adjoint, f);
             parent.accumulate(product);
         })
     }
@@ -1025,16 +1113,18 @@ impl<'t, B: Kernels<E>, E: Real> MatrixVar<'t, B, E> {
         let value = B::matmul(self.value(), other.value());
         let (left, right) = (self.node.clone(), other.node.clone());
         self.record(value, move |adjoint| {
-            let left_adjoint = B::matmul_add(
+            let left_adjoint = B::matmul_transposed_add(
                 adjoint,
-                &B::transpose(&right.value),
+                right.value(),
+                Transposed::Right,
                 left.current_or_zeros(),
             );
             *left.adjoint.borrow_mut() = Some(left_adjoint);
 
-            let right_adjoint = B::matmul_add(
-                &B::transpose(&left.value),
+            let right_adjoint = B::matmul_transposed_add(
+                left.value(),
                 adjoint,
+                Transposed::Left,
                 right.current_or_zeros(),
             );
             *right.adjoint.borrow_mut() = Some(right_adjoint);
@@ -1052,16 +1142,18 @@ impl<'t, B: Kernels<E>, E: Real> MatrixVar<'t, B, E> {
         let value = B::matmul_add(self.value(), other.value(), addend.value().duplicate());
         let (left, right, bias) = (self.node.clone(), other.node.clone(), addend.node.clone());
         self.record(value, move |adjoint| {
-            let left_adjoint = B::matmul_add(
+            let left_adjoint = B::matmul_transposed_add(
                 adjoint,
-                &B::transpose(&right.value),
+                right.value(),
+                Transposed::Right,
                 left.current_or_zeros(),
             );
             *left.adjoint.borrow_mut() = Some(left_adjoint);
 
-            let right_adjoint = B::matmul_add(
-                &B::transpose(&left.value),
+            let right_adjoint = B::matmul_transposed_add(
+                left.value(),
                 adjoint,
+                Transposed::Left,
                 right.current_or_zeros(),
             );
             *right.adjoint.borrow_mut() = Some(right_adjoint);
@@ -1075,8 +1167,8 @@ impl<'t, B: Kernels<E>, E: Real> MatrixVar<'t, B, E> {
         let value = B::matvec(self.value(), v.value());
         let (matrix, vector) = (self.node.clone(), v.node.clone());
         self.record(value, move |adjoint| {
-            matrix.accumulate(outer(adjoint, &vector.value));
-            vector.accumulate(B::vecmat(adjoint, &matrix.value));
+            matrix.accumulate(outer(adjoint, vector.value()));
+            vector.accumulate(B::vecmat(adjoint, matrix.value()));
         })
     }
 
@@ -1091,8 +1183,8 @@ impl<'t, B: Kernels<E>, E: Real> MatrixVar<'t, B, E> {
         let value = B::matvec_add(self.value(), v.value(), addend.value().duplicate());
         let (matrix, vector, bias) = (self.node.clone(), v.node.clone(), addend.node.clone());
         self.record(value, move |adjoint| {
-            matrix.accumulate(outer(adjoint, &vector.value));
-            vector.accumulate(B::vecmat(adjoint, &matrix.value));
+            matrix.accumulate(outer(adjoint, vector.value()));
+            vector.accumulate(B::vecmat(adjoint, matrix.value()));
             bias.accumulate(adjoint.duplicate());
         })
     }
@@ -1108,10 +1200,13 @@ impl<'t, B: Kernels<E>, E: Real> MatrixVar<'t, B, E> {
 
     /// Sum of every element.
     pub fn sum(&self) -> ScalarVar<'t, B, E> {
-        let total = sum_of(self.value().as_slice());
         let parent = self.node.clone();
-        self.record(total, move |adjoint| {
-            let (rows, cols) = parent.value.shape();
+        let total = {
+            let parent = parent.clone();
+            Lazy::deferred(move || sum_of(parent.value().as_slice()))
+        };
+        self.record_lazy(total, move |adjoint| {
+            let (rows, cols) = parent.value().shape();
             parent.accumulate(Matrix::filled(rows, cols, *adjoint));
         })
     }
@@ -1149,7 +1244,7 @@ impl<'t, B: Kernels<E>, E: Real> MatrixVar<'t, B, E> {
         self.record(value, move |adjoint| {
             // The window's gradient is the input correlated with the adjoint,
             // reversed when the forward pass reversed the window.
-            let window_gradient = B::correlate_window_gradient(&input.value, adjoint);
+            let window_gradient = B::correlate_window_gradient(input.value(), adjoint);
             taps.accumulate(if flip {
                 B::flip(&window_gradient)
             } else {
@@ -1158,7 +1253,7 @@ impl<'t, B: Kernels<E>, E: Real> MatrixVar<'t, B, E> {
 
             // The input's gradient is the full correlation of the adjoint with
             // the window, applied the other way round.
-            input.accumulate(B::correlate_input_gradient(adjoint, &taps.value, flip));
+            input.accumulate(B::correlate_input_gradient(adjoint, taps.value(), flip));
         })
     }
 
@@ -1168,7 +1263,7 @@ impl<'t, B: Kernels<E>, E: Real> MatrixVar<'t, B, E> {
         let value = B::pad(self.value(), pad_rows, pad_cols);
         let parent = self.node.clone();
         self.record(value, move |adjoint| {
-            let (rows, cols) = parent.value.shape();
+            let (rows, cols) = parent.value().shape();
             let padded_cols = cols + 2 * pad_cols;
             let interior = adjoint.as_slice();
             let mut inner = Vec::with_capacity(rows * cols);

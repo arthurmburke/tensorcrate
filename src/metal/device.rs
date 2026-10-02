@@ -10,8 +10,8 @@ use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandQueue, MTLComputePipelineState,
-    MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily, MTLLibrary,
+    MTLBuffer, MTLCommandBuffer, MTLCommandQueue, MTLCompileOptions, MTLComputePipelineState,
+    MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily, MTLLanguageVersion, MTLLibrary,
 };
 
 use super::MetalElement;
@@ -35,8 +35,6 @@ pub(super) struct Gpu {
     /// One set of pipelines per [`MetalElement`], indexed by
     /// [`MetalElement::INDEX`].
     pub(super) typed: [Typed; 3],
-    /// The `f16`/`bf16` × `f32`-output TensorOps products behind `matmul_f32`.
-    pub(super) tensorops: Option<TensorOpsPipelines>,
     /// The scan runs over a `float` buffer whatever the tensor's type.
     pub(super) scan: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub(super) fft_bit_reverse: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -58,6 +56,11 @@ pub(super) struct Gpu {
     pub(super) open: RefCell<Option<super::sync::Batch>>,
     /// Specialized kernels for fused programs, by [`codegen::key`](super::codegen::key).
     pub(super) specialized: RefCell<std::collections::HashMap<Vec<u64>, Specialized>>,
+    /// The TensorOps library, on M5-class GPUs.
+    pub(super) tensorops_library: Option<Retained<ProtocolObject<dyn MTLLibrary>>>,
+    /// Pipelines from the TensorOps library made on first use, by function
+    /// name; `None` for one that could not be made.
+    pub(super) tensorops_named: RefCell<std::collections::HashMap<String, Option<Pipeline>>>,
 }
 
 /// A fused program's specialized kernel, as far as it has got.
@@ -87,11 +90,15 @@ pub(super) type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>
 /// instance of the shader of the same name.
 pub(super) struct Typed {
     pub(super) matmul: Pipeline,
-    /// The TensorOps product for this type, on M5-class GPUs.
+    /// Matrix–vector products: one SIMD group per row, and the two passes of
+    /// a vector–matrix product.
+    pub(super) matvec_rows: Pipeline,
+    pub(super) vecmat_bands: Pipeline,
+    pub(super) vecmat_finish: Pipeline,
+    /// The TensorOps product for a 16-bit type with a 16-bit result, on
+    /// M5-class GPUs. `f32` products run on the general kernel instead — see
+    /// [`Gpu::gemm`].
     pub(super) tensorops: Option<Pipeline>,
-    /// The same with relaxed precision, for [`MatmulPrecision::Relaxed`]; `f32`
-    /// only.
-    pub(super) tensorops_relaxed: Option<Pipeline>,
     pub(super) elementwise: Pipeline,
     pub(super) broadcast: Pipeline,
     pub(super) compare: Pipeline,
@@ -127,22 +134,81 @@ pub(super) struct Typed {
 }
 
 impl Gpu {
+    /// The TensorOps function `name` as a pipeline, made on first use.
+    pub(super) fn tensorops_named(&self, name: &str) -> Option<Pipeline> {
+        if let Some(pipeline) = self.tensorops_named.borrow().get(name) {
+            return pipeline.clone();
+        }
+        let pipeline = self.tensorops_library.as_ref().and_then(|library| {
+            let function = library.newFunctionWithName(&NSString::from_str(name))?;
+            self.device
+                .newComputePipelineStateWithFunction_error(&function)
+                .ok()
+        });
+        self.tensorops_named
+            .borrow_mut()
+            .insert(name.to_owned(), pipeline.clone());
+        pipeline
+    }
+
     /// The pipelines compiled for element type `T`.
     pub(super) fn kernels<T: MetalElement>(&self) -> &Typed {
         &self.typed[T::INDEX]
     }
 
-    /// The TensorOps product for `T` at this thread's [`MatmulPrecision`], if
-    /// the GPU has TensorOps and they are enabled.
+    /// The TensorOps product for a 16-bit `T` with a 16-bit result, if the GPU
+    /// has TensorOps and they are enabled.
     pub(super) fn tensorops_matmul<T: MetalElement>(&self) -> Option<&Pipeline> {
-        let kernels = self.kernels::<T>();
-        let relaxed = match matmul_precision() {
-            MatmulPrecision::Relaxed => kernels.tensorops_relaxed.as_ref(),
-            MatmulPrecision::Exact => None,
-        };
-        relaxed
-            .or(kernels.tensorops.as_ref())
+        self.kernels::<T>()
+            .tensorops
+            .as_ref()
             .filter(|_| tensorops_enabled())
+    }
+
+    /// The general TensorOps product of `f32` matrices — `op(A)·op(B)`, added
+    /// into the output if `accumulate` — for an `m × n` result at this thread's
+    /// [`MatmulPrecision`], with the tile it computes per threadgroup. `None`
+    /// for another element type, or without TensorOps.
+    pub(super) fn gemm<T: MetalElement>(
+        &self,
+        operands: Operands,
+        accumulate: bool,
+        m: usize,
+        n: usize,
+    ) -> Option<(Pipeline, Tile)> {
+        if T::SUFFIX != f32::SUFFIX || !tensorops_enabled() {
+            return None;
+        }
+        let (relaxed, (tile, shape)) = product_tile::<T>(m, n);
+        let operands = match operands {
+            Operands::Plain => "nn",
+            Operands::LeftTransposed => "tn",
+            Operands::RightTransposed => "nt",
+        };
+        let name = format!(
+            "gemm_{}_{tile}_{operands}{}",
+            if relaxed { "f32r" } else { "f32" },
+            if accumulate { "_acc" } else { "" }
+        );
+        Some((self.tensorops_named(&name)?, shape))
+    }
+
+    /// The TensorOps product of 16-bit matrices of type `input` (`"f16"` or
+    /// `"bf16"`) with an `f32` result.
+    pub(super) fn gemm_widening(
+        &self,
+        input: &str,
+        m: usize,
+        n: usize,
+    ) -> Option<(Pipeline, Tile)> {
+        if !tensorops_enabled() {
+            return None;
+        }
+        let (tile, shape) = tile(m, n, &[(64, SMALL)]);
+        Some((
+            self.tensorops_named(&format!("gemm_{input}_f32_{tile}_nn"))?,
+            shape,
+        ))
     }
 
     /// The same for a product with a fused epilogue.
@@ -158,9 +224,50 @@ impl Gpu {
     }
 }
 
-pub(super) struct TensorOpsPipelines {
-    pub(super) f16_f32: Pipeline,
-    pub(super) bf16_f32: Pipeline,
+/// Which operand of a general product is read transposed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum Operands {
+    Plain,
+    LeftTransposed,
+    RightTransposed,
+}
+
+/// The rows, columns and SIMD groups of the tile one threadgroup of a general
+/// product computes.
+pub(super) type Tile = (usize, usize, usize);
+
+/// The tiles the general product is compiled for, by their names in the
+/// kernel names.
+const SMALL: (&str, Tile) = ("s", (32, 32, 4));
+const MEDIUM: (&str, Tile) = ("m", (64, 32, 2));
+const LARGE: (&str, Tile) = ("l", (64, 64, 4));
+
+/// Whether an `m × n` TensorOps product over `T` runs at relaxed precision on
+/// this thread, and the tile it is best computed in.
+pub(super) fn product_tile<T: MetalElement>(m: usize, n: usize) -> (bool, (&'static str, Tile)) {
+    if T::SUFFIX != f32::SUFFIX {
+        // 16-bit inputs, which the matrix units take at full rate.
+        return (false, tile(m, n, &[(64, SMALL)]));
+    }
+    match matmul_precision() {
+        MatmulPrecision::Relaxed => (true, tile(m, n, &[(64, SMALL), (256, MEDIUM)])),
+        MatmulPrecision::Exact => (false, tile(m, n, &[(257, SMALL)])),
+    }
+}
+
+/// The tile for an `m × n` product: the first in `smaller` whose bound the
+/// product's count of 64 × 64 tiles is below, and otherwise the largest.
+///
+/// A product with a small output has few large tiles — a 512 × 512 result
+/// has 64 — which leaves most of the GPU's cores idle, so smaller outputs get
+/// smaller tiles. The bounds were measured on an M5 Max, where they double
+/// the speed of products from 256³ to 1024³.
+fn tile(m: usize, n: usize, smaller: &[(usize, (&'static str, Tile))]) -> (&'static str, Tile) {
+    let tiles = m.div_ceil(64) * n.div_ceil(64);
+    smaller
+        .iter()
+        .find(|(bound, _)| tiles < *bound)
+        .map_or(LARGE, |&(_, tile)| tile)
 }
 
 thread_local! {
@@ -257,18 +364,14 @@ pub(super) fn build_gpu() -> Option<Gpu> {
             .newComputePipelineStateWithFunction_error(&function)
             .ok()
     };
-    let tensorops = (|| {
-        Some(TensorOpsPipelines {
-            f16_f32: tensorops_pipeline("matmul_tensorops_f16_f32")?,
-            bf16_f32: tensorops_pipeline("matmul_tensorops_bf16_f32")?,
-        })
-    })();
     let typed = |suffix: &str| -> Option<Typed> {
         let kernel = |name: &str| pipeline(&format!("{name}_{suffix}"));
         Some(Typed {
             matmul: kernel("matmul_tiled")?,
+            matvec_rows: kernel("matvec_rows")?,
+            vecmat_bands: kernel("vecmat_bands")?,
+            vecmat_finish: kernel("vecmat_finish")?,
             tensorops: tensorops_pipeline(&format!("matmul_tensorops_{suffix}")),
-            tensorops_relaxed: tensorops_pipeline(&format!("matmul_tensorops_{suffix}_relaxed")),
             elementwise: kernel("elementwise")?,
             broadcast: kernel("broadcast")?,
             compare: kernel("compare")?,
@@ -308,7 +411,6 @@ pub(super) fn build_gpu() -> Option<Gpu> {
             typed(f16::SUFFIX)?,
             typed(bf16::SUFFIX)?,
         ],
-        tensorops,
         scan: pipeline("scan_step")?,
         fft_bit_reverse: pipeline("fft_bit_reverse")?,
         fft_stage: pipeline("fft_stage")?,
@@ -320,6 +422,8 @@ pub(super) fn build_gpu() -> Option<Gpu> {
         operations: Cell::new(0),
         open: RefCell::new(None),
         specialized: RefCell::new(std::collections::HashMap::new()),
+        tensorops_library,
+        tensorops_named: RefCell::new(std::collections::HashMap::new()),
         device,
         queue,
     })
@@ -367,9 +471,10 @@ impl Gpu {
     pub(super) fn specialized<T: MetalElement>(
         &self,
         code: &[crate::tensors::fused::Encoded],
+        kernel: super::codegen::Kernel,
     ) -> Option<Pipeline> {
         use super::codegen;
-        let key = codegen::key::<T>(code);
+        let key = codegen::key::<T>(code, kernel);
         let mut cache = self.specialized.borrow_mut();
         let seen = match cache.get_mut(&key) {
             Some(Specialized::Ready(pipeline)) => return Some(pipeline.clone()),
@@ -389,7 +494,9 @@ impl Gpu {
         if seen < codegen::COMPILE_AFTER {
             return None;
         }
-        let compiled = codegen::source::<T>(code).and_then(|source| self.compile(&source));
+        let metal4 = matches!(kernel, codegen::Kernel::Epilogue { .. });
+        let compiled =
+            codegen::source::<T>(code, kernel).and_then(|source| self.compile(&source, metal4));
         let entry = match &compiled {
             Some(pipeline) => Specialized::Ready(pipeline.clone()),
             None => Specialized::Failed,
@@ -398,10 +505,17 @@ impl Gpu {
         compiled
     }
 
-    fn compile(&self, source: &str) -> Option<Pipeline> {
+    /// Compile `source`'s `fused_program`, as Metal 4 — which TensorOps need —
+    /// if `metal4`.
+    fn compile(&self, source: &str, metal4: bool) -> Option<Pipeline> {
+        let options = metal4.then(|| {
+            let options = MTLCompileOptions::new();
+            options.setLanguageVersion(MTLLanguageVersion::Version4_0);
+            options
+        });
         let library = self
             .device
-            .newLibraryWithSource_options_error(&NSString::from_str(source), None)
+            .newLibraryWithSource_options_error(&NSString::from_str(source), options.as_deref())
             .map_err(|_error| {
                 #[cfg(test)]
                 eprintln!("a fused kernel failed to compile: {_error}");

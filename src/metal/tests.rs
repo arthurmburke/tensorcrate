@@ -666,3 +666,124 @@ fn specialized_kernels_match_the_interpreter() {
     check::<f16>(4e-3);
     check::<bf16>(2e-2);
 }
+
+#[test]
+fn general_products_read_operands_transposed_and_accumulate() {
+    use super::device::with_gpu;
+    use super::encode::encode_gemm;
+    let (m, k, n) = (70, 45, 33);
+    let a: Vec<f32> = (0..m * k).map(|i| ((i % 7) as f32 - 3.0) * 0.25).collect();
+    let b: Vec<f32> = (0..k * n).map(|i| ((i % 5) as f32 - 2.0) * 0.5).collect();
+    let c: Vec<f32> = (0..m * n).map(|i| (i % 3) as f32).collect();
+    let transpose = |x: &[f32], rows: usize, cols: usize| -> Vec<f32> {
+        (0..rows * cols)
+            .map(|e| x[(e % rows) * cols + e / rows])
+            .collect()
+    };
+    let product = cpu_matmul(&a, &b, m, k, n);
+    let added: Vec<f32> = product.iter().zip(&c).map(|(p, c)| p + c).collect();
+    // Every tile, each operand transposed and neither, accumulating or not.
+    let tiles = [("s", (32, 32, 4)), ("m", (64, 32, 2)), ("l", (64, 64, 4))];
+    let mut cases = Vec::new();
+    for (tile, shape) in tiles {
+        for (operands, stored_a, stored_b) in [
+            ("nn", a.clone(), b.clone()),
+            ("tn", transpose(&a, m, k), b.clone()),
+            ("nt", a.clone(), transpose(&b, k, n)),
+        ] {
+            for accumulate in [false, true] {
+                let suffix = if accumulate { "_acc" } else { "" };
+                let kernel = format!("gemm_f32_{tile}_{operands}{suffix}");
+                cases.push((
+                    kernel,
+                    shape,
+                    stored_a.clone(),
+                    stored_b.clone(),
+                    accumulate,
+                ));
+            }
+        }
+    }
+    for (kernel, tile, stored_a, stored_b, accumulate) in cases {
+        let kernel = kernel.as_str();
+        let (ga, gb) = (
+            MetalBuffer::from_slice(&stored_a).unwrap(),
+            MetalBuffer::from_slice(&stored_b).unwrap(),
+        );
+        let out = MetalBuffer::from_slice(&c).unwrap();
+        let ran = with_gpu(|gpu| {
+            let pipeline = gpu.tensorops_named(kernel)?;
+            encode_gemm(gpu, &pipeline, &ga.raw, &gb.raw, &out.raw, (m, k, n), tile)
+        });
+        if ran.is_none() {
+            return; // no TensorOps on this GPU
+        }
+        synchronize();
+        let want = if accumulate { &added } else { &product };
+        for (i, (g, w)) in out.as_slice().iter().zip(want).enumerate() {
+            assert!(
+                (g - w).abs() <= 1e-4 * w.abs().max(1.0),
+                "{kernel}: element {i} is {g}, expected {w}"
+            );
+        }
+    }
+}
+
+/// The generator's epilogue and sum kernels compile — for every element type
+/// and every product tile — rather than quietly leaving the program on the
+/// interpreter.
+#[test]
+fn generated_kernels_compile_for_every_type_and_tile() {
+    use super::codegen::Kernel;
+    use super::device::with_gpu;
+    use crate::tensors::Compare;
+    use crate::tensors::fused::{Builder, DType, Element, Remap};
+
+    fn check<T: super::MetalElement + Element>() {
+        let mut b = Builder::<T>::new();
+        let product = b.input(T::DTYPE);
+        let bias = b.input_remapped(T::DTYPE, Remap::Row);
+        let shifted = b.add(product, bias);
+        let zero = b.constant(T::from_f64(0.0));
+        let activated = b.compare(Compare::Max, shifted, zero);
+        b.output(activated, DType::F32);
+        let code = b.build().unwrap().encode();
+        let mut sum = Builder::<T>::new();
+        let x = sum.input(T::DTYPE);
+        let row = sum.input_remapped(T::DTYPE, Remap::Row);
+        let e = sum.unary(crate::tensors::Analytic::Exp, x);
+        let y = sum.mul(e, row);
+        sum.output(y, T::DTYPE);
+        let sum_code = sum.build().unwrap().encode();
+        for kernel in [Kernel::RowSums, Kernel::ColumnSums] {
+            let compiled = with_gpu(|gpu| {
+                let _ = gpu.specialized::<T>(&sum_code, kernel);
+                Some(gpu.specialized::<T>(&sum_code, kernel).is_some())
+            });
+            if let Some(compiled) = compiled {
+                assert!(compiled, "{} {kernel:?}", T::SUFFIX);
+            }
+        }
+        for tile in [(32, 32, 4), (64, 32, 2), (64, 64, 4)] {
+            for relaxed in [false, true] {
+                let kernel = Kernel::Epilogue { tile, relaxed };
+                let compiled = with_gpu(|gpu| {
+                    gpu.tensorops_library.as_ref()?;
+                    // Compiled on the second sighting.
+                    let _ = gpu.specialized::<T>(&code, kernel);
+                    Some(gpu.specialized::<T>(&code, kernel).is_some())
+                });
+                if let Some(compiled) = compiled {
+                    assert!(
+                        compiled,
+                        "{} epilogue, tile {tile:?}, relaxed {relaxed}",
+                        T::SUFFIX
+                    );
+                }
+            }
+        }
+    }
+    check::<f32>();
+    check::<f16>();
+    check::<bf16>();
+}

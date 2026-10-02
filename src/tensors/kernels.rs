@@ -400,6 +400,16 @@ impl TryFrom<u16> for Analytic {
     }
 }
 
+/// Which operand of a product is read transposed — see
+/// [`Kernels::matmul_transposed_add`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Transposed {
+    /// `aᵀ·b`.
+    Left,
+    /// `a·bᵀ`.
+    Right,
+}
+
 /// Which way a matrix reduction folds.
 ///
 /// The name says what is *folded*, not what survives: [`Rows`](Axis::Rows)
@@ -900,6 +910,24 @@ pub trait Kernels<T: Real = f32>: Backend {
         addend: Matrix<T, Self>,
     ) -> Matrix<T, Self>;
 
+    /// `addend + aᵀ·b` or `addend + a·bᵀ`, as `transposed` says — the two
+    /// products a matrix product's backward pass needs.
+    ///
+    /// By default the operand is transposed into a tensor of its own first. A
+    /// backend whose product can read an operand transposed where it lies
+    /// overrides this, saving that copy.
+    fn matmul_transposed_add(
+        a: &Matrix<T, Self>,
+        b: &Matrix<T, Self>,
+        transposed: Transposed,
+        addend: Matrix<T, Self>,
+    ) -> Matrix<T, Self> {
+        match transposed {
+            Transposed::Left => Self::matmul_add(&Self::transpose(a), b, addend),
+            Transposed::Right => Self::matmul_add(a, &Self::transpose(b), addend),
+        }
+    }
+
     fn transpose(m: &Matrix<T, Self>) -> Matrix<T, Self>;
 
     /// Valid cross-correlation: output `(i, j)` is the window-shaped patch of
@@ -996,6 +1024,24 @@ pub trait Kernels<T: Real = f32>: Backend {
         updated: &mut [Sink<'_, Self>],
     ) -> Vec<Fresh<Self>>;
 
+    /// Run a fused program with one output of type `T` and sum that output
+    /// along `axis`. Reach this through
+    /// [`Program::run_sum`](super::fused::Program::run_sum), which checks the
+    /// operands first. By default the program runs and its output is summed.
+    #[doc(hidden)]
+    fn fused_sum(
+        program: &Program<T>,
+        shape: (usize, usize),
+        inputs: &[Source<'_, Self>],
+        axis: Axis,
+    ) -> Vector<T, Self>
+    where
+        T: fused::Element,
+    {
+        let data = Self::fused(program, shape, inputs, &mut []).remove(0);
+        fused::axis_sum(fused::Output::new(shape, data).into_matrix::<T>(), axis)
+    }
+
     /// Run a fused elementwise program as the epilogue of `a·b`: the product
     /// is the program's input 0 and `inputs` fill slots 1 on. Reach this
     /// through [`Program::run_matmul`](super::fused::Program::run_matmul),
@@ -1087,7 +1133,7 @@ impl<T: Real> Kernels<T> for Host {
             }
         }
         let mut out = vec![T::zero(); a.len()];
-        crate::vmath::unary_slice(f, a.data(), &mut out);
+        crate::vmath::unary_parallel(f, a.data(), &mut out);
         Vector::new(out)
     }
 
@@ -1123,7 +1169,7 @@ impl<T: Real> Kernels<T> for Host {
             .map(|(&x, &d)| f.derivative(x) * d)
             .collect::<Vec<_>>();
         let mut values = vec![T::zero(); value.len()];
-        crate::vmath::unary_slice(f, value.data(), &mut values);
+        crate::vmath::unary_parallel(f, value.data(), &mut values);
         (Vector::new(values), Vector::new(derivatives))
     }
 
@@ -1218,7 +1264,7 @@ impl<T: Real> Kernels<T> for Host {
             }
         }
         let mut out = vec![T::zero(); a.rows() * a.cols()];
-        crate::vmath::unary_slice(f, a.data(), &mut out);
+        crate::vmath::unary_parallel(f, a.data(), &mut out);
         Matrix::from_flat(a.rows(), a.cols(), out)
     }
 
@@ -1255,7 +1301,7 @@ impl<T: Real> Kernels<T> for Host {
             .map(|(&x, &d)| f.derivative(x) * d)
             .collect::<Vec<_>>();
         let mut values = vec![T::zero(); rows * cols];
-        crate::vmath::unary_slice(f, value.data(), &mut values);
+        crate::vmath::unary_parallel(f, value.data(), &mut values);
         (
             Matrix::from_flat(rows, cols, values),
             Matrix::from_flat(rows, cols, derivatives),
@@ -1280,6 +1326,54 @@ impl<T: Real> Kernels<T> for Host {
             0,
         );
         a.matmul_add(b, addend)
+    }
+
+    fn matmul_transposed_add(
+        a: &Matrix<T, Self>,
+        b: &Matrix<T, Self>,
+        transposed: Transposed,
+        addend: Matrix<T, Self>,
+    ) -> Matrix<T, Self> {
+        // Accelerate reads either operand transposed where it lies.
+        #[cfg(target_os = "macos")]
+        let addend = {
+            let ((a_rows, a_cols), (b_rows, b_cols)) = (a.shape(), b.shape());
+            let (rows, inner, other_inner, cols) = match transposed {
+                Transposed::Left => (a_cols, a_rows, b_rows, b_cols),
+                Transposed::Right => (a_rows, a_cols, b_cols, b_rows),
+            };
+            assert_eq!(
+                inner, other_inner,
+                "matmul_transposed_add: inner dimensions {inner} and {other_inner} differ"
+            );
+            assert_eq!(
+                addend.shape(),
+                (rows, cols),
+                "matmul_transposed_add: the addend is {:?}, not {rows}×{cols}",
+                addend.shape()
+            );
+            let mut output = addend;
+            if super::accelerate_dispatch::gemm(
+                a.data(),
+                transposed == Transposed::Left,
+                b.data(),
+                transposed == Transposed::Right,
+                (rows, inner, cols),
+                output.data_mut(),
+                true,
+            ) {
+                counters::kernel(
+                    (a.rows() * a.cols() + b.rows() * b.cols() + 2 * rows * cols) * size_of::<T>(),
+                    0,
+                );
+                return output;
+            }
+            output
+        };
+        match transposed {
+            Transposed::Left => Self::matmul_add(&Self::transpose(a), b, addend),
+            Transposed::Right => Self::matmul_add(a, &Self::transpose(b), addend),
+        }
     }
 
     fn transpose(m: &Matrix<T, Self>) -> Matrix<T, Self> {
@@ -1596,7 +1690,7 @@ pub(crate) fn correlation_shape(input: (usize, usize), window: (usize, usize)) -
 mod gpu {
     use super::{
         Analytic, Axis, BinaryOp, Compare, Family, Fresh, Kernels, Matrix, Program, Reduce, Sink,
-        SortOrder, Source, Statistic, Vector, correlation_shape, fused,
+        SortOrder, Source, Statistic, Transposed, Vector, correlation_shape, fused,
     };
     use crate::counters;
     use crate::metal::MetalElement;
@@ -1854,6 +1948,48 @@ mod gpu {
             a.matmul_add(b, addend)
         }
 
+        fn matmul_transposed_add(
+            a: &Matrix<T, Self>,
+            b: &Matrix<T, Self>,
+            transposed: Transposed,
+            mut addend: Matrix<T, Self>,
+        ) -> Matrix<T, Self> {
+            let ((a_rows, a_cols), (b_rows, b_cols)) = (a.shape(), b.shape());
+            let (rows, inner, other_inner, cols) = match transposed {
+                Transposed::Left => (a_cols, a_rows, b_rows, b_cols),
+                Transposed::Right => (a_rows, a_cols, b_cols, b_rows),
+            };
+            assert_eq!(
+                inner, other_inner,
+                "matmul_transposed_add: inner dimensions {inner} and {other_inner} differ"
+            );
+            assert_eq!(
+                addend.shape(),
+                (rows, cols),
+                "matmul_transposed_add: the addend is {:?}, not {rows}×{cols}",
+                addend.shape()
+            );
+            if a.storage()
+                .matmul_transposed_accumulate(
+                    b.storage(),
+                    addend.storage_mut(),
+                    transposed,
+                    (rows, inner, cols),
+                )
+                .is_some()
+            {
+                counters::kernel(
+                    (a.rows() * a.cols() + b.rows() * b.cols() + 2 * rows * cols) * size_of::<T>(),
+                    0,
+                );
+                return addend;
+            }
+            match transposed {
+                Transposed::Left => Self::matmul_add(&Self::transpose(a), b, addend),
+                Transposed::Right => Self::matmul_add(a, &Self::transpose(b), addend),
+            }
+        }
+
         fn transpose(m: &Matrix<T, Self>) -> Matrix<T, Self> {
             counters::elementwise_of::<T>(m.rows() * m.cols(), 1);
             m.transpose()
@@ -2107,6 +2243,18 @@ mod gpu {
             T: fused::Element,
         {
             fused::metal_matmul(program, a, b, inputs)
+        }
+
+        fn fused_sum(
+            program: &Program<T>,
+            shape: (usize, usize),
+            inputs: &[Source<'_, Self>],
+            axis: Axis,
+        ) -> Vector<T, Self>
+        where
+            T: fused::Element,
+        {
+            fused::metal_sum(program, shape, inputs, axis)
         }
     }
 

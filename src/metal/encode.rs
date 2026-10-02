@@ -13,7 +13,7 @@ use crate::tensors::{Analytic, Axis, BinaryOp, Compare, Family, Reduce, Statisti
 
 use super::MetalElement;
 use super::buffer::MetalBuffer;
-use super::device::Gpu;
+use super::device::{Gpu, Operands, Tile};
 use super::sync::{blit, compute, queued};
 
 /// Threadgroup tile edge; must match `TILE` in the shader. 16×16 = 256 threads.
@@ -41,6 +41,9 @@ pub(super) fn encode_matmul<T: MetalElement>(
     n: usize,
     accumulate: bool,
 ) -> Option<()> {
+    if let Some((pipeline, tile)) = gpu.gemm::<T>(Operands::Plain, accumulate, m, n) {
+        return encode_gemm(gpu, &pipeline, a, b, output, (m, k, n), tile);
+    }
     if !accumulate && let Some(pipeline) = gpu.tensorops_matmul::<T>() {
         return encode_tensorops_matmul(gpu, pipeline, a, b, output, m, k, n);
     }
@@ -112,6 +115,166 @@ pub(super) fn encode_tensorops_matmul(
         },
         MTLSize {
             width: pipeline.threadExecutionWidth() * 4,
+            height: 1,
+            depth: 1,
+        },
+    );
+    queued(gpu, m.saturating_mul(k).saturating_mul(n) / 128)
+}
+
+/// `y = M·x`, or `y += M·x`, for an `rows × cols` matrix `M`: one SIMD group
+/// per row.
+pub(super) fn encode_matvec<T: MetalElement>(
+    gpu: &Gpu,
+    matrix: &ProtocolObject<dyn MTLBuffer>,
+    x: &ProtocolObject<dyn MTLBuffer>,
+    y: &ProtocolObject<dyn MTLBuffer>,
+    (rows, cols): (usize, usize),
+    accumulate: bool,
+) -> Option<()> {
+    const ROWS_PER_GROUP: usize = 8;
+    let encoder = compute(gpu)?;
+    let pipeline = &gpu.kernels::<T>().matvec_rows;
+    encoder.setComputePipelineState(pipeline);
+    let (rows_u32, cols_u32) = (u32::try_from(rows).ok()?, u32::try_from(cols).ok()?);
+    let accumulate = u32::from(accumulate);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(matrix), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(x), 0, 1);
+        encoder.setBuffer_offset_atIndex(Some(y), 0, 2);
+        encoder.setBytes_length_atIndex(NonNull::from(&rows_u32).cast(), 4, 3);
+        encoder.setBytes_length_atIndex(NonNull::from(&cols_u32).cast(), 4, 4);
+        encoder.setBytes_length_atIndex(NonNull::from(&accumulate).cast(), 4, 5);
+    }
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: rows.div_ceil(ROWS_PER_GROUP),
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: pipeline.threadExecutionWidth() * ROWS_PER_GROUP,
+            height: 1,
+            depth: 1,
+        },
+    );
+    queued(gpu, rows.saturating_mul(cols) / 64)
+}
+
+/// The bands of rows `y = v·M` sums its `rows × cols` matrix in: as many as
+/// keep about this many threads busy, each band at least a few rows long.
+pub(super) fn vecmat_bands(rows: usize, cols: usize) -> (usize, usize) {
+    const THREADS: usize = 64 * 1024;
+    const FEWEST_ROWS: usize = 16;
+    let bands = (THREADS / cols.max(1)).clamp(1, rows.div_ceil(FEWEST_ROWS).max(1));
+    let band = rows.div_ceil(bands).max(1);
+    (rows.div_ceil(band), band)
+}
+
+/// `y = v·M`, or `y += v·M`, for an `rows × cols` matrix `M`: the sums of
+/// each band of rows into `partial` (see [`vecmat_bands`]), then their totals.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn encode_vecmat<T: MetalElement>(
+    gpu: &Gpu,
+    v: &ProtocolObject<dyn MTLBuffer>,
+    matrix: &ProtocolObject<dyn MTLBuffer>,
+    partial: &ProtocolObject<dyn MTLBuffer>,
+    y: &ProtocolObject<dyn MTLBuffer>,
+    (rows, cols): (usize, usize),
+    accumulate: bool,
+) -> Option<()> {
+    let (bands, band) = vecmat_bands(rows, cols);
+    let kernels = gpu.kernels::<T>();
+    let (rows_u32, cols_u32) = (u32::try_from(rows).ok()?, u32::try_from(cols).ok()?);
+    let band_u32 = u32::try_from(band).ok()?;
+    let accumulate = u32::from(accumulate);
+    let encoder = compute(gpu)?;
+    encoder.setComputePipelineState(&kernels.vecmat_bands);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(v), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(matrix), 0, 1);
+        encoder.setBuffer_offset_atIndex(Some(partial), 0, 2);
+        encoder.setBytes_length_atIndex(NonNull::from(&rows_u32).cast(), 4, 3);
+        encoder.setBytes_length_atIndex(NonNull::from(&cols_u32).cast(), 4, 4);
+        encoder.setBytes_length_atIndex(NonNull::from(&band_u32).cast(), 4, 5);
+    }
+    encoder.dispatchThreads_threadsPerThreadgroup(
+        MTLSize {
+            width: cols,
+            height: bands,
+            depth: 1,
+        },
+        MTLSize {
+            width: 64.min(cols),
+            height: 1,
+            depth: 1,
+        },
+    );
+    queued(gpu, rows.saturating_mul(cols) / 64)?;
+    encode_vecmat_finish::<T>(gpu, partial, y, cols, bands, accumulate != 0)
+}
+
+/// `y = Σ partial[b]`, or `y += …`, over the `bands` rows of `cols` partial
+/// sums: the second pass of [`encode_vecmat`].
+pub(super) fn encode_vecmat_finish<T: MetalElement>(
+    gpu: &Gpu,
+    partial: &ProtocolObject<dyn MTLBuffer>,
+    y: &ProtocolObject<dyn MTLBuffer>,
+    cols: usize,
+    bands: usize,
+    accumulate: bool,
+) -> Option<()> {
+    let (cols_u32, bands_u32) = (u32::try_from(cols).ok()?, u32::try_from(bands).ok()?);
+    let accumulate = u32::from(accumulate);
+    let encoder = compute(gpu)?;
+    encoder.setComputePipelineState(&gpu.kernels::<T>().vecmat_finish);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(partial), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(y), 0, 1);
+        encoder.setBytes_length_atIndex(NonNull::from(&cols_u32).cast(), 4, 2);
+        encoder.setBytes_length_atIndex(NonNull::from(&bands_u32).cast(), 4, 3);
+        encoder.setBytes_length_atIndex(NonNull::from(&accumulate).cast(), 4, 4);
+    }
+    dispatch_1d(&encoder, cols);
+    queued(gpu, bands.saturating_mul(cols) / 64)
+}
+
+/// A product on the general TensorOps kernel `pipeline` (see [`Gpu::gemm`]),
+/// whose threadgroups each compute one `tile.0 × tile.1` tile of the `m × n`
+/// output with `tile.2` SIMD groups. It writes, or adds into, every element of
+/// `output`, partial edge tiles included.
+pub(super) fn encode_gemm(
+    gpu: &Gpu,
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    a: &ProtocolObject<dyn MTLBuffer>,
+    b: &ProtocolObject<dyn MTLBuffer>,
+    output: &ProtocolObject<dyn MTLBuffer>,
+    (m, k, n): (usize, usize, usize),
+    tile: Tile,
+) -> Option<()> {
+    let encoder = compute(gpu)?;
+    encoder.setComputePipelineState(pipeline);
+    let (mu, ku, nu) = (
+        u32::try_from(m).ok()?,
+        u32::try_from(k).ok()?,
+        u32::try_from(n).ok()?,
+    );
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(a), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(b), 0, 1);
+        encoder.setBuffer_offset_atIndex(Some(output), 0, 2);
+        encoder.setBytes_length_atIndex(NonNull::from(&mu).cast(), 4, 3);
+        encoder.setBytes_length_atIndex(NonNull::from(&ku).cast(), 4, 4);
+        encoder.setBytes_length_atIndex(NonNull::from(&nu).cast(), 4, 5);
+    }
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(
+        MTLSize {
+            width: n.div_ceil(tile.1),
+            height: m.div_ceil(tile.0),
+            depth: 1,
+        },
+        MTLSize {
+            width: pipeline.threadExecutionWidth() * tile.2,
             height: 1,
             depth: 1,
         },

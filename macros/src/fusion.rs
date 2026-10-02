@@ -826,6 +826,19 @@ fn emit_host(site: &Site<'_>, roots: &[Root]) -> TokenStream {
         stores.iter().map(|store| value(store.value)).collect()
     };
 
+    // Roughly the instructions an element costs, for deciding whether to
+    // split the kernel across threads.
+    let work: usize = plan
+        .graph
+        .nodes
+        .iter()
+        .map(|node| match node {
+            opt::Node::Const(_) => 0,
+            opt::Node::Unary(function, _) if function.is_transcendental() => 8,
+            opt::Node::Binary(opt::Bin::Div | opt::Bin::Rem, ..) => 2,
+            _ => 1,
+        })
+        .sum();
     let bytes = (read.len() + roots.len()) * len;
     let size = quote!(::core::mem::size_of::<#element>());
     let record = {
@@ -848,13 +861,12 @@ fn emit_host(site: &Site<'_>, roots: &[Root]) -> TokenStream {
             #(#slices)*
             #(#hoisted)*
             #record
-            let __fused_out: ::std::vec::Vec<#element> = (0..#len)
-                .map(|__fused_i| {
+            let __fused_out: ::std::vec::Vec<#element> =
+                ::tensorcrate::__private::generate(#len, #work, |__fused_i| {
                     #(#loads)*
                     #(#body)*
                     #result
-                })
-                .collect();
+                });
             #tensor
         };
     }
@@ -866,17 +878,15 @@ fn emit_host(site: &Site<'_>, roots: &[Root]) -> TokenStream {
         .iter()
         .zip(roots)
         .map(|(out, root)| wrap(quote!(#out), root.shape));
-    let zero = site.backend.dtype.literal(0.0);
     quote! {
         #(#slices)*
         #(#hoisted)*
         #record
-        #(let mut #outputs: ::std::vec::Vec<#element> = ::std::vec![#zero; #len];)*
-        for __fused_i in 0..#len {
+        let [#(#outputs),*] = ::tensorcrate::__private::generate_many(#len, #work, |__fused_i| {
             #(#loads)*
             #(#body)*
-            #(#outputs[__fused_i] = #results;)*
-        }
+            [#(#results),*]
+        });
         (#(#tensors),*)
     }
 }

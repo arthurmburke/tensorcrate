@@ -10,6 +10,7 @@ use crate::numbers::Coefficient;
 
 const CBLAS_ROW_MAJOR: c_int = 101;
 const CBLAS_NO_TRANS: c_int = 111;
+const CBLAS_TRANS: c_int = 112;
 
 #[link(name = "Accelerate", kind = "framework")]
 unsafe extern "C" {
@@ -57,6 +58,22 @@ pub fn matmul<T: Coefficient>(
     output: &mut [T],
     accumulate: bool,
 ) -> bool {
+    gemm(a, false, b, false, (rows, inner, cols), output, accumulate)
+}
+
+/// `output = op(a)·op(b)`, plus `output` itself if `accumulate`, where `op`
+/// transposes an operand whose flag is set: `op(a)` is `rows × inner` and
+/// `op(b)` is `inner × cols`, each stored row-major as it is before `op`.
+/// Whether Accelerate ran it.
+pub fn gemm<T: Coefficient>(
+    a: &[T],
+    transpose_a: bool,
+    b: &[T],
+    transpose_b: bool,
+    (rows, inner, cols): (usize, usize, usize),
+    output: &mut [T],
+    accumulate: bool,
+) -> bool {
     if rows.saturating_mul(inner).saturating_mul(cols) < HOST_MATMUL_DISPATCH_OPS {
         return false;
     }
@@ -69,24 +86,36 @@ pub fn matmul<T: Coefficient>(
     let Ok(n) = c_int::try_from(cols) else {
         return false;
     };
+    assert!(a.len() == rows * inner && b.len() == inner * cols && output.len() == rows * cols);
+    // A row-major operand's leading dimension is its stored row length.
+    let (op_a, leading_a) = if transpose_a {
+        (CBLAS_TRANS, m)
+    } else {
+        (CBLAS_NO_TRANS, k)
+    };
+    let (op_b, leading_b) = if transpose_b {
+        (CBLAS_TRANS, k)
+    } else {
+        (CBLAS_NO_TRANS, n)
+    };
 
     if TypeId::of::<T>() == TypeId::of::<f32>() {
-        // SAFETY: TypeId equality proves the element layouts, all slices
-        // have been shape-checked by the caller, and BLAS writes exactly
-        // m*n row-major values into `output`.
+        // SAFETY: TypeId equality proves the element layouts, the lengths were
+        // checked above, and BLAS writes exactly m*n row-major values into
+        // `output`.
         unsafe {
             cblas_sgemm(
                 CBLAS_ROW_MAJOR,
-                CBLAS_NO_TRANS,
-                CBLAS_NO_TRANS,
+                op_a,
+                op_b,
                 m,
                 n,
                 k,
                 1.0,
                 a.as_ptr().cast(),
-                k,
+                leading_a,
                 b.as_ptr().cast(),
-                n,
+                leading_b,
                 f32::from(accumulate),
                 output.as_mut_ptr().cast(),
                 n,
@@ -100,16 +129,16 @@ pub fn matmul<T: Coefficient>(
         unsafe {
             cblas_dgemm(
                 CBLAS_ROW_MAJOR,
-                CBLAS_NO_TRANS,
-                CBLAS_NO_TRANS,
+                op_a,
+                op_b,
                 m,
                 n,
                 k,
                 1.0,
                 a.as_ptr().cast(),
-                k,
+                leading_a,
                 b.as_ptr().cast(),
-                n,
+                leading_b,
                 f64::from(accumulate),
                 output.as_mut_ptr().cast(),
                 n,

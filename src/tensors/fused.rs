@@ -102,12 +102,14 @@
 use std::any::TypeId;
 use std::cell::Cell;
 use std::fmt;
+use std::ops::Range;
 
 use half::{bf16, f16};
 
-use super::{Analytic, Backend, BinaryOp, Compare, Host, Kernels, Matrix, Vector};
+use super::{Analytic, Axis, Backend, BinaryOp, Compare, Host, Kernels, Matrix, Vector};
 use crate::counters;
 use crate::numbers::Real;
+use crate::parallel::Shared;
 
 /// Registers a program may use. Metal keeps them in a per-thread array, so this
 /// is also a bound on the shader's register pressure.
@@ -603,6 +605,82 @@ impl<T: Real> Program<T> {
             .into_iter()
             .map(|data| Output { shape, data })
             .collect()
+    }
+
+    /// Run a program with one output of its own type, and sum that output
+    /// along `axis` — [`Axis::Rows`] totals each row, [`Axis::Columns`] each
+    /// column — without keeping it.
+    ///
+    /// The result is what running the program and summing its output with
+    /// [`Kernels::matvec`] or [`Kernels::vecmat`] against ones gives: on the
+    /// host exactly that. On Metal, once the program has run before, the
+    /// program and the sum are one kernel, and the output is never written to
+    /// memory — so a softmax is two passes over its input, the sums and then
+    /// the normalized values, with nothing in between.
+    ///
+    /// ```
+    /// use tensorcrate::tensors::fused::{Builder, DType};
+    /// use tensorcrate::tensors::{Analytic, Axis, Matrix};
+    ///
+    /// // Σⱼ exp(xᵢⱼ), each row.
+    /// let mut b = Builder::<f32>::new();
+    /// let x = b.input(DType::F32);
+    /// let e = b.unary(Analytic::Exp, x);
+    /// b.output(e, DType::F32);
+    /// let exp = b.build().unwrap();
+    ///
+    /// let x = Matrix::from_rows([[0.0f32, 0.0], [1.0, 0.0]]);
+    /// let sums = exp.run_sum((2, 2), &[&x], Axis::Rows);
+    /// assert_eq!(sums[0], 2.0);
+    /// assert_eq!(sums[1], 1.0f32.exp() + 1.0);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// If the program updates tensors in place, does not have exactly one
+    /// output, or that output is not of type `T`; or if `inputs` disagree with
+    /// the program as in [`run`](Self::run).
+    #[track_caller]
+    pub fn run_sum<B: Kernels<T>>(
+        &self,
+        shape: (usize, usize),
+        inputs: &[&dyn Fusable<B>],
+        axis: Axis,
+    ) -> Vector<T, B>
+    where
+        T: Element,
+    {
+        assert!(
+            self.updated == 0 && self.outputs == [T::DTYPE],
+            "fused sum: the program must have one {} output and update nothing in place",
+            T::DTYPE.name()
+        );
+        assert_eq!(
+            inputs.len(),
+            self.fresh_inputs(),
+            "fused program: expected {} inputs, got {}",
+            self.fresh_inputs(),
+            inputs.len()
+        );
+        let sources: Vec<Source<'_, B>> = inputs.iter().map(|input| input.source()).collect();
+        for (slot, source) in sources.iter().enumerate() {
+            self.check_input(slot, source.dtype(), source.len, shape);
+        }
+        match mode() {
+            Mode::Fused => {
+                let read: usize = self.inputs.iter().map(|dtype| dtype.size()).sum();
+                let total = match axis {
+                    Axis::Rows => shape.0,
+                    Axis::Columns => shape.1,
+                };
+                counters::kernel(read * shape.0 * shape.1 + total * size_of::<T>(), 1);
+                B::fused_sum(self, shape, &sources, axis)
+            }
+            Mode::Unfused => {
+                let data = unfused(self, shape, &sources, &mut []).remove(0);
+                axis_sum(Output { shape, data }.into_matrix::<T>(), axis)
+            }
+        }
     }
 
     /// [`run`](Self::run) for the common case: vectors of one length, all of the
@@ -1741,6 +1819,10 @@ pub struct Output<B: Backend> {
 }
 
 impl<B: Backend> Output<B> {
+    pub(crate) fn new(shape: (usize, usize), data: Fresh<B>) -> Self {
+        Output { shape, data }
+    }
+
     pub fn dtype(&self) -> DType {
         match self.data {
             Fresh::F32(_) => DType::F32,
@@ -1916,18 +1998,53 @@ fn load_unfused<B: Kernels<T>, T: Real>(
     match remap {
         Remap::Identity => tensor,
         Remap::Transpose => B::transpose(&tensor),
-        Remap::Row | Remap::Column => {
-            let vector = B::matrix_as_vector(tensor.storage());
-            let count = if remap == Remap::Row { rows } else { cols };
-            let copies: Vec<B::Vector<T>> = (0..count).map(|_| B::duplicate(vector)).collect();
-            let storage = if remap == Remap::Row {
-                B::vstack(&copies, cols)
-            } else {
-                B::hstack(&copies, rows)
-            };
-            Matrix::from_storage(rows, cols, storage)
-        }
+        Remap::Row => Matrix::from_storage(rows, cols, repeated::<B, T>(tensor, rows, true)),
+        Remap::Column => Matrix::from_storage(rows, cols, repeated::<B, T>(tensor, cols, false)),
     }
+}
+
+/// `piece` — one row, or one column — repeated `count` times, down the rows
+/// (`down`) or across the columns.
+///
+/// By doubling, from the highest bit of `count` down: each step joins the
+/// block built so far to itself, and then the piece once more where the bit is
+/// set — so the copies number at most twice the logarithm of `count` rather
+/// than `count`. Every copy is exact.
+fn repeated<B: Kernels<T>, T: Real>(piece: Matrix<T, B>, count: usize, down: bool) -> B::Matrix<T> {
+    let (piece_rows, piece_cols) = piece.shape();
+    if count == 0 {
+        let empty: [B::Vector<T>; 0] = [];
+        return if down {
+            B::vstack(&empty, piece_cols)
+        } else {
+            B::hstack(&empty, piece_rows)
+        };
+    }
+    // Joins an `a`-copy block and a `b`-copy block.
+    let join = |a: &B::Matrix<T>, a_copies: usize, b: &B::Matrix<T>, b_copies: usize| {
+        if down {
+            B::stack(a, b, a_copies, b_copies, piece_cols)
+        } else {
+            B::concat(a, b, piece_rows, a_copies, b_copies)
+        }
+    };
+    let piece = piece.into_storage();
+    let top = usize::BITS - 1 - count.leading_zeros();
+    // `None` while the block is the piece itself.
+    let mut block: Option<B::Matrix<T>> = None;
+    let mut copies = 1;
+    for bit in (0..top).rev() {
+        let current = block.as_ref().unwrap_or(&piece);
+        let doubled = join(current, copies, current, copies);
+        copies *= 2;
+        block = Some(if count >> bit & 1 == 1 {
+            copies += 1;
+            join(&doubled, copies - 1, &piece, 1)
+        } else {
+            doubled
+        });
+    }
+    block.unwrap_or(piece)
 }
 
 /// `storage` reinterpreted as storage of `U`, when `T` is `U`.
@@ -2250,6 +2367,54 @@ impl SliceMut<'_> {
     }
 }
 
+/// An output's storage, for threads that each write a disjoint window of it.
+#[derive(Clone, Copy)]
+enum Window {
+    F32(Shared<f32>),
+    F16(Shared<f16>),
+    Bf16(Shared<bf16>),
+    F64(Shared<f64>),
+}
+
+impl SliceMut<'_> {
+    fn window(&mut self) -> Window {
+        match self {
+            SliceMut::F32(values) => Window::F32(Shared(values.as_mut_ptr())),
+            SliceMut::F16(values) => Window::F16(Shared(values.as_mut_ptr())),
+            SliceMut::Bf16(values) => Window::Bf16(Shared(values.as_mut_ptr())),
+            SliceMut::F64(values) => Window::F64(Shared(values.as_mut_ptr())),
+        }
+    }
+}
+
+impl Window {
+    /// The elements `range` of the output.
+    ///
+    /// # Safety
+    ///
+    /// `range` lies within the output, which outlives the slice, and no other
+    /// slice of those elements is in use.
+    unsafe fn slice<'a>(self, range: Range<usize>) -> SliceMut<'a> {
+        let len = range.len();
+        unsafe {
+            match self {
+                Window::F32(base) => {
+                    SliceMut::F32(std::slice::from_raw_parts_mut(base.at(range.start), len))
+                }
+                Window::F16(base) => {
+                    SliceMut::F16(std::slice::from_raw_parts_mut(base.at(range.start), len))
+                }
+                Window::Bf16(base) => {
+                    SliceMut::Bf16(std::slice::from_raw_parts_mut(base.at(range.start), len))
+                }
+                Window::F64(base) => {
+                    SliceMut::F64(std::slice::from_raw_parts_mut(base.at(range.start), len))
+                }
+            }
+        }
+    }
+}
+
 /// Allocate a program's fresh outputs.
 fn allocate<T>(program: &Program<T>, len: usize) -> Vec<Owned> {
     program.outputs[program.updated..]
@@ -2290,6 +2455,16 @@ impl Owned {
     }
 }
 
+/// The sums of `matrix` along `axis`, as products with ones — the definition
+/// of [`Program::run_sum`].
+pub(crate) fn axis_sum<T: Real, B: Kernels<T>>(matrix: Matrix<T, B>, axis: Axis) -> Vector<T, B> {
+    let (rows, cols) = matrix.shape();
+    match axis {
+        Axis::Rows => B::matvec(&matrix, &Vector::filled(cols, T::one())),
+        Axis::Columns => B::vecmat(&Vector::filled(rows, T::one()), &matrix),
+    }
+}
+
 /// Run a program on the CPU, over whatever backend's storage, reading it in
 /// place. This is the [`Host`] implementation and the fallback for a Metal
 /// tensor that is not device-resident.
@@ -2305,9 +2480,119 @@ pub(crate) fn interpret_on<B: Backend, T: Real>(
         let inputs: Vec<Slice<'_>> = inputs.iter().map(Source::slice).collect();
         let mut outputs: Vec<SliceMut<'_>> = updated.iter_mut().map(Sink::slice).collect();
         outputs.extend(fresh.iter_mut().map(Owned::slice));
-        interpret(program, shape, &inputs, &mut outputs);
+        if !single_operation(program, &inputs, &mut outputs) {
+            interpret(program, shape, &inputs, &mut outputs);
+        }
     }
     fresh.into_iter().map(Owned::store).collect()
+}
+
+/// Run a program of one operation on fresh operands of its own type — a lone
+/// activation such as `max(x, 0)` — as the kernel that operation is unfused,
+/// over the whole tensor at once, which is what the interpreter would run tile
+/// by tile. Whether it did.
+///
+/// The interpreter's setup and its per-tile dispatch are small, but so is the
+/// operation, and on a short tensor they would show.
+#[cfg(not(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64"))))]
+fn single_operation<T: Real>(
+    _program: &Program<T>,
+    _inputs: &[Slice<'_>],
+    _outputs: &mut [SliceMut<'_>],
+) -> bool {
+    // Without the SIMD tier the interpreter's kernels are the scalar loops,
+    // and there is nothing faster to hand the operation to.
+    false
+}
+
+#[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
+fn single_operation<T: Real>(
+    program: &Program<T>,
+    inputs: &[Slice<'_>],
+    outputs: &mut [SliceMut<'_>],
+) -> bool {
+    use crate::tensors::simd_dispatch as direct;
+    if program.updated != 0 || outputs.len() != 1 || inputs.len() > 2 {
+        return false;
+    }
+    let Some(out) = outputs[0].typed::<T>() else {
+        return false;
+    };
+    let operand = |slot: u8| {
+        inputs
+            .get(usize::from(slot))
+            .and_then(|input| input.typed::<T>())
+    };
+    match program.code[..] {
+        [
+            Instr::Load {
+                dst: x,
+                input,
+                remap: Remap::Identity,
+            },
+            Instr::Unary { dst, op, a },
+            Instr::Store { src, output: 0 },
+        ] if a == x && src == dst => {
+            let Some(values) = operand(input) else {
+                return false;
+            };
+            crate::vmath::unary_parallel(op, values, out);
+            true
+        }
+        [
+            Instr::Load {
+                dst: x,
+                input,
+                remap: Remap::Identity,
+            },
+            Instr::Const { dst: c, value },
+            ref operation,
+            Instr::Store { src, output: 0 },
+        ] if x != c && operation.dst() == Some(src) => {
+            let Some(values) = operand(input) else {
+                return false;
+            };
+            match *operation {
+                Instr::Binary { op, a, b, .. } if (a, b) == (x, c) || (a, b) == (c, x) => {
+                    direct::broadcast(values, value, op, a == c, out)
+                }
+                Instr::Cmp { op, a, b, .. } if (a, b) == (x, c) || (a, b) == (c, x) => {
+                    direct::compare_scalar(values, value, op, a == c, out)
+                }
+                _ => false,
+            }
+        }
+        [
+            Instr::Load {
+                dst: x,
+                input: first,
+                remap: Remap::Identity,
+            },
+            Instr::Load {
+                dst: y,
+                input: second,
+                remap: Remap::Identity,
+            },
+            ref operation,
+            Instr::Store { src, output: 0 },
+        ] if x != y && operation.dst() == Some(src) => {
+            let (Some(xs), Some(ys)) = (operand(first), operand(second)) else {
+                return false;
+            };
+            match *operation {
+                Instr::Binary { op, a, b, .. } if (a, b) == (x, y) => {
+                    direct::elementwise(xs, ys, op, out)
+                }
+                Instr::Binary { op, a, b, .. } if (a, b) == (y, x) => {
+                    direct::elementwise(ys, xs, op, out)
+                }
+                Instr::Cmp { op, a, b, .. } if (a, b) == (x, y) => direct::compare(xs, ys, op, out),
+                Instr::Cmp { op, a, b, .. } if (a, b) == (y, x) => direct::compare(ys, xs, op, out),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 /// The tile interpreter.
@@ -2339,13 +2624,85 @@ fn interpret<T: Real>(
     // so an instruction may overwrite one of its own operands.
     let physical = program.registers + 1;
     let tile_len = tile_len::<T>(physical, len);
-    with_scratch::<T, _>(physical * tile_len, |scratch| {
-        run_tiles(program, shape, inputs, outputs, &plan, scratch, tile_len)
-    });
+    let grain = parallel_grain(program, tile_len);
+    if len < 2 * grain || crate::parallel::threads() <= 1 || !crate::parallel::plain_float::<T>() {
+        with_scratch::<T, _>(physical * tile_len, |scratch| {
+            run_tiles(
+                program,
+                shape,
+                inputs,
+                outputs,
+                &plan,
+                scratch,
+                tile_len,
+                0..len,
+            )
+        });
+        return;
+    }
+    // Every element is computed from the same element of each input — or a
+    // broadcast of one, which is only read — and written to the same element
+    // of each output, so ranges of tiles can run on separate threads. The
+    // tensors updated in place are loaded without a remap, so a range reads
+    // only its own window of them.
+    let windows: Vec<Window> = outputs.iter_mut().map(SliceMut::window).collect();
+    // SAFETY: `T` is a plain float; each range writes only its own window of
+    // each output; the program, plan and inputs are only read.
+    unsafe {
+        crate::parallel::for_ranges_unchecked(len, grain, tile_len, |range| {
+            let mut outputs: Vec<SliceMut<'_>> = windows
+                .iter()
+                .map(|window| window.slice(range.clone()))
+                .collect();
+            with_scratch::<T, _>(physical * tile_len, |scratch| {
+                run_tiles(
+                    program,
+                    shape,
+                    inputs,
+                    &mut outputs,
+                    &plan,
+                    scratch,
+                    tile_len,
+                    range,
+                )
+            });
+        });
+    }
 }
 
-/// The tile loop of [`interpret`], over `scratch` holding one `tile_len` tile
-/// per physical register.
+/// Element-instructions worth giving a thread of their own.
+const PARALLEL_WORK: usize = 64 * 1024;
+
+/// The fewest elements worth giving a thread however costly each is: a
+/// shorter tensor is likely still in the calling core's cache, and splitting
+/// it would only move it to other cores.
+const PARALLEL_ELEMENTS: usize = 8 * 1024;
+
+/// The fewest elements of `program` worth giving a thread: a whole number of
+/// tiles, more of them the cheaper each element is.
+fn parallel_grain<T>(program: &Program<T>, tile_len: usize) -> usize {
+    let per_element: usize = program
+        .code
+        .iter()
+        .map(|instr| match instr {
+            Instr::Const { .. } => 0,
+            Instr::Unary { op, .. } if *op != Analytic::Sqrt => 8,
+            Instr::Binary {
+                op: BinaryOp::Div | BinaryOp::Rem,
+                ..
+            } => 2,
+            _ => 1,
+        })
+        .sum();
+    let elements = (PARALLEL_WORK / per_element.max(1)).max(PARALLEL_ELEMENTS);
+    elements.div_ceil(tile_len).max(1) * tile_len
+}
+
+/// The tile loop of [`interpret`] over the elements `range` — a whole number
+/// of tiles from the start of the space — with `scratch` holding one `tile_len`
+/// tile per physical register. `outputs` are the windows `range` of the
+/// program's outputs.
+#[allow(clippy::too_many_arguments)]
 fn run_tiles<T: Real>(
     program: &Program<T>,
     shape: (usize, usize),
@@ -2354,8 +2711,8 @@ fn run_tiles<T: Real>(
     plan: &Plan,
     scratch: &mut [T],
     tile_len: usize,
+    range: Range<usize>,
 ) {
-    let len = shape.0 * shape.1;
     let fresh_inputs = program.fresh_inputs();
     let physical = program.registers + 1;
     let mut map: [usize; REGISTERS] = std::array::from_fn(|reg| reg.min(physical - 1));
@@ -2367,9 +2724,11 @@ fn run_tiles<T: Real>(
     // written through the spare.
     let mut outside: [Option<*const T>; REGISTERS] = [None; REGISTERS];
 
-    let mut start = 0;
-    while start < len {
-        let n = tile_len.min(len - start);
+    let mut start = range.start;
+    while start < range.end {
+        let n = tile_len.min(range.end - start);
+        // Where the tile lies in the windows of the outputs.
+        let local = start - range.start;
         // The tiles are disjoint `n`-long windows of `scratch`.
         let base = scratch.as_mut_ptr();
         let tile = |physical: usize| unsafe { base.add(physical * tile_len) };
@@ -2387,7 +2746,7 @@ fn run_tiles<T: Real>(
                 match plan.direct[index] {
                     Some(output) => {
                         let values = outputs[output].typed::<T>().expect("planned");
-                        (unsafe { values.as_mut_ptr().add(start) }, true)
+                        (unsafe { values.as_mut_ptr().add(local) }, true)
                     }
                     None => (tile(spare), false),
                 }
@@ -2407,9 +2766,10 @@ fn run_tiles<T: Real>(
                     if slot < fresh_inputs {
                         inputs[slot].gather(start, shape, remap, out);
                     } else {
+                        // An updated tensor, read without a remap.
                         outputs[slot - fresh_inputs]
                             .view()
-                            .gather(start, shape, remap, out);
+                            .gather(local, shape, remap, out);
                     }
                 }
                 Instr::Const { dst, value } => {
@@ -2499,16 +2859,16 @@ fn run_tiles<T: Real>(
                 Instr::Store { src, output } => {
                     let output = &mut outputs[usize::from(output)];
                     match constant[src as usize] {
-                        Some(value) => output.fill(start, n, value),
+                        Some(value) => output.fill(local, n, value),
                         None => {
                             let from = place(src, &outside, &map);
                             // Already there if the plan wrote it in place.
                             let there = output.typed::<T>().is_some_and(|values| {
-                                std::ptr::eq(from, unsafe { values.as_ptr().add(start) })
+                                std::ptr::eq(from, unsafe { values.as_ptr().add(local) })
                             });
                             if !there {
                                 let values = unsafe { std::slice::from_raw_parts(from, n) };
-                                output.scatter(start, values);
+                                output.scatter(local, values);
                             }
                         }
                     }
@@ -2821,6 +3181,51 @@ pub(crate) fn metal<T: crate::metal::MetalElement>(
 ) -> Vec<Fresh<super::Metal>> {
     resident(program, shape, inputs, updated)
         .unwrap_or_else(|| interpret_on(program, shape, inputs, updated))
+}
+
+/// The [`Metal`](super::Metal) entry point for [`Kernels::fused_sum`]: one
+/// kernel when the operands are device-resident and the program has a kernel
+/// of its own, and otherwise the program and then the sums.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub(crate) fn metal_sum<T: crate::metal::MetalElement + Element>(
+    program: &Program<T>,
+    shape: (usize, usize),
+    inputs: &[Source<'_, super::Metal>],
+    axis: Axis,
+) -> Vector<T, super::Metal> {
+    resident_sum(program, shape, inputs, axis).unwrap_or_else(|| {
+        let data = metal(program, shape, inputs, &mut []).remove(0);
+        axis_sum(Output { shape, data }.into_matrix::<T>(), axis)
+    })
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn resident_sum<T: crate::metal::MetalElement + Element>(
+    program: &Program<T>,
+    shape: (usize, usize),
+    inputs: &[Source<'_, super::Metal>],
+    axis: Axis,
+) -> Option<Vector<T, super::Metal>> {
+    use crate::metal::MetalBuffer;
+    use crate::tensors::MetalStorage;
+
+    if !program.runs_on_metal() {
+        return None;
+    }
+    let read = device::sources(inputs)?;
+    let len = match axis {
+        Axis::Rows => shape.0,
+        Axis::Columns => shape.1,
+    };
+    let sums = MetalBuffer::<T>::allocate(len)?;
+    crate::metal::fused_sum::<T>(
+        &program.encode(),
+        shape,
+        &read,
+        axis == Axis::Rows,
+        sums.raw(),
+    )?;
+    Some(Vector::from_storage(len, MetalStorage::from_device(sums)))
 }
 
 /// The [`Metal`](super::Metal) entry point for [`Kernels::matmul_epilogue`]:

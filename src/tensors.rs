@@ -74,6 +74,7 @@ pub use dual::{
 };
 pub use kernels::{
     Analytic, Axis, BinaryOp, Compare, Family, Kernels, Ordered, Reduce, SortOrder, Statistic,
+    Transposed,
 };
 pub use matrix::Matrix;
 pub use tape::{MatrixVar, ScalarVar, Tape, Var, VectorVar};

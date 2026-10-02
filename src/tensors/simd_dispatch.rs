@@ -10,6 +10,8 @@
 //! beyond its result.
 
 use std::any::TypeId;
+use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::{BinaryOp, Compare, Reduce};
 use crate::numbers::{Coefficient, Complex};
@@ -47,6 +49,31 @@ fn from_f64<T: Copy + 'static>(v: f64) -> T {
     unsafe { std::ptr::read((&v as *const f64).cast::<T>()) }
 }
 
+/// Elements per thread for the elementwise kernels, which are bound by memory
+/// bandwidth: below twice this a kernel runs on its calling thread alone.
+const PARALLEL_GRAIN: usize = 32 * 1024;
+
+/// Run `kernel` over windows of `out` and the same windows of its operands, on
+/// several threads when `out` is long enough. Whether the SIMD path ran, which
+/// depends only on the element type and the operation, so is the same for
+/// every window.
+fn split<T: 'static>(out: &mut [T], kernel: impl Fn(Range<usize>, &mut [T]) -> bool) -> bool {
+    if !crate::parallel::plain_float::<T>() || out.len() < 2 * PARALLEL_GRAIN {
+        return kernel(0..out.len(), out);
+    }
+    let ran = AtomicBool::new(true);
+    // SAFETY: `T` is a plain float, and the operands the kernel captures are
+    // slices of it.
+    unsafe {
+        crate::parallel::for_slices_unchecked(out, PARALLEL_GRAIN, |start, window| {
+            if !kernel(start..start + window.len(), window) {
+                ran.store(false, Ordering::Relaxed);
+            }
+        });
+    }
+    ran.into_inner()
+}
+
 pub fn dot<T: Coefficient>(a: &[T], b: &[T]) -> Option<T> {
     if a.len() < MIN_ELEMENTS {
         return None;
@@ -69,6 +96,12 @@ pub fn elementwise<T: Coefficient>(a: &[T], b: &[T], op: BinaryOp, out: &mut [T]
         return false;
     }
     debug_assert!(b.len() == a.len() && out.len() == a.len());
+    split(out, |range, out| {
+        elementwise_window(&a[range.clone()], &b[range], op, out)
+    })
+}
+
+fn elementwise_window<T: Coefficient>(a: &[T], b: &[T], op: BinaryOp, out: &mut [T]) -> bool {
     // The compact floats have kernels of their own: native FP16 lanes, and
     // BF16 through `f32` with one rounding.
     if crate::compact::elementwise(a, b, op, out) {
@@ -108,6 +141,18 @@ pub fn broadcast<T: Coefficient>(
         return false;
     }
     debug_assert_eq!(out.len(), values.len());
+    split(out, |range, out| {
+        broadcast_window(&values[range], scalar, op, scalar_left, out)
+    })
+}
+
+fn broadcast_window<T: Coefficient>(
+    values: &[T],
+    scalar: T,
+    op: BinaryOp,
+    scalar_left: bool,
+    out: &mut [T],
+) -> bool {
     if crate::compact::broadcast(values, scalar, op, scalar_left, out) {
         return true;
     }
@@ -139,6 +184,12 @@ pub fn compare<T: Coefficient>(a: &[T], b: &[T], op: Compare, out: &mut [T]) -> 
         return false;
     }
     debug_assert!(b.len() == a.len() && out.len() == a.len());
+    split(out, |range, out| {
+        compare_window(&a[range.clone()], &b[range], op, out)
+    })
+}
+
+fn compare_window<T: Coefficient>(a: &[T], b: &[T], op: Compare, out: &mut [T]) -> bool {
     if crate::compact::compare(a, b, op, out) {
         return true;
     }
@@ -176,6 +227,18 @@ pub fn compare_scalar<T: Coefficient>(
         return false;
     }
     debug_assert_eq!(out.len(), values.len());
+    split(out, |range, out| {
+        compare_scalar_window(&values[range], scalar, op, scalar_left, out)
+    })
+}
+
+fn compare_scalar_window<T: Coefficient>(
+    values: &[T],
+    scalar: T,
+    op: Compare,
+    scalar_left: bool,
+    out: &mut [T],
+) -> bool {
     if crate::compact::compare_scalar(values, scalar, op, scalar_left, out) {
         return true;
     }
@@ -207,6 +270,12 @@ pub fn clamp<T: Coefficient>(values: &[T], low: T, high: T, out: &mut [T]) -> bo
         return false;
     }
     debug_assert_eq!(out.len(), values.len());
+    split(out, |range, out| {
+        clamp_window(&values[range], low, high, out)
+    })
+}
+
+fn clamp_window<T: Coefficient>(values: &[T], low: T, high: T, out: &mut [T]) -> bool {
     if crate::compact::clamp(values, low, high, out) {
         return true;
     }

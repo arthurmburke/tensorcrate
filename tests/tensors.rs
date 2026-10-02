@@ -402,3 +402,85 @@ fn constructors_and_map_preserve_shape() {
     let lifted: Vector<Complex<f64>> = real.map(|&x| Complex::constant(x));
     assert_eq!(lifted.get(1), Some(&Complex::new(2.0, 0.0)));
 }
+
+/// Small integers, so any summation order gives the same float.
+fn integral<T: From<i16>>(rows: usize, cols: usize, seed: usize) -> Vec<T> {
+    (0..rows * cols)
+        .map(|i| T::from(((i * 7 + seed * 13) % 9) as i16 - 4))
+        .collect()
+}
+
+#[test]
+fn transposes_of_every_shape_move_each_element_once() {
+    // Shapes on either side of the blocking and of the size at which the
+    // transpose splits across threads, including long thin ones.
+    for (rows, cols) in [
+        (0, 5),
+        (1, 1),
+        (3, 70),
+        (33, 31),
+        (1001, 333),
+        (2, 70_001),
+        (70_001, 3),
+    ] {
+        let data: Vec<f32> = (0..rows * cols).map(|i| i as f32).collect();
+        let t = Matrix::from_flat(rows, cols, data.clone()).transpose();
+        assert_eq!(t.shape(), (cols, rows));
+        for i in 0..rows {
+            for j in 0..cols {
+                assert_eq!(
+                    t.as_slice()[j * rows + i],
+                    data[i * cols + j],
+                    "{rows}×{cols} at ({i}, {j})"
+                );
+            }
+        }
+        // A type the threads do not split, through the same blocking.
+        let ints: Vec<i64> = (0..rows * cols).map(|i| i as i64).collect();
+        let t = Matrix::from_flat(rows, cols, ints.clone()).transpose();
+        assert!((0..rows * cols).all(|k| t.as_slice()[(k % cols) * rows + k / cols] == ints[k]));
+    }
+}
+
+#[test]
+fn products_reading_an_operand_transposed_match_transposing_it_first() {
+    use tensorcrate::tensors::{Host, Kernels, Transposed};
+    fn check<T: tensorcrate::numbers::Real + From<i16>>()
+    where
+        Host: Kernels<T>,
+    {
+        // Big enough for Accelerate, and too small for it.
+        for (m, k, n) in [(37, 53, 29), (2, 3, 4)] {
+            let addend = Matrix::<T>::from_flat(m, n, integral(m, n, 1));
+            // aᵀ·b, with a stored k × m.
+            let a = Matrix::<T>::from_flat(k, m, integral(k, m, 2));
+            let b = Matrix::<T>::from_flat(k, n, integral(k, n, 3));
+            let read = Host::matmul_transposed_add(&a, &b, Transposed::Left, addend.clone());
+            let copied = Host::matmul_add(&a.transpose(), &b, addend.clone());
+            assert_eq!(read, copied, "aᵀ·b, {m}×{k}×{n}");
+            // a·bᵀ, with b stored n × k.
+            let a = Matrix::<T>::from_flat(m, k, integral(m, k, 4));
+            let b = Matrix::<T>::from_flat(n, k, integral(n, k, 5));
+            let read = Host::matmul_transposed_add(&a, &b, Transposed::Right, addend.clone());
+            let copied = Host::matmul_add(&a, &b.transpose(), addend);
+            assert_eq!(read, copied, "a·bᵀ, {m}×{k}×{n}");
+        }
+    }
+    check::<f32>();
+    check::<f64>();
+}
+
+#[test]
+#[should_panic(expected = "inner dimensions")]
+fn a_transposed_product_checks_its_inner_dimensions() {
+    use tensorcrate::tensors::{Host, Kernels, Transposed};
+    let a = Matrix::<f32>::from_flat(40, 30, vec![0.0; 1200]);
+    let b = Matrix::<f32>::from_flat(40, 31, vec![0.0; 1240]);
+    // aᵀ·b needs a's rows to match b's rows: fine. a·bᵀ needs columns to match.
+    let _ = Host::matmul_transposed_add(
+        &a,
+        &b,
+        Transposed::Right,
+        Matrix::from_flat(40, 40, vec![0.0; 1600]),
+    );
+}

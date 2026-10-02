@@ -40,6 +40,9 @@ pub mod errors;
 pub mod metal;
 pub mod numbers;
 pub mod optim;
+mod parallel;
+#[doc(hidden)]
+pub use parallel::set_host_threads;
 pub mod persist;
 pub mod projections;
 #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
@@ -57,6 +60,62 @@ pub mod __private {
     #[inline(always)]
     pub fn record_kernel(bytes: usize, allocations: usize) {
         crate::counters::kernel(bytes, allocations);
+    }
+
+    /// Element-instructions worth giving a thread of their own.
+    const PARALLEL_WORK: usize = 256 * 1024;
+
+    /// The fewest elements worth giving a thread, for elements costing `work`
+    /// instructions each.
+    fn grain(work: usize) -> usize {
+        (PARALLEL_WORK / work.max(1)).max(1024)
+    }
+
+    /// `[f(0), …, f(len - 1)]`, computed on several threads when it is worth
+    /// it: `work` is roughly the instructions one element costs. A fused
+    /// `math!` kernel with one result.
+    pub fn generate<T: Send>(len: usize, work: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+        let grain = grain(work);
+        if len < 2 * grain || crate::parallel::threads() <= 1 {
+            return (0..len).map(f).collect();
+        }
+        let mut out = Vec::with_capacity(len);
+        crate::parallel::for_slices(&mut out.spare_capacity_mut()[..len], grain, |start, window| {
+            for (offset, slot) in window.iter_mut().enumerate() {
+                slot.write(f(start + offset));
+            }
+        });
+        // SAFETY: every element below `len` was written.
+        unsafe { out.set_len(len) };
+        out
+    }
+
+    /// [`generate`] for a kernel with `N` results of one type, each element
+    /// computing one of each.
+    pub fn generate_many<T: Copy + Default + Send, const N: usize>(
+        len: usize,
+        work: usize,
+        f: impl Fn(usize) -> [T; N] + Sync,
+    ) -> [Vec<T>; N] {
+        let mut outputs: [Vec<T>; N] = std::array::from_fn(|_| vec![T::default(); len]);
+        let write = |outputs: &[crate::parallel::Shared<T>; N], range: std::ops::Range<usize>| {
+            for i in range {
+                for (output, value) in outputs.iter().zip(f(i)) {
+                    // SAFETY: `i` is below `len`, and in this range only.
+                    unsafe { *output.at(i) = value };
+                }
+            }
+        };
+        let shared = outputs
+            .each_mut()
+            .map(|output| crate::parallel::Shared(output.as_mut_ptr()));
+        let grain = grain(work);
+        if len < 2 * grain {
+            write(&shared, 0..len);
+        } else {
+            crate::parallel::for_ranges(len, grain, 16, |range| write(&shared, range));
+        }
+        outputs
     }
 
     /// The bounds check `clamp` makes, for a fused `clamp` — which must still

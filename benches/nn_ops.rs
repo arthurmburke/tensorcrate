@@ -434,6 +434,19 @@ fn fusion_rows<R>(case: &mut Case, backend: &str, drains: &[Drain], mut run: imp
             });
         }
         interpreted_row(case, backend, drain, &mut run);
+        one_thread_row(case, backend, "fused", || {
+            fused::with_mode(Mode::Fused, &mut run)
+        });
+    }
+}
+
+/// On the host, a row once more on one thread, to show what splitting kernels
+/// across cores buys.
+fn one_thread_row<R>(case: &mut Case, backend: &str, name: &str, run: impl FnMut() -> R) {
+    if backend == "host" {
+        tensorcrate::set_host_threads(1);
+        case.row(&format!("host {name}, 1 thread"), Drain::None, run);
+        tensorcrate::set_host_threads(0);
     }
 }
 
@@ -560,11 +573,18 @@ fn layer_norm_program(cols: usize) -> Program {
     b.build().unwrap()
 }
 
-/// `e / s`: normalizes `exp(x)` by each column's sum.
+/// `exp(x)`, whose column sums are the softmax denominators.
+fn exp_program() -> Program {
+    program(|b, x| b.unary(Analytic::Exp, x))
+}
+
+/// `exp(x) / s`: normalizes `exp(x)` by each column's sum, computing it again
+/// rather than reading it back.
 fn normalize_program() -> Program {
     let mut b = Builder::new();
-    let e = b.input(DType::F32);
+    let x = b.input(DType::F32);
     let sums = b.input_remapped(DType::F32, Remap::Row);
+    let e = b.unary(Analytic::Exp, x);
     let softmax = b.div(e, sums);
     b.output(softmax, DType::F32);
     b.build().unwrap()
@@ -681,6 +701,10 @@ fn activation_rows<B: Kernels>(
         interpreted_row(case, backend, drain, &mut || {
             program.run_vectors(&[&x]).remove(0)
         });
+        one_thread_row(case, backend, "direct kernels", || activation.direct(&x));
+        one_thread_row(case, backend, "fused", || {
+            fused::with_mode(Mode::Fused, || program.run_vectors(&[&x]).remove(0))
+        });
     }
 }
 
@@ -739,20 +763,20 @@ fn layer_norm<B: Kernels>(
     }
 }
 
-/// Softmax down each column of a `features × batch` matrix: `exp`, a column sum
-/// through a product with ones, then the fused normalization.
+/// Softmax down each column of a `features × batch` matrix: the column sums of
+/// `exp(x)`, then the normalization. Fused, each is one kernel and `exp(x)` is
+/// never stored; unfused, it is the `exp` kernel, a product with ones for the
+/// sums, and the `exp` and division kernels again.
 fn softmax<B: Kernels>(
-    program: &Program,
+    (exp, normalize): (&Program, &Program),
     features: usize,
     batch: usize,
 ) -> impl FnMut() -> Matrix<f32, B> {
     let x = matrix::<B>(features, batch, 1);
-    let ones = Vector::<f32>::filled(features, 1.0).to_backend::<B>();
     move || {
-        let e = B::matrix_unary(&x, Analytic::Exp);
-        let sums = B::vecmat(&ones, &e);
-        let inputs: [&dyn Fusable<B>; 2] = [&e, &sums];
-        program
+        let sums = exp.run_sum((features, batch), &[&x], Axis::Columns);
+        let inputs: [&dyn Fusable<B>; 2] = [&x, &sums];
+        normalize
             .run((features, batch), &inputs, &mut [])
             .remove(0)
             .into_matrix::<f32>()
@@ -869,7 +893,7 @@ fn fusion(bench: &mut Bench) {
         }
     }
 
-    let normalize = normalize_program();
+    let (exp, normalize) = (exp_program(), normalize_program());
     for (features, batch) in bench.cfg.pick(&[(128, 128), (1024, 256), (4096, 512)]) {
         let title = format!("softmax, {features} classes × {batch} samples");
         fusion_case!(
@@ -878,10 +902,10 @@ fn fusion(bench: &mut Bench) {
             title,
             Work::Elements(features * batch),
             2e-3,
-            |B| softmax::<B>(&normalize, features, batch)
+            |B| softmax::<B>((&exp, &normalize), features, batch)
         );
         if bench.cfg.wants(&format!("{G}/{title}")) {
-            let out = softmax::<Host>(&normalize, features, batch)();
+            let out = softmax::<Host>((&exp, &normalize), features, batch)();
             for c in [0, batch - 1] {
                 let total: f32 = (0..features).map(|r| out[(r, c)]).sum();
                 assert!(

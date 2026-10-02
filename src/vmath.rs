@@ -545,6 +545,25 @@ pub(crate) fn unary_slice<T: Real>(op: Analytic, values: &[T], out: &mut [T]) {
     }
 }
 
+/// Elements per thread for [`unary_parallel`]: the functions cost a few
+/// nanoseconds an element, so even short tensors are worth splitting.
+const PARALLEL_GRAIN: usize = 8 * 1024;
+
+/// [`unary_slice`], on several threads when `values` is long enough. Each
+/// element's result is the same however the work is split.
+pub(crate) fn unary_parallel<T: Real>(op: Analytic, values: &[T], out: &mut [T]) {
+    assert_eq!(values.len(), out.len(), "unary: lengths differ");
+    if !crate::parallel::plain_float::<T>() || values.len() < 2 * PARALLEL_GRAIN {
+        return unary_slice(op, values, out);
+    }
+    // SAFETY: `T` is a plain float, which threads may share.
+    unsafe {
+        crate::parallel::for_slices_unchecked(out, PARALLEL_GRAIN, |start, window| {
+            unary_slice(op, &values[start..start + window.len()], window);
+        });
+    }
+}
+
 fn as_type<T: 'static, U: Copy + 'static>(x: T) -> Option<U> {
     (TypeId::of::<T>() == TypeId::of::<U>()).then(|| {
         // SAFETY: one type.
