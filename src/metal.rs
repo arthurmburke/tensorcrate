@@ -4,7 +4,9 @@
 //! products, elementwise, broadcast, reduction, sorting, convolution, statistics
 //! and analytic operations, and fused elementwise programs on the GPU, for every
 //! [`MetalElement`] — `f32`, `f16` and `bf16` — with each kernel compiled once
-//! per type. Arithmetic runs in the element type; sums, products and moments
+//! per type. The N-dimensional strided copy behind tensor views moves bits and
+//! is compiled once per element width instead, so it runs for any element type
+//! of 1, 2, 4, 8 or 16 bytes. Arithmetic runs in the element type; sums, products and moments
 //! accumulate in `f32` and round once. M5 GPUs additionally use Metal 4
 //! TensorOps for matrix products. Radix-2 FFTs run in `f32`; `f64`, matrix
 //! inversion, and non-radix-2 FFTs stay on the CPU.
@@ -41,12 +43,12 @@ use half::{bf16, f16};
 use crate::numbers::Real;
 
 pub use buffer::MetalBuffer;
+pub(crate) use codegen::RowStatistics;
 #[doc(hidden)]
 pub use codegen::set_fused_codegen;
 #[doc(hidden)]
 pub use device::set_tensorops;
 pub use device::{MatmulPrecision, matmul_precision, set_matmul_precision};
-pub(crate) use codegen::RowStatistics;
 pub(crate) use fused::{fused_elementwise, fused_rows, fused_sum, matmul_epilogue};
 pub use slices::{broadcast_f32, elementwise_f32, fft_f32_interleaved, ifft_f32_interleaved};
 pub use sync::synchronize;
@@ -107,4 +109,3 @@ impl MetalElement for bf16 {
         bf16::from_bits(if ascending { 0x7FFF } else { 0xFFFF })
     }
 }
-

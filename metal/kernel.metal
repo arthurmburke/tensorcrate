@@ -195,24 +195,49 @@ template [[host_name("vecmat_finish_" #S)]] kernel void vecmat_finish<T>(      \
     constant uint&, uint);
 FOR_EACH_ELEMENT(INSTANTIATE_GEMV)
 
-// `out[r][c] = in[offset + r·row + c·col]`: a strided view, a broadcast or a
-// transpose of `in`, copied into order. A copy, so exact in every type.
+// The layout of a strided copy, matching `StridedLayout` in `encode.rs`: over
+// `shape`, element `[i₀, …]` is `source[source_offset + Σ iₖ·source_strides[k]]`
+// and goes to `target[target_offset + Σ iₖ·target_strides[k]]`. Up to six axes,
+// the most a tensor has.
+struct StridedLayout {
+    uint rank;
+    uint source_offset;
+    uint target_offset;
+    uint shape[6];
+    uint source_strides[6];
+    uint target_strides[6];
+};
+
+// One element of a strided copy per thread, `i` counting the shape in
+// row-major order: a view, a permutation, a slice, a broadcast or one block of
+// a concatenation, read from one layout and written to another. It moves bits,
+// so it is exact for every type and is instantiated by element width rather
+// than element type — an index tensor copies through the same kernel.
 template <typename T>
-kernel void gather_place(
-    device const T* input   [[buffer(0)]],
-    device T* output        [[buffer(1)]],
-    constant uint4& place   [[buffer(2)]],   // offset, row step, column step, cols
+kernel void strided_copy(
+    device const T* source           [[buffer(0)]],
+    device T* target                 [[buffer(1)]],
+    constant StridedLayout& layout   [[buffer(2)]],
     uint i [[thread_position_in_grid]])
 {
-    uint row = i / place.w;
-    uint col = i - row * place.w;
-    output[i] = input[place.x + row * place.y + col * place.z];
+    uint from = layout.source_offset;
+    uint to = layout.target_offset;
+    uint rest = i;
+    for (uint k = layout.rank; k-- > 0;) {
+        uint extent = layout.shape[k];
+        uint coordinate = rest % extent;
+        rest /= extent;
+        from += coordinate * layout.source_strides[k];
+        to += coordinate * layout.target_strides[k];
+    }
+    target[to] = source[from];
 }
 
-#define INSTANTIATE_GATHER(T, S)                                               \
-template [[host_name("gather_place_" #S)]] kernel void gather_place<T>(        \
-    device const T*, device T*, constant uint4&, uint);
-FOR_EACH_ELEMENT(INSTANTIATE_GATHER)
+#define FOR_EACH_WIDTH(M) M(uchar, x8) M(ushort, x16) M(uint, x32) M(ulong, x64) M(uint4, x128)
+#define INSTANTIATE_STRIDED(T, S)                                              \
+template [[host_name("strided_copy_" #S)]] kernel void strided_copy<T>(        \
+    device const T*, device T*, constant StridedLayout&, uint);
+FOR_EACH_WIDTH(INSTANTIATE_STRIDED)
 
 // `+ - * /` in the element type. There is no remainder kernel; the host keeps
 // `BinaryOp::Rem` for itself.

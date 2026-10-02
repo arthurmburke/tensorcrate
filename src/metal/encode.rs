@@ -9,7 +9,9 @@ use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize,
 };
 
-use crate::tensors::{Analytic, Axis, BinaryOp, Compare, Family, Reduce, Statistic};
+use crate::tensors::backend::Strided;
+use crate::tensors::layout::{coalesce, reach};
+use crate::tensors::{Analytic, Axis, BinaryOp, Compare, Family, MAX_RANK, Reduce, Statistic};
 
 use super::MetalElement;
 use super::buffer::MetalBuffer;
@@ -282,23 +284,78 @@ pub(super) fn encode_gemm(
     queued(gpu, m.saturating_mul(k).saturating_mul(n) / 128)
 }
 
-/// `output[r][c] = input[place.at(r, c)]` over a `rows × cols` space.
-pub(super) fn encode_gather<T: MetalElement>(
-    gpu: &Gpu,
-    input: &ProtocolObject<dyn MTLBuffer>,
-    output: &ProtocolObject<dyn MTLBuffer>,
-    place: [u32; 4],
-    len: usize,
-) -> Option<()> {
-    let encoder = compute(gpu)?;
-    encoder.setComputePipelineState(&gpu.kernels::<T>().gather);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
-        encoder.setBytes_length_atIndex(NonNull::from(&place).cast(), 16, 2);
+/// The layout argument of the `strided_copy` shader, field for field.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct StridedLayout {
+    rank: u32,
+    source_offset: u32,
+    target_offset: u32,
+    shape: [u32; MAX_RANK],
+    source_strides: [u32; MAX_RANK],
+    target_strides: [u32; MAX_RANK],
+}
+
+impl StridedLayout {
+    /// The shader's layout for copying `shape` from `from` to `to`, with the
+    /// axes [`coalesce`]d so the kernel does as little index arithmetic as the
+    /// layouts allow, and the number of elements it copies. `None` if an
+    /// element index, on either side, does not fit the shader's 32 bits. Both
+    /// sides are assumed checked against their storage.
+    pub(super) fn new(
+        shape: &[usize],
+        from: Strided<'_>,
+        to: Strided<'_>,
+    ) -> Option<(Self, usize)> {
+        let count = shape
+            .iter()
+            .try_fold(1usize, |count, &extent| count.checked_mul(extent))?;
+        u32::try_from(count).ok()?;
+        u32::try_from(reach(shape, from.offset, from.strides)?).ok()?;
+        u32::try_from(reach(shape, to.offset, to.strides)?).ok()?;
+        let mut layout = StridedLayout {
+            source_offset: u32::try_from(from.offset).ok()?,
+            target_offset: u32::try_from(to.offset).ok()?,
+            ..StridedLayout::default()
+        };
+        if count != 0 {
+            let (shape, [source, target]) = coalesce(shape, [from.strides, to.strides]);
+            layout.rank = shape.len() as u32;
+            for axis in 0..shape.len() {
+                // Every coalesced axis has two or more elements, so each
+                // stride is below the reach checked above.
+                layout.shape[axis] = shape[axis] as u32;
+                layout.source_strides[axis] = source[axis] as u32;
+                layout.target_strides[axis] = target[axis] as u32;
+            }
+        }
+        Some((layout, count))
     }
-    dispatch_1d(&encoder, len);
-    queued(gpu, len)
+}
+
+/// `target[layout.to(i)] = source[layout.from(i)]` for each of `count`
+/// elements of `T`'s width. `None` if no kernel is instantiated for the width.
+pub(super) fn encode_strided_copy<T>(
+    gpu: &Gpu,
+    source: &ProtocolObject<dyn MTLBuffer>,
+    target: &ProtocolObject<dyn MTLBuffer>,
+    layout: &StridedLayout,
+    count: usize,
+) -> Option<()> {
+    let pipeline = gpu.strided_copy::<T>()?;
+    let encoder = compute(gpu)?;
+    encoder.setComputePipelineState(pipeline);
+    unsafe {
+        encoder.setBuffer_offset_atIndex(Some(source), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(target), 0, 1);
+        encoder.setBytes_length_atIndex(
+            NonNull::from(layout).cast(),
+            size_of::<StridedLayout>(),
+            2,
+        );
+    }
+    dispatch_1d(&encoder, count);
+    queued(gpu, count)
 }
 
 pub(super) fn encode_transpose<T: MetalElement>(

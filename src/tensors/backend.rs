@@ -44,8 +44,17 @@
 //! backend the conversion is a move rather than a copy. Operations that really
 //! do depend on the extents, like [`concat`](Backend::concat), take them as
 //! ordinary parameters.
+//!
+//! The one copy that takes a whole layout is the strided copy behind
+//! [`Tensor`](super::Tensor) and [`TensorView`](super::TensorView): up to
+//! [`MAX_RANK`] axes, each with its own stride, read from one storage and
+//! written row-major into a new one, into part of a new one, or into part of
+//! an existing one. It moves bits, so it is defined for every element type —
+//! on `Metal` as one GPU dispatch for any element of 1, 2, 4, 8 or 16 bytes,
+//! integer index types included.
 
 use super::fused::Place;
+use super::layout::{MAX_RANK, element_count, for_each_run, reach};
 
 /// A tensor storage backend.
 ///
@@ -117,13 +126,64 @@ pub trait Backend: sealed::Sealed + Sized + 'static {
 
     /// The `rows × cols` matrix whose element `(r, c)` is element
     /// `place.at(r, c)` of `storage`: a view, a broadcast or a transpose of it,
-    /// copied into order. Every element is copied exactly.
+    /// copied into order. Every element is copied exactly. This is the
+    /// two-axis [`strided_copy`](Self::strided_copy).
     #[doc(hidden)]
     fn gather<T: Copy + 'static>(
         storage: &Self::Vector<T>,
         place: Place,
-        shape: (usize, usize),
-    ) -> Self::Matrix<T>;
+        (rows, cols): (usize, usize),
+    ) -> Self::Matrix<T> {
+        let from = Strided {
+            offset: place.offset,
+            strides: &[place.row, place.col],
+        };
+        Self::vector_into_matrix(Self::strided_copy(storage, &[rows, cols], from))
+    }
+
+    /// The elements of `storage` that a layout of `shape` reads at `from`,
+    /// copied into row-major order: a view, a permutation, a slice or a
+    /// broadcast of it made contiguous. Every element is copied exactly — by
+    /// its bits, so any element type is copied on either backend.
+    ///
+    /// # Panics
+    ///
+    /// If `shape` has more than [`MAX_RANK`](super::MAX_RANK) axes, `from`
+    /// has a different number of strides, or the layout reads past `storage`.
+    #[doc(hidden)]
+    fn strided_copy<T: Copy + 'static>(
+        storage: &Self::Vector<T>,
+        shape: &[usize],
+        from: Strided<'_>,
+    ) -> Self::Vector<T>;
+
+    /// Storage of `len` elements made by copying each region into it: region
+    /// `r` copies `r.shape` from `r.source` at `r.from` to the new storage at
+    /// `r.to`. The regions are expected to cover the storage — a concatenation
+    /// is one region per operand — and any element none of them writes holds
+    /// an unspecified value of `T`.
+    ///
+    /// # Panics
+    ///
+    /// As for [`strided_copy`](Self::strided_copy), for any region.
+    #[doc(hidden)]
+    fn assemble<T: Copy + 'static>(
+        len: usize,
+        regions: &[Region<'_, Self::Vector<T>>],
+    ) -> Self::Vector<T>;
+
+    /// Copy `region` into `target` in place, leaving every element the region
+    /// does not write as it was — the write half of a strided copy, for
+    /// updating part of a tensor such as one position of a cache.
+    ///
+    /// # Panics
+    ///
+    /// As for [`strided_copy`](Self::strided_copy), on either side.
+    #[doc(hidden)]
+    fn strided_write<T: Copy + 'static>(
+        target: &mut Self::Vector<T>,
+        region: Region<'_, Self::Vector<T>>,
+    );
 
     /// Build a matrix from vectors stacked along the vertical axis (the vectors
     /// are rows), each of length `len`.
@@ -185,6 +245,146 @@ pub(crate) fn transfer<T: Copy + 'static, B: Backend, B2: Backend>(
     B2::store_vector(B::vector_slice(storage))
 }
 
+/// One side of a strided copy: over a copied shape, element `[i₀, …, iₙ₋₁]`
+/// is storage element `offset + Σ iₖ·strides[k]`.
+#[doc(hidden)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Strided<'a> {
+    pub offset: usize,
+    pub strides: &'a [usize],
+}
+
+/// One block of a [`Backend::assemble`] or [`Backend::strided_write`]:
+/// `shape` copied from `source` at `from` to the target at `to`.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct Region<'a, S: ?Sized> {
+    pub source: &'a S,
+    pub shape: &'a [usize],
+    pub from: Strided<'a>,
+    pub to: Strided<'a>,
+}
+
+impl<S: ?Sized> Clone for Region<'_, S> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<S: ?Sized> Copy for Region<'_, S> {}
+
+/// Panics unless a layout of `shape` at `at` stays inside `len` elements of
+/// storage; returns the number of elements the layout covers.
+#[track_caller]
+pub(crate) fn check_strided(
+    len: usize,
+    shape: &[usize],
+    at: Strided<'_>,
+    operation: &str,
+) -> usize {
+    assert!(
+        shape.len() <= MAX_RANK,
+        "{operation}: shape {shape:?} has more than {MAX_RANK} axes"
+    );
+    assert_eq!(
+        shape.len(),
+        at.strides.len(),
+        "{operation}: shape {shape:?} has {} axes but {} strides",
+        shape.len(),
+        at.strides.len()
+    );
+    let count = element_count(shape, operation);
+    let end = reach(shape, at.offset, at.strides).unwrap_or(usize::MAX);
+    assert!(
+        end <= len,
+        "{operation}: shape {shape:?} with strides {:?} from offset {} reaches past {len} elements",
+        at.strides,
+        at.offset
+    );
+    count
+}
+
+/// [`Backend::strided_copy`] over a slice.
+pub(crate) fn strided_copy_slice<T: Copy>(
+    values: &[T],
+    shape: &[usize],
+    from: Strided<'_>,
+) -> Vec<T> {
+    let count = check_strided(values.len(), shape, from, "strided copy");
+    let mut out = Vec::with_capacity(count);
+    // The output is row-major, so the walk's order is the order to write in.
+    for_each_run(
+        shape,
+        [from.offset],
+        [from.strides],
+        |[start], len, [step]| match step {
+            1 => out.extend_from_slice(&values[start..start + len]),
+            0 => out.extend(std::iter::repeat_n(values[start], len)),
+            step => out.extend((0..len).map(|index| values[start + index * step])),
+        },
+    );
+    out
+}
+
+/// [`Backend::strided_write`] over slices.
+pub(crate) fn strided_write_slice<T: Copy>(target: &mut [T], region: Region<'_, [T]>) {
+    let Region {
+        source,
+        shape,
+        from,
+        to,
+    } = region;
+    check_strided(source.len(), shape, from, "strided write source");
+    check_strided(target.len(), shape, to, "strided write target");
+    for_each_run(
+        shape,
+        [from.offset, to.offset],
+        [from.strides, to.strides],
+        |[start, target_start], len, [step, target_step]| match (step, target_step) {
+            (1, 1) => target[target_start..target_start + len]
+                .copy_from_slice(&source[start..start + len]),
+            _ => {
+                for index in 0..len {
+                    target[target_start + index * target_step] = source[start + index * step];
+                }
+            }
+        },
+    );
+}
+
+/// [`Backend::assemble`] over slices.
+pub(crate) fn assemble_slices<T: Copy>(len: usize, regions: &[Region<'_, [T]>]) -> Vec<T> {
+    // Every element is written by some region, so the first element of any
+    // region serves as the initial value: it keeps the fill exact without
+    // asking `T` for a zero.
+    let fill = regions.iter().find_map(|region| {
+        let count = check_strided(region.source.len(), region.shape, region.from, "assemble");
+        (count != 0).then(|| region.source[region.from.offset])
+    });
+    let Some(fill) = fill else {
+        assert_eq!(
+            len, 0,
+            "assemble: {len} elements but no region to fill them"
+        );
+        return Vec::new();
+    };
+    let mut out = vec![fill; len];
+    for &region in regions {
+        strided_write_slice(&mut out, region);
+    }
+    out
+}
+
+/// `region` reading a `Vec` as reading its slice.
+fn as_slices<'a, T>(region: &Region<'a, Vec<T>>) -> Region<'a, [T]> {
+    Region {
+        source: region.source.as_slice(),
+        shape: region.shape,
+        from: region.from,
+        to: region.to,
+    }
+}
+
 /// The default backend: elements live in a flat row-major [`Vec`].
 ///
 /// Every element type is supported.
@@ -192,24 +392,6 @@ pub(crate) fn transfer<T: Copy + 'static, B: Backend, B2: Backend>(
 pub struct Host;
 
 impl sealed::Sealed for Host {}
-
-/// [`Backend::gather`] over a slice.
-pub(crate) fn gather_slice<T: Copy>(
-    values: &[T],
-    place: Place,
-    (rows, cols): (usize, usize),
-) -> Vec<T> {
-    let mut out = Vec::with_capacity(rows * cols);
-    for row in 0..rows {
-        let start = place.at(row, 0);
-        match place.col {
-            1 => out.extend_from_slice(&values[start..start + cols]),
-            0 => out.extend(std::iter::repeat_n(values[start], cols)),
-            step => out.extend((0..cols).map(|col| values[start + col * step])),
-        }
-    }
-    out
-}
 
 impl Backend for Host {
     type Vector<T> = Vec<T>;
@@ -261,8 +443,21 @@ impl Backend for Host {
         matrix
     }
 
-    fn gather<T: Copy + 'static>(storage: &Vec<T>, place: Place, shape: (usize, usize)) -> Vec<T> {
-        gather_slice(storage, place, shape)
+    fn strided_copy<T: Copy + 'static>(
+        storage: &Vec<T>,
+        shape: &[usize],
+        from: Strided<'_>,
+    ) -> Vec<T> {
+        strided_copy_slice(storage, shape, from)
+    }
+
+    fn assemble<T: Copy + 'static>(len: usize, regions: &[Region<'_, Vec<T>>]) -> Vec<T> {
+        let regions = regions.iter().map(as_slices).collect::<Vec<_>>();
+        assemble_slices(len, &regions)
+    }
+
+    fn strided_write<T: Copy + 'static>(target: &mut Vec<T>, region: Region<'_, Vec<T>>) {
+        strided_write_slice(target, as_slices(&region));
     }
 
     fn vstack<T: Copy + 'static>(vectors: &[Vec<T>], len: usize) -> Vec<T> {
@@ -342,7 +537,10 @@ mod gpu {
 
     use half::{bf16, f16};
 
-    use super::{Backend, Place, gather_slice, sealed};
+    use super::{
+        Backend, Region, Strided, assemble_slices, check_strided, sealed, strided_copy_slice,
+        strided_write_slice,
+    };
     use crate::metal::{MetalBuffer, MetalElement};
 
     /// `Some($body)` with `$E` naming the [`MetalElement`] that `$T` is — the
@@ -437,20 +635,83 @@ mod gpu {
             matrix
         }
 
-        // The resident kernels exist for every `MetalElement`; any other
-        // element type takes the host path over the shared memory, which gives
-        // the same values.
-        fn gather<T: Copy + 'static>(
+        // A strided copy moves bits, so the GPU copies every element type whose
+        // width the kernel is instantiated for — not only the `MetalElement`s,
+        // so index tensors move on the device too. A storage with no device
+        // allocation, an element of another width, or a layout past the
+        // shader's 32-bit indices is copied by the CPU over the same memory.
+        fn strided_copy<T: Copy + 'static>(
             storage: &MetalStorage<T>,
-            place: Place,
-            shape: (usize, usize),
+            shape: &[usize],
+            from: Strided<'_>,
         ) -> MetalStorage<T> {
-            if let Some(storage) =
-                resident!(T, E => MetalStorage::<E>::gather(cast_ref(storage), place, shape))
+            check_strided(storage.len(), shape, from, "strided copy");
+            if let Some(buffer) = storage
+                .device()
+                .and_then(|buffer| buffer.strided_copy(shape, from))
             {
-                return storage;
+                return MetalStorage::from_device(buffer);
             }
-            MetalStorage::from_slice(&gather_slice(storage.as_slice(), place, shape))
+            MetalStorage::from_slice(&strided_copy_slice(storage.as_slice(), shape, from))
+        }
+
+        // The device path leaves an element no region writes as whatever the
+        // recycled allocation held, so it is taken only for types every bit
+        // pattern is a value of; the host path fills from a real element.
+        fn assemble<T: Copy + 'static>(
+            len: usize,
+            regions: &[Region<'_, MetalStorage<T>>],
+        ) -> MetalStorage<T> {
+            for region in regions {
+                check_strided(region.source.len(), region.shape, region.from, "assemble");
+                check_strided(len, region.shape, region.to, "assemble");
+            }
+            let device = regions
+                .iter()
+                .map(|region| {
+                    Some(Region {
+                        source: region.source.device()?,
+                        shape: region.shape,
+                        from: region.from,
+                        to: region.to,
+                    })
+                })
+                .collect::<Option<Vec<_>>>();
+            if let Some(device) = device
+                && any_bits_valid::<T>()
+                && let Some(buffer) = MetalBuffer::assemble(len, &device)
+            {
+                return MetalStorage::from_device(buffer);
+            }
+            let regions = regions.iter().map(host_region).collect::<Vec<_>>();
+            MetalStorage::from_slice(&assemble_slices(len, &regions))
+        }
+
+        fn strided_write<T: Copy + 'static>(
+            target: &mut MetalStorage<T>,
+            region: Region<'_, MetalStorage<T>>,
+        ) {
+            check_strided(
+                region.source.len(),
+                region.shape,
+                region.from,
+                "strided write",
+            );
+            check_strided(target.len(), region.shape, region.to, "strided write");
+            if let Some(source) = region.source.device()
+                && let Residency::Device(buffer) = &mut target.0
+                && buffer
+                    .strided_write(Region {
+                        source,
+                        shape: region.shape,
+                        from: region.from,
+                        to: region.to,
+                    })
+                    .is_some()
+            {
+                return;
+            }
+            strided_write_slice(target.as_mut_slice(), host_region(&region));
         }
 
         fn vstack<T: Copy + 'static>(vectors: &[MetalStorage<T>], len: usize) -> MetalStorage<T> {
@@ -566,6 +827,36 @@ mod gpu {
     /// Whether `T` and `U` are the same type.
     fn same<T: 'static, U: 'static>() -> bool {
         TypeId::of::<T>() == TypeId::of::<U>()
+    }
+
+    /// Whether every bit pattern of `T`'s width is a value of `T`: the
+    /// primitive numbers.
+    fn any_bits_valid<T: 'static>() -> bool {
+        [
+            TypeId::of::<f32>(),
+            TypeId::of::<f64>(),
+            TypeId::of::<f16>(),
+            TypeId::of::<bf16>(),
+            TypeId::of::<u8>(),
+            TypeId::of::<u16>(),
+            TypeId::of::<u32>(),
+            TypeId::of::<u64>(),
+            TypeId::of::<i8>(),
+            TypeId::of::<i16>(),
+            TypeId::of::<i32>(),
+            TypeId::of::<i64>(),
+        ]
+        .contains(&TypeId::of::<T>())
+    }
+
+    /// `region` reading the shared memory of its source from the CPU.
+    fn host_region<'a, T: Copy + 'static>(region: &Region<'a, MetalStorage<T>>) -> Region<'a, [T]> {
+        Region {
+            source: region.source.as_slice(),
+            shape: region.shape,
+            from: region.from,
+            to: region.to,
+        }
     }
 
     /// `storage` as the [`MetalElement`] it is; only called once [`resident!`]
@@ -690,12 +981,6 @@ mod gpu {
     /// for. Scalars and results are in `T`; the folds that end on the CPU
     /// return their unrounded `f32` accumulator.
     impl<T: MetalElement> MetalStorage<T> {
-        fn gather(&self, place: Place, shape: (usize, usize)) -> Option<Self> {
-            Some(Self(Residency::Device(
-                self.device()?.gather(place, shape)?,
-            )))
-        }
-
         fn vstack(inputs: &[Self], vector_len: usize) -> Option<Self> {
             let buffers = inputs
                 .iter()

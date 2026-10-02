@@ -37,6 +37,7 @@
 //! [`Vector::to_backend`] and [`Matrix::to_backend`] move between the two; see
 //! the [`backend`] module for the details.
 
+
 pub mod analytic;
 pub mod backend;
 pub mod dual;
@@ -46,6 +47,7 @@ pub mod tape;
 
 mod chain;
 mod fft;
+pub(crate) mod layout;
 mod matrix;
 mod ops;
 mod order;
@@ -76,6 +78,7 @@ pub use kernels::{
     Analytic, Axis, BinaryOp, Compare, Family, Kernels, Ordered, Reduce, SortOrder, Statistic,
     Transposed,
 };
+pub use layout::{AxisIndex, MAX_RANK};
 pub use matrix::Matrix;
 pub use tape::{MatrixVar, ScalarVar, Tape, Var, VectorVar};
 pub use vector::Vector;

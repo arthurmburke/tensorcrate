@@ -4,6 +4,8 @@
 
 use half::{bf16, f16};
 
+use crate::tensors::backend::{Region, Strided};
+use crate::tensors::layout::contiguous_strides;
 use crate::tensors::{
     Analytic, Axis, BinaryOp, Compare, Family, Reduce, SortOrder, Statistic, Transposed,
 };
@@ -12,14 +14,75 @@ use super::MetalElement;
 use super::buffer::MetalBuffer;
 use super::device::{Gpu, Operands, Pipeline, Tile, with_gpu};
 use super::encode::{
-    REDUCE_GROUP, encode_axis_distribution, encode_axis_moments, encode_bitonic_stage,
-    encode_broadcast, encode_clamp, encode_compare, encode_compare_scalar, encode_concat,
-    encode_convert, encode_correlate, encode_deviation, encode_distribution, encode_elementwise,
-    encode_fft, encode_flip, encode_gather, encode_gemm, encode_hmerge, encode_matmul,
+    REDUCE_GROUP, StridedLayout, encode_axis_distribution, encode_axis_moments,
+    encode_bitonic_stage, encode_broadcast, encode_clamp, encode_compare, encode_compare_scalar,
+    encode_concat, encode_convert, encode_correlate, encode_deviation, encode_distribution,
+    encode_elementwise, encode_fft, encode_flip, encode_gemm, encode_hmerge, encode_matmul,
     encode_matrix_stack, encode_matvec, encode_pad, encode_power, encode_power_scalar,
-    encode_reduce, encode_scan, encode_sort_prepare, encode_stack, encode_transpose, encode_unary,
-    encode_unary_dual, encode_vecmat, encode_vmerge, vecmat_bands,
+    encode_reduce, encode_scan, encode_sort_prepare, encode_stack, encode_strided_copy,
+    encode_transpose, encode_unary, encode_unary_dual, encode_vecmat, encode_vmerge, vecmat_bands,
 };
+
+/// The strided copies. They move bits, so they are defined for every element
+/// type of a width the kernel is instantiated for — 1, 2, 4, 8 or 16 bytes —
+/// and return `None` for any other, or for a layout whose indices do not fit
+/// the shader's 32 bits. Layouts are assumed checked against their buffers,
+/// which the [`Backend`](crate::tensors::Backend) methods calling these do.
+impl<T: Copy + 'static> MetalBuffer<T> {
+    /// The elements a layout of `shape` reads at `from`, copied on the GPU
+    /// into a new buffer in row-major order.
+    pub(crate) fn strided_copy(&self, shape: &[usize], from: Strided<'_>) -> Option<Self> {
+        let contiguous = contiguous_strides(shape);
+        let to = Strided {
+            offset: 0,
+            strides: &contiguous,
+        };
+        let (layout, count) = StridedLayout::new(shape, from, to)?;
+        with_gpu(|gpu| gpu.strided_copy::<T>().map(|_| ()))?;
+        let output = Self::allocate(count)?;
+        if count != 0 {
+            with_gpu(|gpu| encode_strided_copy::<T>(gpu, &self.raw, &output.raw, &layout, count))?;
+        }
+        Some(output)
+    }
+
+    /// Copy `region` into this buffer in place, on the GPU.
+    ///
+    /// The exclusive borrow is what makes the in-place write sound, as for
+    /// [`matmul_accumulate`](Self::matmul_accumulate).
+    pub(crate) fn strided_write(&mut self, region: Region<'_, Self>) -> Option<()> {
+        let (layout, count) = StridedLayout::new(region.shape, region.from, region.to)?;
+        with_gpu(|gpu| gpu.strided_copy::<T>().map(|_| ()))?;
+        if count != 0 {
+            with_gpu(|gpu| {
+                encode_strided_copy::<T>(gpu, &region.source.raw, &self.raw, &layout, count)
+            })?;
+        }
+        Some(())
+    }
+
+    /// A new buffer of `len` elements with each region copied into it, one
+    /// dispatch per region. An element no region writes is left as the
+    /// allocation found it.
+    pub(crate) fn assemble(len: usize, regions: &[Region<'_, Self>]) -> Option<Self> {
+        // Every layout is checked before anything is encoded, so a region the
+        // GPU cannot copy leaves no half-built output behind.
+        let layouts = regions
+            .iter()
+            .map(|region| StridedLayout::new(region.shape, region.from, region.to))
+            .collect::<Option<Vec<_>>>()?;
+        with_gpu(|gpu| gpu.strided_copy::<T>().map(|_| ()))?;
+        let output = Self::allocate(len)?;
+        for (region, (layout, count)) in regions.iter().zip(&layouts) {
+            if *count != 0 {
+                with_gpu(|gpu| {
+                    encode_strided_copy::<T>(gpu, &region.source.raw, &output.raw, layout, *count)
+                })?;
+            }
+        }
+        Some(output)
+    }
+}
 
 impl<T: MetalElement> MetalBuffer<T> {
     /// Matrix multiplication, with both inputs and the result remaining in
@@ -75,31 +138,6 @@ impl<T: MetalElement> MetalBuffer<T> {
         with_gpu(|gpu| {
             encode_matmul::<T>(gpu, &self.raw, &rhs.raw, &target.raw, m, k, n, accumulate)
         })
-    }
-
-    /// The `rows × cols` matrix whose element `(r, c)` is this buffer's
-    /// element `place.at(r, c)`, copied on the GPU. `None` if the place reads
-    /// past the buffer or does not fit the shader's 32-bit indices.
-    pub(crate) fn gather(
-        &self,
-        place: crate::tensors::fused::Place,
-        (rows, cols): (usize, usize),
-    ) -> Option<Self> {
-        let len = rows.checked_mul(cols)?;
-        if len != 0 && place.end((rows, cols)) > self.len {
-            return None;
-        }
-        let output = Self::allocate(len)?;
-        if len != 0 {
-            let place = [
-                u32::try_from(place.offset).ok()?,
-                u32::try_from(place.row).ok()?,
-                u32::try_from(place.col).ok()?,
-                u32::try_from(cols).ok()?,
-            ];
-            with_gpu(|gpu| encode_gather::<T>(gpu, &self.raw, &output.raw, place, len))?;
-        }
-        Some(output)
     }
 
     /// Transpose a row-major `rows × cols` matrix into a new shared buffer.

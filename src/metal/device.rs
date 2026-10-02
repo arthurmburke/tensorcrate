@@ -37,6 +37,9 @@ pub(super) struct Gpu {
     pub(super) typed: [Typed; 3],
     /// The scan runs over a `float` buffer whatever the tensor's type.
     pub(super) scan: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    /// The strided copy for elements of 1, 2, 4, 8 and 16 bytes, in that
+    /// order: it moves bits, so it is chosen by width rather than type.
+    pub(super) strided_copy: [Pipeline; 5],
     pub(super) fft_bit_reverse: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub(super) fft_stage: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub(super) pool: RefCell<Pool>,
@@ -115,8 +118,6 @@ pub(super) struct Typed {
     pub(super) concat_horizontal: Pipeline,
     pub(super) merge_horizontal: Pipeline,
     pub(super) transpose: Pipeline,
-    /// A strided read of a buffer, copied into order.
-    pub(super) gather: Pipeline,
     pub(super) correlate: Pipeline,
     pub(super) pad_zeros: Pipeline,
     pub(super) flip_both: Pipeline,
@@ -160,6 +161,22 @@ impl Gpu {
     /// The pipelines compiled for element type `T`.
     pub(super) fn kernels<T: MetalElement>(&self) -> &Typed {
         &self.typed[T::INDEX]
+    }
+
+    /// The strided copy for elements of `T`'s width, if it is one the kernel
+    /// is instantiated for. Buffers are bound from their start, which is
+    /// aligned for every width, so element `i` of any of them is aligned for
+    /// the kernel's access whatever `T`'s own alignment.
+    pub(super) fn strided_copy<T>(&self) -> Option<&Pipeline> {
+        let index = match size_of::<T>() {
+            1 => 0,
+            2 => 1,
+            4 => 2,
+            8 => 3,
+            16 => 4,
+            _ => return None,
+        };
+        Some(&self.strided_copy[index])
     }
 
     /// The TensorOps product for a 16-bit `T` with a 16-bit result, if the GPU
@@ -392,7 +409,6 @@ pub(super) fn build_gpu() -> Option<Gpu> {
             concat_horizontal: kernel("concat_horizontal")?,
             merge_horizontal: kernel("merge_horizontal")?,
             transpose: kernel("transpose_tiled")?,
-            gather: kernel("gather_place")?,
             correlate: kernel("correlate")?,
             pad_zeros: kernel("pad_zeros")?,
             flip_both: kernel("flip_both")?,
@@ -420,6 +436,13 @@ pub(super) fn build_gpu() -> Option<Gpu> {
             typed(bf16::SUFFIX)?,
         ],
         scan: pipeline("scan_step")?,
+        strided_copy: [
+            pipeline("strided_copy_x8")?,
+            pipeline("strided_copy_x16")?,
+            pipeline("strided_copy_x32")?,
+            pipeline("strided_copy_x64")?,
+            pipeline("strided_copy_x128")?,
+        ],
         fft_bit_reverse: pipeline("fft_bit_reverse")?,
         fft_stage: pipeline("fft_stage")?,
         pool: RefCell::new(Pool::default()),

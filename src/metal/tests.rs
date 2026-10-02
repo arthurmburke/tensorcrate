@@ -426,6 +426,93 @@ fn matrix_merges_consume_queued_device_buffers() {
     assert_eq!(vertical.to_vec(), expected_vertical);
 }
 
+#[test]
+fn strided_copies_run_on_the_device_without_waiting() {
+    use crate::tensors::backend::{Backend, Region, Strided};
+    use crate::tensors::{Metal, MetalStorage};
+
+    // A `[2, 3, 4]` tensor permuted to `[4, 2, 3]`, read from a queued result.
+    let values = (0..24).map(|index| index as f32).collect::<Vec<_>>();
+    let Some(input) = MetalBuffer::from_slice(&values) else {
+        eprintln!("no Metal device; skipping strided copy comparison");
+        return;
+    };
+    synchronize();
+    let before = activity().unwrap();
+    let queued = input.broadcast(1.0, BinaryOp::Add, false).unwrap();
+    let shape = [4, 2, 3];
+    let from = Strided {
+        offset: 0,
+        strides: &[1, 12, 4],
+    };
+    let permuted = queued.strided_copy(&shape, from).unwrap();
+
+    // Two blocks of a concatenation along the last axis of `[4, 2, 3 + 3]`.
+    let target_strides = [12, 6, 1];
+    let region = |offset| Region {
+        source: &queued,
+        shape: &shape,
+        from,
+        to: Strided {
+            offset,
+            strides: &target_strides,
+        },
+    };
+    let joined = MetalBuffer::assemble(48, &[region(0), region(3)]).unwrap();
+
+    // One of those blocks written again, in place, from the permuted copy.
+    let mut target = MetalBuffer::from_slice(&[0.0f32; 48]).unwrap();
+    let contiguous = [6, 3, 1];
+    target
+        .strided_write(Region {
+            source: &permuted,
+            shape: &shape,
+            from: Strided {
+                offset: 0,
+                strides: &contiguous,
+            },
+            to: Strided {
+                offset: 3,
+                strides: &target_strides,
+            },
+        })
+        .unwrap();
+
+    let (operations, waits) = activity().unwrap();
+    assert_eq!(waits, before.1, "a strided copy synchronized GPU work");
+    assert_eq!(
+        operations - before.0,
+        5,
+        "one broadcast, one copy, two assembled regions and one write"
+    );
+
+    let expected = (0..4)
+        .flat_map(|d| {
+            (0..2).flat_map(move |b| (0..3).map(move |t| (b * 12 + t * 4 + d) as f32 + 1.0))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(permuted.to_vec(), expected);
+    let doubled = expected
+        .chunks(3)
+        .flat_map(|run| run.iter().chain(run).copied())
+        .collect::<Vec<_>>();
+    assert_eq!(joined.to_vec(), doubled);
+    let written = expected
+        .chunks(3)
+        .flat_map(|run| [0.0; 3].into_iter().chain(run.iter().copied()))
+        .collect::<Vec<_>>();
+    assert_eq!(target.to_vec(), written);
+
+    // An index type has no arithmetic kernels but copies on the device.
+    let ids = MetalStorage::from_slice(&(0..24u32).collect::<Vec<_>>());
+    let copied = <Metal as Backend>::strided_copy(&ids, &shape, from);
+    assert!(copied.is_device_resident());
+    let expected = (0..4)
+        .flat_map(|d| (0..2).flat_map(move |b| (0..3).map(move |t| b * 12 + t * 4 + d)))
+        .collect::<Vec<u32>>();
+    assert_eq!(copied.as_slice(), expected);
+}
+
 /// Operations are committed without waiting, so a long dependent chain is
 /// the thing that would break if command buffers on one queue did not run in
 /// commit order, or if a kernel could start before its input was written.
@@ -774,7 +861,11 @@ fn generated_kernels_compile_for_every_type_and_tile() {
         });
         assert_eq!(norm.row_statistics().len(), 2);
         for kernel in [Kernel::RowSums, Kernel::ColumnSums, rows] {
-            let code = if kernel == rows { norm.encode() } else { sum_code.clone() };
+            let code = if kernel == rows {
+                norm.encode()
+            } else {
+                sum_code.clone()
+            };
             let compiled = with_gpu(|gpu| {
                 let _ = gpu.specialized::<T>(&code, kernel);
                 Some(gpu.specialized::<T>(&code, kernel).is_some())
