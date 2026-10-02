@@ -1,4 +1,4 @@
-//! Dynamically-shaped vectors and matrices.
+//! Dynamically-shaped vectors, matrices and N-dimensional tensors.
 //!
 //! [`Vector<T>`] and [`Matrix<T>`] carry their dimensions as ordinary fields, so
 //! a shape can be computed at runtime: reading a length from a file, sizing a
@@ -36,7 +36,35 @@
 //! both backends.
 //! [`Vector::to_backend`] and [`Matrix::to_backend`] move between the two; see
 //! the [`backend`] module for the details.
-
+//!
+//! # N-dimensional tensors
+//!
+//! [`Tensor<T>`] holds up to [`MAX_RANK`] axes over the same flat row-major
+//! storage a [`Vector`] uses, so converting between a tensor and a vector or
+//! matrix — or reshaping one — moves the storage without copying it.
+//! Reordering and slicing — `permute`, `transpose`, `narrow`, `slice`,
+//! `select`, `split`, `chunk` — return a [`TensorView`]: the tensor's storage
+//! read in place through a shape, strides and an offset. A view becomes a
+//! tensor of its own with [`TensorView::contiguous`], one strided copy on the
+//! tensor's backend; [`Tensor::concat`] and [`Tensor::stack`] assemble their
+//! result from views the same way, and [`Tensor::write_slice`] writes one into
+//! part of an existing tensor in place.
+//!
+//! The elementwise arithmetic, analytic functions and comparisons of
+//! [`Kernels`] apply to tensors and views of one shape, and a tensor or a view
+//! whose leading axes fold together is an input to a
+//! [fused program](fused::Program). Shape errors panic, naming the operation
+//! and the shapes, as everywhere in this module.
+//!
+//! ```
+//! use tensorcrate::tensors::Tensor;
+//!
+//! let x = Tensor::from_vec(&[2, 3], vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
+//! let xt = x.transpose(0, 1); // a [3, 2] view: nothing copied
+//! assert_eq!(xt.get(&[2, 1]), Some(6.0));
+//! let y = &xt.contiguous() + xt; // the view is read in order for the kernel
+//! assert_eq!(y.to_vec(), [2.0, 8.0, 4.0, 10.0, 6.0, 12.0]);
+//! ```
 
 pub mod analytic;
 pub mod backend;
@@ -52,7 +80,10 @@ mod matrix;
 mod ops;
 mod order;
 mod shape;
+mod tensor;
+mod tensor_ops;
 mod vector;
+mod view;
 
 #[cfg(target_os = "macos")]
 mod accelerate_dispatch;
@@ -81,7 +112,9 @@ pub use kernels::{
 pub use layout::{AxisIndex, MAX_RANK};
 pub use matrix::Matrix;
 pub use tape::{MatrixVar, ScalarVar, Tape, Var, VectorVar};
+pub use tensor::Tensor;
 pub use vector::Vector;
+pub use view::TensorView;
 
 /// Minimum scalar multiply-accumulates before a Host matrix product leaves the
 /// generic loop. Accelerate and the architecture-specific SIMD kernels share

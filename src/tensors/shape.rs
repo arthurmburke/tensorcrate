@@ -28,6 +28,15 @@ pub(crate) fn assert_same_shape(left: (usize, usize), right: (usize, usize), ope
     );
 }
 
+/// Panics unless two N-dimensional tensors have the same shape.
+#[track_caller]
+pub(crate) fn assert_same_tensor_shape(left: &[usize], right: &[usize], operation: &str) {
+    assert!(
+        left == right,
+        "{operation}: tensor shapes differ, {left:?} and {right:?}"
+    );
+}
+
 /// Panics unless a clamp's bounds describe a non-empty range.
 ///
 /// Written as "not greater" rather than "less or equal" so that a NaN bound —
