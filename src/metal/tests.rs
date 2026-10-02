@@ -755,10 +755,29 @@ fn generated_kernels_compile_for_every_type_and_tile() {
         let y = sum.mul(e, row);
         sum.output(y, T::DTYPE);
         let sum_code = sum.build().unwrap().encode();
-        for kernel in [Kernel::RowSums, Kernel::ColumnSums] {
+        // A layer norm's statistics, of an input stored as `f16` whatever `T`.
+        let mut norm = Builder::<T>::new();
+        let x = norm.input(DType::F16);
+        let mean = norm.row_statistic(x, crate::tensors::fused::RowStatistic::Mean);
+        let deviations = norm.row_statistic(x, crate::tensors::fused::RowStatistic::Deviations);
+        let centered = norm.sub(x, mean);
+        let scaled = norm.div(centered, deviations);
+        norm.output(scaled, T::DTYPE);
+        let norm = norm.build().unwrap();
+        let mut statistics = [(0u8, 0u8, false); 16];
+        statistics[0] = (0, DType::F16 as u8, false);
+        statistics[1] = (0, DType::F16 as u8, true);
+        let rows = Kernel::Rows(super::codegen::RowStatistics {
+            first: 1,
+            statistics,
+            count: 2,
+        });
+        assert_eq!(norm.row_statistics().len(), 2);
+        for kernel in [Kernel::RowSums, Kernel::ColumnSums, rows] {
+            let code = if kernel == rows { norm.encode() } else { sum_code.clone() };
             let compiled = with_gpu(|gpu| {
-                let _ = gpu.specialized::<T>(&sum_code, kernel);
-                Some(gpu.specialized::<T>(&sum_code, kernel).is_some())
+                let _ = gpu.specialized::<T>(&code, kernel);
+                Some(gpu.specialized::<T>(&code, kernel).is_some())
             });
             if let Some(compiled) = compiled {
                 assert!(compiled, "{} {kernel:?}", T::SUFFIX);

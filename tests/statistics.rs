@@ -611,7 +611,15 @@ mod metal {
 
     #[test]
     fn axis_moments_agree_with_the_host() {
-        let host = matrix(23, 31);
+        // Rows of every length mod four, short and long, for the row kernel's
+        // four-wide reads and its tail.
+        for (rows, cols) in [(23, 31), (40, 1024), (5, 4), (9, 130), (3, 2), (17, 4099)] {
+            axis_moments_agree_on(rows, cols);
+        }
+    }
+
+    fn axis_moments_agree_on(rows: usize, cols: usize) {
+        let host = matrix(rows, cols);
         let resident = host.to_backend::<Metal>();
 
         for axis in [Axis::Rows, Axis::Columns] {

@@ -78,6 +78,40 @@ pub(super) enum Kernel {
     /// thread totals one column over one band of rows, for `vecmat_finish` to
     /// add up as it adds up a vector–matrix product's bands.
     ColumnSums,
+    /// The program over whole rows, one threadgroup per row, which first
+    /// computes the row statistics the program reads and then its elements.
+    Rows(RowStatistics),
+}
+
+/// The elements of a row each thread of a [`Kernel::Rows`] kernel keeps in
+/// registers between computing a mean and the deviations from it.
+const ROW_CACHE: usize = 8;
+
+/// The threads a [`Kernel::Rows`] kernel gives each row of `cols`: enough to
+/// give each a few elements, in whole SIMD groups, at most `limit`.
+pub(crate) fn row_threads(cols: usize, width: usize, limit: usize) -> usize {
+    let width = width.max(1);
+    let wanted = cols.div_ceil(4).div_ceil(width) * width;
+    wanted.clamp(width, (limit / width).max(1) * width).min(256)
+}
+
+/// The row statistics a [`Kernel::Rows`] program reads: input slots `first`
+/// on, each a statistic of an input of the program.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(crate) struct RowStatistics {
+    /// The first input slot holding a statistic.
+    pub first: u8,
+    /// For each statistic, in slot order: the input it is of, that input's
+    /// storage type as the shader numbers it, and whether it is the sum of
+    /// squared deviations rather than the mean.
+    pub statistics: [(u8, u8, bool); 16],
+    pub count: usize,
+}
+
+impl RowStatistics {
+    fn each(&self) -> &[(u8, u8, bool)] {
+        &self.statistics[..self.count]
+    }
 }
 
 /// What identifies a program's kernel: its element type, what it is generated
@@ -86,10 +120,11 @@ pub(super) enum Kernel {
 pub(super) fn key<T: MetalElement>(code: &[Encoded], kernel: Kernel) -> Vec<u64> {
     let mut key = Vec::with_capacity(code.len() + 2);
     key.push(T::INDEX as u64);
-    key.push(match kernel {
+    let discriminant = match kernel {
         Kernel::Elementwise => 0,
         Kernel::RowSums => 2,
         Kernel::ColumnSums => 3,
+        Kernel::Rows(rows) => 4 | u64::from(rows.first) << 8 | (rows.count as u64) << 16,
         Kernel::Epilogue {
             tile: (rows, cols, groups),
             relaxed,
@@ -99,7 +134,13 @@ pub(super) fn key<T: MetalElement>(code: &[Encoded], kernel: Kernel) -> Vec<u64>
                 | (groups as u64) << 40
                 | u64::from(relaxed) << 56
         }
-    });
+    };
+    key.push(discriminant);
+    if let Kernel::Rows(rows) = kernel {
+        key.extend(rows.each().iter().map(|&(of, dtype, deviations)| {
+            u64::from(of) | u64::from(dtype) << 8 | u64::from(deviations) << 16
+        }));
+    }
     for instr in code {
         key.push(
             u64::from(instr.kind)
@@ -129,7 +170,11 @@ pub(super) const MAX_CONSTANTS: usize = 1024;
 pub(super) fn source<T: MetalElement>(code: &[Encoded], kernel: Kernel) -> Option<String> {
     let product = matches!(kernel, Kernel::Epilogue { .. });
     let sum = matches!(kernel, Kernel::RowSums | Kernel::ColumnSums);
-    let body = body::<T>(code, product, sum)?;
+    let statistics = match kernel {
+        Kernel::Rows(rows) => rows.first..rows.first + rows.count as u8,
+        _ => 0..0,
+    };
+    let body = body::<T>(code, product, sum, statistics)?;
     let mut source = String::with_capacity(COMMON.len() + body.len() + 4096);
     if product {
         // The TensorOps header comes first: `common.h` is written for every
@@ -163,9 +208,136 @@ pub(super) fn source<T: MetalElement>(code: &[Encoded], kernel: Kernel) -> Optio
             source.push_str("    uint i [[thread_position_in_grid]])\n{\n");
             source
                 .push_str("    const uint rows = shape.rows;\n    const uint cols = shape.cols;\n");
-            source.push_str("    (void)rows; (void)cols; (void)k;\n");
+            // One division for the element, shared by every remapped load.
+            source.push_str("    const uint row = i / cols;\n    const uint col = i - row * cols;\n");
+            source.push_str("    (void)rows; (void)row; (void)col; (void)k;\n");
             source.push_str(&body);
             source.push_str("}\n");
+        }
+        Kernel::Rows(rows) => {
+            let t = register_type::<T>();
+            // A row's total across its threadgroup: each SIMD group's sum
+            // through threadgroup memory, which every SIMD group then adds up
+            // itself. The second barrier keeps the next total from writing
+            // `shared` before every group has read it.
+            source.push_str(
+                r#"
+inline float row_total(float x, threadgroup float* shared, uint simd, uint simds, uint lane) {
+    x = simd_sum(x);
+    if (lane == 0) {
+        shared[simd] = x;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total = simd_sum(lane < simds ? shared[lane] : 0.0f);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return total;
+}
+
+kernel void fused_program(
+    constant float* k [[buffer(0)]],
+    constant FusedShape& shape [[buffer(1)]],
+"#,
+            );
+            for slot in 0..16 {
+                writeln!(
+                    source,
+                    "    device const uchar* in{slot} [[buffer({})]],",
+                    2 + slot
+                )
+                .ok()?;
+            }
+            for slot in 0..8 {
+                writeln!(
+                    source,
+                    "    device uchar* out{slot} [[buffer({})]],",
+                    18 + slot
+                )
+                .ok()?;
+            }
+            write!(
+                source,
+                r#"    uint row [[threadgroup_position_in_grid]],
+    uint t [[thread_position_in_threadgroup]],
+    uint n [[threads_per_threadgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]],
+    uint simds [[simdgroups_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{{
+    const uint rows = shape.rows;
+    const uint cols = shape.cols;
+    (void)k;
+    (void)rows;
+    threadgroup float shared[32];
+    const uint first = row * cols;
+"#
+            )
+            .ok()?;
+            // Each input's moments once, as `matrix_axis_moments` computes them:
+            // the mean, then the squared deviations from it, in `float`. A
+            // thread keeps its first `ROW_CACHE` elements of the row in
+            // registers for the second pass.
+            let mut inputs: Vec<(u8, u8, bool)> = Vec::new();
+            for &(of, dtype, deviations) in rows.each() {
+                match inputs.iter_mut().find(|(input, ..)| *input == of) {
+                    Some(entry) => entry.2 |= deviations,
+                    None => inputs.push((of, dtype, deviations)),
+                }
+            }
+            for &(of, dtype, deviations) in &inputs {
+                write!(
+                    source,
+                    r#"    float cache{of}[{ROW_CACHE}];
+    float total{of} = 0.0f;
+    for (uint j = 0; j < {ROW_CACHE}; j++) {{
+        const uint col = t + j * n;
+        cache{of}[j] = col < cols ? fused_load(in{of}, {dtype}u, first + col) : 0.0f;
+        total{of} += cache{of}[j];
+    }}
+    for (uint col = t + {ROW_CACHE} * n; col < cols; col += n) {{
+        total{of} += fused_load(in{of}, {dtype}u, first + col);
+    }}
+    const float mean{of} = row_total(total{of}, shared, simd, simds, lane) / float(cols);
+"#
+                )
+                .ok()?;
+                if deviations {
+                    write!(
+                        source,
+                        r#"    float squares{of} = 0.0f;
+    for (uint j = 0; j < {ROW_CACHE}; j++) {{
+        if (t + j * n < cols) {{
+            const float d = cache{of}[j] - mean{of};
+            squares{of} += d * d;
+        }}
+    }}
+    for (uint col = t + {ROW_CACHE} * n; col < cols; col += n) {{
+        const float d = fused_load(in{of}, {dtype}u, first + col) - mean{of};
+        squares{of} += d * d;
+    }}
+    const float deviations{of} = row_total(squares{of}, shared, simd, simds, lane);
+"#
+                    )
+                    .ok()?;
+                }
+            }
+            // Rounded to the program's type, as the statistics it would
+            // otherwise read are stored.
+            for (k, &(of, _, deviations)) in rows.each().iter().enumerate() {
+                let which = if deviations { "deviations" } else { "mean" };
+                writeln!(
+                    source,
+                    "    const {t} stat{} = {t}({which}{of});",
+                    usize::from(rows.first) + k
+                )
+                .ok()?;
+            }
+            source.push_str(
+                "    for (uint col = t; col < cols; col += n) {\n        const uint i = first + col;\n",
+            );
+            for line in body.lines() {
+                writeln!(source, "    {line}").ok()?;
+            }
+            source.push_str("    }\n}\n");
         }
         Kernel::RowSums | Kernel::ColumnSums => {
             source.push_str(
@@ -310,8 +482,14 @@ pub(super) fn source<T: MetalElement>(code: &[Encoded], kernel: Kernel) -> Optio
 
 /// The straight-line code for one element `i`: one local per value, the
 /// constants read from `k`. With `product`, input 0 is the local `product`;
-/// with `sum`, the one store adds to the local `acc` instead.
-fn body<T: MetalElement>(code: &[Encoded], product: bool, sum: bool) -> Option<String> {
+/// with `sum`, the one store adds to the local `acc` instead; and the input
+/// slots in `statistics` are the locals `stat{slot}`.
+fn body<T: MetalElement>(
+    code: &[Encoded],
+    product: bool,
+    sum: bool,
+    statistics: std::ops::Range<u8>,
+) -> Option<String> {
     let t = register_type::<T>();
     let mut body = String::new();
     let mut constants = 0usize;
@@ -328,10 +506,20 @@ fn body<T: MetalElement>(code: &[Encoded], product: bool, sum: bool) -> Option<S
         let value = match instr.kind {
             // Load: `op` is the remap, `a` the input slot, `b` its storage type.
             0 if product && instr.a == 0 => format!("{t}(product)"),
-            0 => format!(
-                "{t}(fused_load(in{}, {}u, fused_remap({}, i, rows, cols)))",
-                instr.a, instr.b, instr.op
-            ),
+            // A row statistic, computed above, and read through a column
+            // broadcast: the same for the whole row.
+            0 if statistics.contains(&instr.a) => format!("stat{}", instr.a),
+            // The index a remap reads, from the element's row and column,
+            // which every kernel knows without dividing again per load.
+            0 => {
+                let index = match instr.op {
+                    1 => "col * rows + row",
+                    2 => "col",
+                    3 => "row",
+                    _ => "i",
+                };
+                format!("{t}(fused_load(in{}, {}u, {index}))", instr.a, instr.b)
+            }
             1 => {
                 constants += 1;
                 format!("{t}(k[{}])", constants - 1)

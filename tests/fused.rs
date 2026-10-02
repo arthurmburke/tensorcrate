@@ -1520,3 +1520,174 @@ fn unfused_broadcasts_copy_exactly() {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     broadcasts_copy_exactly_on::<Metal>();
 }
+
+// ---- row statistics -----------------------------------------------------------------
+
+/// A layer norm over an `f32` input and an `f16` one, updating an accumulator
+/// in place: `acc += γ·(x − mean)/√(dev/n + ε) + mean(h)`.
+fn normalize_program(cols: usize) -> Program {
+    use tensorcrate::tensors::fused::RowStatistic;
+    let mut b = Builder::<f32>::new();
+    let x = b.input(DType::F32);
+    let gamma = b.input_remapped(DType::F32, Remap::Row);
+    let h = b.input(DType::F16);
+    let acc = b.update(DType::F32);
+    let mean = b.row_statistic(x, RowStatistic::Mean);
+    let deviations = b.row_statistic(x, RowStatistic::Deviations);
+    let other = b.row_statistic(h, RowStatistic::Mean);
+    let variance = b.scale(deviations, 1.0 / cols as f32);
+    let stabilized = b.shift(variance, 1e-5);
+    let deviation = b.unary(Analytic::Sqrt, stabilized);
+    let centered = b.sub(x, mean);
+    let normalized = b.div(centered, deviation);
+    let scaled = b.mul(normalized, gamma);
+    let shifted = b.add(scaled, other);
+    let next = b.add(acc, shifted);
+    b.set(0, next);
+    b.output(normalized, DType::F32);
+    // Exact, so that the arithmetic is as written and can be checked by hand.
+    b.build_with(&fused::CostModel::BALANCED, Algebra::Exact)
+        .unwrap()
+}
+
+const STATISTIC_SHAPES: [(usize, usize); 6] =
+    [(1, 1), (3, 5), (9, 31), (17, 64), (40, 1000), (300, 7)];
+
+type Normalized = (Vec<f32>, Vec<f32>);
+
+fn run_normalize<B: Kernels>(
+    program: &Program,
+    (rows, cols): (usize, usize),
+    x: &Matrix<f32>,
+    gamma: &Vector<f32>,
+    h: &Matrix<f16>,
+    start: &Matrix<f32>,
+) -> Normalized {
+    let (x, gamma, h) = (
+        x.to_backend::<B>(),
+        gamma.to_backend::<B>(),
+        h.to_backend::<B>(),
+    );
+    let mut acc = start.to_backend::<B>();
+    let inputs: [&dyn Fusable<B>; 3] = [&x, &gamma, &h];
+    let fresh = program
+        .run((rows, cols), &inputs, &mut [&mut acc])
+        .remove(0);
+    (
+        acc.to_backend::<Host>().as_slice().to_vec(),
+        fresh
+            .into_matrix::<f32>()
+            .to_backend::<Host>()
+            .as_slice()
+            .to_vec(),
+    )
+}
+
+fn statistic_operands(
+    rng: &mut Lcg,
+    (rows, cols): (usize, usize),
+) -> (Matrix<f32>, Vector<f32>, Matrix<f16>, Matrix<f32>) {
+    let h: Vec<f16> = rng
+        .vector(rows * cols, -1.0, 1.0)
+        .into_iter()
+        .map(f16::from_f32)
+        .collect();
+    (
+        Matrix::from_flat(rows, cols, rng.vector(rows * cols, -3.0, 3.0)),
+        Vector::new(rng.vector(cols, 0.5, 1.5)),
+        Matrix::from_flat(rows, cols, h),
+        Matrix::from_flat(rows, cols, rng.vector(rows * cols, -1.0, 1.0)),
+    )
+}
+
+#[test]
+fn row_statistics_are_the_axis_moments_bit_for_bit_on_the_host() {
+    let mut rng = Lcg(5150);
+    for shape in STATISTIC_SHAPES {
+        let program = normalize_program(shape.1);
+        assert_eq!(program.given_inputs(), 3);
+        let (x, gamma, h, start) = statistic_operands(&mut rng, shape);
+        let fused = run_normalize::<Host>(&program, shape, &x, &gamma, &h, &start);
+        let unfused = fused::with_mode(Mode::Unfused, || {
+            run_normalize::<Host>(&program, shape, &x, &gamma, &h, &start)
+        });
+        assert_bits_eq(&fused.0, &unfused.0, &format!("{shape:?}, updated"));
+        assert_bits_eq(&fused.1, &unfused.1, &format!("{shape:?}, output"));
+
+        // And by hand: the moments, read as column broadcasts.
+        let (mean, deviations) = Host::matrix_axis_moments(&x, tensorcrate::tensors::Axis::Rows);
+        let wide = Matrix::<f32>::from_flat(
+            shape.0,
+            shape.1,
+            h.as_slice().iter().map(|v| v.to_f32()).collect::<Vec<_>>(),
+        );
+        let (other, _) = Host::matrix_axis_moments(&wide, tensorcrate::tensors::Axis::Rows);
+        let n = shape.1 as f32;
+        for r in 0..shape.0 {
+            for c in 0..shape.1 {
+                let i = r * shape.1 + c;
+                let deviation = (deviations[r] * (1.0 / n) + 1e-5).sqrt();
+                let normalized = (x.as_slice()[i] - mean[r]) / deviation;
+                assert_eq!(
+                    fused.1[i].to_bits(),
+                    normalized.to_bits(),
+                    "{shape:?} at {i}"
+                );
+                let want = start.as_slice()[i] + (normalized * gamma[c] + other[r]);
+                assert_eq!(
+                    fused.0[i].to_bits(),
+                    want.to_bits(),
+                    "{shape:?} updated at {i}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_trace_computes_the_row_statistics_too() {
+    let shape = (4, 6);
+    let program = normalize_program(shape.1);
+    let (x, gamma, h, start) = statistic_operands(&mut Lcg(8), shape);
+    let inputs: [&dyn Fusable<Host>; 4] = [&x, &gamma, &h, &start];
+    let trace = program.trace(shape, &inputs);
+    assert_eq!(trace.len(), program.code().len());
+}
+
+#[test]
+#[should_panic(expected = "a row statistic is of a value `input` returned")]
+fn a_row_statistic_is_of_an_input() {
+    use tensorcrate::tensors::fused::RowStatistic;
+    let mut b = Builder::<f32>::new();
+    let x = b.input(DType::F32);
+    let y = b.scale(x, 2.0);
+    b.row_statistic(y, RowStatistic::Mean);
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+fn metal_row_statistics_match_the_host() {
+    let mut rng = Lcg(5151);
+    for codegen in [false, true] {
+        tensorcrate::metal::set_fused_codegen(codegen);
+        for shape in STATISTIC_SHAPES {
+            let program = normalize_program(shape.1);
+            let (x, gamma, h, start) = statistic_operands(&mut rng, shape);
+            let want = run_normalize::<Host>(&program, shape, &x, &gamma, &h, &start);
+            // Interpreted, then compiled once the program has been seen.
+            for round in 0..3 {
+                let got = run_normalize::<Metal>(&program, shape, &x, &gamma, &h, &start);
+                for (what, got, want) in [("updated", &got.0, &want.0), ("output", &got.1, &want.1)]
+                {
+                    for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+                        assert!(
+                            (g - w).abs() <= 1e-4 * (1.0 + w.abs()),
+                            "codegen {codegen}, {shape:?}, round {round}, {what} {i}: {g} on Metal, {w} on the host"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    tensorcrate::metal::set_fused_codegen(true);
+}

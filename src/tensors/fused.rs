@@ -386,6 +386,34 @@ pub struct Program<T = f32> {
     named: Vec<T>,
     /// The instructions whose constants are computed from uniforms, and how.
     bound: Vec<(usize, optimizer::Scalar)>,
+    /// The inputs the program computes itself, one per statistic it reads
+    /// (see [`Builder::row_statistic`]): input slot `given_inputs() + k` is
+    /// statistic `derived[k].1` of each row of input `derived[k].0`.
+    derived: Vec<(u8, RowStatistic)>,
+}
+
+/// The storage type that holds a `T` exactly.
+fn dtype_of<T: 'static>() -> DType {
+    if TypeId::of::<T>() == TypeId::of::<f16>() {
+        DType::F16
+    } else if TypeId::of::<T>() == TypeId::of::<bf16>() {
+        DType::Bf16
+    } else if TypeId::of::<T>() == TypeId::of::<f64>() {
+        DType::F64
+    } else {
+        DType::F32
+    }
+}
+
+/// A statistic of each row of a program's input, which the program reads as
+/// one value per row — see [`Builder::row_statistic`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum RowStatistic {
+    /// The row's mean.
+    Mean,
+    /// The row's sum of squared deviations from its mean: its variance times
+    /// its length.
+    Deviations,
 }
 
 impl<T: Real> Program<T> {
@@ -480,6 +508,7 @@ impl<T: Real> Program<T> {
             uniforms: 0,
             named: Vec::new(),
             bound: Vec::new(),
+            derived: Vec::new(),
         })
     }
 
@@ -529,9 +558,22 @@ impl<T: Real> Program<T> {
         self.updated
     }
 
-    /// Inputs that are only read.
+    /// Inputs that are only read, counting the statistics the program
+    /// computes for itself.
     pub fn fresh_inputs(&self) -> usize {
         self.inputs.len() - self.updated
+    }
+
+    /// The inputs a caller passes: those only read, less the statistics the
+    /// program computes for itself.
+    pub fn given_inputs(&self) -> usize {
+        self.fresh_inputs() - self.derived.len()
+    }
+
+    /// The statistics the program computes for itself, in the order of the
+    /// input slots after the given ones.
+    pub fn row_statistics(&self) -> &[(u8, RowStatistic)] {
+        &self.derived
     }
 
     /// Outputs allocated by each run.
@@ -572,9 +614,9 @@ impl<T: Real> Program<T> {
     ) -> Vec<Output<B>> {
         assert_eq!(
             inputs.len(),
-            self.fresh_inputs(),
+            self.given_inputs(),
             "fused program: expected {} inputs, got {}",
-            self.fresh_inputs(),
+            self.given_inputs(),
             inputs.len()
         );
         assert_eq!(
@@ -595,11 +637,22 @@ impl<T: Real> Program<T> {
         }
 
         let fresh = match mode() {
-            Mode::Fused => {
+            Mode::Fused if self.derived.is_empty() => {
                 counters::kernel(self.bytes(len), self.fresh_outputs());
                 B::fused(self, shape, &sources, &mut sinks)
             }
-            Mode::Unfused => unfused(self, shape, &sources, &mut sinks),
+            Mode::Fused => {
+                // The statistics are computed from the inputs, not read.
+                let statistics = self.derived.len() * shape.0 * size_of::<T>();
+                counters::kernel(self.bytes(len) - statistics, self.fresh_outputs());
+                B::fused_with_statistics(self, shape, &sources, &mut sinks)
+            }
+            Mode::Unfused => {
+                let statistics = row_statistics(self, shape, &sources);
+                let mut all: Vec<Source<'_, B>> = sources.iter().map(Source::reborrow).collect();
+                all.extend(statistics.iter().map(source_of));
+                unfused(self, shape, &all, &mut sinks)
+            }
         };
         fresh
             .into_iter()
@@ -651,8 +704,9 @@ impl<T: Real> Program<T> {
         T: Element,
     {
         assert!(
-            self.updated == 0 && self.outputs == [T::DTYPE],
-            "fused sum: the program must have one {} output and update nothing in place",
+            self.updated == 0 && self.outputs == [T::DTYPE] && self.derived.is_empty(),
+            "fused sum: the program must have one {} output, update nothing in place and \
+             compute no row statistics",
             T::DTYPE.name()
         );
         assert_eq!(
@@ -759,6 +813,10 @@ impl<T: Real> Program<T> {
             "fused matmul: the epilogue cannot update tensors in place"
         );
         assert!(
+            self.derived.is_empty(),
+            "fused matmul: the epilogue cannot compute row statistics"
+        );
+        assert!(
             !self.inputs.is_empty(),
             "fused matmul: the epilogue must read the product as input 0"
         );
@@ -823,17 +881,28 @@ impl<T: Real> Program<T> {
         shape: (usize, usize),
         inputs: &[&dyn Fusable<B>],
     ) -> Vec<Option<Matrix<T, B>>> {
+        let expected = self.inputs.len() - self.derived.len();
         assert_eq!(
             inputs.len(),
-            self.inputs.len(),
-            "fused trace: expected {} inputs, got {}",
-            self.inputs.len(),
+            expected,
+            "fused trace: expected {expected} inputs, got {}",
             inputs.len()
         );
-        let sources: Vec<Source<'_, B>> = inputs.iter().map(|input| input.source()).collect();
-        for (slot, source) in sources.iter().enumerate() {
+        let mut sources: Vec<Source<'_, B>> = inputs.iter().map(|input| input.source()).collect();
+        // Statistics come before any in-place tensors among the input slots.
+        let given = self.given_inputs();
+        for (index, source) in sources.iter().enumerate() {
+            let slot = if index < given {
+                index
+            } else {
+                index + self.derived.len()
+            };
             self.check_input(slot, source.dtype(), source.len, shape);
         }
+        let updated: Vec<Source<'_, B>> = sources.drain(given..).collect();
+        let statistics = row_statistics(self, shape, &sources);
+        sources.extend(statistics.iter().map(source_of));
+        sources.extend(updated);
         let mut registers: Vec<Option<Register<B, T>>> = (0..REGISTERS).map(|_| None).collect();
         self.code
             .iter()
@@ -1058,6 +1127,9 @@ pub struct Builder<T = f32> {
     loads: Vec<((u8, Remap), Value)>,
     /// Each uniform's initial value, in declaration order.
     uniforms: Vec<T>,
+    /// The row statistics the program reads, in declaration order: the input
+    /// slot each is of, and which.
+    derived: Vec<(u8, RowStatistic)>,
 }
 
 impl<T: Real> Default for Builder<T> {
@@ -1069,6 +1141,7 @@ impl<T: Real> Default for Builder<T> {
             outputs: Vec::new(),
             loads: Vec::new(),
             uniforms: Vec::new(),
+            derived: Vec::new(),
         }
     }
 }
@@ -1095,6 +1168,64 @@ impl<T: Real> Builder<T> {
         self.inputs.push(dtype);
         let slot = (self.inputs.len() - 1) as u8;
         self.load(slot, remap)
+    }
+
+    /// A statistic of each row of `input` — which must be a value an
+    /// [`input`](Self::input) returned, read without a remap — as one value
+    /// per row, broadcast along it.
+    ///
+    /// The program computes it from the input itself: running the program is
+    /// running [`Kernels::matrix_axis_moments`] along [`Axis::Rows`] on the
+    /// input, converted to `T`, and passing the result as an input read
+    /// through [`Remap::Column`]. On the host that is what happens, so the
+    /// program fused and unfused agree bit for bit. On Metal a program that has
+    /// run before is one kernel, with each row's statistics and then its
+    /// elements computed by one SIMD group — so a layer norm reads its input
+    /// once, and writes only its result.
+    ///
+    /// ```
+    /// use tensorcrate::tensors::fused::{Builder, DType, RowStatistic};
+    /// use tensorcrate::tensors::Matrix;
+    ///
+    /// // (x − mean) / sqrt(deviations / n), each row.
+    /// let mut b = Builder::<f32>::new();
+    /// let x = b.input(DType::F32);
+    /// let mean = b.row_statistic(x, RowStatistic::Mean);
+    /// let deviations = b.row_statistic(x, RowStatistic::Deviations);
+    /// let variance = b.scale(deviations, 0.5);
+    /// let deviation = b.unary(tensorcrate::tensors::Analytic::Sqrt, variance);
+    /// let centered = b.sub(x, mean);
+    /// let normalized = b.div(centered, deviation);
+    /// b.output(normalized, DType::F32);
+    /// let program = b.build().unwrap();
+    ///
+    /// let x = Matrix::from_rows([[1.0f32, 3.0], [10.0, 20.0]]);
+    /// let y = program.run((2, 2), &[&x], &mut []).remove(0).into_matrix::<f32>();
+    /// assert_eq!(y.to_rows(), [[-1.0, 1.0], [-1.0, 1.0]]);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// If `input` is not an input read without a remap.
+    #[track_caller]
+    pub fn row_statistic(&mut self, input: Value, statistic: RowStatistic) -> Value {
+        let slot = self
+            .loads
+            .iter()
+            .find(|&&((slot, remap), value)| {
+                value == input && remap == Remap::Identity && usize::from(slot) < MAX_INPUTS
+            })
+            .map(|&((slot, _), _)| slot)
+            .expect("a row statistic is of a value `input` returned");
+        let index = match self.derived.iter().position(|&d| d == (slot, statistic)) {
+            Some(index) => index,
+            None => {
+                self.derived.push((slot, statistic));
+                self.derived.len() - 1
+            }
+        };
+        // Numbered after the given inputs in `build`, once their count is known.
+        self.load((2 * MAX_INPUTS + index) as u8, Remap::Column)
     }
 
     /// Declare a tensor updated in place and return its current value.
@@ -1221,12 +1352,17 @@ impl<T: Real> Builder<T> {
         model: &CostModel,
         algebra: Algebra,
     ) -> Result<Program<T>, ProgramError> {
-        let fresh_inputs = self.inputs.len();
+        // The given inputs, then the statistics, then the in-place tensors.
+        let given = self.inputs.len();
+        let fresh_inputs = given + self.derived.len();
         let slot_of = |slot: u8| -> u8 {
-            if usize::from(slot) >= MAX_INPUTS {
-                (fresh_inputs + usize::from(slot) - MAX_INPUTS) as u8
+            let slot = usize::from(slot);
+            if slot >= 2 * MAX_INPUTS {
+                (given + slot - 2 * MAX_INPUTS) as u8
+            } else if slot >= MAX_INPUTS {
+                (fresh_inputs + slot - MAX_INPUTS) as u8
             } else {
-                slot
+                slot as u8
             }
         };
 
@@ -1245,6 +1381,7 @@ impl<T: Real> Builder<T> {
         }
 
         let mut inputs = self.inputs;
+        inputs.extend(self.derived.iter().map(|_| dtype_of::<T>()));
         inputs.extend(self.updates.iter().map(|&(dtype, _)| dtype));
         let mut outputs: Vec<DType> = self.updates.iter().map(|&(dtype, _)| dtype).collect();
         outputs.extend(self.outputs.iter().map(|&(dtype, _)| dtype));
@@ -1306,6 +1443,7 @@ impl<T: Real> Builder<T> {
             .collect();
         program.named = constants;
         program.uniforms = uniforms;
+        program.derived = self.derived;
         Ok(program)
     }
 }
@@ -1681,7 +1819,7 @@ pub struct Sink<'a, B: Backend> {
 
 impl<B: Backend> Source<'_, B> {
     /// Another handle on the same storage.
-    fn reborrow(&self) -> Source<'_, B> {
+    pub(crate) fn reborrow(&self) -> Source<'_, B> {
         Source {
             data: self.data,
             len: self.len,
@@ -2455,6 +2593,83 @@ impl Owned {
     }
 }
 
+/// A vector of the program's own type as a program input.
+pub(crate) fn source_of<B: Backend, T: Real>(vector: &Vector<T, B>) -> Source<'_, B> {
+    let storage = vector.storage();
+    // SAFETY (each cast): `T` is the type compared with, so `B::Vector<T>` is
+    // the storage type cast to.
+    let data = unsafe {
+        if TypeId::of::<T>() == TypeId::of::<f32>() {
+            SourceData::F32(&*std::ptr::from_ref(storage).cast::<B::Vector<f32>>())
+        } else if TypeId::of::<T>() == TypeId::of::<f16>() {
+            SourceData::F16(&*std::ptr::from_ref(storage).cast::<B::Vector<f16>>())
+        } else if TypeId::of::<T>() == TypeId::of::<bf16>() {
+            SourceData::Bf16(&*std::ptr::from_ref(storage).cast::<B::Vector<bf16>>())
+        } else {
+            assert_eq!(TypeId::of::<T>(), TypeId::of::<f64>(), "a float type");
+            SourceData::F64(&*std::ptr::from_ref(storage).cast::<B::Vector<f64>>())
+        }
+    };
+    Source {
+        data,
+        len: vector.len(),
+    }
+}
+
+/// The input as a `rows × cols` matrix of `T`: a copy, converted if it is
+/// stored as another type.
+pub(crate) fn input_matrix<B: Kernels<T>, T: Real>(
+    source: &Source<'_, B>,
+    shape: (usize, usize),
+) -> Matrix<T, B> {
+    load_unfused(source, shape, Remap::Identity)
+}
+
+/// The row statistics a program computes for itself, from its given
+/// `inputs`, in the order of their input slots — each pair of moments computed
+/// once, by [`Kernels::row_moments`].
+pub(crate) fn row_statistics<B: Kernels<T>, T: Real>(
+    program: &Program<T>,
+    shape: (usize, usize),
+    inputs: &[Source<'_, B>],
+) -> Vec<Vector<T, B>> {
+    let mut moments: Vec<(u8, Option<Vector<T, B>>, Option<Vector<T, B>>)> = Vec::new();
+    for &(slot, _) in &program.derived {
+        if !moments.iter().any(|&(of, ..)| of == slot) {
+            let (mean, deviations) = B::row_moments(&inputs[usize::from(slot)], shape);
+            moments.push((slot, Some(mean), Some(deviations)));
+        }
+    }
+    program
+        .derived
+        .iter()
+        .map(|&(slot, statistic)| {
+            let (_, mean, deviations) = moments
+                .iter_mut()
+                .find(|(of, ..)| *of == slot)
+                .expect("computed above");
+            match statistic {
+                RowStatistic::Mean => mean.take(),
+                RowStatistic::Deviations => deviations.take(),
+            }
+            .expect("each statistic is read once")
+        })
+        .collect()
+}
+
+/// [`row_moments`](Kernels::row_moments) on the host, read in place when the
+/// input is stored as `T`.
+pub(crate) fn host_row_moments<T: Real>(
+    source: &Source<'_, Host>,
+    shape: (usize, usize),
+) -> (Vector<T, Host>, Vector<T, Host>) {
+    let moments = match source.typed::<T>() {
+        Some(values) => crate::statistics::axis_moments_of(&values[..], shape, Axis::Rows),
+        None => input_matrix::<Host, T>(source, shape).moments_axis(Axis::Rows),
+    };
+    (moments.means, moments.sum_squared_deviations)
+}
+
 /// The sums of `matrix` along `axis`, as products with ones — the definition
 /// of [`Program::run_sum`].
 pub(crate) fn axis_sum<T: Real, B: Kernels<T>>(matrix: Matrix<T, B>, axis: Axis) -> Vector<T, B> {
@@ -3181,6 +3396,90 @@ pub(crate) fn metal<T: crate::metal::MetalElement>(
 ) -> Vec<Fresh<super::Metal>> {
     resident(program, shape, inputs, updated)
         .unwrap_or_else(|| interpret_on(program, shape, inputs, updated))
+}
+
+/// The [`Metal`](super::Metal) entry point for
+/// [`Kernels::fused_with_statistics`]: one kernel over whole rows when every
+/// operand is device-resident and the program has a kernel of its own, and
+/// otherwise the statistics and then [`metal`].
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub(crate) fn metal_with_statistics<T: crate::metal::MetalElement>(
+    program: &Program<T>,
+    shape: (usize, usize),
+    inputs: &[Source<'_, super::Metal>],
+    updated: &mut [Sink<'_, super::Metal>],
+) -> Vec<Fresh<super::Metal>> {
+    if let Some(fresh) = resident_rows(program, shape, inputs, updated) {
+        return fresh;
+    }
+    let statistics = row_statistics(program, shape, inputs);
+    let mut all: Vec<Source<'_, super::Metal>> = inputs.iter().map(Source::reborrow).collect();
+    all.extend(statistics.iter().map(source_of));
+    metal(program, shape, &all, updated)
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn resident_rows<T: crate::metal::MetalElement>(
+    program: &Program<T>,
+    shape: (usize, usize),
+    inputs: &[Source<'_, super::Metal>],
+    updated: &[Sink<'_, super::Metal>],
+) -> Option<Vec<Fresh<super::Metal>>> {
+    if !program.runs_on_metal() || program.derived.len() > 16 {
+        return None;
+    }
+    let mut read = device::sources(inputs)?;
+    // The statistics' slots, which the kernel computes rather than reads.
+    let filler = *read.first()?;
+    read.extend(program.derived.iter().map(|_| filler));
+    let mut written = Vec::with_capacity(program.outputs.len());
+    for target in updated {
+        let buffer = device::sink(&target.data)?;
+        read.push(buffer);
+        written.push(buffer);
+    }
+    let fresh = device::allocate(program, shape.0 * shape.1)?;
+    written.extend(fresh.iter().map(device::Allocation::raw));
+
+    let mut statistics = [(0u8, 0u8, false); 16];
+    for (entry, &(of, statistic)) in statistics.iter_mut().zip(&program.derived) {
+        *entry = (
+            of,
+            program.inputs[usize::from(of)] as u8,
+            statistic == RowStatistic::Deviations,
+        );
+    }
+    let statistics = crate::metal::RowStatistics {
+        first: program.given_inputs() as u8,
+        statistics,
+        count: program.derived.len(),
+    };
+    crate::metal::fused_rows::<T>(&program.encode(), shape, &read, &written, statistics)?;
+    Some(
+        fresh
+            .into_iter()
+            .map(device::Allocation::into_fresh)
+            .collect(),
+    )
+}
+
+/// [`row_moments`](Kernels::row_moments) on Metal: the moments kernel on the
+/// input where it lies, when it is resident and of type `T`.
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub(crate) fn metal_row_moments<T: crate::metal::MetalElement>(
+    source: &Source<'_, super::Metal>,
+    (rows, cols): (usize, usize),
+) -> (Vector<T, super::Metal>, Vector<T, super::Metal>) {
+    let resident = (rows != 0 && cols != 0)
+        .then(|| source.typed::<T>()?.axis_moments(rows, cols, Axis::Rows))
+        .flatten();
+    match resident {
+        Some((means, deviations)) => (
+            Vector::from_storage(rows, means),
+            Vector::from_storage(rows, deviations),
+        ),
+        None => super::Metal::matrix_axis_moments(&input_matrix(source, (rows, cols)), Axis::Rows),
+    }
 }
 
 /// The [`Metal`](super::Metal) entry point for [`Kernels::fused_sum`]: one

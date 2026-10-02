@@ -77,10 +77,12 @@ const SPECIALIZED_CACHE: usize = 256;
 
 /// Command buffers kept queued ahead of the GPU before an allocation waits for
 /// an old one to finish rather than making a new one.
-const QUEUE_DEPTH: u64 = 4;
-
-/// The smallest allocation worth waiting for rather than making afresh.
-const WAIT_FOR_BYTES: usize = 1 << 20;
+///
+/// Waiting wakes the CPU some tens of microseconds after the command buffer
+/// completes, so the GPU needs that much work still queued behind it: with
+/// four, a pipelined loop of 1M-element operations ran at a third of the
+/// speed it does with eight.
+const QUEUE_DEPTH: u64 = 8;
 
 pub(super) type CommandBuffer = Retained<ProtocolObject<dyn MTLCommandBuffer>>;
 
@@ -122,6 +124,8 @@ pub(super) struct Typed {
     pub(super) power_scalar: Pipeline,
     pub(super) deviation: Pipeline,
     pub(super) axis_moments: Pipeline,
+    /// The same along rows, one SIMD group per row.
+    pub(super) row_moments: Pipeline,
     pub(super) distribution: Pipeline,
     pub(super) axis_distribution: Pipeline,
     pub(super) fused: Pipeline,
@@ -395,6 +399,7 @@ pub(super) fn build_gpu() -> Option<Gpu> {
             power_scalar: kernel("power_scalar")?,
             deviation: kernel("deviation_partial")?,
             axis_moments: kernel("axis_moments")?,
+            row_moments: kernel("row_moments")?,
             distribution: kernel("distribution")?,
             axis_distribution: kernel("axis_distribution")?,
             fused: kernel("fused_elementwise")?,
@@ -446,15 +451,12 @@ impl Gpu {
             return Some(buffer);
         }
         // When the CPU has run well ahead of the GPU, every intermediate it
-        // dropped is still owed to a queued kernel. For a large tensor,
-        // allocating afresh then costs more than the kernel itself — Metal
-        // zero-fills new memory — and grows without bound, so once enough work
-        // is queued to keep the GPU busy, wait for the oldest command holding a
-        // suitable allocation instead. A small allocation is cheaper than the
-        // wait, so it is simply made.
-        let fence = (len >= WAIT_FOR_BYTES)
-            .then(|| self.pool.borrow().oldest_fitting(len))
-            .flatten();
+        // dropped is still owed to a queued kernel. Allocating afresh then
+        // costs more than a kernel — Metal zero-fills new memory: about 5 µs
+        // for 256 KB and 200 µs for 16 MB — and grows without bound, so once
+        // enough work is queued to keep the GPU busy, wait for the oldest
+        // command holding a suitable allocation instead.
+        let fence = self.pool.borrow().oldest_fitting(len);
         if let Some(fence) = fence
             && fence + QUEUE_DEPTH <= self.committed.get()
             && super::sync::wait_through(self, fence)

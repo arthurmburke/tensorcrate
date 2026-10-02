@@ -448,7 +448,7 @@ fn moments_of<T: Coefficient + Float>(values: &[T]) -> Moments<T> {
 /// whole row of partial sums at a time instead reads the matrix once in storage
 /// order and keeps the accumulator's own stride at one, which is both
 /// cache-friendly and the shape a SIMD kernel wants.
-fn axis_moments_of<T: Coefficient + Float>(
+pub(crate) fn axis_moments_of<T: Coefficient + Float>(
     data: &[T],
     shape: (usize, usize),
     axis: Axis,

@@ -99,7 +99,7 @@ pub(crate) fn fused_elementwise<T: MetalElement>(
             }
         }
         dispatch_1d(&encoder, len);
-        queued(gpu, len.saturating_mul(code.len().div_ceil(4)))
+        queued(gpu, len)
     })
 }
 
@@ -272,7 +272,7 @@ pub(crate) fn fused_sum<T: MetalElement>(
                 encoder.setBuffer_offset_atIndex(Some(buffer), 0, 2 + slot);
             }
         };
-        let work = rows.saturating_mul(cols).saturating_mul(code.len().div_ceil(4));
+        let work = rows.saturating_mul(cols);
         if rows_axis {
             const ROWS_PER_GROUP: usize = 8;
             let encoder = compute(gpu)?;
@@ -319,5 +319,81 @@ pub(crate) fn fused_sum<T: MetalElement>(
         );
         queued(gpu, work)?;
         encode_vecmat_finish::<T>(gpu, partial.raw(), y, cols, bands, false)
+    })
+}
+
+/// Encode a fused program that reads row statistics of its inputs as one
+/// kernel over whole rows (see [`codegen::Kernel::Rows`]) — once the program
+/// has run often enough to have one. `None` before then, leaving the caller to
+/// compute the statistics and run the program on them.
+///
+/// `inputs` and `outputs` are bound as [`fused_elementwise`] binds them; the
+/// slots of the statistics are bound to a filler the kernel never reads.
+pub(crate) fn fused_rows<T: MetalElement>(
+    code: &[crate::tensors::fused::Encoded],
+    (rows, cols): (usize, usize),
+    inputs: &[&ProtocolObject<dyn MTLBuffer>],
+    outputs: &[&ProtocolObject<dyn MTLBuffer>],
+    statistics: codegen::RowStatistics,
+) -> Option<()> {
+    if rows == 0
+        || cols == 0
+        || code.is_empty()
+        || outputs.is_empty()
+        || inputs.len() > FUSED_INPUT_SLOTS
+        || outputs.len() > FUSED_OUTPUT_SLOTS
+    {
+        return None;
+    }
+    let shape = FusedShape {
+        rows: u32::try_from(rows).ok()?,
+        cols: u32::try_from(cols).ok()?,
+        count: u32::try_from(code.len()).ok()?,
+    };
+    let filler = inputs.first().copied().unwrap_or(outputs[0]);
+    with_gpu(|gpu| {
+        let pipeline = codegen::enabled()
+            .then(|| gpu.specialized::<T>(code, codegen::Kernel::Rows(statistics)))
+            .flatten()?;
+        let constants = codegen::constants(code);
+        let encoder = compute(gpu)?;
+        encoder.setComputePipelineState(&pipeline);
+        unsafe {
+            let first = constants.first().unwrap_or(&0.0);
+            let bytes = std::mem::size_of_val(constants.as_slice()).max(4);
+            encoder.setBytes_length_atIndex(NonNull::from(first).cast(), bytes, 0);
+            encoder.setBytes_length_atIndex(
+                NonNull::from(&shape).cast(),
+                size_of::<FusedShape>(),
+                1,
+            );
+            for slot in 0..FUSED_INPUT_SLOTS {
+                let buffer = inputs.get(slot).copied().unwrap_or(filler);
+                encoder.setBuffer_offset_atIndex(Some(buffer), 0, 2 + slot);
+            }
+            for slot in 0..FUSED_OUTPUT_SLOTS {
+                let buffer = outputs.get(slot).copied().unwrap_or(outputs[0]);
+                encoder.setBuffer_offset_atIndex(Some(buffer), 0, 2 + FUSED_INPUT_SLOTS + slot);
+            }
+        }
+        // One threadgroup per row.
+        let threads = codegen::row_threads(
+            cols,
+            pipeline.threadExecutionWidth(),
+            pipeline.maxTotalThreadsPerThreadgroup(),
+        );
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: rows,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: threads,
+                height: 1,
+                depth: 1,
+            },
+        );
+        queued(gpu, rows.saturating_mul(cols))
     })
 }

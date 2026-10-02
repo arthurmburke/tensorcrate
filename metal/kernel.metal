@@ -893,6 +893,64 @@ template [[host_name("axis_moments_" #S)]] kernel void axis_moments<T>(        \
     constant AxisOp&, uint);
 FOR_EACH_ELEMENT(INSTANTIATE_AXIS_MOMENTS)
 
+// The same moments of each row, by one SIMD group per row: its lanes read the
+// row four elements at a time, a stride apart, so that together they read
+// whole cache lines, and `simd_sum` combines them. The second pass reads the
+// row again from cache. One thread per row, above, would leave a 1024-row
+// matrix with 1024 threads, each reading lines no neighbour shares.
+template <typename T>
+kernel void row_moments(
+    device const T* input      [[buffer(0)]],
+    device T* means            [[buffer(1)]],
+    device T* deviations       [[buffer(2)]],
+    constant uint& rows        [[buffer(3)]],
+    constant uint& cols        [[buffer(4)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint simd [[simdgroup_index_in_threadgroup]],
+    uint simds [[simdgroups_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    uint row = group * simds + simd;
+    if (row >= rows) {
+        return;
+    }
+    device const T* line = input + ulong(row) * cols;
+    // Whole groups of four when every row starts on one.
+    uint wide = cols % 4 == 0 ? cols / 4 : 0;
+    device const vec<T, 4>* quads = (device const vec<T, 4>*)line;
+
+    float total = 0.0f;
+    for (uint q = lane; q < wide; q += 32) {
+        float4 v = float4(quads[q]);
+        total += (v.x + v.y) + (v.z + v.w);
+    }
+    for (uint c = wide * 4 + lane; c < cols; c += 32) {
+        total += float(line[c]);
+    }
+    float mean = simd_sum(total) / float(cols);
+
+    float deviation = 0.0f;
+    for (uint q = lane; q < wide; q += 32) {
+        float4 d = float4(quads[q]) - mean;
+        deviation += dot(d, d);
+    }
+    for (uint c = wide * 4 + lane; c < cols; c += 32) {
+        float d = float(line[c]) - mean;
+        deviation += d * d;
+    }
+    deviation = simd_sum(deviation);
+    if (lane == 0) {
+        means[row] = T(mean);
+        deviations[row] = T(deviation);
+    }
+}
+
+#define INSTANTIATE_ROW_MOMENTS(T, S)                                          \
+template [[host_name("row_moments_" #S)]] kernel void row_moments<T>(          \
+    device const T*, device T*, device T*, constant uint&, constant uint&,     \
+    uint, uint, uint, uint);
+FOR_EACH_ELEMENT(INSTANTIATE_ROW_MOMENTS)
+
 // These must agree with `statistics::special`, which is the same mathematics in
 // double precision. They do not agree bit for bit and are not meant to: the
 // host rounds a `f64` result once, while everything here is `f32` throughout.

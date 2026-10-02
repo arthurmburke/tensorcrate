@@ -1024,6 +1024,35 @@ pub trait Kernels<T: Real = f32>: Backend {
         updated: &mut [Sink<'_, Self>],
     ) -> Vec<Fresh<Self>>;
 
+    /// The mean and the sum of squared deviations of each row of a program's
+    /// input, as [`matrix_axis_moments`](Self::matrix_axis_moments) along
+    /// [`Axis::Rows`] gives them for the input converted to `T`. By default
+    /// the input is copied into a matrix first.
+    #[doc(hidden)]
+    fn row_moments(
+        input: &Source<'_, Self>,
+        shape: (usize, usize),
+    ) -> (Vector<T, Self>, Vector<T, Self>) {
+        Self::matrix_axis_moments(&fused::input_matrix(input, shape), Axis::Rows)
+    }
+
+    /// Run a fused program that computes row statistics of its inputs (see
+    /// [`Builder::row_statistic`](super::fused::Builder::row_statistic)):
+    /// `inputs` are the given ones. By default the statistics are computed
+    /// first and passed to [`fused`](Self::fused) as inputs.
+    #[doc(hidden)]
+    fn fused_with_statistics(
+        program: &Program<T>,
+        shape: (usize, usize),
+        inputs: &[Source<'_, Self>],
+        updated: &mut [Sink<'_, Self>],
+    ) -> Vec<Fresh<Self>> {
+        let statistics = fused::row_statistics(program, shape, inputs);
+        let mut all: Vec<Source<'_, Self>> = inputs.iter().map(Source::reborrow).collect();
+        all.extend(statistics.iter().map(fused::source_of));
+        Self::fused(program, shape, &all, updated)
+    }
+
     /// Run a fused program with one output of type `T` and sum that output
     /// along `axis`. Reach this through
     /// [`Program::run_sum`](super::fused::Program::run_sum), which checks the
@@ -1549,6 +1578,13 @@ impl<T: Real> Kernels<T> for Host {
         T: fused::Element,
     {
         fused::host_matmul(program, a, b, inputs)
+    }
+
+    fn row_moments(
+        input: &Source<'_, Self>,
+        shape: (usize, usize),
+    ) -> (Vector<T, Self>, Vector<T, Self>) {
+        fused::host_row_moments(input, shape)
     }
 }
 
@@ -2255,6 +2291,22 @@ mod gpu {
             T: fused::Element,
         {
             fused::metal_sum(program, shape, inputs, axis)
+        }
+
+        fn row_moments(
+            input: &Source<'_, Self>,
+            shape: (usize, usize),
+        ) -> (Vector<T, Self>, Vector<T, Self>) {
+            fused::metal_row_moments(input, shape)
+        }
+
+        fn fused_with_statistics(
+            program: &Program<T>,
+            shape: (usize, usize),
+            inputs: &[Source<'_, Self>],
+            updated: &mut [Sink<'_, Self>],
+        ) -> Vec<Fresh<Self>> {
+            fused::metal_with_statistics(program, shape, inputs, updated)
         }
     }
 

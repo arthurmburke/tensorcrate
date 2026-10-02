@@ -775,6 +775,31 @@ pub(super) fn encode_axis_moments<T: MetalElement>(
 ) -> Option<()> {
     let encoder = compute(gpu)?;
     let (rows_u32, cols_u32) = (u32::try_from(rows).ok()?, u32::try_from(cols).ok()?);
+    if axis == Axis::Rows {
+        const ROWS_PER_GROUP: usize = 8;
+        let pipeline = &gpu.kernels::<T>().row_moments;
+        encoder.setComputePipelineState(pipeline);
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(means), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(deviations), 0, 2);
+            encoder.setBytes_length_atIndex(NonNull::from(&rows_u32).cast(), 4, 3);
+            encoder.setBytes_length_atIndex(NonNull::from(&cols_u32).cast(), 4, 4);
+        }
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: rows.div_ceil(ROWS_PER_GROUP),
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: pipeline.threadExecutionWidth() * ROWS_PER_GROUP,
+                height: 1,
+                depth: 1,
+            },
+        );
+        return queued(gpu, rows * cols);
+    }
     encoder.setComputePipelineState(&gpu.kernels::<T>().axis_moments);
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(input), 0, 0);

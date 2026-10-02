@@ -46,7 +46,8 @@ pub use codegen::set_fused_codegen;
 #[doc(hidden)]
 pub use device::set_tensorops;
 pub use device::{MatmulPrecision, matmul_precision, set_matmul_precision};
-pub(crate) use fused::{fused_elementwise, fused_sum, matmul_epilogue};
+pub(crate) use codegen::RowStatistics;
+pub(crate) use fused::{fused_elementwise, fused_rows, fused_sum, matmul_epilogue};
 pub use slices::{broadcast_f32, elementwise_f32, fft_f32_interleaved, ifft_f32_interleaved};
 pub use sync::synchronize;
 
@@ -106,3 +107,4 @@ impl MetalElement for bf16 {
         bf16::from_bits(if ascending { 0x7FFF } else { 0xFFFF })
     }
 }
+

@@ -54,7 +54,9 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use tensorcrate::optim::{Adam, Rule};
-use tensorcrate::tensors::fused::{self, Builder, DType, Fusable, Mode, Program, Remap};
+use tensorcrate::tensors::fused::{
+    self, Builder, DType, Fusable, Mode, Program, Remap, RowStatistic,
+};
 use tensorcrate::tensors::{
     Analytic, Axis, Backend, BinaryOp, Compare, Host, Kernels, Matrix, Tape, Vector,
 };
@@ -552,16 +554,16 @@ fn chain(len: usize) -> Program {
     })
 }
 
-/// `scale·(x − mean) / sqrt(variance + ε) + shift`, per row. Inputs: the matrix,
-/// each row's mean and sum of squared deviations (read down the columns), and the
-/// learned scale and shift (read across the rows).
+/// `scale·(x − mean) / sqrt(variance + ε) + shift`, per row: the mean and the
+/// sum of squared deviations are statistics the program computes of its input,
+/// and the learned scale and shift are read across the rows.
 fn layer_norm_program(cols: usize) -> Program {
     let mut b = Builder::new();
     let x = b.input(DType::F32);
-    let mean = b.input_remapped(DType::F32, Remap::Column);
-    let deviations = b.input_remapped(DType::F32, Remap::Column);
     let gamma = b.input_remapped(DType::F32, Remap::Row);
     let beta = b.input_remapped(DType::F32, Remap::Row);
+    let mean = b.row_statistic(x, RowStatistic::Mean);
+    let deviations = b.row_statistic(x, RowStatistic::Deviations);
     let variance = b.scale(deviations, 1.0 / cols as f32);
     let stabilized = b.shift(variance, 1e-5);
     let deviation = b.unary(Analytic::Sqrt, stabilized);
@@ -754,8 +756,7 @@ fn layer_norm<B: Kernels>(
     let gamma = vector::<B>(cols, 2);
     let beta = vector::<B>(cols, 3);
     move || {
-        let (mean, deviations) = B::matrix_axis_moments(&x, Axis::Rows);
-        let inputs: [&dyn Fusable<B>; 5] = [&x, &mean, &deviations, &gamma, &beta];
+        let inputs: [&dyn Fusable<B>; 3] = [&x, &gamma, &beta];
         program
             .run((rows, cols), &inputs, &mut [])
             .remove(0)
@@ -1048,6 +1049,15 @@ fn matmul(bench: &mut Bench) {
             );
             case.row("metal f16 → f32 (pipelined)", Drain::PerBatch, || {
                 ha.matmul_f32(&hb)
+            });
+            assert_close_to_scale(
+                "relaxed metal matmul vs host",
+                &ha.matmul(&hb).to_f32::<Host>().flat(),
+                host.as_slice(),
+                2e-2,
+            );
+            case.row("metal f16 → f16 (pipelined)", Drain::PerBatch, || {
+                ha.matmul(&hb)
             });
         }
     }
