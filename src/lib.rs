@@ -80,11 +80,15 @@ pub mod __private {
             return (0..len).map(f).collect();
         }
         let mut out = Vec::with_capacity(len);
-        crate::parallel::for_slices(&mut out.spare_capacity_mut()[..len], grain, |start, window| {
-            for (offset, slot) in window.iter_mut().enumerate() {
-                slot.write(f(start + offset));
-            }
-        });
+        crate::parallel::for_slices(
+            &mut out.spare_capacity_mut()[..len],
+            grain,
+            |start, window| {
+                for (offset, slot) in window.iter_mut().enumerate() {
+                    slot.write(f(start + offset));
+                }
+            },
+        );
         // SAFETY: every element below `len` was written.
         unsafe { out.set_len(len) };
         out
