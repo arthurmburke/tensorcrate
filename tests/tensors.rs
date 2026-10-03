@@ -194,7 +194,7 @@ fn ifft_supports_edge_lengths_and_f32() {
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
-fn tensor_operations_use_metal_or_transparently_fall_back() {
+fn tensor_operations_cover_matrix_vector_shapes() {
     let a = Matrix::<f32>::from_rows((0..32).map(|row| {
         (0..32)
             .map(|col| (row + col) as f32 * 0.125)

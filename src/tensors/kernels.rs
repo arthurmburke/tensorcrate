@@ -1845,14 +1845,14 @@ mod gpu {
     use super::{
         Analytic, Axis, AxisReduction, BinaryOp, Compare, Family, Fresh, Kernels, Matrix, Pairwise,
         Program, Reduce, Sink, SortOrder, Source, Statistic, TensorView, Transposed, Vector,
-        correlation_shape, fused, strided,
+        correlation_shape, fused,
     };
     use crate::counters;
     use crate::metal::MetalElement;
     use crate::numbers::Real;
     use crate::tensors::backend::Strided;
     use crate::tensors::metal_backend::{matrix_elementwise, vector_elementwise};
-    use crate::tensors::{Host, Metal, MetalStorage};
+    use crate::tensors::{Metal, MetalStorage, require_metal};
 
     /// Forwarding again, but to the resident operations: every one of these
     /// leaves its result in GPU-shared memory, and runs the kernels compiled for
@@ -1945,20 +1945,14 @@ mod gpu {
             f: Analytic,
         ) -> (Vector<T, Self>, Vector<T, Self>) {
             counters::kernel(4 * value.len() * size_of::<T>(), 2);
-            match value.storage().unary_dual(tangent.storage(), f) {
-                Some((v, t)) => (
-                    Vector::from_storage(value.len(), v),
-                    Vector::from_storage(tangent.len(), t),
-                ),
-                None => {
-                    let (v, t) = Host::vector_unary_dual(
-                        &value.to_backend::<Host>(),
-                        &tangent.to_backend::<Host>(),
-                        f,
-                    );
-                    (v.to_backend(), t.to_backend())
-                }
-            }
+            let (v, t) = require_metal(
+                "vector dual analytic operation",
+                value.storage().unary_dual(tangent.storage(), f),
+            );
+            (
+                Vector::from_storage(value.len(), v),
+                Vector::from_storage(tangent.len(), t),
+            )
         }
 
         fn dot(a: &Vector<T, Self>, b: &Vector<T, Self>) -> T {
@@ -2067,20 +2061,14 @@ mod gpu {
         ) -> (Matrix<T, Self>, Matrix<T, Self>) {
             counters::kernel(4 * value.rows() * value.cols() * size_of::<T>(), 2);
             let (rows, cols) = value.shape();
-            match value.storage().unary_dual(tangent.storage(), f) {
-                Some((v, t)) => (
-                    Matrix::from_storage(rows, cols, v),
-                    Matrix::from_storage(rows, cols, t),
-                ),
-                None => {
-                    let (v, t) = Host::matrix_unary_dual(
-                        &value.to_backend::<Host>(),
-                        &tangent.to_backend::<Host>(),
-                        f,
-                    );
-                    (v.to_backend(), t.to_backend())
-                }
-            }
+            let (v, t) = require_metal(
+                "matrix dual analytic operation",
+                value.storage().unary_dual(tangent.storage(), f),
+            );
+            (
+                Matrix::from_storage(rows, cols, v),
+                Matrix::from_storage(rows, cols, t),
+            )
         }
 
         fn matmul(a: &Matrix<T, Self>, b: &Matrix<T, Self>) -> Matrix<T, Self> {
@@ -2167,31 +2155,25 @@ mod gpu {
             let (rows, cols) = input.shape();
             let (window_rows, window_cols) = window.shape();
             let (out_rows, out_cols) = correlation_shape(input.shape(), window.shape());
-            match input.storage().correlate(
-                window.storage(),
-                rows,
-                cols,
-                window_rows,
-                window_cols,
-                flip,
-            ) {
-                Some(data) => Matrix::from_storage(out_rows, out_cols, data),
-                None => Host::correlate(
-                    &input.to_backend::<Host>(),
-                    &window.to_backend::<Host>(),
+            let data = require_metal(
+                "matrix correlation",
+                input.storage().correlate(
+                    window.storage(),
+                    rows,
+                    cols,
+                    window_rows,
+                    window_cols,
                     flip,
-                )
-                .to_backend(),
-            }
+                ),
+            );
+            Matrix::from_storage(out_rows, out_cols, data)
         }
 
         fn flip(input: &Matrix<T, Self>) -> Matrix<T, Self> {
             counters::elementwise_of::<T>(input.rows() * input.cols(), 1);
             let (rows, cols) = input.shape();
-            match input.storage().flip(rows, cols) {
-                Some(data) => Matrix::from_storage(rows, cols, data),
-                None => Host::flip(&input.to_backend::<Host>()).to_backend(),
-            }
+            let data = require_metal("matrix flip", input.storage().flip(rows, cols));
+            Matrix::from_storage(rows, cols, data)
         }
 
         fn correlate_window_gradient(
@@ -2234,15 +2216,8 @@ mod gpu {
                     !forward_flip,
                 )
             });
-            match full {
-                Some(data) => Matrix::from_storage(rows, cols, data),
-                None => Host::correlate_input_gradient(
-                    &adjoint.to_backend::<Host>(),
-                    &window.to_backend::<Host>(),
-                    forward_flip,
-                )
-                .to_backend(),
-            }
+            let data = require_metal("correlation input gradient", full);
+            Matrix::from_storage(rows, cols, data)
         }
 
         fn pad(input: &Matrix<T, Self>, pad_rows: usize, pad_cols: usize) -> Matrix<T, Self> {
@@ -2254,22 +2229,24 @@ mod gpu {
             );
             let (rows, cols) = input.shape();
             let (padded_rows, padded_cols) = (rows + 2 * pad_rows, cols + 2 * pad_cols);
-            match input.storage().pad(rows, cols, pad_rows, pad_cols) {
-                Some(data) => Matrix::from_storage(padded_rows, padded_cols, data),
-                None => Host::pad(&input.to_backend::<Host>(), pad_rows, pad_cols).to_backend(),
-            }
+            let data = require_metal(
+                "matrix padding",
+                input.storage().pad(rows, cols, pad_rows, pad_cols),
+            );
+            Matrix::from_storage(padded_rows, padded_cols, data)
         }
 
         fn vector_moments(a: &Vector<T, Self>) -> (T, T) {
             counters::kernel(2 * a.len() * size_of::<T>(), 0);
-            resident_moments(a.storage(), a.len())
-                .unwrap_or_else(|| <Host as Kernels<T>>::vector_moments(&a.to_backend::<Host>()))
+            require_metal("vector moments", resident_moments(a.storage(), a.len()))
         }
 
         fn matrix_moments(a: &Matrix<T, Self>) -> (T, T) {
             counters::kernel(2 * a.rows() * a.cols() * size_of::<T>(), 0);
-            resident_moments(a.storage(), a.rows() * a.cols())
-                .unwrap_or_else(|| <Host as Kernels<T>>::matrix_moments(&a.to_backend::<Host>()))
+            require_metal(
+                "matrix moments",
+                resident_moments(a.storage(), a.rows() * a.cols()),
+            )
         }
 
         fn matrix_axis_moments(
@@ -2287,17 +2264,11 @@ mod gpu {
             let resident = (rows != 0 && cols != 0)
                 .then(|| a.storage().axis_moments(rows, cols, axis))
                 .flatten();
-            match resident {
-                Some((means, deviations)) => (
-                    Vector::from_storage(extent, means),
-                    Vector::from_storage(extent, deviations),
-                ),
-                None => {
-                    let (means, deviations) =
-                        Host::matrix_axis_moments(&a.to_backend::<Host>(), axis);
-                    (means.to_backend(), deviations.to_backend())
-                }
-            }
+            let (means, deviations) = require_metal("matrix axis moments", resident);
+            (
+                Vector::from_storage(extent, means),
+                Vector::from_storage(extent, deviations),
+            )
         }
 
         fn vector_distribution(
@@ -2307,19 +2278,12 @@ mod gpu {
             parameters: (T, T),
         ) -> Vector<T, Self> {
             counters::elementwise_of::<T>(a.len(), 1);
-            match a
-                .storage()
-                .distribution(family, statistic, widen_pair(parameters))
-            {
-                Some(data) => Vector::from_storage(a.len(), data),
-                None => Host::vector_distribution(
-                    &a.to_backend::<Host>(),
-                    family,
-                    statistic,
-                    parameters,
-                )
-                .to_backend(),
-            }
+            let data = require_metal(
+                "vector distribution",
+                a.storage()
+                    .distribution(family, statistic, widen_pair(parameters)),
+            );
+            Vector::from_storage(a.len(), data)
         }
 
         fn matrix_distribution(
@@ -2330,19 +2294,12 @@ mod gpu {
         ) -> Matrix<T, Self> {
             counters::elementwise_of::<T>(a.rows() * a.cols(), 1);
             let (rows, cols) = a.shape();
-            match a
-                .storage()
-                .distribution(family, statistic, widen_pair(parameters))
-            {
-                Some(data) => Matrix::from_storage(rows, cols, data),
-                None => Host::matrix_distribution(
-                    &a.to_backend::<Host>(),
-                    family,
-                    statistic,
-                    parameters,
-                )
-                .to_backend(),
-            }
+            let data = require_metal(
+                "matrix distribution",
+                a.storage()
+                    .distribution(family, statistic, widen_pair(parameters)),
+            );
+            Matrix::from_storage(rows, cols, data)
         }
 
         fn matrix_axis_distribution(
@@ -2366,18 +2323,8 @@ mod gpu {
                 family,
                 statistic,
             );
-            match resident {
-                Some(data) => Matrix::from_storage(rows, cols, data),
-                None => Host::matrix_axis_distribution(
-                    &a.to_backend::<Host>(),
-                    axis,
-                    family,
-                    statistic,
-                    &first.to_backend::<Host>(),
-                    &second.to_backend::<Host>(),
-                )
-                .to_backend(),
-            }
+            let data = require_metal("matrix axis distribution", resident);
+            Matrix::from_storage(rows, cols, data)
         }
 
         fn fused(
@@ -2430,8 +2377,7 @@ mod gpu {
         }
 
         // The three strided operations run one GPU dispatch each, reading the
-        // views in place. Without a device — or for the remainder, which has
-        // no shader — they run the host kernel over the shared memory.
+        // views in place. Unsupported operations fail instead of using Host.
         fn strided_binary(
             a: TensorView<'_, T, Self>,
             b: TensorView<'_, T, Self>,
@@ -2456,10 +2402,8 @@ mod gpu {
                 a.shape(),
                 op,
             );
-            match resident {
-                Some(data) => Vector::from_storage(a.len(), data),
-                None => Vector::build(&strided::binary(a.strided(), b.strided(), op)),
-            }
+            let data = require_metal("strided binary operation", resident);
+            Vector::from_storage(a.len(), data)
         }
 
         fn reduce_axes(
@@ -2469,10 +2413,11 @@ mod gpu {
         ) -> Vector<T, Self> {
             let split = input.split_for(axes);
             counters::kernel((input.len() + split.results()) * size_of::<T>(), 1);
-            match input.data().storage().reduce_axes(&split, op) {
-                Some(data) => Vector::from_storage(split.results(), data),
-                None => Vector::build(&strided::reduce(input.strided(), axes, op)),
-            }
+            let data = require_metal(
+                "strided axis reduction",
+                input.data().storage().reduce_axes(&split, op),
+            );
+            Vector::from_storage(split.results(), data)
         }
 
         fn arg_reduce(
@@ -2485,10 +2430,11 @@ mod gpu {
                 input.len() * size_of::<T>() + split.results() * size_of::<u32>(),
                 1,
             );
-            match input.data().storage().arg_reduce(&split, op) {
-                Some(data) => Vector::from_storage(split.results(), data),
-                None => Vector::build(&strided::arg_reduce(input.strided(), axis, op)),
-            }
+            let data = require_metal(
+                "strided argument reduction",
+                input.data().storage().arg_reduce(&split, op),
+            );
+            Vector::from_storage(split.results(), data)
         }
     }
 
@@ -2497,8 +2443,7 @@ mod gpu {
     /// The mean has to reach the CPU before the deviation pass can be encoded
     /// with it, so this is two dispatched reductions with a synchronization
     /// between them rather than one fused kernel — the same shape the two-pass
-    /// variance takes everywhere else. `None` where there is no device, which
-    /// sends the caller to the host.
+    /// variance takes everywhere else. `None` means Metal could not execute it.
     ///
     /// Both passes accumulate in `f32`, and the deviations are measured from
     /// the unrounded `f32` mean; the pair rounds to `T` once, at the end.

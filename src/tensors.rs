@@ -124,6 +124,8 @@ mod metal_backend;
 
 pub use algebra::{Dot, MatMul, MatVec, Transpose, VecMat};
 pub use analytic::Transcendental;
+#[cfg(all(feature = "metal", target_os = "macos"))]
+pub(crate) use backend::require_metal;
 pub use backend::{Backend, Host};
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub use backend::{Metal, MetalStorage};

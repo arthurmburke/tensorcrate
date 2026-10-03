@@ -1,6 +1,8 @@
 // Shared by `kernel.metal` and `tensorops.metal`: the operation enums, the
 // elementwise value functions, and the fused-program interpreter, so a matrix
 // product's epilogue runs exactly the code `fused_elementwise` does.
+// The Rust Metal backend treats a missing kernel as an error; operations are
+// never completed by a Host implementation after dispatch selection.
 #pragma once
 
 #include <metal_stdlib>

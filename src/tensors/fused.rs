@@ -3002,9 +3002,8 @@ pub(crate) fn axis_sum<T: Real, B: Kernels<T>>(matrix: Matrix<T, B>, axis: Axis)
     }
 }
 
-/// Run a program on the CPU, over whatever backend's storage, reading it in
-/// place. This is the [`Host`] implementation and the fallback for a Metal
-/// tensor that is not device-resident.
+/// Run a program on the CPU, over the backend's storage, reading it in place.
+/// This is the [`Host`] implementation.
 pub(crate) fn interpret_on<B: Backend, T: Real>(
     program: &Program<T>,
     shape: (usize, usize),
@@ -3732,10 +3731,9 @@ pub(crate) fn host<T: Real>(
 }
 
 /// The [`Metal`](super::Metal) entry point for [`Kernels::fused`]: one
-/// dispatch of the bytecode shader when every operand is device-resident and
-/// every instruction has a shader implementation, and otherwise the host
-/// interpreter over the shared memory — the same fallback every Metal kernel
-/// has.
+/// dispatch of the bytecode shader. A non-resident operand or an instruction
+/// without a shader implementation is rejected rather than interpreted on the
+/// Host.
 ///
 /// The shader is compiled once per [`MetalElement`](crate::metal::MetalElement)
 /// and the program's own `T` picks the instance, so a `Program<f16>` runs in
@@ -3747,8 +3745,7 @@ pub(crate) fn metal<T: crate::metal::MetalElement>(
     inputs: &[Source<'_, super::Metal>],
     updated: &mut [Sink<'_, super::Metal>],
 ) -> Vec<Fresh<super::Metal>> {
-    resident(program, shape, inputs, updated)
-        .unwrap_or_else(|| interpret_on(program, shape, inputs, updated))
+    super::require_metal("fused program", resident(program, shape, inputs, updated))
 }
 
 /// The [`Metal`](super::Metal) entry point for
@@ -4019,6 +4016,18 @@ fn resident<T: crate::metal::MetalElement>(
     }
     let fresh = device::allocate(program, len)?;
     written.extend(fresh.iter().map(device::Allocation::raw));
+
+    // An empty program result needs resident allocations but no kernel. Treat
+    // that as successful Metal execution instead of invoking the Host
+    // interpreter merely because there are no threads to dispatch.
+    if len == 0 {
+        return Some(
+            fresh
+                .into_iter()
+                .map(device::Allocation::into_fresh)
+                .collect(),
+        );
+    }
 
     let places = shader_places(program, shape, inputs, 0)?;
     crate::metal::fused_elementwise::<T>(&program.encode(), shape, &read, &written, &places)?;

@@ -45,6 +45,10 @@
 //! backend call at all: the same storage is simply given a different shape, a
 //! move rather than a copy on either backend.
 //!
+//! Metal operations never fall back to Host execution. If a device, allocation,
+//! or kernel is unavailable, the operation panics. Transfer to [`Host`]
+//! explicitly when CPU execution is intended.
+//!
 //! Anything that is not one dense run is several storages. A compressed sparse
 //! row matrix, for instance, is its stored values plus two index arrays, each a
 //! `Storage` on whichever backend the matrix lives on; it needs nothing from the
@@ -380,16 +384,16 @@ impl Backend for Host {
 pub use gpu::{Metal, MetalStorage};
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
+pub(crate) use gpu::require_metal;
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
 mod gpu {
     use std::any::TypeId;
     use std::fmt;
 
     use half::{bf16, f16};
 
-    use super::{
-        Backend, Region, Strided, assemble_slices, check_strided, sealed, strided_copy_slice,
-        strided_write_slice,
-    };
+    use super::{Backend, Region, Strided, check_strided, sealed};
     use crate::metal::{MetalBuffer, MetalElement};
 
     use crate::tensors::{Analytic, Axis, BinaryOp, Compare, Family, Reduce, SortOrder, Statistic};
@@ -409,6 +413,16 @@ mod gpu {
     pub struct Metal;
 
     impl sealed::Sealed for Metal {}
+
+    /// Require an operation selected through the Metal backend to have encoded
+    /// a Metal kernel. Host execution is only available through an explicit
+    /// backend transfer.
+    #[track_caller]
+    pub(crate) fn require_metal<T>(operation: &str, result: Option<T>) -> T {
+        result.unwrap_or_else(|| {
+            panic!("Metal {operation} could not execute on the GPU; Host fallback is disabled")
+        })
+    }
 
     impl Backend for Metal {
         type Storage<T> = MetalStorage<T>;
@@ -435,27 +449,25 @@ mod gpu {
 
         // A strided copy moves bits, so the GPU copies every element type whose
         // width the kernel is instantiated for — not only the `MetalElement`s,
-        // so index tensors move on the device too. A storage with no device
-        // allocation, an element of another width, or a layout past the
-        // shader's 32-bit indices is copied by the CPU over the same memory.
+        // so index tensors move on the device too.
         fn strided_copy<T: Copy + 'static>(
             storage: &MetalStorage<T>,
             shape: &[usize],
             from: Strided<'_>,
         ) -> MetalStorage<T> {
             check_strided(storage.len(), shape, from, "strided copy");
-            if let Some(buffer) = storage
-                .device()
-                .and_then(|buffer| buffer.strided_copy(shape, from))
-            {
-                return MetalStorage::from_device(buffer);
-            }
-            MetalStorage::from_slice(&strided_copy_slice(storage.as_slice(), shape, from))
+            let buffer = require_metal(
+                "strided copy",
+                storage
+                    .device()
+                    .and_then(|buffer| buffer.strided_copy(shape, from)),
+            );
+            MetalStorage::from_device(buffer)
         }
 
         // The device path leaves an element no region writes as whatever the
-        // recycled allocation held, so it is taken only for types every bit
-        // pattern is a value of; the host path fills from a real element.
+        // recycled allocation held, so it is available only for types where
+        // every bit pattern is a value.
         fn assemble<T: Copy + 'static>(
             len: usize,
             regions: &[Region<'_, MetalStorage<T>>],
@@ -475,14 +487,13 @@ mod gpu {
                     })
                 })
                 .collect::<Option<Vec<_>>>();
-            if let Some(device) = device
-                && any_bits_valid::<T>()
-                && let Some(buffer) = MetalBuffer::assemble(len, &device)
-            {
-                return MetalStorage::from_device(buffer);
-            }
-            let regions = regions.iter().map(host_region).collect::<Vec<_>>();
-            MetalStorage::from_slice(&assemble_slices(len, &regions))
+            let buffer = require_metal(
+                "assemble",
+                device
+                    .filter(|_| any_bits_valid::<T>())
+                    .and_then(|device| MetalBuffer::assemble(len, &device)),
+            );
+            MetalStorage::from_device(buffer)
         }
 
         fn strided_write<T: Copy + 'static>(
@@ -496,20 +507,19 @@ mod gpu {
                 "strided write",
             );
             check_strided(target.len(), region.shape, region.to, "strided write");
-            if let Some(source) = region.source.device()
+            let encoded = if let Some(source) = region.source.device()
                 && let Residency::Device(buffer) = &mut target.0
-                && buffer
-                    .strided_write(Region {
-                        source,
-                        shape: region.shape,
-                        from: region.from,
-                        to: region.to,
-                    })
-                    .is_some()
             {
-                return;
-            }
-            strided_write_slice(target.as_mut_slice(), host_region(&region));
+                buffer.strided_write(Region {
+                    source,
+                    shape: region.shape,
+                    from: region.from,
+                    to: region.to,
+                })
+            } else {
+                None
+            };
+            require_metal("strided write", encoded);
         }
     }
 
@@ -529,35 +539,23 @@ mod gpu {
             TypeId::of::<i16>(),
             TypeId::of::<i32>(),
             TypeId::of::<i64>(),
+            TypeId::of::<(u64, u64)>(),
         ]
         .contains(&TypeId::of::<T>())
     }
 
-    /// `region` reading the shared memory of its source from the CPU.
-    fn host_region<'a, T: Copy + 'static>(region: &Region<'a, MetalStorage<T>>) -> Region<'a, [T]> {
-        Region {
-            source: region.source.as_slice(),
-            shape: region.shape,
-            from: region.from,
-            to: region.to,
-        }
-    }
-
     /// The allocation behind a [`Metal`]-backed tensor.
     ///
-    /// Normally this is GPU-shared memory that kernels read in place. When the
-    /// process has no Metal device — or an allocation fails — the values live in
-    /// an ordinary `Vec` instead and operations fall back to the [`Host`] paths.
-    /// Choosing a backend says where the data should live; it never changes the
-    /// numbers that come out.
-    ///
-    /// [`Host`]: super::Host
+    /// Normally this is GPU-shared memory that kernels read in place. If the
+    /// process has no Metal device, values are retained temporarily so they can
+    /// still be transferred explicitly to [`Host`](super::Host). Attempting a
+    /// Metal operation on such storage panics rather than running on the CPU.
     pub struct MetalStorage<T = f32>(Residency<T>);
 
     enum Residency<T> {
         /// A shared allocation the GPU can read without a copy.
         Device(MetalBuffer<T>),
-        /// No Metal device was available; the CPU kernels run over this instead.
+        /// No Metal device was available. Metal operations reject this storage.
         Host(Vec<T>),
     }
 
@@ -573,18 +571,18 @@ mod gpu {
         /// the GPU, queued like any kernel, so nothing waits.
         pub(crate) fn duplicate(&self) -> Self {
             match &self.0 {
-                Residency::Device(buffer) => match buffer.duplicate() {
-                    Some(copy) => Self(Residency::Device(copy)),
-                    None => Self::from_slice(buffer.as_slice()),
-                },
-                Residency::Host(values) => Self(Residency::Host(values.clone())),
+                Residency::Device(buffer) => Self(Residency::Device(require_metal(
+                    "storage duplicate",
+                    buffer.duplicate(),
+                ))),
+                Residency::Host(_) => require_metal("storage duplicate", None),
             }
         }
 
         /// Whether the values really are in GPU-shared memory.
         ///
-        /// `false` means no Metal device was available and this tensor is
-        /// CPU-resident; its operations still produce the same results.
+        /// `false` means no Metal device was available. Metal operations on the
+        /// storage will panic instead of executing on the CPU.
         pub fn is_device_resident(&self) -> bool {
             matches!(self.0, Residency::Device(_))
         }
@@ -645,8 +643,7 @@ mod gpu {
         }
 
         /// `C[m×n] = A[m×k] · B[k×n]`, entirely on the GPU. `None` when either
-        /// operand is not device-resident or the dispatch failed, leaving the
-        /// caller to use its host path.
+        /// operand is not device-resident or the dispatch failed.
         pub(crate) fn matmul(&self, rhs: &Self, m: usize, k: usize, n: usize) -> Option<Self> {
             let product = self.device()?.matmul(rhs.device()?, m, k, n)?;
             Some(Self(Residency::Device(product)))
@@ -668,8 +665,7 @@ mod gpu {
 
         /// `target += A[m×k]·B[k×n]`, accumulated by the matmul kernel itself.
         ///
-        /// `None` when any of the three is not device-resident, leaving the
-        /// caller to add with its host path.
+        /// `None` when any of the three is not device-resident or dispatch fails.
         pub(crate) fn matmul_accumulate(
             &self,
             rhs: &Self,

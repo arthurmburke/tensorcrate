@@ -541,9 +541,7 @@ fn an_axis_names_what_it_folds() {
 
 // ---- the Metal tier ---------------------------------------------------------
 //
-// These run wherever the backend compiles, device or no device: without one the
-// Metal backend falls back to host storage and host kernels, and the answers are
-// supposed to agree either way. The tolerances are looser than the host tests
+// These require a Metal device. The tolerances are looser than the host tests
 // because the shaders evaluate in `f32` throughout while the host evaluates the
 // same mathematics in `f64` and rounds once.
 
@@ -739,8 +737,7 @@ mod metal {
     fn results_stay_in_shared_memory() {
         let resident = matrix(32, 32).to_backend::<Metal>();
         if !resident.is_device_resident() {
-            // No Metal device on this machine; the fallback path is what the
-            // agreement tests above already cover.
+            // No Metal device on this machine; Metal operations are unavailable.
             return;
         }
 
