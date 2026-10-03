@@ -103,6 +103,7 @@ mod ops;
 mod order;
 mod reduction;
 mod shape;
+mod sparse;
 mod strided;
 mod tensor;
 mod tensor_ops;
