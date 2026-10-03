@@ -72,7 +72,7 @@ pub struct DualMatrix<B: Kernels<T> = Host, T: Real = f32> {
 
 impl<B: Kernels<T>, T: Real> Clone for DualVector<B, T>
 where
-    B::Vector<T>: Clone,
+    B::Storage<T>: Clone,
 {
     fn clone(&self) -> Self {
         DualVector {
@@ -84,7 +84,7 @@ where
 
 impl<B: Kernels<T>, T: Real> Clone for DualMatrix<B, T>
 where
-    B::Matrix<T>: Clone,
+    B::Storage<T>: Clone,
 {
     fn clone(&self) -> Self {
         DualMatrix {
@@ -803,8 +803,8 @@ impl<B: Kernels<T>, T: Real> DualMatrix<B, T> {
         let len = self.rows() * self.cols();
         let (value, tangent) = self.into_parts();
         DualVector {
-            value: Vector::from_storage(len, B::matrix_into_flattened(value.into_storage())),
-            tangent: Vector::from_storage(len, B::matrix_into_flattened(tangent.into_storage())),
+            value: Vector::from_storage(len, value.into_storage()),
+            tangent: Vector::from_storage(len, tangent.into_storage()),
         }
     }
 
@@ -827,12 +827,8 @@ impl<B: Kernels<T>, T: Real> DualMatrix<B, T> {
         );
         let (value, tangent) = vector.into_parts();
         DualMatrix {
-            value: Matrix::from_storage(rows, cols, B::vector_into_matrix(value.into_storage())),
-            tangent: Matrix::from_storage(
-                rows,
-                cols,
-                B::vector_into_matrix(tangent.into_storage()),
-            ),
+            value: Matrix::from_storage(rows, cols, value.into_storage()),
+            tangent: Matrix::from_storage(rows, cols, tangent.into_storage()),
         }
     }
 
@@ -851,8 +847,8 @@ impl<B: Kernels<T>, T: Real> DualVector<B, T> {
         let len = self.len();
         let (value, tangent) = self.into_parts();
         DualMatrix {
-            value: Matrix::from_storage(1, len, B::vector_into_matrix(value.into_storage())),
-            tangent: Matrix::from_storage(1, len, B::vector_into_matrix(tangent.into_storage())),
+            value: Matrix::from_storage(1, len, value.into_storage()),
+            tangent: Matrix::from_storage(1, len, tangent.into_storage()),
         }
     }
 
@@ -861,8 +857,8 @@ impl<B: Kernels<T>, T: Real> DualVector<B, T> {
         let len = self.len();
         let (value, tangent) = self.into_parts();
         DualMatrix {
-            value: Matrix::from_storage(len, 1, B::vector_into_matrix(value.into_storage())),
-            tangent: Matrix::from_storage(len, 1, B::vector_into_matrix(tangent.into_storage())),
+            value: Matrix::from_storage(len, 1, value.into_storage()),
+            tangent: Matrix::from_storage(len, 1, tangent.into_storage()),
         }
     }
 }
@@ -883,16 +879,14 @@ pub fn matrix_gradient<B: Kernels<T>, T: Real>(
         .map(|input| {
             let tangent = f(&DualVector::seed(duplicate_vector(at), input)).tangent;
             shape = tangent.shape();
-            tangent.into_storage()
+            tangent
         })
         .collect::<Vec<_>>();
 
-    let (rows, cols) = shape;
-    Matrix::from_storage(
-        rows,
-        cols * tangents.len(),
-        B::hmerge(&tangents, rows, cols),
-    )
+    if tangents.is_empty() {
+        return Matrix::build(0, 0, &[]);
+    }
+    Matrix::hstack(&tangents)
 }
 
 /// The Jacobian of `f` at `at`, by one forward pass per input element.
@@ -910,11 +904,11 @@ pub fn jacobian<B: Kernels<T>, T: Real>(
         .map(|input| {
             let tangent = f(&DualVector::seed(duplicate_vector(at), input)).tangent;
             outputs = tangent.len();
-            tangent.into_storage()
+            tangent
         })
         .collect::<Vec<_>>();
 
-    Matrix::from_storage(outputs, tangents.len(), B::hstack(&tangents, outputs))
+    Vector::stack_columns(outputs, &tangents)
 }
 
 /// The gradient of a scalar-valued `f` with respect to a *matrix* input.
@@ -956,10 +950,10 @@ pub fn gradient_wrt_matrix<B: Kernels<T>, T: Real>(
             let partials = (0..cols)
                 .map(|col| f(&DualMatrix::seed(duplicate_matrix(at), row, col)).dual)
                 .collect::<Vec<_>>();
-            Vector::<T, B>::build(&partials).into_storage()
+            Vector::<T, B>::build(&partials)
         })
         .collect::<Vec<_>>();
-    Matrix::from_storage(rows, cols, B::vstack(&stacked, cols))
+    Vector::stack_rows(cols, &stacked)
 }
 
 /// The Jacobian of a vector-valued `f` with respect to a *matrix* input.
@@ -996,10 +990,10 @@ pub fn jacobian_wrt_matrix<B: Kernels<T>, T: Real>(
             ))
             .tangent;
             outputs = tangent.len();
-            tangent.into_storage()
+            tangent
         })
         .collect::<Vec<_>>();
-    Matrix::from_storage(outputs, rows * cols, B::hstack(&columns, outputs))
+    Vector::stack_columns(outputs, &columns)
 }
 
 /// The gradient of a scalar-valued `f` at `at`, by one forward pass per input —

@@ -963,11 +963,7 @@ impl<'t, B: Kernels<E>, E: Real> VectorVar<'t, B, E> {
     /// View as a `1 × N` matrix; the adjoint flows straight back.
     pub fn into_row(&self) -> MatrixVar<'t, B, E> {
         let len = self.len();
-        let value = Matrix::from_storage(
-            1,
-            len,
-            B::vector_into_matrix(self.value().duplicate().into_storage()),
-        );
+        let value = Matrix::from_storage(1, len, self.value().duplicate().into_storage());
         let parent = self.node.clone();
         self.record(value, move |adjoint| {
             parent.accumulate(Vector::build(adjoint.as_slice()));
@@ -993,11 +989,7 @@ impl<'t, B: Kernels<E>, E: Real> VectorVar<'t, B, E> {
     /// View as an `N × 1` matrix; the adjoint flows straight back.
     pub fn into_column(&self) -> MatrixVar<'t, B, E> {
         let len = self.len();
-        let value = Matrix::from_storage(
-            len,
-            1,
-            B::vector_into_matrix(self.value().duplicate().into_storage()),
-        );
+        let value = Matrix::from_storage(len, 1, self.value().duplicate().into_storage());
         let parent = self.node.clone();
         self.record(value, move |adjoint| {
             parent.accumulate(Vector::build(adjoint.as_slice()));
@@ -1008,16 +1000,8 @@ impl<'t, B: Kernels<E>, E: Real> VectorVar<'t, B, E> {
 /// The outer product `u ⊗ v` as a `u.len() × v.len()` matrix, built from the
 /// column/row views the backend already provides.
 fn outer<B: Kernels<E>, E: Real>(u: &Vector<E, B>, v: &Vector<E, B>) -> Matrix<E, B> {
-    let column = Matrix::from_storage(
-        u.len(),
-        1,
-        B::vector_into_matrix(u.to_backend::<B>().into_storage()),
-    );
-    let row = Matrix::from_storage(
-        1,
-        v.len(),
-        B::vector_into_matrix(v.to_backend::<B>().into_storage()),
-    );
+    let column = Matrix::from_storage(u.len(), 1, u.to_backend::<B>().into_storage());
+    let row = Matrix::from_storage(1, v.len(), v.to_backend::<B>().into_storage());
     B::matmul(&column, &row)
 }
 
@@ -1387,10 +1371,7 @@ impl<'t, B: Kernels<E>, E: Real> MatrixVar<'t, B, E> {
     /// Row-major flattening, and its exact inverse on the way back.
     pub fn flattened(&self) -> VectorVar<'t, B, E> {
         let (rows, cols) = self.shape();
-        let value = Vector::from_storage(
-            rows * cols,
-            B::matrix_into_flattened(self.value().duplicate().into_storage()),
-        );
+        let value = Vector::from_storage(rows * cols, self.value().duplicate().into_storage());
         let parent = self.node.clone();
         self.record(value, move |adjoint| {
             parent.accumulate(Matrix::build(rows, cols, adjoint.as_slice()));
@@ -1567,10 +1548,10 @@ pub fn jacobian<B: Kernels<E>, E: Real>(
     let rows = (0..outputs)
         .map(|row| {
             output.backward_with(basis_vector::<B, E>(outputs, row));
-            input.grad().into_storage()
+            input.grad()
         })
         .collect::<Vec<_>>();
-    Matrix::from_storage(outputs, inputs, B::vstack(&rows, inputs))
+    Vector::stack_rows(inputs, &rows)
 }
 
 /// The full Jacobian of a vector-valued `f` with respect to a matrix input, as
@@ -1591,10 +1572,10 @@ pub fn jacobian_wrt_matrix<B: Kernels<E>, E: Real>(
     let rows = (0..outputs)
         .map(|row| {
             output.backward_with(basis_vector::<B, E>(outputs, row));
-            B::matrix_into_flattened(input.grad().into_storage())
+            Vector::from_storage(inputs, input.grad().into_storage())
         })
         .collect::<Vec<_>>();
-    Matrix::from_storage(outputs, inputs, B::vstack(&rows, inputs))
+    Vector::stack_rows(inputs, &rows)
 }
 
 /// The `index`th standard basis vector of length `len`, the seed that extracts

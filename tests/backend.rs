@@ -9,7 +9,7 @@
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
 use tensorcrate::numbers::{bf16, f16};
-use tensorcrate::tensors::{Backend, BinaryOp, Host, Matrix, Metal, Vector};
+use tensorcrate::tensors::{BinaryOp, Host, Matrix, Metal, Vector};
 
 /// Deterministic filler with a mix of signs and magnitudes, all integral so
 /// GPU and CPU accumulation orders agree exactly.
@@ -65,118 +65,136 @@ fn filled_allocates_directly_on_the_backend() {
     assert_eq!(sevens.to_backend::<Host>().to_rows(), [[7.0f32; 6]; 4]);
 }
 
+/// `Matrix` and `Vector` results on both backends, as host rows.
+fn both<T: tensorcrate::numbers::Real>(
+    on_host: impl Fn() -> Matrix<T, Host>,
+    on_metal: impl Fn() -> Matrix<T, Metal>,
+) -> (Vec<Vec<T>>, Vec<Vec<T>>) {
+    (
+        on_host().to_rows(),
+        on_metal().to_backend::<Host>().to_rows(),
+    )
+}
+
 #[test]
 fn stacking_vectors_uses_row_major_matrix_layout() {
-    let rows = [
-        Metal::store_vector(&[-3.0, -2.0, -1.0]),
-        Metal::store_vector(&[4.0, 5.0, 6.0]),
+    let vectors = [
+        Vector::new([-3.0f32, -2.0, -1.0]),
+        Vector::new([4.0, 5.0, 6.0]),
     ];
-    let vertical = Metal::vstack(&rows, 3);
-    assert_eq!(
-        Metal::matrix_slice(&vertical),
-        &[-3.0, -2.0, -1.0, 4.0, 5.0, 6.0]
-    );
+    let resident = vectors.each_ref().map(|v| v.to_backend::<Metal>());
+
+    let (host, metal) = both(|| Vector::vstack(&vectors), || Vector::vstack(&resident));
+    assert_eq!(host, [[-3.0, -2.0, -1.0], [4.0, 5.0, 6.0]]);
+    assert_eq!(metal, host);
 
     let columns = [
-        Metal::store_vector(&[1.0, 2.0]),
-        Metal::store_vector(&[3.0, 4.0]),
-        Metal::store_vector(&[5.0, 6.0]),
+        Vector::new([1.0f32, 2.0]),
+        Vector::new([3.0, 4.0]),
+        Vector::new([5.0, 6.0]),
     ];
-    let horizontal = Metal::hstack(&columns, 2);
-    assert_eq!(
-        Metal::matrix_slice(&horizontal),
-        &[1.0, 3.0, 5.0, 2.0, 4.0, 6.0]
-    );
+    let resident = columns.each_ref().map(|v| v.to_backend::<Metal>());
+    let (host, metal) = both(|| Vector::hstack(&columns), || Vector::hstack(&resident));
+    assert_eq!(host, [[1.0, 3.0, 5.0], [2.0, 4.0, 6.0]]);
+    assert_eq!(metal, host);
 
-    // A zero extent on either axis is still a shape the storage layer accepts.
-    let empty = Metal::vstack::<f32>(&[], 3);
-    assert!(Metal::matrix_slice(&empty).is_empty());
-    let empty = Metal::hstack::<f32>(&[], 2);
-    assert!(Metal::matrix_slice(&empty).is_empty());
+    // Empty vectors still stack: to a matrix with a zero extent.
+    let empty = [Vector::<f32, Metal>::filled(0, 0.0), Vector::filled(0, 0.0)];
+    assert_eq!(Vector::vstack(&empty).shape(), (2, 0));
+    assert_eq!(Vector::hstack(&empty).shape(), (0, 2));
 }
 
 #[test]
-fn concatenating_and_stacking_matrices_preserves_row_major_layout() {
-    // Storage is flat row-major on both backends, so both sides of each pair
-    // are compared as one run of elements.
-    let host_concat = Host::concat(&vec![1.0, 2.0, 3.0, 4.0], &vec![5.0, 6.0], 2, 2, 1);
-    assert_eq!(host_concat, [1.0, 2.0, 5.0, 3.0, 4.0, 6.0]);
-
-    let host_stack = Host::stack(&vec![1.0, 2.0], &vec![3.0, 4.0, 5.0, 6.0], 1, 2, 2);
-    assert_eq!(host_stack, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-
-    let left = Metal::store_matrix(&[1.0, 2.0, 3.0, 4.0]);
-    let right = Metal::store_matrix(&[5.0, 6.0]);
-    let concat = Metal::concat(&left, &right, 2, 2, 1);
-    assert_eq!(
-        Metal::matrix_slice(&concat),
-        &[1.0, 2.0, 5.0, 3.0, 4.0, 6.0]
-    );
-
-    let top = Metal::store_matrix(&[1.0, 2.0]);
-    let bottom = Metal::store_matrix(&[3.0, 4.0, 5.0, 6.0]);
-    let stack = Metal::stack(&top, &bottom, 1, 2, 2);
-    assert_eq!(Metal::matrix_slice(&stack), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-
-    let empty_left = Metal::store_matrix(&[]);
-    let right = Metal::store_matrix(&[7.0, 8.0]);
-    let concat = Metal::concat(&empty_left, &right, 2, 0, 1);
-    assert_eq!(Metal::matrix_slice(&concat), &[7.0, 8.0]);
-
-    let empty_top = Metal::store_matrix(&[]);
-    let bottom = Metal::store_matrix(&[9.0, 10.0]);
-    let stack = Metal::stack(&empty_top, &bottom, 0, 1, 2);
-    assert_eq!(Metal::matrix_slice(&stack), &[9.0, 10.0]);
+#[should_panic(expected = "differ in length")]
+fn stacking_vectors_of_different_lengths_panics() {
+    Vector::vstack([Vector::new([1.0f32]), Vector::new([1.0, 2.0])]);
 }
 
 #[test]
-fn merging_matrix_collections_preserves_input_order() {
-    let matrices = [
-        vec![1.0, 2.0, 3.0, 4.0],
-        vec![5.0, 6.0, 7.0, 8.0],
-        vec![9.0, 10.0, 11.0, 12.0],
-    ];
+#[should_panic(expected = "no vectors to stack")]
+fn stacking_no_vectors_panics() {
+    Vector::<f32, Host>::hstack(Vec::<Vector<f32>>::new());
+}
+
+#[test]
+fn hstack_and_vstack_place_matrices_in_row_major_order() {
+    let a = Matrix::from_rows([[1.0f32, 2.0], [3.0, 4.0]]);
+    let b = Matrix::from_rows([[5.0f32], [6.0]]);
+    let (ra, rb) = (a.to_backend::<Metal>(), b.to_backend::<Metal>());
+    let (host, metal) = both(|| Matrix::hstack([&a, &b]), || Matrix::hstack([&ra, &rb]));
+    assert_eq!(host, [[1.0, 2.0, 5.0], [3.0, 4.0, 6.0]]);
+    assert_eq!(metal, host);
+
+    let top = Matrix::from_rows([[1.0f32, 2.0]]);
+    let bottom = Matrix::from_rows([[3.0f32, 4.0], [5.0, 6.0]]);
+    let (rt, rb) = (top.to_backend::<Metal>(), bottom.to_backend::<Metal>());
+    let (host, metal) = both(
+        || Matrix::vstack([&top, &bottom]),
+        || Matrix::vstack([&rt, &rb]),
+    );
+    assert_eq!(host, [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]);
+    assert_eq!(metal, host);
+
+    // A matrix with a zero extent contributes nothing.
+    let no_columns = Matrix::<f32, Metal>::filled(2, 0, 0.0);
+    let right = Matrix::from_rows([[7.0f32], [8.0]]).to_backend::<Metal>();
+    let joined = Matrix::hstack([&no_columns, &right]);
+    assert_eq!(joined.to_backend::<Host>().to_rows(), [[7.0], [8.0]]);
+
+    let no_rows = Matrix::<f32, Metal>::filled(0, 2, 0.0);
+    let below = Matrix::from_rows([[9.0f32, 10.0]]).to_backend::<Metal>();
+    let joined = Matrix::vstack([&no_rows, &below]);
+    assert_eq!(joined.to_backend::<Host>().to_rows(), [[9.0, 10.0]]);
+}
+
+#[test]
+fn stacking_many_matrices_preserves_input_order() {
+    let matrices = (0..3)
+        .map(|k| {
+            Matrix::from_flat(
+                2,
+                2,
+                (1..=4).map(|i| (4 * k + i) as f32).collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let resident = matrices
+        .iter()
+        .map(|m| m.to_backend::<Metal>())
+        .collect::<Vec<_>>();
+
+    let (host, metal) = both(|| Matrix::hstack(&matrices), || Matrix::hstack(&resident));
     assert_eq!(
-        Host::hmerge(&matrices, 2, 2),
+        host,
         [
-            1.0, 2.0, 5.0, 6.0, 9.0, 10.0, 3.0, 4.0, 7.0, 8.0, 11.0, 12.0
+            [1.0, 2.0, 5.0, 6.0, 9.0, 10.0],
+            [3.0, 4.0, 7.0, 8.0, 11.0, 12.0]
         ]
     );
-    assert_eq!(
-        Host::vmerge(&matrices, 2, 2),
-        [
-            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0
-        ]
-    );
+    assert_eq!(metal, host);
 
-    let matrices = [
-        Metal::store_matrix(&[1.0, 2.0, 3.0, 4.0]),
-        Metal::store_matrix(&[5.0, 6.0, 7.0, 8.0]),
-        Metal::store_matrix(&[9.0, 10.0, 11.0, 12.0]),
-    ];
-    let horizontal = Metal::hmerge(&matrices, 2, 2);
+    let (host, metal) = both(|| Matrix::vstack(&matrices), || Matrix::vstack(&resident));
     assert_eq!(
-        Metal::matrix_slice(&horizontal),
-        &[
-            1.0, 2.0, 5.0, 6.0, 9.0, 10.0, 3.0, 4.0, 7.0, 8.0, 11.0, 12.0
-        ]
+        host.concat(),
+        (1..=12).map(|i| i as f32).collect::<Vec<_>>()
     );
+    assert_eq!(metal, host);
+}
 
-    let matrices = [
-        Metal::store_matrix(&[1.0, 2.0, 3.0, 4.0]),
-        Metal::store_matrix(&[5.0, 6.0, 7.0, 8.0]),
-        Metal::store_matrix(&[9.0, 10.0, 11.0, 12.0]),
-    ];
-    let vertical = Metal::vmerge(&matrices, 2, 2);
-    assert_eq!(
-        Metal::matrix_slice(&vertical),
-        &[
-            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0
-        ]
-    );
+#[test]
+#[should_panic(expected = "differ in their columns")]
+fn vstack_of_matrices_with_different_columns_panics() {
+    let a = Matrix::<f32>::from_rows([[1.0, 2.0]]);
+    let b = Matrix::<f32>::from_rows([[1.0, 2.0, 3.0]]);
+    Matrix::vstack([&a, &b]);
+}
 
-    assert!(Metal::matrix_slice(&Metal::hmerge::<f32>(&[], 2, 3)).is_empty());
-    assert!(Metal::matrix_slice(&Metal::vmerge::<f32>(&[], 2, 3)).is_empty());
+#[test]
+#[should_panic(expected = "differ in their rows")]
+fn hstack_of_matrices_with_different_rows_panics() {
+    let a = Matrix::<f32>::from_rows([[1.0], [2.0]]);
+    let b = Matrix::<f32>::from_rows([[1.0]]);
+    Matrix::hstack([&a, &b]);
 }
 
 #[test]

@@ -18,12 +18,11 @@ use super::device::{Gpu, Operands, Pipeline, Tile, with_gpu};
 use super::encode::{
     BinaryLayout, Folding, REDUCE_GROUP, ReduceLayout, StridedLayout, encode_axis_distribution,
     encode_axis_moments, encode_axis_reduce, encode_bitonic_stage, encode_broadcast, encode_clamp,
-    encode_compare, encode_compare_scalar, encode_concat, encode_convert, encode_correlate,
-    encode_deviation, encode_distribution, encode_elementwise, encode_fft, encode_flip,
-    encode_gemm, encode_hmerge, encode_matmul, encode_matrix_stack, encode_matvec, encode_pad,
-    encode_power, encode_power_scalar, encode_reduce, encode_scan, encode_sort_prepare,
-    encode_stack, encode_strided_binary, encode_strided_copy, encode_transpose, encode_unary,
-    encode_unary_dual, encode_vecmat, encode_vmerge, vecmat_bands,
+    encode_compare, encode_compare_scalar, encode_convert, encode_correlate, encode_deviation,
+    encode_distribution, encode_elementwise, encode_fft, encode_flip, encode_gemm, encode_matmul,
+    encode_matvec, encode_pad, encode_power, encode_power_scalar, encode_reduce, encode_scan,
+    encode_sort_prepare, encode_strided_binary, encode_strided_copy, encode_transpose,
+    encode_unary, encode_unary_dual, encode_vecmat, vecmat_bands,
 };
 
 /// The strided copies. They move bits, so they are defined for every element
@@ -748,110 +747,6 @@ impl<T: MetalElement> MetalBuffer<T> {
                     scalar_left,
                 )
             })?;
-        }
-        Some(output)
-    }
-
-    /// Stack equal-length buffers as rows of one row-major matrix.
-    pub(crate) fn vstack(inputs: &[&Self], vector_len: usize) -> Option<Self> {
-        Self::stack(inputs, vector_len, 1, |index| index * vector_len)
-    }
-
-    /// Stack equal-length buffers as columns of one row-major matrix.
-    pub(crate) fn hstack(inputs: &[&Self], vector_len: usize) -> Option<Self> {
-        let columns = inputs.len();
-        Self::stack(inputs, vector_len, columns, |index| index)
-    }
-
-    fn stack(
-        inputs: &[&Self],
-        vector_len: usize,
-        output_stride: usize,
-        offset: impl Fn(usize) -> usize,
-    ) -> Option<Self> {
-        if inputs.iter().any(|input| input.len != vector_len) {
-            return None;
-        }
-        let output = Self::allocate(inputs.len().checked_mul(vector_len)?)?;
-        if output.len != 0 {
-            with_gpu(|gpu| {
-                encode_stack::<T>(gpu, inputs, &output.raw, vector_len, output_stride, offset)
-            })?;
-        }
-        Some(output)
-    }
-
-    /// Concatenate two row-major matrices horizontally.
-    pub(crate) fn concat_matrix(
-        &self,
-        rhs: &Self,
-        rows: usize,
-        left_cols: usize,
-        right_cols: usize,
-    ) -> Option<Self> {
-        if self.len != rows.checked_mul(left_cols)? || rhs.len != rows.checked_mul(right_cols)? {
-            return None;
-        }
-        let output_cols = left_cols.checked_add(right_cols)?;
-        let output = Self::allocate(rows.checked_mul(output_cols)?)?;
-        if output.len != 0 {
-            with_gpu(|gpu| {
-                encode_concat::<T>(
-                    gpu,
-                    &self.raw,
-                    &rhs.raw,
-                    &output.raw,
-                    rows,
-                    left_cols,
-                    right_cols,
-                )
-            })?;
-        }
-        Some(output)
-    }
-
-    /// Concatenate two row-major matrices vertically using contiguous blits.
-    pub(crate) fn stack_matrix(
-        &self,
-        rhs: &Self,
-        top_rows: usize,
-        bottom_rows: usize,
-        cols: usize,
-    ) -> Option<Self> {
-        if self.len != top_rows.checked_mul(cols)? || rhs.len != bottom_rows.checked_mul(cols)? {
-            return None;
-        }
-        let output = Self::allocate(self.len.checked_add(rhs.len)?)?;
-        if output.len != 0 {
-            with_gpu(|gpu| {
-                encode_matrix_stack::<T>(gpu, &self.raw, &rhs.raw, &output.raw, self.len, rhs.len)
-            })?;
-        }
-        Some(output)
-    }
-
-    /// Merge equally shaped row-major matrices horizontally.
-    pub(crate) fn hmerge(inputs: &[&Self], rows: usize, cols: usize) -> Option<Self> {
-        let matrix_len = rows.checked_mul(cols)?;
-        if inputs.iter().any(|input| input.len != matrix_len) {
-            return None;
-        }
-        let output = Self::allocate(matrix_len.checked_mul(inputs.len())?)?;
-        if output.len != 0 {
-            with_gpu(|gpu| encode_hmerge::<T>(gpu, inputs, &output.raw, rows, cols))?;
-        }
-        Some(output)
-    }
-
-    /// Merge equally shaped row-major matrices vertically with contiguous blits.
-    pub(crate) fn vmerge(inputs: &[&Self], rows: usize, cols: usize) -> Option<Self> {
-        let matrix_len = rows.checked_mul(cols)?;
-        if inputs.iter().any(|input| input.len != matrix_len) {
-            return None;
-        }
-        let output = Self::allocate(matrix_len.checked_mul(inputs.len())?)?;
-        if output.len != 0 {
-            with_gpu(|gpu| encode_vmerge::<T>(gpu, inputs, &output.raw, matrix_len))?;
         }
         Some(output)
     }

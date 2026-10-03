@@ -1764,13 +1764,13 @@ pub trait Element: Real + sealed::Sealed {
     const DTYPE: DType;
 
     #[doc(hidden)]
-    fn source<B: Backend>(storage: &B::Vector<Self>) -> SourceData<'_, B>;
+    fn source<B: Backend>(storage: &B::Storage<Self>) -> SourceData<'_, B>;
 
     #[doc(hidden)]
-    fn sink<B: Backend>(storage: &mut B::Vector<Self>) -> SinkData<'_, B>;
+    fn sink<B: Backend>(storage: &mut B::Storage<Self>) -> SinkData<'_, B>;
 
     #[doc(hidden)]
-    fn unwrap<B: Backend>(fresh: Fresh<B>) -> Option<B::Vector<Self>>;
+    fn unwrap<B: Backend>(fresh: Fresh<B>) -> Option<B::Storage<Self>>;
 }
 
 macro_rules! element {
@@ -1778,15 +1778,15 @@ macro_rules! element {
         impl Element for $ty {
             const DTYPE: DType = DType::$variant;
 
-            fn source<B: Backend>(storage: &B::Vector<Self>) -> SourceData<'_, B> {
+            fn source<B: Backend>(storage: &B::Storage<Self>) -> SourceData<'_, B> {
                 SourceData::$variant(storage)
             }
 
-            fn sink<B: Backend>(storage: &mut B::Vector<Self>) -> SinkData<'_, B> {
+            fn sink<B: Backend>(storage: &mut B::Storage<Self>) -> SinkData<'_, B> {
                 SinkData::$variant(storage)
             }
 
-            fn unwrap<B: Backend>(fresh: Fresh<B>) -> Option<B::Vector<Self>> {
+            fn unwrap<B: Backend>(fresh: Fresh<B>) -> Option<B::Storage<Self>> {
                 match fresh {
                     Fresh::$variant(storage) => Some(storage),
                     _ => None,
@@ -1804,10 +1804,10 @@ element!(f64, F64);
 /// Borrowed storage of one of the [`DType`]s.
 #[doc(hidden)]
 pub enum SourceData<'a, B: Backend> {
-    F32(&'a B::Vector<f32>),
-    F16(&'a B::Vector<f16>),
-    Bf16(&'a B::Vector<bf16>),
-    F64(&'a B::Vector<f64>),
+    F32(&'a B::Storage<f32>),
+    F16(&'a B::Storage<f16>),
+    Bf16(&'a B::Storage<bf16>),
+    F64(&'a B::Storage<f64>),
 }
 
 // Shared references whatever `B` is, so copyable without `B: Copy`.
@@ -1822,19 +1822,19 @@ impl<B: Backend> Copy for SourceData<'_, B> {}
 /// Mutably borrowed storage of one of the [`DType`]s.
 #[doc(hidden)]
 pub enum SinkData<'a, B: Backend> {
-    F32(&'a mut B::Vector<f32>),
-    F16(&'a mut B::Vector<f16>),
-    Bf16(&'a mut B::Vector<bf16>),
-    F64(&'a mut B::Vector<f64>),
+    F32(&'a mut B::Storage<f32>),
+    F16(&'a mut B::Storage<f16>),
+    Bf16(&'a mut B::Storage<bf16>),
+    F64(&'a mut B::Storage<f64>),
 }
 
 /// Owned storage of one of the [`DType`]s, as a program allocates it.
 #[doc(hidden)]
 pub enum Fresh<B: Backend> {
-    F32(B::Vector<f32>),
-    F16(B::Vector<f16>),
-    Bf16(B::Vector<bf16>),
-    F64(B::Vector<f64>),
+    F32(B::Storage<f32>),
+    F16(B::Storage<f16>),
+    Bf16(B::Storage<bf16>),
+    F64(B::Storage<f64>),
 }
 
 /// A program input: storage and its length.
@@ -1876,13 +1876,13 @@ impl<B: Backend> Source<'_, B> {
     }
 
     /// The storage, if it holds `T`s.
-    fn typed<T: 'static>(&self) -> Option<&B::Vector<T>> {
+    fn typed<T: 'static>(&self) -> Option<&B::Storage<T>> {
         fn cast<B: Backend, U: 'static, T: 'static>(
-            storage: &B::Vector<U>,
-        ) -> Option<&B::Vector<T>> {
+            storage: &B::Storage<U>,
+        ) -> Option<&B::Storage<T>> {
             // SAFETY: `U` is `T`, so the two storage types are one type.
             (TypeId::of::<U>() == TypeId::of::<T>())
-                .then(|| unsafe { &*(storage as *const B::Vector<U>).cast::<B::Vector<T>>() })
+                .then(|| unsafe { &*(storage as *const B::Storage<U>).cast::<B::Storage<T>>() })
         }
         match self.data {
             SourceData::F32(storage) => cast::<B, f32, T>(storage),
@@ -1894,10 +1894,10 @@ impl<B: Backend> Source<'_, B> {
 
     pub(crate) fn slice(&self) -> Slice<'_> {
         match self.data {
-            SourceData::F32(storage) => Slice::F32(B::vector_slice(storage)),
-            SourceData::F16(storage) => Slice::F16(B::vector_slice(storage)),
-            SourceData::Bf16(storage) => Slice::Bf16(B::vector_slice(storage)),
-            SourceData::F64(storage) => Slice::F64(B::vector_slice(storage)),
+            SourceData::F32(storage) => Slice::F32(B::as_slice(storage)),
+            SourceData::F16(storage) => Slice::F16(B::as_slice(storage)),
+            SourceData::Bf16(storage) => Slice::Bf16(B::as_slice(storage)),
+            SourceData::F64(storage) => Slice::F64(B::as_slice(storage)),
         }
     }
 }
@@ -1914,10 +1914,10 @@ impl<B: Backend> Sink<'_, B> {
 
     pub(crate) fn slice(&mut self) -> SliceMut<'_> {
         match &mut self.data {
-            SinkData::F32(storage) => SliceMut::F32(B::vector_slice_mut(storage)),
-            SinkData::F16(storage) => SliceMut::F16(B::vector_slice_mut(storage)),
-            SinkData::Bf16(storage) => SliceMut::Bf16(B::vector_slice_mut(storage)),
-            SinkData::F64(storage) => SliceMut::F64(B::vector_slice_mut(storage)),
+            SinkData::F32(storage) => SliceMut::F32(B::as_mut_slice(storage)),
+            SinkData::F16(storage) => SliceMut::F16(B::as_mut_slice(storage)),
+            SinkData::Bf16(storage) => SliceMut::Bf16(B::as_mut_slice(storage)),
+            SinkData::F64(storage) => SliceMut::F64(B::as_mut_slice(storage)),
         }
     }
 
@@ -2002,7 +2002,7 @@ impl<T: Element, B: Backend> FusableMut<B> for Vector<T, B> {
 impl<T: Element, B: Backend> Fusable<B> for Matrix<T, B> {
     fn source(&self) -> Source<'_, B> {
         Source {
-            data: T::source::<B>(B::matrix_as_vector(self.storage())),
+            data: T::source::<B>(self.storage()),
             len: self.rows() * self.cols(),
             view: None,
         }
@@ -2017,7 +2017,7 @@ impl<T: Element, B: Backend> FusableMut<B> for Matrix<T, B> {
     fn sink(&mut self) -> Sink<'_, B> {
         let len = self.rows() * self.cols();
         Sink {
-            data: T::sink::<B>(B::matrix_as_vector_mut(self.storage_mut())),
+            data: T::sink::<B>(self.storage_mut()),
             len,
         }
     }
@@ -2211,11 +2211,7 @@ impl<'a, T: Copy + 'static, B: Backend> MatrixView<'a, T, B> {
         Matrix::from_storage(
             self.view.rows,
             self.view.cols,
-            B::gather(
-                B::matrix_as_vector(self.matrix.storage()),
-                place,
-                self.shape(),
-            ),
+            B::gather(self.matrix.storage(), place, self.shape()),
         )
     }
 }
@@ -2223,7 +2219,7 @@ impl<'a, T: Copy + 'static, B: Backend> MatrixView<'a, T, B> {
 impl<T: Element, B: Backend> Fusable<B> for MatrixView<'_, T, B> {
     fn source(&self) -> Source<'_, B> {
         Source {
-            data: T::source::<B>(B::matrix_as_vector(self.matrix.storage())),
+            data: T::source::<B>(self.matrix.storage()),
             len: self.view.rows * self.view.cols,
             view: Some(self.view),
         }
@@ -2356,7 +2352,7 @@ impl<B: Backend> Output<B> {
     pub fn into_matrix<T: Element>(self) -> Matrix<T, B> {
         let (rows, cols) = self.shape;
         let storage = self.into_vector::<T>().into_storage();
-        Matrix::from_storage(rows, cols, B::vector_into_matrix(storage))
+        Matrix::from_storage(rows, cols, storage)
     }
 }
 
@@ -2491,7 +2487,7 @@ fn load_unfused<B: Kernels<T>, T: Real>(
     // device would wait for every queued kernel.
     let widened = match source.typed::<T>() {
         Some(_) => None,
-        None => Some(B::store_vector(&source.slice().widen::<T>())),
+        None => Some(B::store(&source.slice().widen::<T>())),
     };
     let storage = widened
         .as_ref()
@@ -2499,7 +2495,7 @@ fn load_unfused<B: Kernels<T>, T: Real>(
         .expect("one of the two");
     let place = Place::of(source.view, remap, shape);
     let stored = if source.view.is_none() && place.in_order(cols) {
-        B::vector_into_matrix(B::duplicate(storage))
+        B::duplicate(storage)
     } else {
         // A view, a transpose or a broadcast: every element copied into
         // place, exactly.
@@ -2510,15 +2506,15 @@ fn load_unfused<B: Kernels<T>, T: Real>(
 
 /// `storage` reinterpreted as storage of `U`, when `T` is `U`.
 fn retype<B: Backend, T: 'static, U: 'static>(
-    storage: B::Vector<T>,
-) -> Result<B::Vector<U>, B::Vector<T>> {
+    storage: B::Storage<T>,
+) -> Result<B::Storage<U>, B::Storage<T>> {
     if TypeId::of::<T>() != TypeId::of::<U>() {
         return Err(storage);
     }
     let storage = std::mem::ManuallyDrop::new(storage);
     // SAFETY: `T` is `U`, so the two storage types are one type; the value is
     // moved, since the original is never dropped.
-    Ok(unsafe { std::mem::transmute_copy::<B::Vector<T>, B::Vector<U>>(&storage) })
+    Ok(unsafe { std::mem::transmute_copy::<B::Storage<T>, B::Storage<U>>(&storage) })
 }
 
 fn scalar_binary<T: Real>(op: BinaryOp, a: T, b: T) -> T {
@@ -2533,7 +2529,7 @@ fn scalar_binary<T: Real>(op: BinaryOp, a: T, b: T) -> T {
 
 /// Convert a `T` tensor to an output's storage type.
 fn narrow<B: Kernels<T>, T: Real>(tensor: Matrix<T, B>, dtype: DType) -> Fresh<B> {
-    let storage = B::matrix_into_flattened(tensor.into_storage());
+    let storage = tensor.into_storage();
     // Storage of the program's own type is the result as it stands.
     let storage = match dtype {
         DType::F32 => retype::<B, T, f32>(storage).map(Fresh::F32),
@@ -2545,12 +2541,12 @@ fn narrow<B: Kernels<T>, T: Real>(tensor: Matrix<T, B>, dtype: DType) -> Fresh<B
         Ok(fresh) => return fresh,
         Err(storage) => storage,
     };
-    let values = B::vector_slice(&storage);
+    let values = B::as_slice(&storage);
     match dtype {
-        DType::F32 => Fresh::F32(B::vector_from_vec(convert(values))),
-        DType::F16 => Fresh::F16(B::vector_from_vec(convert(values))),
-        DType::Bf16 => Fresh::Bf16(B::vector_from_vec(convert(values))),
-        DType::F64 => Fresh::F64(B::vector_from_vec(convert(values))),
+        DType::F32 => Fresh::F32(B::from_vec(convert(values))),
+        DType::F16 => Fresh::F16(B::from_vec(convert(values))),
+        DType::Bf16 => Fresh::Bf16(B::from_vec(convert(values))),
+        DType::F64 => Fresh::F64(B::from_vec(convert(values))),
     }
 }
 
@@ -2908,10 +2904,10 @@ impl Owned {
 
     fn store<B: Backend>(self) -> Fresh<B> {
         match self {
-            Owned::F32(values) => Fresh::F32(B::vector_from_vec(values)),
-            Owned::F16(values) => Fresh::F16(B::vector_from_vec(values)),
-            Owned::Bf16(values) => Fresh::Bf16(B::vector_from_vec(values)),
-            Owned::F64(values) => Fresh::F64(B::vector_from_vec(values)),
+            Owned::F32(values) => Fresh::F32(B::from_vec(values)),
+            Owned::F16(values) => Fresh::F16(B::from_vec(values)),
+            Owned::Bf16(values) => Fresh::Bf16(B::from_vec(values)),
+            Owned::F64(values) => Fresh::F64(B::from_vec(values)),
         }
     }
 }
@@ -2919,18 +2915,18 @@ impl Owned {
 /// A vector of the program's own type as a program input.
 pub(crate) fn source_of<B: Backend, T: Real>(vector: &Vector<T, B>) -> Source<'_, B> {
     let storage = vector.storage();
-    // SAFETY (each cast): `T` is the type compared with, so `B::Vector<T>` is
+    // SAFETY (each cast): `T` is the type compared with, so `B::Storage<T>` is
     // the storage type cast to.
     let data = unsafe {
         if TypeId::of::<T>() == TypeId::of::<f32>() {
-            SourceData::F32(&*std::ptr::from_ref(storage).cast::<B::Vector<f32>>())
+            SourceData::F32(&*std::ptr::from_ref(storage).cast::<B::Storage<f32>>())
         } else if TypeId::of::<T>() == TypeId::of::<f16>() {
-            SourceData::F16(&*std::ptr::from_ref(storage).cast::<B::Vector<f16>>())
+            SourceData::F16(&*std::ptr::from_ref(storage).cast::<B::Storage<f16>>())
         } else if TypeId::of::<T>() == TypeId::of::<bf16>() {
-            SourceData::Bf16(&*std::ptr::from_ref(storage).cast::<B::Vector<bf16>>())
+            SourceData::Bf16(&*std::ptr::from_ref(storage).cast::<B::Storage<bf16>>())
         } else {
             assert_eq!(TypeId::of::<T>(), TypeId::of::<f64>(), "a float type");
-            SourceData::F64(&*std::ptr::from_ref(storage).cast::<B::Vector<f64>>())
+            SourceData::F64(&*std::ptr::from_ref(storage).cast::<B::Storage<f64>>())
         }
     };
     Source {
@@ -4081,14 +4077,12 @@ fn resident_matmul<T: crate::metal::MetalElement>(
     b: &Matrix<T, super::Metal>,
     inputs: &[Source<'_, super::Metal>],
 ) -> Option<Vec<Fresh<super::Metal>>> {
-    use super::Backend;
-
     if !program.runs_on_metal() {
         return None;
     }
     let (m, k, n) = (a.rows(), a.cols(), b.cols());
-    let left = device::raw(super::Metal::matrix_as_vector(a.storage()))?;
-    let right = device::raw(super::Metal::matrix_as_vector(b.storage()))?;
+    let left = device::raw(a.storage())?;
+    let right = device::raw(b.storage())?;
     let read = device::sources(inputs)?;
     let fresh = device::allocate(program, m * n)?;
     let written: Vec<&device::Raw> = fresh.iter().map(device::Allocation::raw).collect();

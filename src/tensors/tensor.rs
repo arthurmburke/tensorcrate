@@ -321,7 +321,7 @@ impl<T: Copy + 'static, B: Backend> Tensor<T, B> {
             self.rank()
         );
         let (rows, cols) = (self.shape[0], self.shape[1]);
-        Matrix::from_storage(rows, cols, B::vector_into_matrix(self.data.into_storage()))
+        Matrix::from_storage(rows, cols, self.data.into_storage())
     }
 
     /// A copy of this tensor on the same backend — on `Metal`, made on the
@@ -596,7 +596,7 @@ impl<T: Copy + 'static, B: Backend> From<Matrix<T, B>> for Tensor<T, B> {
     /// A matrix as a tensor of two axes, without copying.
     fn from(matrix: Matrix<T, B>) -> Self {
         let (rows, cols) = matrix.shape();
-        let data = B::matrix_into_flattened(matrix.into_storage());
+        let data = matrix.into_storage();
         Tensor {
             shape: Dims::new(&[rows, cols], "from"),
             data: Vector::from_storage(rows * cols, data),

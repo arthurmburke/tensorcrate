@@ -463,7 +463,7 @@ impl<'a, T: Copy + 'static, B: Backend> TensorView<'a, T, B> {
     }
 
     /// The copy of this view's elements to `to`, for an assembly or a write.
-    pub(crate) fn region<'r>(&'r self, to: Strided<'r>) -> Region<'r, B::Vector<T>> {
+    pub(crate) fn region<'r>(&'r self, to: Strided<'r>) -> Region<'r, B::Storage<T>> {
         Region {
             source: self.data.storage(),
             shape: &self.shape,

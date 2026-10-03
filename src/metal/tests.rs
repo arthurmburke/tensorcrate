@@ -230,27 +230,65 @@ fn shared_buffers_keep_chained_operations_gpu_resident() {
     }
 }
 
+/// Stacking vectors and matrices is a strided copy per operand, queued behind
+/// the kernels still writing them rather than waiting for those.
 #[test]
-fn stacking_reads_queued_device_results_without_host_staging() {
-    let Some(first) = MetalBuffer::from_slice(&[1.0, 2.0, 3.0]) else {
-        eprintln!("no Metal device; skipping device stacking comparison");
-        return;
+fn stacking_consumes_queued_device_results_without_waiting() {
+    use crate::tensors::{Host, Matrix, Metal, Vector};
+
+    const ROWS: usize = 19;
+    const COLS: usize = 7;
+    let values = |seed: usize, len: usize| {
+        (0..len)
+            .map(|index| (seed * 1_000 + index) as f32)
+            .collect::<Vec<_>>()
     };
-    let second = MetalBuffer::from_slice(&[4.0, 5.0, 6.0]).unwrap();
+    let vectors = (0..3)
+        .map(|seed| Vector::new(values(seed, COLS)).to_backend::<Metal>())
+        .collect::<Vec<_>>();
+    if !vectors[0].is_device_resident() {
+        eprintln!("no Metal device; skipping the device stacking comparison");
+        return;
+    }
+    let matrices = (0..3)
+        .map(|seed| Matrix::from_flat(ROWS, COLS, values(seed, ROWS * COLS)).to_backend::<Metal>())
+        .collect::<Vec<_>>();
+    synchronize();
+    let before = activity().unwrap();
 
-    // Leave both inputs as pending GPU results. The stack dispatch must
-    // consume those buffers directly, in command-queue order.
-    let first = first.broadcast(10.0, BinaryOp::Add, false).unwrap();
-    let second = second.broadcast(20.0, BinaryOp::Add, false).unwrap();
-
-    let vertical = MetalBuffer::vstack(&[&first, &second], 3).unwrap();
-    assert_eq!(vertical.to_vec(), vec![11.0, 12.0, 13.0, 24.0, 25.0, 26.0]);
-
-    let horizontal = MetalBuffer::hstack(&[&first, &second], 3).unwrap();
+    // Every operand is a pending GPU result when it is stacked.
+    let vectors = vectors
+        .iter()
+        .enumerate()
+        .map(|(index, vector)| vector.scale(index as f32 + 1.0))
+        .collect::<Vec<_>>();
+    let matrices = matrices
+        .iter()
+        .enumerate()
+        .map(|(index, matrix)| matrix.scale(index as f32 + 1.0))
+        .collect::<Vec<_>>();
+    let rows = Vector::vstack(&vectors);
+    let columns = Vector::hstack(&vectors);
+    let tall = Matrix::vstack(&matrices);
+    let wide = Matrix::hstack(&matrices);
     assert_eq!(
-        horizontal.to_vec(),
-        vec![11.0, 24.0, 12.0, 25.0, 13.0, 26.0]
+        activity().unwrap().1,
+        before.1,
+        "stacking unexpectedly synchronized GPU work"
     );
+
+    let on_host = |matrix: &Matrix<f32, Metal>| matrix.to_backend::<Host>();
+    let host_vectors = vectors
+        .iter()
+        .map(|vector| vector.to_backend::<Host>())
+        .collect::<Vec<_>>();
+    let host_matrices = matrices.iter().map(on_host).collect::<Vec<_>>();
+    assert_eq!(on_host(&rows), Vector::vstack(&host_vectors));
+    assert_eq!(on_host(&columns), Vector::hstack(&host_vectors));
+    assert_eq!(on_host(&tall), Matrix::vstack(&host_matrices));
+    assert_eq!(on_host(&wide), Matrix::hstack(&host_matrices));
+    assert_eq!(wide.shape(), (ROWS, 3 * COLS));
+    assert_eq!(tall.shape(), (3 * ROWS, COLS));
 }
 
 #[test]
@@ -284,146 +322,6 @@ fn tiled_transpose_stays_queued_and_handles_partial_tiles() {
 
     let empty = MetalBuffer::<f32>::from_slice(&[]).unwrap();
     assert!(empty.transpose(0, COLS).unwrap().is_empty());
-}
-
-#[test]
-fn matrix_concat_and_stack_stay_on_the_device() {
-    const ROWS: usize = 19;
-    const LEFT_COLS: usize = 13;
-    const RIGHT_COLS: usize = 7;
-    synchronize();
-    let before = activity().unwrap_or_default();
-
-    let left_values = (0..ROWS * LEFT_COLS)
-        .map(|index| index as f32)
-        .collect::<Vec<_>>();
-    let right_values = (0..ROWS * RIGHT_COLS)
-        .map(|index| 1_000.0 + index as f32)
-        .collect::<Vec<_>>();
-    let Some(left) = MetalBuffer::from_slice(&left_values) else {
-        eprintln!("no Metal device; skipping matrix assembly comparison");
-        return;
-    };
-    let right = MetalBuffer::from_slice(&right_values).unwrap();
-    let left = left.broadcast(1.0, BinaryOp::Add, false).unwrap();
-    let right = right.broadcast(2.0, BinaryOp::Add, false).unwrap();
-    let concat = left
-        .concat_matrix(&right, ROWS, LEFT_COLS, RIGHT_COLS)
-        .unwrap();
-
-    const TOP_ROWS: usize = 5;
-    const BOTTOM_ROWS: usize = 7;
-    const COLS: usize = 11;
-    let top_values = (0..TOP_ROWS * COLS)
-        .map(|index| index as f32)
-        .collect::<Vec<_>>();
-    let bottom_values = (0..BOTTOM_ROWS * COLS)
-        .map(|index| 500.0 + index as f32)
-        .collect::<Vec<_>>();
-    let top = MetalBuffer::from_slice(&top_values)
-        .unwrap()
-        .broadcast(3.0, BinaryOp::Add, false)
-        .unwrap();
-    let bottom = MetalBuffer::from_slice(&bottom_values)
-        .unwrap()
-        .broadcast(4.0, BinaryOp::Add, false)
-        .unwrap();
-    let stack = top
-        .stack_matrix(&bottom, TOP_ROWS, BOTTOM_ROWS, COLS)
-        .unwrap();
-
-    let (operations, waits) = activity().unwrap();
-    assert_eq!(
-        waits, before.1,
-        "matrix assembly unexpectedly synchronized GPU work"
-    );
-    assert_eq!(operations - before.0, 6, "unexpected number of operations");
-
-    let mut expected_concat = Vec::with_capacity(ROWS * (LEFT_COLS + RIGHT_COLS));
-    for row in 0..ROWS {
-        expected_concat.extend(
-            left_values[row * LEFT_COLS..(row + 1) * LEFT_COLS]
-                .iter()
-                .map(|value| value + 1.0),
-        );
-        expected_concat.extend(
-            right_values[row * RIGHT_COLS..(row + 1) * RIGHT_COLS]
-                .iter()
-                .map(|value| value + 2.0),
-        );
-    }
-    assert_eq!(concat.to_vec(), expected_concat);
-
-    let expected_stack = top_values
-        .iter()
-        .map(|value| value + 3.0)
-        .chain(bottom_values.iter().map(|value| value + 4.0))
-        .collect::<Vec<_>>();
-    assert_eq!(stack.to_vec(), expected_stack);
-}
-
-#[test]
-fn matrix_merges_consume_queued_device_buffers() {
-    const MATRICES: usize = 3;
-    const ROWS: usize = 19;
-    const COLS: usize = 7;
-    synchronize();
-    let before = activity().unwrap_or_default();
-
-    let host = (0..MATRICES)
-        .map(|matrix| {
-            (0..ROWS * COLS)
-                .map(|index| matrix as f32 * 1_000.0 + index as f32)
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    let Some(inputs) = host
-        .iter()
-        .map(|values| MetalBuffer::from_slice(values))
-        .collect::<Option<Vec<_>>>()
-    else {
-        eprintln!("no Metal device; skipping matrix merge comparison");
-        return;
-    };
-    let queued = inputs
-        .iter()
-        .enumerate()
-        .map(|(index, input)| {
-            input
-                .broadcast(index as f32 + 1.0, BinaryOp::Add, false)
-                .unwrap()
-        })
-        .collect::<Vec<_>>();
-    let buffers = queued.iter().collect::<Vec<_>>();
-
-    let horizontal = MetalBuffer::hmerge(&buffers, ROWS, COLS).unwrap();
-    let vertical = MetalBuffer::vmerge(&buffers, ROWS, COLS).unwrap();
-
-    let (operations, waits) = activity().unwrap();
-    assert_eq!(
-        waits, before.1,
-        "matrix merge unexpectedly synchronized GPU work"
-    );
-    assert_eq!(operations - before.0, 5, "unexpected number of operations");
-
-    let mut expected_horizontal = Vec::with_capacity(MATRICES * ROWS * COLS);
-    for row in 0..ROWS {
-        for (matrix, values) in host.iter().enumerate() {
-            expected_horizontal.extend(
-                values[row * COLS..(row + 1) * COLS]
-                    .iter()
-                    .map(|value| value + matrix as f32 + 1.0),
-            );
-        }
-    }
-    assert_eq!(horizontal.to_vec(), expected_horizontal);
-
-    let expected_vertical = host
-        .iter()
-        .enumerate()
-        .flat_map(|(matrix, values)| values.iter().map(move |value| value + matrix as f32 + 1.0))
-        .collect::<Vec<_>>();
-    assert_eq!(vertical.to_vec(), expected_vertical);
 }
 
 #[test]

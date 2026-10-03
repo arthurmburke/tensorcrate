@@ -15,8 +15,8 @@ use tensorcrate::projections::{project_onto_ball, project_onto_box, project_onto
 use tensorcrate::statistics::{AxisStatistics, Correction, Distribution, Statistics};
 use tensorcrate::tensors::fused::{self, Builder, DType, Fusable, Mode, Program};
 use tensorcrate::tensors::{
-    Analytic, Backend, BinaryOp, Compare, DualMatrix, DualVector, Host, Kernels, Matrix, Ordered,
-    Reduce, SortOrder, Tape, Transcendental, Vector, gradient, tape,
+    Analytic, BinaryOp, Compare, DualMatrix, DualVector, Host, Kernels, Matrix, Ordered, Reduce,
+    SortOrder, Tape, Transcendental, Vector, gradient, tape,
 };
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -599,31 +599,30 @@ fn a_projection_refuses_a_vector_longer_than_the_element_can_index() {
 // ---- backend helpers --------------------------------------------------------------
 
 #[test]
-fn stacking_and_merging_work_for_any_element() {
-    let rows = [vec![1.0f64, 2.0], vec![3.0, 4.0]];
-    assert_eq!(Host::vstack(&rows, 2), [1.0, 2.0, 3.0, 4.0]);
-    assert_eq!(Host::hstack(&rows, 2), [1.0, 3.0, 2.0, 4.0]);
-    assert_eq!(Host::vstack::<f64>(&[], 3), Vec::<f64>::new());
-    assert_eq!(Host::hstack::<f64>(&[], 3), Vec::<f64>::new());
+fn stacking_works_for_any_element() {
+    let rows = [Vector::new([1.0f64, 2.0]), Vector::new([3.0, 4.0])];
+    assert_eq!(Vector::vstack(&rows).data(), [1.0, 2.0, 3.0, 4.0]);
+    assert_eq!(Vector::hstack(&rows).data(), [1.0, 3.0, 2.0, 4.0]);
 
-    let (a, b) = (vec![1u8, 2, 3, 4], vec![5u8, 6]);
-    assert_eq!(Host::concat(&a, &b, 2, 2, 1), [1, 2, 5, 3, 4, 6]);
-    assert_eq!(Host::stack(&a, &b, 2, 1, 2), [1, 2, 3, 4, 5, 6]);
+    let (a, b) = (
+        Matrix::from_flat(2, 2, [1u8, 2, 3, 4]),
+        Matrix::from_flat(2, 1, [5u8, 6]),
+    );
+    assert_eq!(Matrix::hstack([&a, &b]).data(), [1, 2, 5, 3, 4, 6]);
+    let (a, b) = (
+        Matrix::from_flat(2, 2, [1u8, 2, 3, 4]),
+        Matrix::from_flat(1, 2, [5u8, 6]),
+    );
+    assert_eq!(Matrix::vstack([&a, &b]).data(), [1, 2, 3, 4, 5, 6]);
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn metal_stacks_non_f32_elements_through_the_host_path() {
-    let a = Metal::store_vector(&[1.0f64, 2.0]);
-    let b = Metal::store_vector(&[3.0f64, 4.0]);
-    let stacked = Metal::vstack(&[a, b], 2);
-    assert_eq!(Metal::matrix_slice(&stacked), [1.0, 2.0, 3.0, 4.0]);
-    let a = Metal::store_vector(&[1.0f64, 2.0]);
-    let b = Metal::store_vector(&[3.0f64, 4.0]);
-    assert_eq!(
-        Metal::matrix_slice(&Metal::hstack(&[a, b], 2)),
-        [1.0, 3.0, 2.0, 4.0]
-    );
+    let a = Vector::new([1.0f64, 2.0]).to_backend::<Metal>();
+    let b = Vector::new([3.0f64, 4.0]).to_backend::<Metal>();
+    assert_eq!(Vector::vstack([&a, &b]).as_slice(), [1.0, 2.0, 3.0, 4.0]);
+    assert_eq!(Vector::hstack([&a, &b]).as_slice(), [1.0, 3.0, 2.0, 4.0]);
 }
 
 // ---- persistence -----------------------------------------------------------------
