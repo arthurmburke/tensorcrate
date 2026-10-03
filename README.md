@@ -773,6 +773,29 @@ still in cache. Every split kernel computes each element on its own, so results 
 for bit on any number of cores. Reductions are not split, since a sum's rounding would then depend
 on the thread count. On an M5 Max a GELU over 16M `f32`s takes 2.1 ms against 20 ms on one core.
 
+Host elementwise operations also come in a consuming form. An owned left operand holds the
+result, so nothing is allocated or zeroed. `a + b` and `a + &b` consume `a`, as do `-a` and the
+`into_` methods: `into_scale`, `into_min`, `into_max`, `into_min_scalar`, `into_max_scalar`,
+`into_clamp`, `into_compare`, `into_compare_scalar` and `into_map`. `&a + &b` and the borrowing
+methods leave both operands intact. The results match the borrowing forms bit for bit.
+
+With `simd`, `f32` and `f64` run in-place kernels. `f16` and `bf16` keep their out-of-place
+kernels, and other element types run a scalar loop over the same allocation.
+
+```rust
+let activations = (x.clone() + &bias).into_max_scalar(0.0); // relu(x + bias), one allocation
+```
+
+On an Apple M5 Max, 4,096 `f32`s, median of the `nn_ops` quick run:
+
+| Operation | Borrowing | Consuming | Raw kernel |
+| --- | --- | --- | --- |
+| add | 332 ns | 182 ns | 173 ns |
+| relu | 330 ns | 127 ns | 141 ns |
+
+At 1M elements the consuming forms take 14 µs (add) and 15 µs (relu) against 38 µs and 36 µs. That
+is a cache-warm figure, since one buffer rather than two is touched.
+
 ### Element types
 
 The backend-generic layers are written once over any `Real` element type, `f32`, `f64`, `f16` or
@@ -1080,7 +1103,8 @@ step — and compares the ways the crate can run each one:
 - **fused and unfused**: the same fused program with fusion switched on and off, plus the plain
   `Kernels` calls a caller would write without it;
 - **scalar, SIMD and Host API**: a plain loop, the architecture kernel called directly, and the
-  tensor method, which dispatches through Accelerate and SIMD and allocates its result;
+  tensor method, which dispatches through Accelerate and SIMD and allocates its result, and for
+  elementwise cases the consuming method, which does not;
 - **Host and Metal**: launch latency (waiting after every call), pipelined launches (waiting once
   per batch), and the cost of uploading and downloading around each call;
 - **threads and compilation**: host rows run again on one thread, and Metal fused rows again on the

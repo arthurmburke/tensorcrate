@@ -426,3 +426,67 @@ fn fft_rejects_a_length_that_is_not_a_power_of_two() {
     let mut buf = [0.0f32; 24];
     fft_f32::radix2(&mut buf, 12, -1.0);
 }
+
+/// Every in-place kernel writes what its out-of-place twin writes, at lengths
+/// that leave a ragged tail.
+macro_rules! assign_kernels_match {
+    ($name:ident, $k:ident, $t:ty) => {
+        #[test]
+        fn $name() {
+            for n in [0usize, 1, 3, 4, 15, 16, 17, 53, 130] {
+                let a: Vec<$t> = (0..n).map(|i| (i as $t) * 0.75 - 9.0).collect();
+                let b: Vec<$t> = (0..n).map(|i| ((i % 7) as $t) + 1.0).collect();
+                let same = |what: &str, got: &[$t], want: &[$t]| {
+                    for i in 0..n {
+                        assert!(
+                            got[i] == want[i] || (got[i].is_nan() && want[i].is_nan()),
+                            "{what}: n={n} i={i}: {} against {}",
+                            got[i],
+                            want[i]
+                        );
+                    }
+                };
+                for op in [
+                    BinaryOp::Add,
+                    BinaryOp::Sub,
+                    BinaryOp::Mul,
+                    BinaryOp::Div,
+                    BinaryOp::Rem,
+                ] {
+                    let mut want = vec![0.0; n];
+                    $k::elementwise(&a, &b, op, &mut want);
+                    let mut got = a.clone();
+                    $k::elementwise_assign(&mut got, &b, op);
+                    same(&format!("elementwise {op:?}"), &got, &want);
+                    for scalar_left in [false, true] {
+                        $k::broadcast(&a, 2.5, op, scalar_left, &mut want);
+                        let mut got = a.clone();
+                        $k::broadcast_assign(&mut got, 2.5, op, scalar_left);
+                        same(&format!("broadcast {op:?} {scalar_left}"), &got, &want);
+                    }
+                }
+                for op in Compare::ALL {
+                    let mut want = vec![0.0; n];
+                    $k::compare(&a, &b, op, &mut want);
+                    let mut got = a.clone();
+                    $k::compare_assign(&mut got, &b, op);
+                    same(&format!("compare {op:?}"), &got, &want);
+                    for scalar_left in [false, true] {
+                        $k::compare_scalar(&a, 0.0, op, scalar_left, &mut want);
+                        let mut got = a.clone();
+                        $k::compare_scalar_assign(&mut got, 0.0, op, scalar_left);
+                        same(&format!("compare_scalar {op:?} {scalar_left}"), &got, &want);
+                    }
+                }
+                let mut want = vec![0.0; n];
+                $k::clamp(&a, -2.0, 3.0, &mut want);
+                let mut got = a.clone();
+                $k::clamp_assign(&mut got, -2.0, 3.0);
+                same("clamp", &got, &want);
+            }
+        }
+    };
+}
+
+assign_kernels_match!(f32_assign_kernels_match_out_of_place, f32k, f32);
+assign_kernels_match!(f64_assign_kernels_match_out_of_place, f64k, f64);

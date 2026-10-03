@@ -302,6 +302,157 @@ fn clamp_window<T: Coefficient>(values: &[T], low: T, high: T, out: &mut [T]) ->
     false
 }
 
+// ---- in place -----------------------------------------------------------------
+//
+// The same operations with the result written over the left operand, so a
+// caller that owns it never allocates. Each returns whether the SIMD path ran,
+// and touches nothing when it did not. The compact floats have no in-place
+// kernels: they answer `false`, and the caller decides what to do about it.
+
+/// `a = a op b`, returning whether the SIMD path ran.
+pub fn elementwise_assign<T: Coefficient>(a: &mut [T], b: &[T], op: BinaryOp) -> bool {
+    if a.len() < MIN_ELEMENTS || op == BinaryOp::Rem {
+        return false;
+    }
+    debug_assert_eq!(a.len(), b.len());
+    split(a, |range, a| {
+        // SAFETY: the `TypeId` check inside `as_slice_mut` makes `T` the float.
+        unsafe {
+            if let (Some(a), Some(b)) = (
+                as_slice_mut::<T, f32>(a),
+                as_slice::<T, f32>(&b[range.clone()]),
+            ) {
+                crate::simd::f32k::elementwise_assign(a, b, op);
+                return true;
+            }
+            if let (Some(a), Some(b)) = (as_slice_mut::<T, f64>(a), as_slice::<T, f64>(&b[range])) {
+                crate::simd::f64k::elementwise_assign(a, b, op);
+                return true;
+            }
+        }
+        false
+    })
+}
+
+/// `values = values op scalar` (or `scalar op values`), returning whether the
+/// SIMD path ran.
+pub fn broadcast_assign<T: Coefficient>(
+    values: &mut [T],
+    scalar: T,
+    op: BinaryOp,
+    scalar_left: bool,
+) -> bool {
+    if values.len() < MIN_ELEMENTS || op == BinaryOp::Rem {
+        return false;
+    }
+    split(values, |_, values| {
+        // SAFETY: as in `elementwise_assign`.
+        unsafe {
+            if let (Some(v), Some(s)) = (
+                as_slice_mut::<T, f32>(values),
+                as_slice::<T, f32>(std::slice::from_ref(&scalar)),
+            ) {
+                crate::simd::f32k::broadcast_assign(v, s[0], op, scalar_left);
+                return true;
+            }
+            if let (Some(v), Some(s)) = (
+                as_slice_mut::<T, f64>(values),
+                as_slice::<T, f64>(std::slice::from_ref(&scalar)),
+            ) {
+                crate::simd::f64k::broadcast_assign(v, s[0], op, scalar_left);
+                return true;
+            }
+        }
+        false
+    })
+}
+
+/// `a = compare(a, b)`, returning whether the SIMD path ran.
+pub fn compare_assign<T: Coefficient>(a: &mut [T], b: &[T], op: Compare) -> bool {
+    if a.len() < MIN_ELEMENTS {
+        return false;
+    }
+    debug_assert_eq!(a.len(), b.len());
+    split(a, |range, a| {
+        // SAFETY: as in `elementwise_assign`.
+        unsafe {
+            if let (Some(a), Some(b)) = (
+                as_slice_mut::<T, f32>(a),
+                as_slice::<T, f32>(&b[range.clone()]),
+            ) {
+                crate::simd::f32k::compare_assign(a, b, op);
+                return true;
+            }
+            if let (Some(a), Some(b)) = (as_slice_mut::<T, f64>(a), as_slice::<T, f64>(&b[range])) {
+                crate::simd::f64k::compare_assign(a, b, op);
+                return true;
+            }
+        }
+        false
+    })
+}
+
+/// `values = compare(values, scalar)`, returning whether the SIMD path ran.
+pub fn compare_scalar_assign<T: Coefficient>(
+    values: &mut [T],
+    scalar: T,
+    op: Compare,
+    scalar_left: bool,
+) -> bool {
+    if values.len() < MIN_ELEMENTS {
+        return false;
+    }
+    split(values, |_, values| {
+        // SAFETY: as in `elementwise_assign`.
+        unsafe {
+            if let (Some(v), Some(s)) = (
+                as_slice_mut::<T, f32>(values),
+                as_slice::<T, f32>(std::slice::from_ref(&scalar)),
+            ) {
+                crate::simd::f32k::compare_scalar_assign(v, s[0], op, scalar_left);
+                return true;
+            }
+            if let (Some(v), Some(s)) = (
+                as_slice_mut::<T, f64>(values),
+                as_slice::<T, f64>(std::slice::from_ref(&scalar)),
+            ) {
+                crate::simd::f64k::compare_scalar_assign(v, s[0], op, scalar_left);
+                return true;
+            }
+        }
+        false
+    })
+}
+
+/// `values = min(max(values, low), high)`, returning whether the SIMD path ran.
+pub fn clamp_assign<T: Coefficient>(values: &mut [T], low: T, high: T) -> bool {
+    if values.len() < MIN_ELEMENTS {
+        return false;
+    }
+    split(values, |_, values| {
+        // SAFETY: as in `elementwise_assign`.
+        unsafe {
+            if let (Some(v), Some(low), Some(high)) = (
+                as_slice_mut::<T, f32>(values),
+                as_slice::<T, f32>(std::slice::from_ref(&low)),
+                as_slice::<T, f32>(std::slice::from_ref(&high)),
+            ) {
+                crate::simd::f32k::clamp_assign(v, low[0], high[0]);
+                return true;
+            }
+            if let (Some(v), Some(low), Some(high)) = (
+                as_slice_mut::<T, f64>(values),
+                as_slice::<T, f64>(std::slice::from_ref(&low)),
+                as_slice::<T, f64>(std::slice::from_ref(&high)),
+            ) {
+                crate::simd::f64k::clamp_assign(v, low[0], high[0]);
+                return true;
+            }
+        }
+        false
+    })
+}
+
 /// The whole-slice fold, or `None` for an element type the kernels do not
 /// cover (and for slices too short to be worth the dispatch).
 pub fn reduce<T: Coefficient>(values: &[T], op: Reduce) -> Option<T> {

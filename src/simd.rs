@@ -203,25 +203,31 @@ macro_rules! neon_kernels {
                 total
             }
 
-            /// One pass of `vector` over `values` into `out`, four vectors per
-            /// iteration so several are in flight, and `scalar` over the tail.
+            /// One pass of `vector` over `n` values at `x`, written to `o`, four
+            /// vectors per iteration so several are in flight, and `scalar` over
+            /// the tail.
             ///
-            /// Always inlined, so each caller's closures — one operation, chosen
-            /// before the loop — compile into a loop of their own.
+            /// Every vector is loaded before the one result that replaces it is
+            /// stored, so `o` may equal `x`: that is the in-place form. Always
+            /// inlined, so each caller's closures — one operation, chosen before
+            /// the loop — compile into a loop of their own.
+            ///
+            /// # Safety
+            ///
+            /// `x` must be valid for reads and `o` for writes of `n` elements,
+            /// and the two must be equal or not overlap.
             #[inline(always)]
-            fn map1(
-                values: &[$t],
-                out: &mut [$t],
+            unsafe fn map1(
+                x: *const $t,
+                o: *mut $t,
+                n: usize,
                 vector: impl Fn($v) -> $v,
                 scalar: impl Fn($t) -> $t,
             ) {
-                let n = values.len();
-                contract::same_len("map", &[n, out.len()]);
                 let mut i = 0;
-                // SAFETY: the lengths were checked above, and every vector
-                // access covers `LANES` elements that end at or before `n`.
+                // SAFETY: every vector access covers `LANES` elements that end
+                // at or before `n`.
                 unsafe {
-                    let (x, o) = (values.as_ptr(), out.as_mut_ptr());
                     while i + 4 * LANES <= n {
                         let v0 = $load(x.add(i));
                         let v1 = $load(x.add(i + LANES));
@@ -237,28 +243,31 @@ macro_rules! neon_kernels {
                         $store(o.add(i), vector($load(x.add(i))));
                         i += LANES;
                     }
-                }
-                while i < n {
-                    out[i] = scalar(values[i]);
-                    i += 1;
+                    while i < n {
+                        *o.add(i) = scalar(*x.add(i));
+                        i += 1;
+                    }
                 }
             }
 
-            /// [`map1`] over two operands.
+            /// [`map1`] over two operands. `o` may equal `x`, but not `y`.
+            ///
+            /// # Safety
+            ///
+            /// As for [`map1`], with `y` valid for reads of `n` elements and
+            /// not overlapping `o`.
             #[inline(always)]
-            fn map2(
-                a: &[$t],
-                b: &[$t],
-                out: &mut [$t],
+            unsafe fn map2(
+                x: *const $t,
+                y: *const $t,
+                o: *mut $t,
+                n: usize,
                 vector: impl Fn($v, $v) -> $v,
                 scalar: impl Fn($t, $t) -> $t,
             ) {
-                let n = a.len();
-                contract::same_len("map", &[n, b.len(), out.len()]);
                 let mut i = 0;
                 // SAFETY: as in `map1`.
                 unsafe {
-                    let (x, y, o) = (a.as_ptr(), b.as_ptr(), out.as_mut_ptr());
                     while i + 4 * LANES <= n {
                         let a0 = $load(x.add(i));
                         let a1 = $load(x.add(i + LANES));
@@ -278,30 +287,37 @@ macro_rules! neon_kernels {
                         $store(o.add(i), vector($load(x.add(i)), $load(y.add(i))));
                         i += LANES;
                     }
-                }
-                while i < n {
-                    out[i] = scalar(a[i], b[i]);
-                    i += 1;
+                    while i < n {
+                        *o.add(i) = scalar(*x.add(i), *y.add(i));
+                        i += 1;
+                    }
                 }
             }
 
             /// [`map1`] of `f(scalar, x)` or `f(x, scalar)`, as `scalar_left`
             /// says.
+            ///
+            /// # Safety
+            ///
+            /// As for [`map1`].
             #[inline(always)]
-            fn map_scalar(
-                values: &[$t],
+            unsafe fn map_scalar(
+                x: *const $t,
+                o: *mut $t,
+                n: usize,
                 scalar: $t,
                 scalar_left: bool,
-                out: &mut [$t],
                 vector: impl Fn($v, $v) -> $v,
                 lane: impl Fn($t, $t) -> $t,
             ) {
                 // SAFETY: NEON is part of the aarch64 baseline.
                 let splat = unsafe { $dup(scalar) };
-                if scalar_left {
-                    map1(values, out, |x| vector(splat, x), |x| lane(scalar, x));
-                } else {
-                    map1(values, out, |x| vector(x, splat), |x| lane(x, scalar));
+                unsafe {
+                    if scalar_left {
+                        map1(x, o, n, |x| vector(splat, x), |x| lane(scalar, x));
+                    } else {
+                        map1(x, o, n, |x| vector(x, splat), |x| lane(x, scalar));
+                    }
                 }
             }
 
@@ -339,19 +355,49 @@ macro_rules! neon_kernels {
             pub fn elementwise(a: &[$t], b: &[$t], op: BinaryOp, out: &mut [$t]) {
                 let n = a.len();
                 contract::same_len("elementwise", &[n, b.len(), out.len()]);
-                if op == BinaryOp::Rem {
-                    for i in 0..n {
-                        out[i] = a[i] % b[i];
+                // SAFETY: the lengths agree, and `out` is a distinct borrow.
+                unsafe { elementwise_raw(a.as_ptr(), b.as_ptr(), out.as_mut_ptr(), n, op) }
+            }
+
+            /// [`elementwise`] into the left operand: `a = a op b`.
+            #[inline]
+            pub fn elementwise_assign(a: &mut [$t], b: &[$t], op: BinaryOp) {
+                let n = a.len();
+                contract::same_len("elementwise_assign", &[n, b.len()]);
+                let a = a.as_mut_ptr();
+                // SAFETY: the lengths agree, `b` is a distinct borrow, and
+                // reading and writing `a` at the same index is what `map2`
+                // allows.
+                unsafe { elementwise_raw(a, b.as_ptr(), a, n, op) }
+            }
+
+            /// # Safety
+            ///
+            /// As for [`map2`].
+            #[inline(always)]
+            unsafe fn elementwise_raw(
+                a: *const $t,
+                b: *const $t,
+                out: *mut $t,
+                n: usize,
+                op: BinaryOp,
+            ) {
+                unsafe {
+                    if op == BinaryOp::Rem {
+                        for i in 0..n {
+                            *out.add(i) = *a.add(i) % *b.add(i);
+                        }
+                        return;
                     }
-                    return;
+                    specialize_binary!(op, OP => map2(
+                        a,
+                        b,
+                        out,
+                        n,
+                        |x, y| binary_vectors(OP, x, y),
+                        |x, y| binary_values(OP, x, y),
+                    ))
                 }
-                specialize_binary!(op, OP => map2(
-                    a,
-                    b,
-                    out,
-                    |x, y| binary_vectors(OP, x, y),
-                    |x, y| binary_values(OP, x, y),
-                ))
             }
 
             /// Tensor/scalar broadcast. `scalar_left` selects operand order for
@@ -366,24 +412,54 @@ macro_rules! neon_kernels {
             ) {
                 let n = values.len();
                 contract::same_len("broadcast", &[n, out.len()]);
-                if op == BinaryOp::Rem {
-                    for i in 0..n {
-                        out[i] = if scalar_left {
-                            scalar % values[i]
-                        } else {
-                            values[i] % scalar
-                        };
-                    }
-                    return;
+                // SAFETY: the lengths agree, and `out` is a distinct borrow.
+                unsafe {
+                    broadcast_raw(values.as_ptr(), out.as_mut_ptr(), n, scalar, op, scalar_left)
                 }
-                specialize_binary!(op, OP => map_scalar(
-                    values,
-                    scalar,
-                    scalar_left,
-                    out,
-                    |x, y| binary_vectors(OP, x, y),
-                    |x, y| binary_values(OP, x, y),
-                ))
+            }
+
+            /// [`broadcast`] in place.
+            #[inline]
+            pub fn broadcast_assign(values: &mut [$t], scalar: $t, op: BinaryOp, scalar_left: bool) {
+                let (ptr, n) = (values.as_mut_ptr(), values.len());
+                // SAFETY: reading and writing at the same index is what `map1`
+                // allows.
+                unsafe { broadcast_raw(ptr, ptr, n, scalar, op, scalar_left) }
+            }
+
+            /// # Safety
+            ///
+            /// As for [`map1`].
+            #[inline(always)]
+            unsafe fn broadcast_raw(
+                x: *const $t,
+                o: *mut $t,
+                n: usize,
+                scalar: $t,
+                op: BinaryOp,
+                scalar_left: bool,
+            ) {
+                unsafe {
+                    if op == BinaryOp::Rem {
+                        for i in 0..n {
+                            *o.add(i) = if scalar_left {
+                                scalar % *x.add(i)
+                            } else {
+                                *x.add(i) % scalar
+                            };
+                        }
+                        return;
+                    }
+                    specialize_binary!(op, OP => map_scalar(
+                        x,
+                        o,
+                        n,
+                        scalar,
+                        scalar_left,
+                        |x, y| binary_vectors(OP, x, y),
+                        |x, y| binary_values(OP, x, y),
+                    ))
+                }
             }
 
             /// The scalar definition of every comparison, for the ragged tail —
@@ -465,15 +541,38 @@ macro_rules! neon_kernels {
             /// Elementwise comparison of two slices.
             #[inline]
             pub fn compare(a: &[$t], b: &[$t], op: Compare, out: &mut [$t]) {
-                contract::same_len("compare", &[a.len(), b.len(), out.len()]);
-                specialize_compare!(op, OP => map2(
-                    a,
-                    b,
-                    out,
-                    // SAFETY: NEON is part of the aarch64 baseline.
-                    |x, y| unsafe { compare_vectors(OP, x, y) },
-                    |x, y| compare_values(OP, x, y),
-                ))
+                let n = a.len();
+                contract::same_len("compare", &[n, b.len(), out.len()]);
+                // SAFETY: the lengths agree, and `out` is a distinct borrow.
+                unsafe { compare_raw(a.as_ptr(), b.as_ptr(), out.as_mut_ptr(), n, op) }
+            }
+
+            /// [`compare`] into the left operand.
+            #[inline]
+            pub fn compare_assign(a: &mut [$t], b: &[$t], op: Compare) {
+                let n = a.len();
+                contract::same_len("compare_assign", &[n, b.len()]);
+                let a = a.as_mut_ptr();
+                // SAFETY: as in `elementwise_assign`.
+                unsafe { compare_raw(a, b.as_ptr(), a, n, op) }
+            }
+
+            /// # Safety
+            ///
+            /// As for [`map2`].
+            #[inline(always)]
+            unsafe fn compare_raw(a: *const $t, b: *const $t, out: *mut $t, n: usize, op: Compare) {
+                unsafe {
+                    specialize_compare!(op, OP => map2(
+                        a,
+                        b,
+                        out,
+                        n,
+                        // SAFETY: NEON is part of the aarch64 baseline.
+                        |x, y| compare_vectors(OP, x, y),
+                        |x, y| compare_values(OP, x, y),
+                    ))
+                }
             }
 
             /// Comparison against a splatted scalar. `scalar_left` selects the
@@ -486,16 +585,46 @@ macro_rules! neon_kernels {
                 scalar_left: bool,
                 out: &mut [$t],
             ) {
-                contract::same_len("compare_scalar", &[values.len(), out.len()]);
-                specialize_compare!(op, OP => map_scalar(
-                    values,
-                    scalar,
-                    scalar_left,
-                    out,
-                    // SAFETY: NEON is part of the aarch64 baseline.
-                    |x, y| unsafe { compare_vectors(OP, x, y) },
-                    |x, y| compare_values(OP, x, y),
-                ))
+                let n = values.len();
+                contract::same_len("compare_scalar", &[n, out.len()]);
+                // SAFETY: the lengths agree, and `out` is a distinct borrow.
+                unsafe {
+                    compare_scalar_raw(values.as_ptr(), out.as_mut_ptr(), n, scalar, op, scalar_left)
+                }
+            }
+
+            /// [`compare_scalar`] in place.
+            #[inline]
+            pub fn compare_scalar_assign(values: &mut [$t], scalar: $t, op: Compare, scalar_left: bool) {
+                let (ptr, n) = (values.as_mut_ptr(), values.len());
+                // SAFETY: as in `broadcast_assign`.
+                unsafe { compare_scalar_raw(ptr, ptr, n, scalar, op, scalar_left) }
+            }
+
+            /// # Safety
+            ///
+            /// As for [`map1`].
+            #[inline(always)]
+            unsafe fn compare_scalar_raw(
+                x: *const $t,
+                o: *mut $t,
+                n: usize,
+                scalar: $t,
+                op: Compare,
+                scalar_left: bool,
+            ) {
+                unsafe {
+                    specialize_compare!(op, OP => map_scalar(
+                        x,
+                        o,
+                        n,
+                        scalar,
+                        scalar_left,
+                        // SAFETY: NEON is part of the aarch64 baseline.
+                        |x, y| compare_vectors(OP, x, y),
+                        |x, y| compare_values(OP, x, y),
+                    ))
+                }
             }
 
             /// Elementwise square root. `fsqrt` is correctly rounded, as IEEE
@@ -530,21 +659,36 @@ macro_rules! neon_kernels {
             pub fn clamp(values: &[$t], low: $t, high: $t, out: &mut [$t]) {
                 let n = values.len();
                 contract::same_len("clamp", &[n, out.len()]);
-                let mut i = 0;
-                // SAFETY: the slice lengths were checked on entry, and every
-                // vector access covers `LANES` elements that end at or before
-                // `n`.
+                // SAFETY: the lengths agree, and `out` is a distinct borrow.
+                unsafe { clamp_raw(values.as_ptr(), out.as_mut_ptr(), n, low, high) }
+            }
+
+            /// [`clamp`] in place.
+            #[inline]
+            pub fn clamp_assign(values: &mut [$t], low: $t, high: $t) {
+                let (ptr, n) = (values.as_mut_ptr(), values.len());
+                // SAFETY: as in `broadcast_assign`.
+                unsafe { clamp_raw(ptr, ptr, n, low, high) }
+            }
+
+            /// # Safety
+            ///
+            /// As for [`map1`].
+            #[inline(always)]
+            unsafe fn clamp_raw(x: *const $t, o: *mut $t, n: usize, low: $t, high: $t) {
+                // SAFETY: every vector access covers `LANES` elements that end
+                // at or before `n`.
                 unsafe {
                     let (vlow, vhigh) = ($dup(low), $dup(high));
+                    let mut i = 0;
                     while i + LANES <= n {
-                        let vx = $load(values.as_ptr().add(i));
-                        $store(out.as_mut_ptr().add(i), $min($max(vx, vlow), vhigh));
+                        $store(o.add(i), $min($max($load(x.add(i)), vlow), vhigh));
                         i += LANES;
                     }
-                }
-                while i < n {
-                    out[i] = values[i].max(low).min(high);
-                    i += 1;
+                    while i < n {
+                        *o.add(i) = (*x.add(i)).max(low).min(high);
+                        i += 1;
+                    }
                 }
             }
 

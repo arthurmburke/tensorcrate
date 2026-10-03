@@ -138,15 +138,45 @@ macro_rules! x86_kernels {
 
             #[inline]
             pub fn elementwise(a: &[$t], b: &[$t], op: BinaryOp, out: &mut [$t]) {
-                contract::same_len("elementwise", &[a.len(), b.len(), out.len()]);
-                if op == BinaryOp::Rem {
-                    for i in 0..a.len() {
-                        out[i] = a[i] % b[i];
+                let n = a.len();
+                contract::same_len("elementwise", &[n, b.len(), out.len()]);
+                // SAFETY: the lengths agree, and `out` is a distinct borrow.
+                unsafe { elementwise_raw(a.as_ptr(), b.as_ptr(), out.as_mut_ptr(), n, op) };
+            }
+
+            /// [`elementwise`] into the left operand: `a = a op b`.
+            #[inline]
+            pub fn elementwise_assign(a: &mut [$t], b: &[$t], op: BinaryOp) {
+                let n = a.len();
+                contract::same_len("elementwise_assign", &[n, b.len()]);
+                let a = a.as_mut_ptr();
+                // SAFETY: the lengths agree and `b` is a distinct borrow. Every
+                // vector is loaded before the result that replaces it is
+                // stored, so `out` may equal `a`.
+                unsafe { elementwise_raw(a, b.as_ptr(), a, n, op) };
+            }
+
+            /// # Safety
+            ///
+            /// `a` and `b` must be valid for reads and `out` for writes of `n`
+            /// elements. `out` may equal `a` but must not otherwise
+            /// overlap an operand.
+            #[inline]
+            unsafe fn elementwise_raw(
+                a: *const $t,
+                b: *const $t,
+                out: *mut $t,
+                n: usize,
+                op: BinaryOp,
+            ) {
+                unsafe {
+                    if op == BinaryOp::Rem {
+                        scalar_elementwise(a, b, op, out, n, 0);
+                    } else if has_avx2() {
+                        elementwise_avx(a, b, op, out, n);
+                    } else {
+                        elementwise_sse(a, b, op, out, n);
                     }
-                } else if has_avx2() {
-                    unsafe { elementwise_avx(a, b, op, out) };
-                } else {
-                    unsafe { elementwise_sse(a, b, op, out) };
                 }
             }
 
@@ -155,11 +185,17 @@ macro_rules! x86_kernels {
             /// The CPU must support `avx2`, and the slices must have the
             /// lengths the safe entry point checks before calling this.
             #[target_feature(enable = "avx2")]
-            unsafe fn elementwise_avx(a: &[$t], b: &[$t], op: BinaryOp, out: &mut [$t]) {
+            unsafe fn elementwise_avx(
+                a: *const $t,
+                b: *const $t,
+                op: BinaryOp,
+                out: *mut $t,
+                n: usize,
+            ) {
                 let mut i = 0;
-                while i + $avx_lanes <= a.len() {
-                    let va = $avx_load(a.as_ptr().add(i));
-                    let vb = $avx_load(b.as_ptr().add(i));
+                while i + $avx_lanes <= n {
+                    let va = $avx_load(a.add(i));
+                    let vb = $avx_load(b.add(i));
                     let result = match op {
                         BinaryOp::Add => $avx_add(va, vb),
                         BinaryOp::Sub => $avx_sub(va, vb),
@@ -167,10 +203,10 @@ macro_rules! x86_kernels {
                         BinaryOp::Div => $avx_div(va, vb),
                         BinaryOp::Rem => unreachable!(),
                     };
-                    $avx_store(out.as_mut_ptr().add(i), result);
+                    $avx_store(out.add(i), result);
                     i += $avx_lanes;
                 }
-                scalar_elementwise(a, b, op, out, i);
+                scalar_elementwise(a, b, op, out, n, i);
             }
 
             /// # Safety
@@ -178,11 +214,17 @@ macro_rules! x86_kernels {
             /// The CPU must support `sse2`, and the slices must have the
             /// lengths the safe entry point checks before calling this.
             #[target_feature(enable = "sse2")]
-            unsafe fn elementwise_sse(a: &[$t], b: &[$t], op: BinaryOp, out: &mut [$t]) {
+            unsafe fn elementwise_sse(
+                a: *const $t,
+                b: *const $t,
+                op: BinaryOp,
+                out: *mut $t,
+                n: usize,
+            ) {
                 let mut i = 0;
-                while i + $sse_lanes <= a.len() {
-                    let va = $sse_load(a.as_ptr().add(i));
-                    let vb = $sse_load(b.as_ptr().add(i));
+                while i + $sse_lanes <= n {
+                    let va = $sse_load(a.add(i));
+                    let vb = $sse_load(b.add(i));
                     let result = match op {
                         BinaryOp::Add => $sse_add(va, vb),
                         BinaryOp::Sub => $sse_sub(va, vb),
@@ -190,20 +232,27 @@ macro_rules! x86_kernels {
                         BinaryOp::Div => $sse_div(va, vb),
                         BinaryOp::Rem => unreachable!(),
                     };
-                    $sse_store(out.as_mut_ptr().add(i), result);
+                    $sse_store(out.add(i), result);
                     i += $sse_lanes;
                 }
-                scalar_elementwise(a, b, op, out, i);
+                scalar_elementwise(a, b, op, out, n, i);
             }
 
-            fn scalar_elementwise(a: &[$t], b: &[$t], op: BinaryOp, out: &mut [$t], start: usize) {
-                for i in start..a.len() {
-                    out[i] = match op {
-                        BinaryOp::Add => a[i] + b[i],
-                        BinaryOp::Sub => a[i] - b[i],
-                        BinaryOp::Mul => a[i] * b[i],
-                        BinaryOp::Div => a[i] / b[i],
-                        BinaryOp::Rem => a[i] % b[i],
+            unsafe fn scalar_elementwise(
+                a: *const $t,
+                b: *const $t,
+                op: BinaryOp,
+                out: *mut $t,
+                n: usize,
+                start: usize,
+            ) {
+                for i in start..n {
+                    *out.add(i) = match op {
+                        BinaryOp::Add => *a.add(i) + *b.add(i),
+                        BinaryOp::Sub => *a.add(i) - *b.add(i),
+                        BinaryOp::Mul => *a.add(i) * *b.add(i),
+                        BinaryOp::Div => *a.add(i) / *b.add(i),
+                        BinaryOp::Rem => *a.add(i) % *b.add(i),
                     };
                 }
             }
@@ -216,13 +265,57 @@ macro_rules! x86_kernels {
                 scalar_left: bool,
                 out: &mut [$t],
             ) {
-                contract::same_len("broadcast", &[values.len(), out.len()]);
-                if op == BinaryOp::Rem {
-                    scalar_broadcast(values, scalar, op, scalar_left, out, 0);
-                } else if has_avx2() {
-                    unsafe { broadcast_avx(values, scalar, op, scalar_left, out) };
-                } else {
-                    unsafe { broadcast_sse(values, scalar, op, scalar_left, out) };
+                let n = values.len();
+                contract::same_len("broadcast", &[n, out.len()]);
+                // SAFETY: the lengths agree, and `out` is a distinct borrow.
+                unsafe {
+                    broadcast_raw(
+                        values.as_ptr(),
+                        scalar,
+                        op,
+                        scalar_left,
+                        out.as_mut_ptr(),
+                        n,
+                    )
+                };
+            }
+
+            /// [`broadcast`] in place.
+            #[inline]
+            pub fn broadcast_assign(
+                values: &mut [$t],
+                scalar: $t,
+                op: BinaryOp,
+                scalar_left: bool,
+            ) {
+                let (values, n) = (values.as_mut_ptr(), values.len());
+                // SAFETY: every vector is loaded before the result that
+                // replaces it is stored, so `out` may equal `values`.
+                unsafe { broadcast_raw(values, scalar, op, scalar_left, values, n) };
+            }
+
+            /// # Safety
+            ///
+            /// `values` must be valid for reads and `out` for writes of `n`
+            /// elements. `out` may equal `values` but must not otherwise
+            /// overlap an operand.
+            #[inline]
+            unsafe fn broadcast_raw(
+                values: *const $t,
+                scalar: $t,
+                op: BinaryOp,
+                scalar_left: bool,
+                out: *mut $t,
+                n: usize,
+            ) {
+                unsafe {
+                    if op == BinaryOp::Rem {
+                        scalar_broadcast(values, scalar, op, scalar_left, out, n, 0);
+                    } else if has_avx2() {
+                        broadcast_avx(values, scalar, op, scalar_left, out, n);
+                    } else {
+                        broadcast_sse(values, scalar, op, scalar_left, out, n);
+                    }
                 }
             }
 
@@ -232,16 +325,17 @@ macro_rules! x86_kernels {
             /// lengths the safe entry point checks before calling this.
             #[target_feature(enable = "avx2")]
             unsafe fn broadcast_avx(
-                values: &[$t],
+                values: *const $t,
                 scalar: $t,
                 op: BinaryOp,
                 scalar_left: bool,
-                out: &mut [$t],
+                out: *mut $t,
+                n: usize,
             ) {
                 let scalar = $avx_set1(scalar);
                 let mut i = 0;
-                while i + $avx_lanes <= values.len() {
-                    let value = $avx_load(values.as_ptr().add(i));
+                while i + $avx_lanes <= n {
+                    let value = $avx_load(values.add(i));
                     let (lhs, rhs) = if scalar_left {
                         (scalar, value)
                     } else {
@@ -254,10 +348,10 @@ macro_rules! x86_kernels {
                         BinaryOp::Div => $avx_div(lhs, rhs),
                         BinaryOp::Rem => unreachable!(),
                     };
-                    $avx_store(out.as_mut_ptr().add(i), result);
+                    $avx_store(out.add(i), result);
                     i += $avx_lanes;
                 }
-                scalar_broadcast(values, scalar_value(scalar), op, scalar_left, out, i);
+                scalar_broadcast(values, scalar_value(scalar), op, scalar_left, out, n, i);
             }
 
             /// # Safety
@@ -266,16 +360,17 @@ macro_rules! x86_kernels {
             /// lengths the safe entry point checks before calling this.
             #[target_feature(enable = "sse2")]
             unsafe fn broadcast_sse(
-                values: &[$t],
+                values: *const $t,
                 scalar_value_: $t,
                 op: BinaryOp,
                 scalar_left: bool,
-                out: &mut [$t],
+                out: *mut $t,
+                n: usize,
             ) {
                 let scalar = $sse_set1(scalar_value_);
                 let mut i = 0;
-                while i + $sse_lanes <= values.len() {
-                    let value = $sse_load(values.as_ptr().add(i));
+                while i + $sse_lanes <= n {
+                    let value = $sse_load(values.add(i));
                     let (lhs, rhs) = if scalar_left {
                         (scalar, value)
                     } else {
@@ -288,10 +383,10 @@ macro_rules! x86_kernels {
                         BinaryOp::Div => $sse_div(lhs, rhs),
                         BinaryOp::Rem => unreachable!(),
                     };
-                    $sse_store(out.as_mut_ptr().add(i), result);
+                    $sse_store(out.add(i), result);
                     i += $sse_lanes;
                 }
-                scalar_broadcast(values, scalar_value_, op, scalar_left, out, i);
+                scalar_broadcast(values, scalar_value_, op, scalar_left, out, n, i);
             }
 
             /// # Safety
@@ -304,21 +399,22 @@ macro_rules! x86_kernels {
                 lanes[0]
             }
 
-            fn scalar_broadcast(
-                values: &[$t],
+            unsafe fn scalar_broadcast(
+                values: *const $t,
                 scalar: $t,
                 op: BinaryOp,
                 scalar_left: bool,
-                out: &mut [$t],
+                out: *mut $t,
+                n: usize,
                 start: usize,
             ) {
-                for i in start..values.len() {
+                for i in start..n {
                     let (lhs, rhs) = if scalar_left {
-                        (scalar, values[i])
+                        (scalar, *values.add(i))
                     } else {
-                        (values[i], scalar)
+                        (*values.add(i), scalar)
                     };
-                    out[i] = match op {
+                    *out.add(i) = match op {
                         BinaryOp::Add => lhs + rhs,
                         BinaryOp::Sub => lhs - rhs,
                         BinaryOp::Mul => lhs * rhs,
@@ -481,11 +577,35 @@ macro_rules! x86_kernels {
             /// Elementwise comparison of two slices.
             #[inline]
             pub fn compare(a: &[$t], b: &[$t], op: Compare, out: &mut [$t]) {
-                contract::same_len("compare", &[a.len(), b.len(), out.len()]);
-                if has_avx2() {
-                    unsafe { compare_slices_avx(a, b, op, out) };
-                } else {
-                    unsafe { compare_slices_sse(a, b, op, out) };
+                let n = a.len();
+                contract::same_len("compare", &[n, b.len(), out.len()]);
+                // SAFETY: the lengths agree, and `out` is a distinct borrow.
+                unsafe { compare_raw(a.as_ptr(), b.as_ptr(), out.as_mut_ptr(), n, op) };
+            }
+
+            /// [`compare`] into the left operand.
+            #[inline]
+            pub fn compare_assign(a: &mut [$t], b: &[$t], op: Compare) {
+                let n = a.len();
+                contract::same_len("compare_assign", &[n, b.len()]);
+                let a = a.as_mut_ptr();
+                // SAFETY: as in `elementwise_assign`.
+                unsafe { compare_raw(a, b.as_ptr(), a, n, op) };
+            }
+
+            /// # Safety
+            ///
+            /// `a` and `b` must be valid for reads and `out` for writes of `n`
+            /// elements. `out` may equal `a` but must not otherwise
+            /// overlap an operand.
+            #[inline]
+            unsafe fn compare_raw(a: *const $t, b: *const $t, out: *mut $t, n: usize, op: Compare) {
+                unsafe {
+                    if has_avx2() {
+                        compare_slices_avx(a, b, op, out, n);
+                    } else {
+                        compare_slices_sse(a, b, op, out, n);
+                    }
                 }
             }
 
@@ -494,15 +614,21 @@ macro_rules! x86_kernels {
             /// The CPU must support `avx2`, and the slices must have the
             /// lengths the safe entry point checks before calling this.
             #[target_feature(enable = "avx2")]
-            unsafe fn compare_slices_avx(a: &[$t], b: &[$t], op: Compare, out: &mut [$t]) {
+            unsafe fn compare_slices_avx(
+                a: *const $t,
+                b: *const $t,
+                op: Compare,
+                out: *mut $t,
+                n: usize,
+            ) {
                 let mut i = 0;
-                while i + $avx_lanes <= a.len() {
-                    let va = $avx_load(a.as_ptr().add(i));
-                    let vb = $avx_load(b.as_ptr().add(i));
-                    $avx_store(out.as_mut_ptr().add(i), compare_avx(op, va, vb));
+                while i + $avx_lanes <= n {
+                    let va = $avx_load(a.add(i));
+                    let vb = $avx_load(b.add(i));
+                    $avx_store(out.add(i), compare_avx(op, va, vb));
                     i += $avx_lanes;
                 }
-                scalar_compare(a, b, op, out, i);
+                scalar_compare(a, b, op, out, n, i);
             }
 
             /// # Safety
@@ -510,20 +636,33 @@ macro_rules! x86_kernels {
             /// The CPU must support `sse2`, and the slices must have the
             /// lengths the safe entry point checks before calling this.
             #[target_feature(enable = "sse2")]
-            unsafe fn compare_slices_sse(a: &[$t], b: &[$t], op: Compare, out: &mut [$t]) {
+            unsafe fn compare_slices_sse(
+                a: *const $t,
+                b: *const $t,
+                op: Compare,
+                out: *mut $t,
+                n: usize,
+            ) {
                 let mut i = 0;
-                while i + $sse_lanes <= a.len() {
-                    let va = $sse_load(a.as_ptr().add(i));
-                    let vb = $sse_load(b.as_ptr().add(i));
-                    $sse_store(out.as_mut_ptr().add(i), compare_sse(op, va, vb));
+                while i + $sse_lanes <= n {
+                    let va = $sse_load(a.add(i));
+                    let vb = $sse_load(b.add(i));
+                    $sse_store(out.add(i), compare_sse(op, va, vb));
                     i += $sse_lanes;
                 }
-                scalar_compare(a, b, op, out, i);
+                scalar_compare(a, b, op, out, n, i);
             }
 
-            fn scalar_compare(a: &[$t], b: &[$t], op: Compare, out: &mut [$t], start: usize) {
-                for i in start..a.len() {
-                    out[i] = compare_values(op, a[i], b[i]);
+            unsafe fn scalar_compare(
+                a: *const $t,
+                b: *const $t,
+                op: Compare,
+                out: *mut $t,
+                n: usize,
+                start: usize,
+            ) {
+                for i in start..n {
+                    *out.add(i) = compare_values(op, *a.add(i), *b.add(i));
                 }
             }
 
@@ -537,11 +676,54 @@ macro_rules! x86_kernels {
                 scalar_left: bool,
                 out: &mut [$t],
             ) {
-                contract::same_len("compare_scalar", &[values.len(), out.len()]);
-                if has_avx2() {
-                    unsafe { compare_scalar_avx(values, scalar, op, scalar_left, out) };
-                } else {
-                    unsafe { compare_scalar_sse(values, scalar, op, scalar_left, out) };
+                let n = values.len();
+                contract::same_len("compare_scalar", &[n, out.len()]);
+                // SAFETY: the lengths agree, and `out` is a distinct borrow.
+                unsafe {
+                    compare_scalar_raw(
+                        values.as_ptr(),
+                        scalar,
+                        op,
+                        scalar_left,
+                        out.as_mut_ptr(),
+                        n,
+                    )
+                };
+            }
+
+            /// [`compare_scalar`] in place.
+            #[inline]
+            pub fn compare_scalar_assign(
+                values: &mut [$t],
+                scalar: $t,
+                op: Compare,
+                scalar_left: bool,
+            ) {
+                let (values, n) = (values.as_mut_ptr(), values.len());
+                // SAFETY: as in `broadcast_assign`.
+                unsafe { compare_scalar_raw(values, scalar, op, scalar_left, values, n) };
+            }
+
+            /// # Safety
+            ///
+            /// `values` must be valid for reads and `out` for writes of `n`
+            /// elements. `out` may equal `values` but must not otherwise
+            /// overlap an operand.
+            #[inline]
+            unsafe fn compare_scalar_raw(
+                values: *const $t,
+                scalar: $t,
+                op: Compare,
+                scalar_left: bool,
+                out: *mut $t,
+                n: usize,
+            ) {
+                unsafe {
+                    if has_avx2() {
+                        compare_scalar_avx(values, scalar, op, scalar_left, out, n);
+                    } else {
+                        compare_scalar_sse(values, scalar, op, scalar_left, out, n);
+                    }
                 }
             }
 
@@ -551,25 +733,26 @@ macro_rules! x86_kernels {
             /// lengths the safe entry point checks before calling this.
             #[target_feature(enable = "avx2")]
             unsafe fn compare_scalar_avx(
-                values: &[$t],
+                values: *const $t,
                 scalar: $t,
                 op: Compare,
                 scalar_left: bool,
-                out: &mut [$t],
+                out: *mut $t,
+                n: usize,
             ) {
                 let splat = $avx_set1(scalar);
                 let mut i = 0;
-                while i + $avx_lanes <= values.len() {
-                    let value = $avx_load(values.as_ptr().add(i));
+                while i + $avx_lanes <= n {
+                    let value = $avx_load(values.add(i));
                     let (lhs, rhs) = if scalar_left {
                         (splat, value)
                     } else {
                         (value, splat)
                     };
-                    $avx_store(out.as_mut_ptr().add(i), compare_avx(op, lhs, rhs));
+                    $avx_store(out.add(i), compare_avx(op, lhs, rhs));
                     i += $avx_lanes;
                 }
-                scalar_compare_scalar(values, scalar, op, scalar_left, out, i);
+                scalar_compare_scalar(values, scalar, op, scalar_left, out, n, i);
             }
 
             /// # Safety
@@ -578,42 +761,44 @@ macro_rules! x86_kernels {
             /// lengths the safe entry point checks before calling this.
             #[target_feature(enable = "sse2")]
             unsafe fn compare_scalar_sse(
-                values: &[$t],
+                values: *const $t,
                 scalar: $t,
                 op: Compare,
                 scalar_left: bool,
-                out: &mut [$t],
+                out: *mut $t,
+                n: usize,
             ) {
                 let splat = $sse_set1(scalar);
                 let mut i = 0;
-                while i + $sse_lanes <= values.len() {
-                    let value = $sse_load(values.as_ptr().add(i));
+                while i + $sse_lanes <= n {
+                    let value = $sse_load(values.add(i));
                     let (lhs, rhs) = if scalar_left {
                         (splat, value)
                     } else {
                         (value, splat)
                     };
-                    $sse_store(out.as_mut_ptr().add(i), compare_sse(op, lhs, rhs));
+                    $sse_store(out.add(i), compare_sse(op, lhs, rhs));
                     i += $sse_lanes;
                 }
-                scalar_compare_scalar(values, scalar, op, scalar_left, out, i);
+                scalar_compare_scalar(values, scalar, op, scalar_left, out, n, i);
             }
 
-            fn scalar_compare_scalar(
-                values: &[$t],
+            unsafe fn scalar_compare_scalar(
+                values: *const $t,
                 scalar: $t,
                 op: Compare,
                 scalar_left: bool,
-                out: &mut [$t],
+                out: *mut $t,
+                n: usize,
                 start: usize,
             ) {
-                for i in start..values.len() {
+                for i in start..n {
                     let (lhs, rhs) = if scalar_left {
-                        (scalar, values[i])
+                        (scalar, *values.add(i))
                     } else {
-                        (values[i], scalar)
+                        (*values.add(i), scalar)
                     };
-                    out[i] = compare_values(op, lhs, rhs);
+                    *out.add(i) = compare_values(op, lhs, rhs);
                 }
             }
 
@@ -666,11 +851,33 @@ macro_rules! x86_kernels {
             /// Confine every element to `[low, high]`, in one pass.
             #[inline]
             pub fn clamp(values: &[$t], low: $t, high: $t, out: &mut [$t]) {
-                contract::same_len("clamp", &[values.len(), out.len()]);
-                if has_avx2() {
-                    unsafe { clamp_avx(values, low, high, out) };
-                } else {
-                    unsafe { clamp_sse(values, low, high, out) };
+                let n = values.len();
+                contract::same_len("clamp", &[n, out.len()]);
+                // SAFETY: the lengths agree, and `out` is a distinct borrow.
+                unsafe { clamp_raw(values.as_ptr(), low, high, out.as_mut_ptr(), n) };
+            }
+
+            /// [`clamp`] in place.
+            #[inline]
+            pub fn clamp_assign(values: &mut [$t], low: $t, high: $t) {
+                let (values, n) = (values.as_mut_ptr(), values.len());
+                // SAFETY: as in `broadcast_assign`.
+                unsafe { clamp_raw(values, low, high, values, n) };
+            }
+
+            /// # Safety
+            ///
+            /// `values` must be valid for reads and `out` for writes of `n`
+            /// elements. `out` may equal `values` but must not otherwise
+            /// overlap an operand.
+            #[inline]
+            unsafe fn clamp_raw(values: *const $t, low: $t, high: $t, out: *mut $t, n: usize) {
+                unsafe {
+                    if has_avx2() {
+                        clamp_avx(values, low, high, out, n);
+                    } else {
+                        clamp_sse(values, low, high, out, n);
+                    }
                 }
             }
 
@@ -679,18 +886,15 @@ macro_rules! x86_kernels {
             /// The CPU must support `avx2`, and the slices must have the
             /// lengths the safe entry point checks before calling this.
             #[target_feature(enable = "avx2")]
-            unsafe fn clamp_avx(values: &[$t], low: $t, high: $t, out: &mut [$t]) {
+            unsafe fn clamp_avx(values: *const $t, low: $t, high: $t, out: *mut $t, n: usize) {
                 let (vlow, vhigh) = ($avx_set1(low), $avx_set1(high));
                 let mut i = 0;
-                while i + $avx_lanes <= values.len() {
-                    let value = $avx_load(values.as_ptr().add(i));
-                    $avx_store(
-                        out.as_mut_ptr().add(i),
-                        min_avx(max_avx(value, vlow), vhigh),
-                    );
+                while i + $avx_lanes <= n {
+                    let value = $avx_load(values.add(i));
+                    $avx_store(out.add(i), min_avx(max_avx(value, vlow), vhigh));
                     i += $avx_lanes;
                 }
-                scalar_clamp(values, low, high, out, i);
+                scalar_clamp(values, low, high, out, n, i);
             }
 
             /// # Safety
@@ -698,23 +902,27 @@ macro_rules! x86_kernels {
             /// The CPU must support `sse2`, and the slices must have the
             /// lengths the safe entry point checks before calling this.
             #[target_feature(enable = "sse2")]
-            unsafe fn clamp_sse(values: &[$t], low: $t, high: $t, out: &mut [$t]) {
+            unsafe fn clamp_sse(values: *const $t, low: $t, high: $t, out: *mut $t, n: usize) {
                 let (vlow, vhigh) = ($sse_set1(low), $sse_set1(high));
                 let mut i = 0;
-                while i + $sse_lanes <= values.len() {
-                    let value = $sse_load(values.as_ptr().add(i));
-                    $sse_store(
-                        out.as_mut_ptr().add(i),
-                        min_sse(max_sse(value, vlow), vhigh),
-                    );
+                while i + $sse_lanes <= n {
+                    let value = $sse_load(values.add(i));
+                    $sse_store(out.add(i), min_sse(max_sse(value, vlow), vhigh));
                     i += $sse_lanes;
                 }
-                scalar_clamp(values, low, high, out, i);
+                scalar_clamp(values, low, high, out, n, i);
             }
 
-            fn scalar_clamp(values: &[$t], low: $t, high: $t, out: &mut [$t], start: usize) {
-                for i in start..values.len() {
-                    out[i] = values[i].max(low).min(high);
+            unsafe fn scalar_clamp(
+                values: *const $t,
+                low: $t,
+                high: $t,
+                out: *mut $t,
+                n: usize,
+                start: usize,
+            ) {
+                for i in start..n {
+                    *out.add(i) = (*values.add(i)).max(low).min(high);
                 }
             }
 

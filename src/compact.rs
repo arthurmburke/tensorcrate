@@ -94,6 +94,12 @@ fn cast_vec<T: 'static, U: 'static>(values: Vec<T>) -> Vec<U> {
     }
 }
 
+/// Whether `T` is `f16` or `bf16`.
+#[cfg_attr(not(feature = "simd"), allow(dead_code))]
+pub(crate) fn is_compact<T: 'static>() -> bool {
+    same::<T, f16>() || same::<T, bf16>()
+}
+
 /// Evaluate `$body` with `$C` bound to the compact type `$T` is, or give
 /// `$otherwise` when it is neither.
 macro_rules! dispatch {
