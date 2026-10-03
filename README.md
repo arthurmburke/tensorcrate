@@ -20,8 +20,11 @@ API to use for model training, dynamic data, and GPU execution.
   `max`, `min`, `mean`, `var` over any axes, `argmax`/`argmin`), each one kernel on Host or Metal.
 - Real, complex, dual, and complex-dual arithmetic.
 - A `math!` macro with tensor literals, broadcasting, analytic functions, and `@` products.
-- Reverse-mode autodiff with a tape and forward-mode autodiff with dual tensors.
-- SGD, Momentum/Nesterov, AdaGrad, RMSProp, and Adam.
+- Reverse-mode autodiff with a tape and forward-mode autodiff with dual tensors. The tape
+  differentiates N-dimensional tensors too: broadcasting arithmetic, layout operations (reshape,
+  permute, slice, split, concatenate) and axis reductions, with every backward rule on the tensor's
+  backend.
+- SGD, Momentum/Nesterov, AdaGrad, RMSProp, and Adam, for vector, matrix and tensor parameters.
 - Projected gradient descent for box, norm-ball, simplex, or custom constraints.
 - Means, variances, and normal or inverse-Gaussian distribution functions, whole-tensor or by axis.
 - A generic host backend, Accelerate and SIMD CPU paths, and resident Apple Metal storage.
@@ -445,6 +448,51 @@ when it is only for logging. Forward-mode drivers and dual tensors live in
 inputs and many outputs. Reverse-mode gradient and Jacobian helpers live in
 `tensorcrate::tensors::tape`.
 
+### Tensors on the tape
+
+`tape.tensor(t)` records a `Tensor` of any rank as a `TensorVar`, on which the tensor operations
+differentiate:
+
+- `+ - * /`, `power`, `maximum` and `minimum`, broadcasting as `Tensor`'s do; a broadcast operand
+  receives its adjoint summed back to its own shape, so a `[D]` bias gets the sum over the batch
+  and positions;
+- every analytic function, `power_scalar`, `scale`, `shift`, `neg`, `abs`, `relu` and `clamp`;
+- `reshape`, `permute`, `transpose`, `narrow`, `slice`, `select`, `split`, `chunk`,
+  `TensorVar::concat`, `TensorVar::stack`, `squeeze`, `unsqueeze`, `broadcast_to` and
+  `contiguous`;
+- `sum_axes`, `mean_axes`, `var_axes` (either correction), `max_axes` and `min_axes`, and the
+  whole-tensor `sum` and `mean` to a scalar;
+- `to_matrix(rows, cols)` and `to_vector()`, and `to_tensor(&shape)` on a matrix or vector
+  variable, so tensor code can use `matmul` and the other matrix products.
+
+Ties follow the vector rules: `maximum` splits a tie between its operands, and `max_axes` /
+`min_axes` split the adjoint evenly among the elements that tie for the extreme (NaNs, which the
+reduction passes over, receive none). A value on the tape is a whole tensor, so a layout operation
+records one strided copy of what it reads. Its adjoint goes back by the inverse permutation, by
+narrowing a concatenation's pieces back out, or — for a slice — by a strided write into that part
+of the parent's adjoint, added in place. Every rule runs on the tensor's backend, so on Metal the
+backward pass stays on the GPU in `f32`, `f16` or `bf16`.
+
+```rust
+use tensorcrate::tensors::{Tape, Tensor};
+
+let tape = Tape::new();
+let x = tape.tensor(Tensor::<f32>::ones(&[2, 3, 8])); // [batch, time, 2·model]
+let w = tape.tensor(Tensor::<f32>::filled(&[8, 8], 0.1));
+let bias = tape.tensor(Tensor::<f32>::zeros(&[8]));
+
+// A projection through the matrix product, split into two halves of two heads each.
+let projected = x.to_matrix(6, 8).matmul(&w.to_matrix(8, 8)).to_tensor(&[2, 3, 8]);
+let [gate, value] = <[_; 2]>::try_from(projected.chunk(-1, 2)).ok().unwrap();
+let heads = (&gate.tanh() * &value).reshape(&[2, 3, 2, 2]).permute(&[0, 2, 1, 3]);
+let out = &heads.permute(&[0, 2, 1, 3]).reshape(&[2, 3, 4]) + &bias.narrow(0, 0, 4);
+let loss = out.max_axes(-1, false).mean();
+loss.backward();
+
+assert_eq!(w.grad().shape(), [8, 8]);
+assert_eq!(bias.grad().to_vec()[4..], [0.0; 4]); // the unused half of the bias
+```
+
 ## Training a model
 
 `minimize` owns the standard single-parameter training loop: it creates a fresh tape, records the
@@ -521,6 +569,11 @@ state are updated in place. So a tensor gradient can be anything of the paramete
 program reads — the parameters' own type, or a view of a larger matrix (`&grads.view(.., 0..d)`, or
 `&grads.column_view(j)` for a vector). A matrix gradient must have the parameters' shape. Code
 generic over the parameter type passes `gradient.as_gradient()`.
+
+A `Tensor` of any rank is a parameter too, updated in place by the same fused programs over the
+`(prod(leading), last)` space of its rows, on Host or Metal — so a `[H, D, D]` weight follows
+exactly the trajectory its `(H·D) × D` matrix would. Its gradient is a `TensorVar`'s `grad()`, or a
+view of a larger tensor whose leading axes fold (`&grads.narrow(-1, 0, d)`).
 
 See `examples/gradient_descent.rs` for larger linear and nonlinear fits and
 `examples/optimizers.rs` for mini-batches and multi-parameter training.
