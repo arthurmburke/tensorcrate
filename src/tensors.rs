@@ -69,7 +69,8 @@
 //!
 //! Recorded on a [`Tape`] as a [`TensorVar`], a tensor differentiates
 //! through all of these — the broadcasting arithmetic, the layout operations
-//! and the reductions; see the [`tape`] module.
+//! and the reductions — and a [`Tensor`] is a parameter the
+//! [optimizers](crate::optim) update in place; see the [`tape`] module.
 //!
 //! ```
 //! use tensorcrate::tensors::Tensor;

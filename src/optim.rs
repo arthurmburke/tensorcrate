@@ -56,12 +56,15 @@ use crate::tensors::fused::{
     Builder, Element, Fusable, FusableMut, FusableOf, Instr, Output, Program, Remap,
 };
 use crate::tensors::tape::Adjoint;
-use crate::tensors::{Analytic, BinaryOp, Host, Kernels, Matrix, ScalarVar, Tape, Var, Vector};
+use crate::tensors::{
+    Analytic, BinaryOp, Host, Kernels, Matrix, ScalarVar, Tape, Tensor, Var, Vector,
+};
 
 /// A tensor an optimizer can carry: the elementwise algebra the update rules
 /// need, plus the ability to put itself on a tape.
 ///
-/// Implemented for scalars, [`Vector`] and [`Matrix`] of any element type —
+/// Implemented for scalars, [`Vector`], [`Matrix`] and N-dimensional
+/// [`Tensor`] of any element type —
 /// `f32`, `f64`, [`f16`](crate::numbers::f16) or [`bf16`](crate::numbers::bf16) —
 /// so a rule is written once and applies to any of them, on either backend,
 /// without leaving it. (Metal computes in `f32`, `f16` and `bf16`, so those are
@@ -80,13 +83,13 @@ pub trait Parameter: Sized + 'static {
     /// Where this parameter's elements live.
     type Backend: Kernels<Self::Elem>;
 
-    /// What a rule reads this parameter's gradient from. For a [`Vector`] or a
-    /// [`Matrix`], any tensor of [`Self::Elem`](Parameter::Elem) a fused
-    /// program reads in the parameter's shape
-    /// ([`FusableOf`](crate::tensors::fused::FusableOf)): the same type, or a
-    /// [`MatrixView`](crate::tensors::fused::MatrixView) of a larger matrix.
-    /// For a scalar, the scalar. For a parameter type of your own, usually the
-    /// type itself.
+    /// What a rule reads this parameter's gradient from. For a [`Vector`], a
+    /// [`Matrix`] or a [`Tensor`], any tensor of
+    /// [`Self::Elem`](Parameter::Elem) a fused program reads in the
+    /// parameter's shape ([`FusableOf`]): the same type, or a view of a
+    /// larger one — a [`MatrixView`](crate::tensors::fused::MatrixView) or a
+    /// [`TensorView`](crate::tensors::TensorView). For a scalar, the scalar.
+    /// For a parameter type of your own, usually the type itself.
     type Gradient<'a>: ?Sized + 'a;
 
     /// This parameter as a gradient for one of its own type — what generic
@@ -549,6 +552,98 @@ impl<T: Element, B: Kernels<T>> Parameter for Matrix<T, B> {
         run_fused(program, shape, inputs, updated)
             .into_iter()
             .map(Output::into_matrix)
+            .collect()
+    }
+}
+
+/// A tensor of any rank, run as a fused program reads one: over the space of
+/// its rows, every axis but the last folded into them, or over `1 × len`
+/// below two axes. The update is the same elementwise program either way,
+/// so a `[H, D, D]` weight takes the steps a `(H·D) × D` matrix would.
+impl<T: Element, B: Kernels<T>> Parameter for Tensor<T, B> {
+    type Elem = T;
+    type Backend = B;
+    type Gradient<'a> = dyn FusableOf<T, B> + 'a;
+
+    fn as_gradient(&self) -> &(dyn FusableOf<T, B> + '_) {
+        self
+    }
+
+    fn zeros_like(&self) -> Self {
+        Tensor::filled(self.shape(), T::zero())
+    }
+
+    fn duplicate(&self) -> Self {
+        self.contiguous()
+    }
+
+    fn add(&self, other: &Self) -> Self {
+        self.elementwise(other, BinaryOp::Add)
+    }
+
+    fn subtract(&self, other: &Self) -> Self {
+        self.elementwise(other, BinaryOp::Sub)
+    }
+
+    fn multiply(&self, other: &Self) -> Self {
+        self.elementwise(other, BinaryOp::Mul)
+    }
+
+    fn divide(&self, other: &Self) -> Self {
+        self.elementwise(other, BinaryOp::Div)
+    }
+
+    fn scale(&self, factor: T) -> Self {
+        Tensor::scale(self, factor)
+    }
+
+    fn shift(&self, offset: T) -> Self {
+        self.with_scalar(offset, BinaryOp::Add, false)
+    }
+
+    fn sqrt(&self) -> Self {
+        self.unary(Analytic::Sqrt)
+    }
+
+    fn record<'t>(&self, tape: &'t Tape<B>) -> Var<'t, Self, B> {
+        tape.tensor(self.contiguous())
+    }
+
+    /// Over the parameters' rows. A gradient with a shape — a tensor of two
+    /// or more axes, a matrix or a view — must have the parameters' number of
+    /// elements and, for parameters of two or more axes, their row length.
+    #[track_caller]
+    fn fused(
+        program: &Program<T>,
+        inputs: &[&(dyn FusableOf<T, B> + '_)],
+        updated: &mut [&mut Self],
+    ) -> Vec<Self> {
+        let dims = updated.first().map(|t| t.shape().to_vec());
+        let len = dims
+            .as_ref()
+            .map(|dims| dims.iter().product())
+            .or_else(|| inputs.first().map(|input| input.source().len))
+            .unwrap_or(0);
+        let space = match dims.as_deref() {
+            Some([leading @ .., last]) if !leading.is_empty() => {
+                (leading.iter().product::<usize>(), *last)
+            }
+            _ => (1, len),
+        };
+        for input in inputs {
+            if let Some((rows, cols)) = input.shape() {
+                let fits = rows * cols == len && (space.0 == 1 || cols == space.1);
+                assert!(
+                    fits,
+                    "a {rows}×{cols} gradient for parameters of shape {:?}",
+                    dims.as_deref().unwrap_or(&[len])
+                );
+            }
+        }
+        let dims = dims.unwrap_or_else(|| vec![len]);
+        run_fused(program, space, inputs, updated)
+            .into_iter()
+            .map(|output| Tensor::from_vector(&dims, output.into_vector()))
             .collect()
     }
 }
