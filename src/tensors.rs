@@ -99,6 +99,7 @@ mod chain;
 mod fft;
 pub(crate) mod layout;
 mod matrix;
+mod sparse;
 mod ops;
 mod order;
 mod reduction;
