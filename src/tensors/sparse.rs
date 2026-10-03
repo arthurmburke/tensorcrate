@@ -123,6 +123,11 @@ impl<T> SparseMatrix<T> {
         self.row_indices.reserve(additional);
         self.col_indices.reserve(additional);
     }
+
+    /// Return a slice of the stored non-zero values.
+    pub fn data(&self) -> &[T] {
+        &self.values
+    }
 }
 
 impl<T> SparseMatrix<T>
@@ -199,6 +204,15 @@ where
             col_indices,
             zero: T::zero(),
         }
+    }
+
+    /// Return an iterator over the triplets `(row, column, value)` of the stored entries.
+    pub fn triplets(&self) -> impl Iterator<Item = (usize, usize, &T)> {
+        self.row_indices
+            .iter()
+            .zip(&self.col_indices)
+            .zip(&self.values)
+            .map(|((&row, &col), value)| (row, col, value))
     }
 
     /// Build a sparse matrix from `(row, column, value)` entries.
@@ -347,6 +361,19 @@ where
             result[row] = result[row] + *value * vector[col];
         }
         result
+    }
+
+    /// Apply `f` to the stored values, preserving the sparse coordinates.
+    /// Values mapped to zero are omitted from the result.
+    pub fn map<U>(&self, f: impl Fn(&T) -> U) -> SparseMatrix<U>
+    where
+        U: Coefficient + 'static,
+    {
+        SparseMatrix::from_triplets(
+            self.nrows,
+            self.ncols,
+            self.iter().map(|((row, col), value)| (row, col, f(value))),
+        )
     }
 
     /// Converts the matrix to a dense backend.

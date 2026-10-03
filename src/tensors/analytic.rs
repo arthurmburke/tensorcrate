@@ -55,14 +55,14 @@
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use crate::metal::MetalElement;
 use crate::numbers::{
-    Arccos, Arcsin, Arctan, Cos, Cosh, Csc, Exp, Ln, Power, Real, Sec, Sin, Sinh, Sqrt, Tan, Tanh,
-    bf16, f16,
+    Arccos, Arcsin, Arctan, Coefficient, Cos, Cosh, Csc, Exp, Ln, Power, Real, Sec, Sin, Sinh,
+    Sqrt, Tan, Tanh, bf16, f16,
 };
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use crate::tensors::Metal;
 use crate::tensors::kernels::{Analytic, Kernels};
 use crate::tensors::shape::{assert_same_len, assert_same_shape};
-use crate::tensors::{Host, Matrix, Vector};
+use crate::tensors::{Host, Matrix, SparseMatrix, Vector};
 
 impl<T: Real> Vector<T, Host> {
     /// Apply an analytic function to every element.
@@ -92,6 +92,24 @@ impl<T: Real> Matrix<T, Host> {
         let mut out = vec![T::zero(); self.rows() * self.cols()];
         crate::vmath::unary_parallel(f, self.data(), &mut out);
         Matrix::from_flat(self.rows(), self.cols(), out)
+    }
+}
+
+impl<T: Real> SparseMatrix<T> {
+    /// Apply an analytic function to the stored values.
+    ///
+    /// Implicit zero entries remain implicit zeroes. Values that become zero
+    /// are removed from the sparse result.
+    pub fn analytic(&self, f: Analytic) -> Self {
+        let mut values = vec![T::zero(); self.nnz()];
+        crate::vmath::unary_parallel(f, self.data(), &mut values);
+        SparseMatrix::from_triplets(
+            self.rows(),
+            self.cols(),
+            self.triplets()
+                .zip(values)
+                .map(|((row, col, _), value)| (row, col, value)),
+        )
     }
 }
 
@@ -181,6 +199,17 @@ macro_rules! elementwise_analytic {
                 }
             }
 
+            impl<T> SparseMatrix<T>
+            where
+                T: $Trait + Coefficient + Copy + 'static,
+                <T as $Trait>::Output: Coefficient + 'static,
+            {
+                #[doc = concat!("Elementwise `", stringify!($method), "` on stored values.")]
+                pub fn $method(&self) -> SparseMatrix<<T as $Trait>::Output> {
+                    self.map(|&x| <T as $Trait>::$method(x))
+                }
+            }
+
             // ---- the scalar traits, so generic code accepts tensors ----
 
             impl<T: $Trait + Copy> $Trait for &Vector<T, Host> {
@@ -193,6 +222,18 @@ macro_rules! elementwise_analytic {
 
             impl<T: $Trait + Copy> $Trait for &Matrix<T, Host> {
                 type Output = Matrix<<T as $Trait>::Output, Host>;
+
+                fn $method(self) -> Self::Output {
+                    self.map(|&x| <T as $Trait>::$method(x))
+                }
+            }
+
+            impl<T> $Trait for &SparseMatrix<T>
+            where
+                T: $Trait + Coefficient + Copy + 'static,
+                <T as $Trait>::Output: Coefficient + 'static,
+            {
+                type Output = SparseMatrix<<T as $Trait>::Output>;
 
                 fn $method(self) -> Self::Output {
                     self.map(|&x| <T as $Trait>::$method(x))
@@ -295,6 +336,35 @@ impl<T: Power + Copy + 'static> Vector<T, Host> {
     ) -> Vector<<T as Power>::Output, Host> {
         assert_same_len(self.len(), exponents.len(), "pow");
         Vector::new(power_pairs(self.data(), exponents.data()))
+    }
+}
+
+impl<T> SparseMatrix<T>
+where
+    T: Power + Coefficient + Copy + 'static,
+    <T as Power>::Output: Coefficient + 'static,
+{
+    /// Raise the stored values to a common exponent.
+    ///
+    /// Implicit zero entries remain implicit zeroes.
+    pub fn pow(&self, exponent: T) -> SparseMatrix<<T as Power>::Output> {
+        self.map(|&value| value.power(exponent))
+    }
+
+    /// Raise the stored values to the corresponding exponents.
+    ///
+    /// # Panics
+    ///
+    /// If the matrices have different shapes.
+    #[track_caller]
+    pub fn pow_elementwise(&self, exponents: &Self) -> SparseMatrix<<T as Power>::Output> {
+        assert_same_shape(self.shape(), exponents.shape(), "pow");
+        SparseMatrix::from_triplets(
+            self.rows(),
+            self.cols(),
+            self.iter()
+                .map(|((row, col), &base)| (row, col, base.power(exponents.value(row, col)))),
+        )
     }
 }
 
@@ -511,6 +581,31 @@ impl<T: Power + Copy + 'static> Power<&Matrix<T, Host>> for &Matrix<T, Host> {
     }
 }
 
+impl<T> Power<T> for &SparseMatrix<T>
+where
+    T: Power + Coefficient + Copy + 'static,
+    <T as Power>::Output: Coefficient + 'static,
+{
+    type Output = SparseMatrix<<T as Power>::Output>;
+
+    fn power(self, exponent: T) -> Self::Output {
+        self.pow(exponent)
+    }
+}
+
+impl<T> Power<&SparseMatrix<T>> for &SparseMatrix<T>
+where
+    T: Power + Coefficient + Copy + 'static,
+    <T as Power>::Output: Coefficient + 'static,
+{
+    type Output = SparseMatrix<<T as Power>::Output>;
+
+    #[track_caller]
+    fn power(self, exponents: &SparseMatrix<T>) -> Self::Output {
+        self.pow_elementwise(exponents)
+    }
+}
+
 /// A scalar base with a tensor exponent — `2^v`, elementwise.
 ///
 /// This is the one order with no method to hang it on, since the tensor is the
@@ -530,6 +625,14 @@ macro_rules! scalar_base_power {
             type Output = Matrix<$t, Host>;
 
             fn power(self, exponents: &Matrix<$t, Host>) -> Self::Output {
+                exponents.map(|&exponent| <$t as Power>::power(self, exponent))
+            }
+        }
+
+        impl Power<&SparseMatrix<$t>> for $t {
+            type Output = SparseMatrix<$t>;
+
+            fn power(self, exponents: &SparseMatrix<$t>) -> Self::Output {
                 exponents.map(|&exponent| <$t as Power>::power(self, exponent))
             }
         }
@@ -707,5 +810,21 @@ impl<T: Real, B: Kernels<T>> Transcendental for Matrix<T, B> {
 
     fn pow_elementwise(&self, exponents: &Self) -> Self {
         B::matrix_power(self, exponents)
+    }
+}
+
+impl<T: Real> Transcendental for SparseMatrix<T> {
+    type Elem = T;
+
+    fn analytic(&self, f: Analytic) -> Self {
+        SparseMatrix::analytic(self, f)
+    }
+
+    fn pow(&self, exponent: T) -> Self {
+        SparseMatrix::pow(self, exponent)
+    }
+
+    fn pow_elementwise(&self, exponents: &Self) -> Self {
+        SparseMatrix::pow_elementwise(self, exponents)
     }
 }
