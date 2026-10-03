@@ -43,11 +43,13 @@ pub(super) fn encode_matmul<T: MetalElement>(
     n: usize,
     accumulate: bool,
 ) -> Option<()> {
-    if let Some((pipeline, tile)) = gpu.gemm::<T>(Operands::Plain, accumulate, m, n) {
-        return encode_gemm(gpu, &pipeline, a, b, output, (m, k, n), tile);
-    }
+    // The 16-bit product has a dedicated kernel for the plain case; the general
+    // one covers the rest, accumulating included.
     if !accumulate && let Some(pipeline) = gpu.tensorops_matmul::<T>() {
         return encode_tensorops_matmul(gpu, pipeline, a, b, output, m, k, n);
+    }
+    if let Some((pipeline, tile)) = gpu.gemm::<T>(Operands::Plain, accumulate, m, n) {
+        return encode_gemm(gpu, &pipeline, a, b, output, (m, k, n), tile);
     }
     let encoder = compute(gpu)?;
     encoder.setComputePipelineState(&gpu.kernels::<T>().matmul);

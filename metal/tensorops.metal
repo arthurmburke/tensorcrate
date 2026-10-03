@@ -311,3 +311,110 @@ TENSORCRATE_GEMM(PREFIX##_l_nn, INPUT, OUTPUT, 64, 64, 4, false, false, false, f
 
 TENSORCRATE_GEMM_NN(gemm_f16_f32, half, float)
 TENSORCRATE_GEMM_NN(gemm_bf16_f32, bfloat, float)
+
+// ---- the general product on 16-bit matrices -------------------------------------
+//
+// `C = op(A)·op(B)`, or `C += op(A)·op(B)`, with `A`, `B` and `C` all `half` or
+// `bfloat`: what the backward pass of a 16-bit product needs. The tile is
+// accumulated in `float` and staged in threadgroup memory, since a cooperative
+// tensor stores only to a tensor of its own element type. Each thread then
+// rounds its share into `C` once, adding the old value first when accumulating,
+// so the result is rounded as the narrow kernel's is. Layouts as `tensorcrate_gemm`.
+template <typename T, int TM, int TN, int G, bool TA, bool TB, bool Accumulate>
+METAL_FUNC void tensorcrate_gemm_narrow(
+    device T* A,
+    device T* B,
+    device T* C,
+    uint M,
+    uint K,
+    uint N,
+    uint2 group,
+    uint thread_index,
+    uint threads,
+    threadgroup float* staging)
+{
+    constexpr auto descriptor = matmul2d_descriptor(
+        TM,
+        TN,
+        static_cast<int>(dynamic_extent),
+        TA,
+        TB,
+        false
+    );
+    const int32_t m = int32_t(M), k = int32_t(K), n = int32_t(N);
+    auto tensor_a = tensor(
+        A,
+        dextents<int32_t, 2>{TA ? m : k, TA ? k : m},
+        array<int32_t, 2>{1, TA ? m : k}
+    );
+    auto tensor_b = tensor(
+        B,
+        dextents<int32_t, 2>{TB ? k : n, TB ? n : k},
+        array<int32_t, 2>{1, TB ? k : n}
+    );
+    auto staged = tensor(
+        staging,
+        dextents<int32_t, 2>{TN, TM},
+        array<int32_t, 2>{1, TN}
+    );
+
+    matmul2d<descriptor, execution_simdgroups<G>> operation;
+    auto tile_a = TA ? tensor_a.slice(int32_t(group.y) * TM, 0)
+                     : tensor_a.slice(0, int32_t(group.y) * TM);
+    auto tile_b = TB ? tensor_b.slice(0, int32_t(group.x) * TN)
+                     : tensor_b.slice(int32_t(group.x) * TN, 0);
+    auto accumulator = operation.template get_destination_cooperative_tensor<
+        decltype(tile_a),
+        decltype(tile_b),
+        float
+    >();
+    operation.run(tile_a, tile_b, accumulator);
+    accumulator.store(staged);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint e = thread_index; e < uint(TM * TN); e += threads) {
+        uint row = group.y * TM + e / TN;
+        uint col = group.x * TN + e % TN;
+        if (row < M && col < N) {
+            float value = staging[e];
+            if (Accumulate) {
+                value += float(C[row * N + col]);
+            }
+            C[row * N + col] = T(value);
+        }
+    }
+}
+
+#define TENSORCRATE_GEMM_NARROW(NAME, T, TM, TN, G, TA, TB, ACC)             \
+kernel void NAME(                                                            \
+    device T* A [[buffer(0)]],                                                \
+    device T* B [[buffer(1)]],                                                \
+    device T* C [[buffer(2)]],                                                \
+    constant uint& M [[buffer(3)]],                                           \
+    constant uint& K [[buffer(4)]],                                           \
+    constant uint& N [[buffer(5)]],                                           \
+    uint2 group [[threadgroup_position_in_grid]],                             \
+    uint2 lane [[thread_position_in_threadgroup]],                            \
+    uint2 threads [[threads_per_threadgroup]])                                \
+{                                                                            \
+    threadgroup float staging[TM * TN];                                      \
+    tensorcrate_gemm_narrow<T, TM, TN, G, TA, TB, ACC>(                      \
+        A, B, C, M, K, N, group, lane.x, threads.x, staging);                \
+}
+
+#define TENSORCRATE_GEMM_NARROW_TILE(PREFIX, T, TILE, TM, TN, G)                          \
+TENSORCRATE_GEMM_NARROW(PREFIX##_##TILE##_nn, T, TM, TN, G, false, false, false)          \
+TENSORCRATE_GEMM_NARROW(PREFIX##_##TILE##_tn, T, TM, TN, G, true, false, false)           \
+TENSORCRATE_GEMM_NARROW(PREFIX##_##TILE##_nt, T, TM, TN, G, false, true, false)           \
+TENSORCRATE_GEMM_NARROW(PREFIX##_##TILE##_nn_acc, T, TM, TN, G, false, false, true)       \
+TENSORCRATE_GEMM_NARROW(PREFIX##_##TILE##_tn_acc, T, TM, TN, G, true, false, true)        \
+TENSORCRATE_GEMM_NARROW(PREFIX##_##TILE##_nt_acc, T, TM, TN, G, false, true, true)
+
+#define TENSORCRATE_GEMM_NARROW_TILES(PREFIX, T)                                \
+TENSORCRATE_GEMM_NARROW_TILE(PREFIX, T, s, 32, 32, 4)                           \
+TENSORCRATE_GEMM_NARROW_TILE(PREFIX, T, m, 64, 32, 2)                           \
+TENSORCRATE_GEMM_NARROW_TILE(PREFIX, T, l, 64, 64, 4)
+
+// Named `gemm_narrow_<type>_<tile>_<operands>`, as the `float` kernels are.
+TENSORCRATE_GEMM_NARROW_TILES(gemm_narrow_f16, half)
+TENSORCRATE_GEMM_NARROW_TILES(gemm_narrow_bf16, bfloat)

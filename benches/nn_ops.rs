@@ -1059,6 +1059,53 @@ fn matmul(bench: &mut Bench) {
             case.row("metal f16 → f16 (pipelined)", Drain::PerBatch, || {
                 ha.matmul(&hb)
             });
+
+            // The products a 16-bit matmul's backward pass runs: `C += Aᵀ·B` and
+            // `C += A·Bᵀ`, read transposed where they lie and accumulated into
+            // `C`. Without TensorOps they are a transpose copy and the tiled
+            // kernel, so the third row is what the matrix units save.
+            use tensorcrate::metal::set_tensorops;
+            use tensorcrate::tensors::Transposed;
+            let zero =
+                || Matrix::from_flat(n, n, vec![half::f16::ZERO; n * n]).to_backend::<Metal>();
+            assert_close_to_scale(
+                "f16 metal Aᵀ·B vs host",
+                &Metal::matmul_transposed_add(&ha, &hb, Transposed::Left, zero())
+                    .to_f32::<Host>()
+                    .flat(),
+                a.transpose().matmul(&b).as_slice(),
+                2e-2,
+            );
+            for (label, transposed) in [
+                ("metal f16 C += Aᵀ·B (pipelined)", Transposed::Left),
+                ("metal f16 C += A·Bᵀ (pipelined)", Transposed::Right),
+            ] {
+                // Accumulating in place, so the timing holds no copy of `C`.
+                let mut acc = Some(zero());
+                case.row(label, Drain::PerBatch, || {
+                    acc = Some(Metal::matmul_transposed_add(
+                        &ha,
+                        &hb,
+                        transposed,
+                        acc.take().unwrap(),
+                    ));
+                });
+            }
+            set_tensorops(false);
+            let mut acc = Some(zero());
+            case.row(
+                "metal f16 C += Aᵀ·B, tiled kernel (pipelined)",
+                Drain::PerBatch,
+                || {
+                    acc = Some(Metal::matmul_transposed_add(
+                        &ha,
+                        &hb,
+                        Transposed::Left,
+                        acc.take().unwrap(),
+                    ));
+                },
+            );
+            set_tensorops(true);
         }
     }
 }

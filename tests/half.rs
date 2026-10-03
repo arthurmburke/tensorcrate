@@ -484,6 +484,54 @@ mod metal {
         );
     }
 
+    /// The backward pass of a product runs `Ā += C̄·Bᵀ` and `B̄ += Aᵀ·C̄` as
+    /// accumulating products over a transposed operand. They must agree with
+    /// the host on the matrix units and on the tiled fallback alike.
+    fn matmul_backward_matches_host<T: MetalElement>() {
+        let mut rng = Lcg(23);
+        for (m, k, n) in [(5usize, 7usize, 3usize), (70, 45, 33), (130, 65, 129)] {
+            let a = Matrix::from_flat(m, k, rng.vector::<T>(m * k, -1.0, 1.0));
+            let b = Matrix::from_flat(k, n, rng.vector::<T>(k * n, -1.0, 1.0));
+            let host_tape = Tape::<Host>::new();
+            let (ha, hb) = (host_tape.matrix(a.clone()), host_tape.matrix(b.clone()));
+            ha.matmul(&hb).sum().backward();
+
+            for tensorops in [true, false] {
+                tensorcrate::metal::set_tensorops(tensorops);
+                let tape = Tape::<Metal>::new();
+                let (ra, rb) = (
+                    tape.matrix(a.to_backend::<Metal>()),
+                    tape.matrix(b.to_backend::<Metal>()),
+                );
+                ra.matmul(&rb).sum().backward();
+                assert!(ra.grad().is_device_resident());
+                // Each gradient is a sum over `n` or `m` products that round
+                // once, so the tolerance grows with the inner dimension.
+                let ulps = 8.0 + (m.max(n) as f64).sqrt();
+                let what = format!("{m}×{k}×{n}, tensorops {tensorops}");
+                close(
+                    ra.grad().as_slice(),
+                    ha.grad().data(),
+                    ulps,
+                    &format!("Ā {what}"),
+                );
+                close(
+                    rb.grad().as_slice(),
+                    hb.grad().data(),
+                    ulps,
+                    &format!("B̄ {what}"),
+                );
+            }
+        }
+        tensorcrate::metal::set_tensorops(true);
+    }
+
+    #[test]
+    fn half_precision_matmul_backward_matches_the_host() {
+        matmul_backward_matches_host::<f16>();
+        matmul_backward_matches_host::<bf16>();
+    }
+
     #[test]
     fn half_precision_stacking_stays_on_the_device() {
         let value = |x: f64| f16::from_f64(x);
