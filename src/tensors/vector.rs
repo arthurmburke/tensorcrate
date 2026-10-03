@@ -1,9 +1,11 @@
 //! [`Vector`]: a one-dimensional tensor whose length is a runtime value.
 
+use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::fmt::{self, Display};
 use std::ops::Index;
 
+use super::matrix::{Block, assemble_blocks};
 use super::order::{ordered_max, ordered_min};
 use super::shape::{assert_inner, assert_ordered_bounds, assert_same_len};
 #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
@@ -15,14 +17,14 @@ use crate::numbers::{Coefficient, Real};
 /// default [`Host`] backend.
 pub struct Vector<T, B: Backend = Host> {
     len: usize,
-    data: B::Vector<T>,
+    data: B::Storage<T>,
 }
 
 // The storage type varies with the backend, so these are the derives written by
 // hand: which of them a tensor gets depends on what its storage supports.
 impl<T, B: Backend> Clone for Vector<T, B>
 where
-    B::Vector<T>: Clone,
+    B::Storage<T>: Clone,
 {
     fn clone(&self) -> Self {
         Vector {
@@ -34,18 +36,18 @@ where
 
 impl<T, B: Backend> PartialEq for Vector<T, B>
 where
-    B::Vector<T>: PartialEq,
+    B::Storage<T>: PartialEq,
 {
     fn eq(&self, other: &Self) -> bool {
         self.len == other.len && self.data == other.data
     }
 }
 
-impl<T, B: Backend> Eq for Vector<T, B> where B::Vector<T>: Eq {}
+impl<T, B: Backend> Eq for Vector<T, B> where B::Storage<T>: Eq {}
 
 impl<T, B: Backend> fmt::Debug for Vector<T, B>
 where
-    B::Vector<T>: fmt::Debug,
+    B::Storage<T>: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Vector")
@@ -98,43 +100,43 @@ impl<T: Copy + 'static, B: Backend> Vector<T, B> {
     pub fn filled(len: usize, value: T) -> Self {
         Vector {
             len,
-            data: B::store_vector(&vec![value; len]),
+            data: B::store(&vec![value; len]),
         }
     }
 
     /// Borrow the elements as a slice, without copying.
     pub fn as_slice(&self) -> &[T] {
-        B::vector_slice(&self.data)
+        B::as_slice(&self.data)
     }
 
     /// Build from values on backend `B`. The length is the slice's.
     pub(crate) fn build(values: &[T]) -> Self {
         Vector {
             len: values.len(),
-            data: B::store_vector(values),
+            data: B::store(values),
         }
     }
 
     /// Attach a length to storage that already holds exactly that many values —
     /// how a tensor is rebuilt from the result of a kernel dispatch.
-    pub(crate) fn from_storage(len: usize, data: B::Vector<T>) -> Self {
+    pub(crate) fn from_storage(len: usize, data: B::Storage<T>) -> Self {
         Vector { len, data }
     }
 
     /// The backend storage itself, which the kernels hand straight to a
     /// dispatch.
-    pub(crate) fn storage(&self) -> &B::Vector<T> {
+    pub(crate) fn storage(&self) -> &B::Storage<T> {
         &self.data
     }
 
     /// The backend storage itself, for a dispatch that accumulates in place.
-    pub(crate) fn storage_mut(&mut self) -> &mut B::Vector<T> {
+    pub(crate) fn storage_mut(&mut self) -> &mut B::Storage<T> {
         &mut self.data
     }
 
     /// Consume this vector and take its storage, which is how a reshape moves
     /// the elements instead of copying them.
-    pub(crate) fn into_storage(self) -> B::Vector<T> {
+    pub(crate) fn into_storage(self) -> B::Storage<T> {
         self.data
     }
 
@@ -143,12 +145,110 @@ impl<T: Copy + 'static, B: Backend> Vector<T, B> {
         self.as_slice().to_vec()
     }
 
+    /// Vectors as the rows of a matrix, in order. Every vector must have the
+    /// same length.
+    ///
+    /// ```
+    /// use tensorcrate::tensors::{Matrix, Vector};
+    ///
+    /// let a = Vector::new([1.0f32, 2.0]);
+    /// let b = Vector::new([3.0f32, 4.0]);
+    /// assert_eq!(Vector::vstack([&a, &b]), Matrix::from_rows([[1.0, 2.0], [3.0, 4.0]]));
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// If there are no vectors, or their lengths differ.
+    #[track_caller]
+    pub fn vstack<V: Borrow<Self>>(parts: impl IntoIterator<Item = V>) -> Matrix<T, B> {
+        let parts = parts.into_iter().collect::<Vec<_>>();
+        let first = parts
+            .first()
+            .unwrap_or_else(|| panic!("vstack: there are no vectors to stack"))
+            .borrow();
+        Self::stack_rows(first.len, &parts)
+    }
+
+    /// Vectors as the columns of a matrix, in order. Every vector must have
+    /// the same length.
+    ///
+    /// ```
+    /// use tensorcrate::tensors::{Matrix, Vector};
+    ///
+    /// let a = Vector::new([1.0f32, 2.0]);
+    /// let b = Vector::new([3.0f32, 4.0]);
+    /// assert_eq!(Vector::hstack([&a, &b]), Matrix::from_rows([[1.0, 3.0], [2.0, 4.0]]));
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// If there are no vectors, or their lengths differ.
+    #[track_caller]
+    pub fn hstack<V: Borrow<Self>>(parts: impl IntoIterator<Item = V>) -> Matrix<T, B> {
+        let parts = parts.into_iter().collect::<Vec<_>>();
+        let first = parts
+            .first()
+            .unwrap_or_else(|| panic!("hstack: there are no vectors to stack"))
+            .borrow();
+        Self::stack_columns(first.len, &parts)
+    }
+
+    /// [`vstack`](Self::vstack) of vectors of `len` elements, of which there
+    /// may be none.
+    #[track_caller]
+    pub(crate) fn stack_rows<V: Borrow<Self>>(len: usize, parts: &[V]) -> Matrix<T, B> {
+        let blocks = parts
+            .iter()
+            .enumerate()
+            .map(|(row, part)| {
+                let part = part.borrow();
+                assert_eq!(
+                    part.len, len,
+                    "vstack: vectors of {len} and {} elements differ in length",
+                    part.len
+                );
+                Block {
+                    source: &part.data,
+                    shape: (1, len),
+                    at: (row, 0),
+                }
+            })
+            .collect::<Vec<_>>();
+        let rows = parts.len();
+        Matrix::from_storage(rows, len, assemble_blocks::<T, B>((rows, len), &blocks))
+    }
+
+    /// [`hstack`](Self::hstack) of vectors of `len` elements, of which there
+    /// may be none.
+    #[track_caller]
+    pub(crate) fn stack_columns<V: Borrow<Self>>(len: usize, parts: &[V]) -> Matrix<T, B> {
+        let blocks = parts
+            .iter()
+            .enumerate()
+            .map(|(column, part)| {
+                let part = part.borrow();
+                assert_eq!(
+                    part.len, len,
+                    "hstack: vectors of {len} and {} elements differ in length",
+                    part.len
+                );
+                Block {
+                    source: &part.data,
+                    shape: (len, 1),
+                    at: (0, column),
+                }
+            })
+            .collect::<Vec<_>>();
+        let cols = parts.len();
+        Matrix::from_storage(len, cols, assemble_blocks::<T, B>((len, cols), &blocks))
+    }
+
     /// Consume this vector and view its elements as a `1 × len` row matrix.
     ///
     /// On the Metal backend this only changes the recorded shape; the existing
     /// allocation is reused without a copy or kernel dispatch.
     pub fn into_row_matrix(self) -> Matrix<T, B> {
-        Matrix::from_storage(1, self.len, B::vector_into_matrix(self.data))
+        Matrix::from_storage(1, self.len, self.data)
     }
 
     /// Consume this vector and view its elements as a `len × 1` column matrix.
@@ -156,7 +256,7 @@ impl<T: Copy + 'static, B: Backend> Vector<T, B> {
     /// As with [`into_row_matrix`](Self::into_row_matrix), Metal reuses the
     /// existing allocation.
     pub fn into_column_matrix(self) -> Matrix<T, B> {
-        Matrix::from_storage(self.len, 1, B::vector_into_matrix(self.data))
+        Matrix::from_storage(self.len, 1, self.data)
     }
 }
 
@@ -168,7 +268,7 @@ impl<T: Real, B: Backend> Vector<T, B> {
             .collect::<Vec<_>>();
         Vector {
             len,
-            data: B::store_vector(&values),
+            data: B::store(&values),
         }
     }
 }

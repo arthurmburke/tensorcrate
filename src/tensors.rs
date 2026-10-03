@@ -47,7 +47,8 @@
 //! read in place through a shape, strides and an offset. A view becomes a
 //! tensor of its own with [`TensorView::contiguous`], one strided copy on the
 //! tensor's backend; [`Tensor::concat`] and [`Tensor::stack`] assemble their
-//! result from views the same way, and [`Tensor::write_slice`] writes one into
+//! result from views the same way — as do [`Matrix::vstack`], [`Matrix::hstack`],
+//! [`Vector::vstack`] and [`Vector::hstack`] — and [`Tensor::write_slice`] writes one into
 //! part of an existing tensor in place.
 //!
 //! The elementwise arithmetic, analytic functions and comparisons of

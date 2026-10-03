@@ -1,12 +1,14 @@
 //! [`Matrix`]: a two-dimensional, row-major tensor whose shape is a runtime
 //! value.
 
+use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::fmt::{self, Display};
 use std::ops::Index;
 
 #[cfg(target_os = "macos")]
 use super::accelerate_dispatch;
+use super::backend::{Region, Strided};
 use super::order::{ordered_max, ordered_min};
 use super::shape::{assert_inner, assert_ordered_bounds, assert_same_len, assert_same_shape};
 #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
@@ -20,14 +22,14 @@ use crate::numbers::{Coefficient, Real};
 pub struct Matrix<T, B: Backend = Host> {
     rows: usize,
     cols: usize,
-    data: B::Matrix<T>,
+    data: B::Storage<T>,
 }
 
 // As for `Vector`: hand-written derives, because the storage type — and so which
 // of these a tensor gets — depends on the backend.
 impl<T, B: Backend> Clone for Matrix<T, B>
 where
-    B::Matrix<T>: Clone,
+    B::Storage<T>: Clone,
 {
     fn clone(&self) -> Self {
         Matrix {
@@ -40,18 +42,18 @@ where
 
 impl<T, B: Backend> PartialEq for Matrix<T, B>
 where
-    B::Matrix<T>: PartialEq,
+    B::Storage<T>: PartialEq,
 {
     fn eq(&self, other: &Self) -> bool {
         self.shape() == other.shape() && self.data == other.data
     }
 }
 
-impl<T, B: Backend> Eq for Matrix<T, B> where B::Matrix<T>: Eq {}
+impl<T, B: Backend> Eq for Matrix<T, B> where B::Storage<T>: Eq {}
 
 impl<T, B: Backend> fmt::Debug for Matrix<T, B>
 where
-    B::Matrix<T>: fmt::Debug,
+    B::Storage<T>: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Matrix")
@@ -100,9 +102,7 @@ impl<T: Copy + 'static, B: Backend> Matrix<T, B> {
         Matrix {
             rows: self.rows,
             cols: self.cols,
-            data: B2::vector_into_matrix(super::backend::transfer::<T, B, B2>(
-                B::matrix_as_vector(&self.data),
-            )),
+            data: super::backend::transfer::<T, B, B2>(&self.data),
         }
     }
 
@@ -112,13 +112,114 @@ impl<T: Copy + 'static, B: Backend> Matrix<T, B> {
         Matrix {
             rows,
             cols,
-            data: B::store_matrix(&vec![value; rows * cols]),
+            data: B::store(&vec![value; rows * cols]),
         }
     }
 
     /// Borrow the elements as one flat row-major slice, without copying.
     pub fn as_slice(&self) -> &[T] {
-        B::matrix_slice(&self.data)
+        B::as_slice(&self.data)
+    }
+
+    /// Matrices placed one above the other: the rows of each, in order. Every
+    /// matrix must have the same number of columns.
+    ///
+    /// Each is read in place and copied once into the result, on the matrices'
+    /// backend — a single GPU dispatch on `Metal`.
+    ///
+    /// ```
+    /// use tensorcrate::tensors::Matrix;
+    ///
+    /// let top = Matrix::<f32>::from_rows([[1.0, 2.0]]);
+    /// let bottom = Matrix::<f32>::from_rows([[3.0, 4.0], [5.0, 6.0]]);
+    /// assert_eq!(
+    ///     Matrix::vstack([&top, &bottom]),
+    ///     Matrix::from_rows([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]),
+    /// );
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// If there are no matrices, or two of them differ in their column count.
+    #[track_caller]
+    pub fn vstack<M: Borrow<Self>>(parts: impl IntoIterator<Item = M>) -> Self {
+        let parts = parts.into_iter().collect::<Vec<_>>();
+        let first = parts
+            .first()
+            .unwrap_or_else(|| panic!("vstack: there are no matrices to stack"))
+            .borrow();
+        let cols = first.cols;
+        let mut rows = 0;
+        let blocks = parts
+            .iter()
+            .map(|part| {
+                let part = part.borrow();
+                assert_eq!(
+                    part.cols,
+                    cols,
+                    "vstack: shapes {:?} and {:?} differ in their columns",
+                    first.shape(),
+                    part.shape()
+                );
+                let block = Block {
+                    source: &part.data,
+                    shape: part.shape(),
+                    at: (rows, 0),
+                };
+                rows += part.rows;
+                block
+            })
+            .collect::<Vec<_>>();
+        Self::from_storage(rows, cols, assemble_blocks::<T, B>((rows, cols), &blocks))
+    }
+
+    /// Matrices placed side by side: the columns of each, in order. Every
+    /// matrix must have the same number of rows.
+    ///
+    /// ```
+    /// use tensorcrate::tensors::Matrix;
+    ///
+    /// let left = Matrix::<f32>::from_rows([[1.0], [2.0]]);
+    /// let right = Matrix::<f32>::from_rows([[3.0, 4.0], [5.0, 6.0]]);
+    /// assert_eq!(
+    ///     Matrix::hstack([&left, &right]),
+    ///     Matrix::from_rows([[1.0, 3.0, 4.0], [2.0, 5.0, 6.0]]),
+    /// );
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// If there are no matrices, or two of them differ in their row count.
+    #[track_caller]
+    pub fn hstack<M: Borrow<Self>>(parts: impl IntoIterator<Item = M>) -> Self {
+        let parts = parts.into_iter().collect::<Vec<_>>();
+        let first = parts
+            .first()
+            .unwrap_or_else(|| panic!("hstack: there are no matrices to stack"))
+            .borrow();
+        let rows = first.rows;
+        let mut cols = 0;
+        let blocks = parts
+            .iter()
+            .map(|part| {
+                let part = part.borrow();
+                assert_eq!(
+                    part.rows,
+                    rows,
+                    "hstack: shapes {:?} and {:?} differ in their rows",
+                    first.shape(),
+                    part.shape()
+                );
+                let block = Block {
+                    source: &part.data,
+                    shape: part.shape(),
+                    at: (0, cols),
+                };
+                cols += part.cols;
+                block
+            })
+            .collect::<Vec<_>>();
+        Self::from_storage(rows, cols, assemble_blocks::<T, B>((rows, cols), &blocks))
     }
 
     /// Build from typed row-major values on backend `B`.
@@ -127,32 +228,80 @@ impl<T: Copy + 'static, B: Backend> Matrix<T, B> {
         Matrix {
             rows,
             cols,
-            data: B::store_matrix(values),
+            data: B::store(values),
         }
     }
 
     /// Attach a shape to storage that already holds exactly `rows * cols`
     /// values — how a tensor is rebuilt from the result of a kernel dispatch.
-    pub(crate) fn from_storage(rows: usize, cols: usize, data: B::Matrix<T>) -> Self {
+    pub(crate) fn from_storage(rows: usize, cols: usize, data: B::Storage<T>) -> Self {
         Matrix { rows, cols, data }
     }
 
     /// The backend storage itself, which the kernels hand straight to a
     /// dispatch.
-    pub(crate) fn storage(&self) -> &B::Matrix<T> {
+    pub(crate) fn storage(&self) -> &B::Storage<T> {
         &self.data
     }
 
     /// The backend storage itself, for a dispatch that accumulates in place.
-    pub(crate) fn storage_mut(&mut self) -> &mut B::Matrix<T> {
+    pub(crate) fn storage_mut(&mut self) -> &mut B::Storage<T> {
         &mut self.data
     }
 
     /// Consume this matrix and take its storage, which is how a reshape moves
     /// the elements instead of copying them.
-    pub(crate) fn into_storage(self) -> B::Matrix<T> {
+    pub(crate) fn into_storage(self) -> B::Storage<T> {
         self.data
     }
+}
+
+/// A `shape`-d matrix of `source`, to be copied into a larger one with its
+/// first element at `at`.
+pub(super) struct Block<'a, S> {
+    pub(super) source: &'a S,
+    pub(super) shape: (usize, usize),
+    pub(super) at: (usize, usize),
+}
+
+/// The row-major `rows × cols` storage made by copying each block to its place:
+/// one strided region per block, so the backend runs one copy for each.
+///
+/// The blocks are expected to cover the result, as for [`Backend::assemble`].
+pub(super) fn assemble_blocks<T: Copy + 'static, B: Backend>(
+    (rows, cols): (usize, usize),
+    blocks: &[Block<'_, B::Storage<T>>],
+) -> B::Storage<T> {
+    // A region borrows its shape and strides, so they are laid out first.
+    let layouts = blocks
+        .iter()
+        .map(|block| {
+            let (block_rows, block_cols) = block.shape;
+            (
+                [block_rows, block_cols],
+                [block_cols, 1],
+                block.at.0 * cols + block.at.1,
+            )
+        })
+        .collect::<Vec<_>>();
+    let into = [cols, 1];
+    let regions = blocks
+        .iter()
+        .zip(&layouts)
+        .map(|(block, (shape, from, offset))| Region {
+            source: block.source,
+            shape,
+            from: Strided {
+                offset: 0,
+                strides: from,
+            },
+            to: Strided {
+                offset: *offset,
+                strides: &into,
+            },
+        })
+        .collect::<Vec<_>>();
+    B::assemble(rows * cols, &regions)
 }
 
 impl<T> Matrix<T, Host> {

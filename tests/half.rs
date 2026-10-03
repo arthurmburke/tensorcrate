@@ -486,25 +486,17 @@ mod metal {
 
     #[test]
     fn half_precision_stacking_stays_on_the_device() {
-        use tensorcrate::tensors::Backend;
-
         let value = |x: f64| f16::from_f64(x);
         let rows = [
-            Metal::store_vector(&[value(1.0), value(2.0)]),
-            Metal::store_vector(&[value(3.0), value(4.0)]),
+            Vector::new([value(1.0), value(2.0)]).to_backend::<Metal>(),
+            Vector::new([value(3.0), value(4.0)]).to_backend::<Metal>(),
         ];
-        let stacked = Metal::vstack(&rows, 2);
+        let stacked = Vector::vstack(&rows);
         assert!(stacked.is_device_resident());
-        assert_eq!(
-            Metal::matrix_slice(&stacked),
-            [1.0, 2.0, 3.0, 4.0].map(value)
-        );
-        let columns = Metal::hstack(&rows, 2);
+        assert_eq!(stacked.as_slice(), [1.0, 2.0, 3.0, 4.0].map(value));
+        let columns = Vector::hstack(&rows);
         assert!(columns.is_device_resident());
-        assert_eq!(
-            Metal::matrix_slice(&columns),
-            [1.0, 3.0, 2.0, 4.0].map(value)
-        );
+        assert_eq!(columns.as_slice(), [1.0, 3.0, 2.0, 4.0].map(value));
     }
 
     /// The resident results above could in principle have been computed on the

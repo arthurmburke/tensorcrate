@@ -15,7 +15,6 @@ use crate::tensors::layout::{Split, coalesce, reach};
 use crate::tensors::{Analytic, Axis, BinaryOp, Compare, Family, MAX_RANK, Reduce, Statistic};
 
 use super::MetalElement;
-use super::buffer::MetalBuffer;
 use super::device::{Gpu, Operands, Tile};
 use super::sync::{blit, compute, queued};
 
@@ -811,75 +810,6 @@ pub(super) fn encode_broadcast<T: MetalElement>(
     queued(gpu, len)
 }
 
-pub(super) fn encode_stack<T: MetalElement>(
-    gpu: &Gpu,
-    inputs: &[&MetalBuffer<T>],
-    output: &ProtocolObject<dyn MTLBuffer>,
-    vector_len: usize,
-    output_stride: usize,
-    offset: impl Fn(usize) -> usize,
-) -> Option<()> {
-    let count = u32::try_from(vector_len).ok()?;
-    let output_stride = u32::try_from(output_stride).ok()?;
-    let offsets = (0..inputs.len())
-        .map(|index| u32::try_from(offset(index)).ok())
-        .collect::<Option<Vec<_>>>()?;
-
-    let encoder = compute(gpu)?;
-    encoder.setComputePipelineState(&gpu.kernels::<T>().stack_vector);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
-        encoder.setBytes_length_atIndex(NonNull::from(&count).cast(), 4, 2);
-        encoder.setBytes_length_atIndex(NonNull::from(&output_stride).cast(), 4, 4);
-    }
-    for (input, offset) in inputs.iter().zip(&offsets) {
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(&input.raw), 0, 0);
-            encoder.setBytes_length_atIndex(NonNull::from(offset).cast(), 4, 3);
-        }
-        dispatch_1d(&encoder, vector_len);
-    }
-    queued(gpu, vector_len * inputs.len())
-}
-
-pub(super) fn encode_concat<T: MetalElement>(
-    gpu: &Gpu,
-    left: &ProtocolObject<dyn MTLBuffer>,
-    right: &ProtocolObject<dyn MTLBuffer>,
-    output: &ProtocolObject<dyn MTLBuffer>,
-    rows: usize,
-    left_cols: usize,
-    right_cols: usize,
-) -> Option<()> {
-    let rows_u32 = u32::try_from(rows).ok()?;
-    let left_cols_u32 = u32::try_from(left_cols).ok()?;
-    let right_cols_u32 = u32::try_from(right_cols).ok()?;
-    let output_cols = left_cols.checked_add(right_cols)?;
-
-    let encoder = compute(gpu)?;
-    encoder.setComputePipelineState(&gpu.kernels::<T>().concat_horizontal);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(left), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(right), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(output), 0, 2);
-        encoder.setBytes_length_atIndex(NonNull::from(&rows_u32).cast(), 4, 3);
-        encoder.setBytes_length_atIndex(NonNull::from(&left_cols_u32).cast(), 4, 4);
-        encoder.setBytes_length_atIndex(NonNull::from(&right_cols_u32).cast(), 4, 5);
-    }
-    let groups = MTLSize {
-        width: output_cols.div_ceil(TILE),
-        height: rows.div_ceil(TILE),
-        depth: 1,
-    };
-    let per_group = MTLSize {
-        width: TILE,
-        height: TILE,
-        depth: 1,
-    };
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, per_group);
-    queued(gpu, rows * output_cols)
-}
-
 /// Copy `bytes` from the front of `source` to the front of `destination` on the
 /// GPU timeline, so it waits for whatever is still writing `source` without the
 /// CPU having to.
@@ -900,102 +830,6 @@ pub(super) fn encode_copy(
         );
     }
     queued(gpu, bytes / 4)
-}
-
-pub(super) fn encode_matrix_stack<T: MetalElement>(
-    gpu: &Gpu,
-    top: &ProtocolObject<dyn MTLBuffer>,
-    bottom: &ProtocolObject<dyn MTLBuffer>,
-    output: &ProtocolObject<dyn MTLBuffer>,
-    top_len: usize,
-    bottom_len: usize,
-) -> Option<()> {
-    let top_bytes = top_len.checked_mul(size_of::<T>())?;
-    let bottom_bytes = bottom_len.checked_mul(size_of::<T>())?;
-    let encoder = blit(gpu)?;
-    unsafe {
-        if top_bytes != 0 {
-            encoder.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
-                top, 0, output, 0, top_bytes,
-            );
-        }
-        if bottom_bytes != 0 {
-            encoder.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
-                bottom,
-                0,
-                output,
-                top_bytes,
-                bottom_bytes,
-            );
-        }
-    }
-    queued(gpu, (top_bytes + bottom_bytes) / 4)
-}
-
-pub(super) fn encode_hmerge<T: MetalElement>(
-    gpu: &Gpu,
-    inputs: &[&MetalBuffer<T>],
-    output: &ProtocolObject<dyn MTLBuffer>,
-    rows: usize,
-    cols: usize,
-) -> Option<()> {
-    let rows_u32 = u32::try_from(rows).ok()?;
-    let cols_u32 = u32::try_from(cols).ok()?;
-    let output_cols = cols.checked_mul(inputs.len())?;
-    let output_cols_u32 = u32::try_from(output_cols).ok()?;
-    let offsets = (0..inputs.len())
-        .map(|index| u32::try_from(index.checked_mul(cols)?).ok())
-        .collect::<Option<Vec<_>>>()?;
-
-    let encoder = compute(gpu)?;
-    encoder.setComputePipelineState(&gpu.kernels::<T>().merge_horizontal);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
-        encoder.setBytes_length_atIndex(NonNull::from(&rows_u32).cast(), 4, 2);
-        encoder.setBytes_length_atIndex(NonNull::from(&cols_u32).cast(), 4, 3);
-        encoder.setBytes_length_atIndex(NonNull::from(&output_cols_u32).cast(), 4, 4);
-    }
-    let groups = MTLSize {
-        width: cols.div_ceil(TILE),
-        height: rows.div_ceil(TILE),
-        depth: 1,
-    };
-    let per_group = MTLSize {
-        width: TILE,
-        height: TILE,
-        depth: 1,
-    };
-    for (input, offset) in inputs.iter().zip(&offsets) {
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(&input.raw), 0, 0);
-            encoder.setBytes_length_atIndex(NonNull::from(offset).cast(), 4, 5);
-        }
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, per_group);
-    }
-    queued(gpu, rows * output_cols)
-}
-
-pub(super) fn encode_vmerge<T: MetalElement>(
-    gpu: &Gpu,
-    inputs: &[&MetalBuffer<T>],
-    output: &ProtocolObject<dyn MTLBuffer>,
-    matrix_len: usize,
-) -> Option<()> {
-    let matrix_bytes = matrix_len.checked_mul(size_of::<T>())?;
-    let encoder = blit(gpu)?;
-    for (index, input) in inputs.iter().enumerate() {
-        let destination_offset = index.checked_mul(matrix_bytes)?;
-        unsafe {
-            encoder.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
-                &input.raw,
-                0,
-                output,
-                destination_offset,
-                matrix_bytes,
-            );
-        }
-    }
-    queued(gpu, matrix_bytes / 4 * inputs.len())
 }
 
 /// The first round of a deviation fold: one partial per threadgroup.
