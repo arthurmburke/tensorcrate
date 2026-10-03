@@ -8,7 +8,7 @@
 use half::{bf16, f16};
 use tensorcrate::optim::{AdaGrad, Adam, Momentum, Parameter, RmsProp, Rule, Sgd};
 use tensorcrate::tensors::fused::{
-    self, Algebra, Builder, DType, Fusable, Instr, Mode, Program, ProgramError, Remap, Value,
+    self, Algebra, Builder, DType, Fusable, Instr, Mode, Program, ProgramError, Remap, FusedValue,
 };
 use tensorcrate::tensors::{Analytic, BinaryOp, Compare, Host, Kernels, Matrix, Vector};
 
@@ -309,9 +309,9 @@ const BINARIES: [BinaryOp; 5] = [
 fn random_program(rng: &mut Lcg, inputs: usize, outputs: usize, metal: bool) -> Program {
     loop {
         let mut b = Builder::new();
-        let mut values: Vec<Value> = (0..inputs).map(|_| b.input(DType::F32)).collect();
+        let mut values: Vec<FusedValue> = (0..inputs).map(|_| b.input(DType::F32)).collect();
         for _ in 0..rng.below(24) + 2 {
-            let pick = |rng: &mut Lcg, values: &[Value]| values[rng.below(values.len())];
+            let pick = |rng: &mut Lcg, values: &[FusedValue]| values[rng.below(values.len())];
             let value = match rng.below(10) {
                 0 => b.constant(rng.uniform(-2.0, 2.0)),
                 1 | 2 => {
@@ -862,8 +862,8 @@ fn the_builder_reuses_registers_once_values_die() {
     // other one, so all seventeen are live at once and cannot fit.
     let build = |algebra: Algebra| {
         let mut b = Builder::<f32>::new();
-        let inputs: Vec<Value> = (0..16).map(|_| b.input(DType::F32)).collect();
-        let mut values: Vec<Value> = inputs.iter().map(|&x| b.unary(Analytic::Sqrt, x)).collect();
+        let inputs: Vec<FusedValue> = (0..16).map(|_| b.input(DType::F32)).collect();
+        let mut values: Vec<FusedValue> = inputs.iter().map(|&x| b.unary(Analytic::Sqrt, x)).collect();
         let both = b.mul(inputs[0], inputs[1]);
         values.push(b.unary(Analytic::Sqrt, both));
         let mut sum = values[0];

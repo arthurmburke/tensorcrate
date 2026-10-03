@@ -1129,7 +1129,7 @@ impl<T: Real + fmt::Debug> fmt::Display for Program<T> {
 
 /// A value inside a [`Builder`]: written once, read any number of times.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Value(usize);
+pub struct FusedValue(usize);
 
 #[derive(Copy, Clone, Debug)]
 enum Node<T> {
@@ -1137,9 +1137,9 @@ enum Node<T> {
     Const(T),
     /// Uniform number `k`, in declaration order.
     Uniform(usize),
-    Binary(BinaryOp, Value, Value),
-    Unary(Analytic, Value),
-    Cmp(Compare, Value, Value),
+    Binary(BinaryOp, FusedValue, FusedValue),
+    Unary(Analytic, FusedValue),
+    Cmp(Compare, FusedValue, FusedValue),
 }
 
 /// Assembles a [`Program`] from single-assignment values, allocating registers.
@@ -1156,9 +1156,9 @@ enum Node<T> {
 pub struct Builder<T = f32> {
     nodes: Vec<Node<T>>,
     inputs: Vec<DType>,
-    updates: Vec<(DType, Option<Value>)>,
-    outputs: Vec<(DType, Value)>,
-    loads: Vec<((u8, Remap), Value)>,
+    updates: Vec<(DType, Option<FusedValue>)>,
+    outputs: Vec<(DType, FusedValue)>,
+    loads: Vec<((u8, Remap), FusedValue)>,
     /// Each uniform's initial value, in declaration order.
     uniforms: Vec<T>,
     /// The row statistics the program reads, in declaration order: the input
@@ -1185,20 +1185,20 @@ impl<T: Real> Builder<T> {
         Self::default()
     }
 
-    fn push(&mut self, node: Node<T>) -> Value {
+    fn push(&mut self, node: Node<T>) -> FusedValue {
         self.nodes.push(node);
-        Value(self.nodes.len() - 1)
+        FusedValue(self.nodes.len() - 1)
     }
 
     /// Declare a read-only input and load it unremapped.
     ///
     /// Inputs are numbered in declaration order.
-    pub fn input(&mut self, dtype: DType) -> Value {
+    pub fn input(&mut self, dtype: DType) -> FusedValue {
         self.input_remapped(dtype, Remap::Identity)
     }
 
     /// Declare a read-only input read through `remap`.
-    pub fn input_remapped(&mut self, dtype: DType, remap: Remap) -> Value {
+    pub fn input_remapped(&mut self, dtype: DType, remap: Remap) -> FusedValue {
         self.inputs.push(dtype);
         let slot = (self.inputs.len() - 1) as u8;
         self.load(slot, remap)
@@ -1242,7 +1242,7 @@ impl<T: Real> Builder<T> {
     ///
     /// If `input` is not an input read without a remap.
     #[track_caller]
-    pub fn row_statistic(&mut self, input: Value, statistic: RowStatistic) -> Value {
+    pub fn row_statistic(&mut self, input: FusedValue, statistic: RowStatistic) -> FusedValue {
         let slot = self
             .loads
             .iter()
@@ -1263,7 +1263,7 @@ impl<T: Real> Builder<T> {
     }
 
     /// Declare a tensor updated in place and return its current value.
-    pub fn update(&mut self, dtype: DType) -> Value {
+    pub fn update(&mut self, dtype: DType) -> FusedValue {
         self.updates.push((dtype, None));
         // The final slot number is only known once every input is declared, so
         // update slots are numbered from the top of the range and renumbered in
@@ -1274,17 +1274,17 @@ impl<T: Real> Builder<T> {
 
     /// Give in-place tensor `index` (in [`update`](Self::update) order) its
     /// new value.
-    pub fn set(&mut self, index: usize, value: Value) {
+    pub fn set(&mut self, index: usize, value: FusedValue) {
         self.updates[index].1 = Some(value);
     }
 
     /// Store `value` to a fresh output of type `dtype`. Outputs are numbered in
     /// declaration order, after the in-place tensors.
-    pub fn output(&mut self, value: Value, dtype: DType) {
+    pub fn output(&mut self, value: FusedValue, dtype: DType) {
         self.outputs.push((dtype, value));
     }
 
-    fn load(&mut self, slot: u8, remap: Remap) -> Value {
+    fn load(&mut self, slot: u8, remap: Remap) -> FusedValue {
         if let Some(&(_, value)) = self.loads.iter().find(|(key, _)| *key == (slot, remap)) {
             return value;
         }
@@ -1293,7 +1293,7 @@ impl<T: Real> Builder<T> {
         value
     }
 
-    pub fn constant(&mut self, value: T) -> Value {
+    pub fn constant(&mut self, value: T) -> FusedValue {
         self.push(Node::Const(value))
     }
 
@@ -1308,49 +1308,49 @@ impl<T: Real> Builder<T> {
     /// into the program's constants, so it runs once per
     /// [`set_uniform`](Program::set_uniform), in the program's element type,
     /// rather than once per element.
-    pub fn uniform(&mut self, value: T) -> Value {
+    pub fn uniform(&mut self, value: T) -> FusedValue {
         self.uniforms.push(value);
         let index = self.uniforms.len() - 1;
         self.push(Node::Uniform(index))
     }
 
-    pub fn binary(&mut self, op: BinaryOp, a: Value, b: Value) -> Value {
+    pub fn binary(&mut self, op: BinaryOp, a: FusedValue, b: FusedValue) -> FusedValue {
         self.push(Node::Binary(op, a, b))
     }
 
-    pub fn add(&mut self, a: Value, b: Value) -> Value {
+    pub fn add(&mut self, a: FusedValue, b: FusedValue) -> FusedValue {
         self.binary(BinaryOp::Add, a, b)
     }
 
-    pub fn sub(&mut self, a: Value, b: Value) -> Value {
+    pub fn sub(&mut self, a: FusedValue, b: FusedValue) -> FusedValue {
         self.binary(BinaryOp::Sub, a, b)
     }
 
-    pub fn mul(&mut self, a: Value, b: Value) -> Value {
+    pub fn mul(&mut self, a: FusedValue, b: FusedValue) -> FusedValue {
         self.binary(BinaryOp::Mul, a, b)
     }
 
-    pub fn div(&mut self, a: Value, b: Value) -> Value {
+    pub fn div(&mut self, a: FusedValue, b: FusedValue) -> FusedValue {
         self.binary(BinaryOp::Div, a, b)
     }
 
     /// `a · factor`, the fused form of a scalar broadcast.
-    pub fn scale(&mut self, a: Value, factor: T) -> Value {
+    pub fn scale(&mut self, a: FusedValue, factor: T) -> FusedValue {
         let factor = self.constant(factor);
         self.mul(a, factor)
     }
 
     /// `a + offset`.
-    pub fn shift(&mut self, a: Value, offset: T) -> Value {
+    pub fn shift(&mut self, a: FusedValue, offset: T) -> FusedValue {
         let offset = self.constant(offset);
         self.add(a, offset)
     }
 
-    pub fn unary(&mut self, op: Analytic, a: Value) -> Value {
+    pub fn unary(&mut self, op: Analytic, a: FusedValue) -> FusedValue {
         self.push(Node::Unary(op, a))
     }
 
-    pub fn compare(&mut self, op: Compare, a: Value, b: Value) -> Value {
+    pub fn compare(&mut self, op: Compare, a: FusedValue, b: FusedValue) -> FusedValue {
         self.push(Node::Cmp(op, a, b))
     }
 
@@ -1401,7 +1401,7 @@ impl<T: Real> Builder<T> {
         };
 
         // Stores, in-place tensors first.
-        let mut stores: Vec<(Value, u8)> = Vec::new();
+        let mut stores: Vec<(FusedValue, u8)> = Vec::new();
         for (index, (_, value)) in self.updates.iter().enumerate() {
             let Some(value) = *value else {
                 return Err(ProgramError::OutputNotStoredOnce {

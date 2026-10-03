@@ -1063,12 +1063,12 @@ impl<P: Parameter> Rule<P> for Adam<P> {
 /// `p − rate · g / (√s + ε)`, the step the adaptive rules share.
 fn descend<T: Real>(
     b: &mut Builder<T>,
-    p: crate::tensors::fused::Value,
-    g: crate::tensors::fused::Value,
-    scale: crate::tensors::fused::Value,
+    p: crate::tensors::fused::FusedValue,
+    g: crate::tensors::fused::FusedValue,
+    scale: crate::tensors::fused::FusedValue,
     epsilon: T,
     rate: T,
-) -> crate::tensors::fused::Value {
+) -> crate::tensors::fused::FusedValue {
     let root = b.unary(Analytic::Sqrt, scale);
     let denominator = b.shift(root, epsilon);
     let step = b.div(g, denominator);

@@ -500,7 +500,7 @@ macro_rules! fusion_case {
     };
 }
 
-fn program(build: impl FnOnce(&mut Builder, fused::Value) -> fused::Value) -> Program {
+fn program(build: impl FnOnce(&mut Builder, fused::FusedValue) -> fused::FusedValue) -> Program {
     let mut b = Builder::new();
     let x = b.input(DType::F32);
     let y = build(&mut b, x);
