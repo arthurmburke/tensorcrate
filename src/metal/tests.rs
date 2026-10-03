@@ -714,6 +714,82 @@ fn general_products_read_operands_transposed_and_accumulate() {
     }
 }
 
+/// The 16-bit general product reads operands transposed and accumulates on the
+/// matrix units, rounding once. Every operand is a small dyadic rational, so
+/// the `f32` sums are exact and the result must equal the rounded exact value.
+#[test]
+fn half_products_read_operands_transposed_and_accumulate() {
+    use super::device::with_gpu;
+    use crate::tensors::Transposed;
+
+    fn check<T: super::MetalElement>(name: &str) {
+        use crate::numbers::Real;
+        let to_t = |v: f32| <T as Real>::from_f64(f64::from(v));
+        let to_f32 = |v: T| num_traits::ToPrimitive::to_f32(&v).unwrap();
+        let (m, k, n) = (70, 45, 33);
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 7) as f32 - 3.0) * 0.25).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| ((i % 5) as f32 - 2.0) * 0.5).collect();
+        let c: Vec<f32> = (0..m * n).map(|i| (i % 3) as f32).collect();
+        let transpose = |x: &[f32], rows: usize, cols: usize| -> Vec<f32> {
+            (0..rows * cols)
+                .map(|e| x[(e % rows) * cols + e / rows])
+                .collect()
+        };
+        let narrow = |x: &[f32]| -> Vec<T> { x.iter().map(|&v| to_t(v)).collect() };
+        let product = cpu_matmul(&a, &b, m, k, n);
+        let round = |x: f32| to_f32(to_t(x));
+        let want_product: Vec<f32> = product.iter().copied().map(round).collect();
+        let want_added: Vec<f32> = product.iter().zip(&c).map(|(p, c)| round(p + c)).collect();
+
+        let a_buf = MetalBuffer::<T>::from_slice(&narrow(&a));
+        let Some(a_buf) = a_buf else { return };
+        let b_buf = MetalBuffer::<T>::from_slice(&narrow(&b)).unwrap();
+        if with_gpu(|gpu| gpu.tensorops_library.as_ref().map(|_| ())).is_none() {
+            return; // no TensorOps on this GPU
+        }
+
+        let mut target = MetalBuffer::<T>::from_slice(&narrow(&c)).unwrap();
+        a_buf
+            .matmul_accumulate(&b_buf, &mut target, m, k, n)
+            .unwrap();
+        synchronize();
+        let got: Vec<f32> = target.as_slice().iter().map(|&v| to_f32(v)).collect();
+        assert_eq!(got, want_added, "{name}: accumulate");
+
+        let at = MetalBuffer::<T>::from_slice(&narrow(&transpose(&a, m, k))).unwrap();
+        let bt = MetalBuffer::<T>::from_slice(&narrow(&transpose(&b, k, n))).unwrap();
+        for (transposed, left, right, accumulate) in [
+            (Transposed::Left, &at, &b_buf, false),
+            (Transposed::Right, &a_buf, &bt, false),
+            (Transposed::Left, &at, &b_buf, true),
+            (Transposed::Right, &a_buf, &bt, true),
+        ] {
+            let seed = if accumulate {
+                narrow(&c)
+            } else {
+                narrow(&vec![0.0; m * n])
+            };
+            let mut target = MetalBuffer::<T>::from_slice(&seed).unwrap();
+            // The accumulating form adds to `c`; the plain form is `c = 0`.
+            left.matmul_transposed_accumulate(right, &mut target, transposed, (m, k, n))
+                .unwrap_or_else(|| panic!("{name}: {transposed:?} ran without TensorOps"));
+            synchronize();
+            let got: Vec<f32> = target.as_slice().iter().map(|&v| to_f32(v)).collect();
+            let want = if accumulate {
+                &want_added
+            } else {
+                &want_product
+            };
+            assert_eq!(
+                &got, want,
+                "{name}: {transposed:?}, accumulate {accumulate}"
+            );
+        }
+    }
+    check::<f16>("f16");
+    check::<bf16>("bf16");
+}
+
 /// The generator's epilogue and sum kernels compile — for every element type
 /// and every product tile — rather than quietly leaving the program on the
 /// interpreter.

@@ -192,10 +192,11 @@ impl Gpu {
             .filter(|_| tensorops_enabled())
     }
 
-    /// The general TensorOps product of `f32` matrices — `op(A)·op(B)`, added
-    /// into the output if `accumulate` — for an `m × n` result at this thread's
-    /// [`MatmulPrecision`], with the tile it computes per threadgroup. `None`
-    /// for another element type, or without TensorOps.
+    /// The general TensorOps product — `op(A)·op(B)`, added into the output if
+    /// `accumulate` — for an `m × n` result of element type `T`, with the tile
+    /// it computes per threadgroup. `f32` runs at this thread's
+    /// [`MatmulPrecision`]; `f16` and `bf16` accumulate in `f32` and round
+    /// once. `None` without TensorOps.
     pub(super) fn gemm<T: MetalElement>(
         &self,
         operands: Operands,
@@ -203,18 +204,22 @@ impl Gpu {
         m: usize,
         n: usize,
     ) -> Option<(Pipeline, Tile)> {
-        if T::SUFFIX != f32::SUFFIX || !tensorops_enabled() {
+        if !tensorops_enabled() {
             return None;
         }
         let (relaxed, (tile, shape)) = product_tile::<T>(m, n);
+        let kernel = if T::SUFFIX == f32::SUFFIX {
+            if relaxed { "gemm_f32r" } else { "gemm_f32" }.to_string()
+        } else {
+            format!("gemm_narrow_{}", T::SUFFIX)
+        };
         let operands = match operands {
             Operands::Plain => "nn",
             Operands::LeftTransposed => "tn",
             Operands::RightTransposed => "nt",
         };
         let name = format!(
-            "gemm_{}_{tile}_{operands}{}",
-            if relaxed { "f32r" } else { "f32" },
+            "{kernel}_{tile}_{operands}{}",
             if accumulate { "_acc" } else { "" }
         );
         Some((self.tensorops_named(&name)?, shape))
