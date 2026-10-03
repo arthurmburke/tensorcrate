@@ -137,6 +137,7 @@ pub use kernels::{
 pub use layout::{AxisIndex, MAX_RANK};
 pub use matrix::Matrix;
 pub use reduction::Axes;
+pub use sparse::SparseMatrix;
 pub use tape::{MatrixVar, ScalarVar, Tape, TensorVar, Var, VectorVar};
 pub use tensor::Tensor;
 pub use vector::Vector;
