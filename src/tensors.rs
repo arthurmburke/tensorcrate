@@ -95,6 +95,7 @@ pub mod fused;
 pub mod kernels;
 pub mod tape;
 
+mod algebra;
 mod chain;
 mod fft;
 pub(crate) mod layout;
@@ -121,6 +122,7 @@ pub(crate) mod simd_dispatch;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod metal_backend;
 
+pub use algebra::{Dot, MatMul, MatVec, Transpose, VecMat};
 pub use analytic::Transcendental;
 pub use backend::{Backend, Host};
 #[cfg(all(feature = "metal", target_os = "macos"))]

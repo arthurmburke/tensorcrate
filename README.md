@@ -93,6 +93,22 @@ explicit:
 - `vector.dot(&vector)`
 - `vector.outer(&vector)` on differentiable variables
 
+The named products also have operation traits: `MatMul`, `MatVec`, `VecMat`,
+`Dot`, and `Transpose`. Their associated output types preserve the concrete
+representation, so one generic function can accept a dense value, a
+forward-mode dual value, or a reverse-mode tape variable:
+
+```rust
+use tensorcrate::tensors::{MatMul, Transpose};
+
+fn gram<M>(matrix: &M) -> M::Output
+where
+    M: MatMul + Transpose<Output = M>,
+{
+    matrix.transpose().matmul(matrix)
+}
+```
+
 Borrow operands when you want to keep using them: `&a + &b` leaves both tensors intact.
 
 ## N-dimensional tensors
