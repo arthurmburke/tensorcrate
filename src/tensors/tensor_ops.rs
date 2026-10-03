@@ -27,7 +27,7 @@
 
 use std::ops::{Add, Deref, Div, Mul, Neg, Sub};
 
-use super::fused::{Element, Fusable, FusableOf, Source, View};
+use super::fused::{Element, Fusable, FusableMut, FusableOf, Sink, Source, View};
 use super::kernels::Pairwise;
 use super::layout::broadcast_shape;
 use super::{Analytic, Backend, BinaryOp, Compare, Kernels, Tensor, TensorView, Vector};
@@ -375,6 +375,18 @@ impl<T: Element, B: Backend> Fusable<B> for Tensor<T, B> {
 }
 
 impl<T: Element, B: Backend> FusableOf<T, B> for Tensor<T, B> {}
+
+/// A tensor owns its elements in row-major order, so a program can update it
+/// in place as it does a [`Vector`] of the same length.
+impl<T: Element, B: Backend> FusableMut<B> for Tensor<T, B> {
+    fn sink(&mut self) -> Sink<'_, B> {
+        let len = self.len();
+        Sink {
+            data: T::sink::<B>(self.vector_mut().storage_mut()),
+            len,
+        }
+    }
+}
 
 /// A view is read by a fused program in place, through its strides, as the
 /// matrix of its rows like a [`Tensor`] — which needs its leading axes to step

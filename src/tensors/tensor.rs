@@ -214,6 +214,11 @@ impl<T: Copy + 'static, B: Backend> Tensor<T, B> {
         &self.data
     }
 
+    /// The flat storage, for a kernel that updates the elements in place.
+    pub(crate) fn vector_mut(&mut self) -> &mut Vector<T, B> {
+        &mut self.data
+    }
+
     /// The element at `index`, one coordinate per axis, or `None` if it is
     /// out of range. On `Metal` this waits for queued work, as any read does.
     pub fn get(&self, index: &[usize]) -> Option<T> {

@@ -1961,8 +1961,9 @@ pub trait Fusable<B: Backend> {
     }
 }
 
-/// A tensor a [`Program`] can also update in place: a [`Vector`] or a
-/// [`Matrix`], which own their elements. A view cannot be updated.
+/// A tensor a [`Program`] can also update in place: a [`Vector`], a
+/// [`Matrix`] or a [`Tensor`](super::Tensor), which own their elements. A
+/// view cannot be updated.
 pub trait FusableMut<B: Backend>: Fusable<B> {
     #[doc(hidden)]
     fn sink(&mut self) -> Sink<'_, B>;
