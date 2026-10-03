@@ -98,6 +98,7 @@ pub mod tape;
 mod algebra;
 mod chain;
 mod fft;
+mod host_inplace;
 pub(crate) mod layout;
 mod matrix;
 mod ops;

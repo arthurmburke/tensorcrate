@@ -5,6 +5,7 @@ use std::cmp::Ordering;
 use std::fmt::{self, Display};
 use std::ops::Index;
 
+use super::host_inplace;
 use super::matrix::{Block, assemble_blocks};
 use super::order::{ordered_max, ordered_min};
 use super::shape::{assert_inner, assert_ordered_bounds, assert_same_len};
@@ -322,6 +323,25 @@ impl<T> Vector<T, Host> {
         }
     }
 
+    /// Apply `f` to every element, consuming this vector and reusing its
+    /// allocation.
+    ///
+    /// ```
+    /// use tensorcrate::tensors::Vector;
+    ///
+    /// let v = Vector::new([1.0f32, -2.0, 3.0]).into_map(|x| x * x);
+    /// assert_eq!(v.data(), [1.0, 4.0, 9.0]);
+    /// ```
+    pub fn into_map(self, f: impl Fn(T) -> T) -> Self
+    where
+        T: Copy,
+    {
+        Vector {
+            len: self.len,
+            data: host_inplace::map(self.data, f),
+        }
+    }
+
     /// Combine two vectors element by element with `f`, producing a vector of
     /// the new element type.
     ///
@@ -375,6 +395,30 @@ impl<T: Coefficient> Vector<T, Host> {
     /// Multiply every element by `scalar`.
     pub fn scale(&self, scalar: T) -> Self {
         self.broadcast_right(scalar, BinaryOp::Mul)
+    }
+
+    /// [`scale`](Self::scale), consuming this vector and reusing its
+    /// allocation.
+    pub fn into_scale(self, scalar: T) -> Self {
+        self.into_broadcast_right(scalar, BinaryOp::Mul)
+    }
+
+    /// The consuming form of [`broadcast_right`](Self::broadcast_right).
+    #[doc(hidden)]
+    pub fn into_broadcast_right(self, scalar: T, op: BinaryOp) -> Self {
+        Vector {
+            len: self.len,
+            data: host_inplace::broadcast(self.data, scalar, op, false),
+        }
+    }
+
+    /// The consuming form of [`broadcast_left`](Self::broadcast_left).
+    #[doc(hidden)]
+    pub fn into_broadcast_left(self, scalar: T, op: BinaryOp) -> Self {
+        Vector {
+            len: self.len,
+            data: host_inplace::broadcast(self.data, scalar, op, true),
+        }
     }
 
     /// Implementation hook used by `math!` for tensor/scalar broadcasting.
@@ -607,6 +651,76 @@ impl<T: Coefficient + PartialOrd> Vector<T, Host> {
         self.map(|&value| ordered_min(ordered_max(value, low), high))
     }
 
+    /// [`min`](Self::min), consuming this vector and reusing its allocation.
+    ///
+    /// # Panics
+    ///
+    /// If the two lengths differ.
+    #[track_caller]
+    pub fn into_min(self, other: &Self) -> Self {
+        assert_same_len(self.len, other.len, "min");
+        Vector {
+            len: self.len,
+            data: host_inplace::compare(self.data, &other.data, Compare::Min, ordered_min),
+        }
+    }
+
+    /// [`max`](Self::max), consuming this vector and reusing its allocation.
+    ///
+    /// # Panics
+    ///
+    /// If the two lengths differ.
+    #[track_caller]
+    pub fn into_max(self, other: &Self) -> Self {
+        assert_same_len(self.len, other.len, "max");
+        Vector {
+            len: self.len,
+            data: host_inplace::compare(self.data, &other.data, Compare::Max, ordered_max),
+        }
+    }
+
+    /// [`min_scalar`](Self::min_scalar), consuming this vector and reusing its
+    /// allocation.
+    pub fn into_min_scalar(self, scalar: T) -> Self {
+        Vector {
+            len: self.len,
+            data: host_inplace::compare_scalar(self.data, scalar, Compare::Min, false, ordered_min),
+        }
+    }
+
+    /// [`max_scalar`](Self::max_scalar), consuming this vector and reusing its
+    /// allocation. `into_max_scalar(0)` is a relu that allocates nothing.
+    ///
+    /// ```
+    /// use tensorcrate::tensors::Vector;
+    ///
+    /// let v = Vector::new([-1.0f32, 0.5, -3.0]).into_max_scalar(0.0);
+    /// assert_eq!(v.data(), [0.0, 0.5, 0.0]);
+    /// ```
+    pub fn into_max_scalar(self, scalar: T) -> Self {
+        Vector {
+            len: self.len,
+            data: host_inplace::compare_scalar(self.data, scalar, Compare::Max, false, ordered_max),
+        }
+    }
+
+    /// [`clamp`](Self::clamp), consuming this vector and reusing its
+    /// allocation.
+    ///
+    /// # Panics
+    ///
+    /// If `low > high`.
+    #[track_caller]
+    pub fn into_clamp(self, low: T, high: T) -> Self {
+        assert_ordered_bounds(&low, &high);
+        Vector {
+            len: self.len,
+            data: host_inplace::clamp(self.data, low, high, |value| {
+                ordered_min(ordered_max(value, low), high)
+            }),
+        }
+    }
+
     /// The smallest element, or `None` when there are none.
     pub fn minimum(&self) -> Option<T> {
         self.fold_extreme(Reduce::Min, ordered_min)
@@ -708,6 +822,38 @@ impl<T: Real> Vector<T, Host> {
         })
     }
 
+    /// [`compare`](Self::compare), consuming this vector and reusing its
+    /// allocation.
+    ///
+    /// # Panics
+    ///
+    /// If the two lengths differ.
+    #[track_caller]
+    pub fn into_compare(self, other: &Self, op: Compare) -> Self {
+        assert_same_len(self.len, other.len, "compare");
+        Vector {
+            len: self.len,
+            data: host_inplace::compare(self.data, &other.data, op, |left, right| {
+                op.value(left, right)
+            }),
+        }
+    }
+
+    /// [`compare_scalar`](Self::compare_scalar), consuming this vector and
+    /// reusing its allocation.
+    pub fn into_compare_scalar(self, scalar: T, op: Compare, scalar_left: bool) -> Self {
+        Vector {
+            len: self.len,
+            data: host_inplace::compare_scalar(
+                self.data,
+                scalar,
+                op,
+                scalar_left,
+                |left, right| op.value(left, right),
+            ),
+        }
+    }
+
     /// Fold the whole vector to one value. An empty vector gives
     /// [`op.identity()`](Reduce::identity).
     pub fn reduce(&self, op: Reduce) -> T {
@@ -749,6 +895,16 @@ impl<T: Display> Display for Vector<T, Host> {
 }
 
 impl<T: Coefficient> Vector<T, Host> {
+    /// `self op rhs` over this vector's allocation.
+    #[track_caller]
+    pub(super) fn zip_into(self, rhs: &Self, op: BinaryOp, f: impl Fn(T, T) -> T) -> Self {
+        assert_same_len(self.len, rhs.len, op.name());
+        Vector {
+            len: self.len,
+            data: host_inplace::zip(self.data, &rhs.data, op, f),
+        }
+    }
+
     #[track_caller]
     pub(super) fn zip_with(&self, rhs: &Self, op: BinaryOp, f: impl Fn(T, T) -> T) -> Self {
         assert_same_len(self.len, rhs.len, op.name());

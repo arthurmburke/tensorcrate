@@ -1094,6 +1094,11 @@ fn simd(bench: &mut Bench) {
             f32k::elementwise(&x, &y, BinaryOp::Add, &mut out);
             assert_eq!(out, check, "simd add");
             assert_eq!((&hx + &hy).as_slice(), &check[..], "host add");
+            assert_eq!(
+                (hx.clone() + &hy).as_slice(),
+                &check[..],
+                "host consuming add"
+            );
             case.row("scalar loop", Drain::None, || {
                 let (x, y) = (black_box(&x), black_box(&y));
                 for i in 0..n {
@@ -1106,6 +1111,13 @@ fn simd(bench: &mut Bench) {
                 black_box(&mut out);
             });
             case.row("host API", Drain::None, || &hx + &hy);
+            // The accumulator is moved through the operator and back, so the
+            // one allocation is overwritten every call.
+            let mut state = Some(hx.clone());
+            case.row("host API, consuming", Drain::None, || {
+                let sum = state.take().unwrap() + black_box(&hy);
+                state = Some(black_box(sum));
+            });
         }
 
         let reference_dot: f64 = x.iter().zip(&y).map(|(&a, &b)| a as f64 * b as f64).sum();
@@ -1165,6 +1177,11 @@ fn simd(bench: &mut Bench) {
             f32k::compare_scalar(&x, 0.0, Compare::Max, false, &mut out);
             assert_eq!(out, check, "simd relu");
             assert_eq!(hx.max_scalar(0.0).as_slice(), &check[..], "host relu");
+            assert_eq!(
+                hx.clone().into_max_scalar(0.0).as_slice(),
+                &check[..],
+                "host consuming relu"
+            );
             case.row("scalar loop", Drain::None, || {
                 let x = black_box(&x);
                 for i in 0..n {
@@ -1177,6 +1194,10 @@ fn simd(bench: &mut Bench) {
                 black_box(&mut out);
             });
             case.row("host API", Drain::None, || hx.max_scalar(0.0));
+            let mut state = Some(hx.clone());
+            case.row("host API, consuming", Drain::None, || {
+                state = Some(black_box(state.take().unwrap().into_max_scalar(0.0)));
+            });
         }
 
         // No SIMD entry point for these: the Host API runs the crate's own

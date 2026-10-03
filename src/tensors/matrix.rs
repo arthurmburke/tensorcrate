@@ -9,6 +9,7 @@ use std::ops::Index;
 #[cfg(target_os = "macos")]
 use super::accelerate_dispatch;
 use super::backend::{Region, Strided};
+use super::host_inplace;
 use super::order::{ordered_max, ordered_min};
 use super::shape::{assert_inner, assert_ordered_bounds, assert_same_len, assert_same_shape};
 #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
@@ -419,6 +420,19 @@ impl<T> Matrix<T, Host> {
         self.data.get(row * self.cols + col)
     }
 
+    /// Apply `f` to every element, consuming this matrix and reusing its
+    /// allocation.
+    pub fn into_map(self, f: impl Fn(T) -> T) -> Self
+    where
+        T: Copy,
+    {
+        Matrix {
+            rows: self.rows,
+            cols: self.cols,
+            data: host_inplace::map(self.data, f),
+        }
+    }
+
     /// Apply `f` to every element, producing a matrix of the new element type.
     pub fn map<U>(&self, f: impl Fn(&T) -> U) -> Matrix<U, Host> {
         Matrix {
@@ -491,6 +505,32 @@ impl<T: Coefficient> Matrix<T, Host> {
     /// Multiply every element by `scalar`.
     pub fn scale(&self, scalar: T) -> Self {
         self.broadcast_right(scalar, BinaryOp::Mul)
+    }
+
+    /// [`scale`](Self::scale), consuming this matrix and reusing its
+    /// allocation.
+    pub fn into_scale(self, scalar: T) -> Self {
+        self.into_broadcast_right(scalar, BinaryOp::Mul)
+    }
+
+    /// The consuming form of [`broadcast_right`](Self::broadcast_right).
+    #[doc(hidden)]
+    pub fn into_broadcast_right(self, scalar: T, op: BinaryOp) -> Self {
+        Matrix {
+            rows: self.rows,
+            cols: self.cols,
+            data: host_inplace::broadcast(self.data, scalar, op, false),
+        }
+    }
+
+    /// The consuming form of [`broadcast_left`](Self::broadcast_left).
+    #[doc(hidden)]
+    pub fn into_broadcast_left(self, scalar: T, op: BinaryOp) -> Self {
+        Matrix {
+            rows: self.rows,
+            cols: self.cols,
+            data: host_inplace::broadcast(self.data, scalar, op, true),
+        }
     }
 
     /// Implementation hook used by `math!` for tensor/scalar broadcasting.
@@ -909,6 +949,74 @@ impl<T: Coefficient + PartialOrd> Matrix<T, Host> {
         self.map(|&value| ordered_min(ordered_max(value, low), high))
     }
 
+    /// [`min`](Self::min), consuming this matrix and reusing its allocation.
+    ///
+    /// # Panics
+    ///
+    /// If the two shapes differ.
+    #[track_caller]
+    pub fn into_min(self, other: &Self) -> Self {
+        assert_same_shape(self.shape(), other.shape(), "min");
+        Matrix {
+            rows: self.rows,
+            cols: self.cols,
+            data: host_inplace::compare(self.data, &other.data, Compare::Min, ordered_min),
+        }
+    }
+
+    /// [`max`](Self::max), consuming this matrix and reusing its allocation.
+    ///
+    /// # Panics
+    ///
+    /// If the two shapes differ.
+    #[track_caller]
+    pub fn into_max(self, other: &Self) -> Self {
+        assert_same_shape(self.shape(), other.shape(), "max");
+        Matrix {
+            rows: self.rows,
+            cols: self.cols,
+            data: host_inplace::compare(self.data, &other.data, Compare::Max, ordered_max),
+        }
+    }
+
+    /// [`min_scalar`](Self::min_scalar), consuming this matrix and reusing its
+    /// allocation.
+    pub fn into_min_scalar(self, scalar: T) -> Self {
+        Matrix {
+            rows: self.rows,
+            cols: self.cols,
+            data: host_inplace::compare_scalar(self.data, scalar, Compare::Min, false, ordered_min),
+        }
+    }
+
+    /// [`max_scalar`](Self::max_scalar), consuming this matrix and reusing its
+    /// allocation.
+    pub fn into_max_scalar(self, scalar: T) -> Self {
+        Matrix {
+            rows: self.rows,
+            cols: self.cols,
+            data: host_inplace::compare_scalar(self.data, scalar, Compare::Max, false, ordered_max),
+        }
+    }
+
+    /// [`clamp`](Self::clamp), consuming this matrix and reusing its
+    /// allocation.
+    ///
+    /// # Panics
+    ///
+    /// If `low > high`.
+    #[track_caller]
+    pub fn into_clamp(self, low: T, high: T) -> Self {
+        assert_ordered_bounds(&low, &high);
+        Matrix {
+            rows: self.rows,
+            cols: self.cols,
+            data: host_inplace::clamp(self.data, low, high, |value| {
+                ordered_min(ordered_max(value, low), high)
+            }),
+        }
+    }
+
     fn against_scalar(&self, value: T, op: Compare, scalar: fn(T, T) -> T) -> Self {
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
         {
@@ -947,6 +1055,40 @@ impl<T: Real> Matrix<T, Host> {
         Matrix::from_flat(self.rows, self.cols, values)
     }
 
+    /// [`compare`](Self::compare), consuming this matrix and reusing its
+    /// allocation.
+    ///
+    /// # Panics
+    ///
+    /// If the two shapes differ.
+    #[track_caller]
+    pub fn into_compare(self, other: &Self, op: Compare) -> Self {
+        assert_same_shape(self.shape(), other.shape(), "compare");
+        Matrix {
+            rows: self.rows,
+            cols: self.cols,
+            data: host_inplace::compare(self.data, &other.data, op, |left, right| {
+                op.value(left, right)
+            }),
+        }
+    }
+
+    /// [`compare_scalar`](Self::compare_scalar), consuming this matrix and
+    /// reusing its allocation.
+    pub fn into_compare_scalar(self, scalar: T, op: Compare, scalar_left: bool) -> Self {
+        Matrix {
+            rows: self.rows,
+            cols: self.cols,
+            data: host_inplace::compare_scalar(
+                self.data,
+                scalar,
+                op,
+                scalar_left,
+                |left, right| op.value(left, right),
+            ),
+        }
+    }
+
     /// Elementwise comparison against a scalar.
     pub fn compare_scalar(&self, scalar: T, op: Compare, scalar_left: bool) -> Self {
         #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
@@ -983,6 +1125,17 @@ impl<T: Display> Display for Matrix<T, Host> {
 }
 
 impl<T: Coefficient> Matrix<T, Host> {
+    /// `self op rhs` over this matrix's allocation.
+    #[track_caller]
+    pub(super) fn zip_into(self, rhs: &Self, op: BinaryOp, f: impl Fn(T, T) -> T) -> Self {
+        assert_same_shape(self.shape(), rhs.shape(), op.name());
+        Matrix {
+            rows: self.rows,
+            cols: self.cols,
+            data: host_inplace::zip(self.data, &rhs.data, op, f),
+        }
+    }
+
     #[track_caller]
     pub(super) fn zip_with(&self, rhs: &Self, op: BinaryOp, f: impl Fn(T, T) -> T) -> Self {
         assert_same_shape(self.shape(), rhs.shape(), op.name());
