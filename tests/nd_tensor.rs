@@ -709,6 +709,17 @@ mod metal {
         check(|i| i as u32);
         check(|i| i as f64 * 0.5);
         check(|i| (i as u64, i as u64 * 3)); // 16 bytes
-        check(|i| [i as u8; 3]); // a width with no kernel takes the host path
+        let host = Tensor::from_vec(
+            &[3, 4, 2],
+            (0..24).map(|i| [i as u8; 3]).collect::<Vec<_>>(),
+        );
+        let device = host.to_backend::<Metal>();
+        let unsupported = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            device.permute(&[2, 0, 1]).contiguous()
+        }));
+        assert!(
+            unsupported.is_err(),
+            "an unsupported element width must not fall back to Host"
+        );
     }
 }

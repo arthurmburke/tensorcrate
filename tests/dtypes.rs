@@ -618,11 +618,15 @@ fn stacking_works_for_any_element() {
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
-fn metal_stacks_non_f32_elements_through_the_host_path() {
+fn metal_stacks_non_f32_elements_on_the_device() {
     let a = Vector::new([1.0f64, 2.0]).to_backend::<Metal>();
     let b = Vector::new([3.0f64, 4.0]).to_backend::<Metal>();
-    assert_eq!(Vector::vstack([&a, &b]).as_slice(), [1.0, 2.0, 3.0, 4.0]);
-    assert_eq!(Vector::hstack([&a, &b]).as_slice(), [1.0, 3.0, 2.0, 4.0]);
+    let rows = Vector::vstack([&a, &b]);
+    let columns = Vector::hstack([&a, &b]);
+    assert!(rows.is_device_resident());
+    assert!(columns.is_device_resident());
+    assert_eq!(rows.as_slice(), [1.0, 2.0, 3.0, 4.0]);
+    assert_eq!(columns.as_slice(), [1.0, 3.0, 2.0, 4.0]);
 }
 
 // ---- persistence -----------------------------------------------------------------

@@ -1,10 +1,7 @@
 //! The `Metal` tensor backend: same answers as `Host`, different memory.
 //!
-//! These tests run everywhere the backend compiles, with or without a Metal
-//! device — a machine without one falls back to CPU storage and CPU kernels, and
-//! the results are supposed to be identical either way. The claim that
-//! intermediates *stay* in shared memory is checked with `is_device_resident`,
-//! guarded on the inputs actually having landed there.
+//! These tests require a Metal device. The backend rejects unavailable or
+//! unsupported GPU operations rather than silently executing Host kernels.
 
 #![cfg(all(feature = "metal", target_os = "macos"))]
 
@@ -345,9 +342,6 @@ fn elementwise_operators_and_broadcasts_match_the_host_backend() {
     assert_eq!((&ga - &gb).to_backend::<Host>(), a.clone() - b.clone());
     assert_eq!((&ga * &gb).to_backend::<Host>(), a.clone() * b.clone());
     assert_eq!((&ga / &gb).to_backend::<Host>(), a.clone() / b.clone());
-    // The shaders have no remainder kernel, so this one falls back to the host
-    // and comes back; the answer still has to match.
-    assert_eq!((&ga % &gb).to_backend::<Host>(), a.clone() % b);
     assert_eq!((-&ga).to_backend::<Host>(), -a.clone());
     assert_eq!(ga.scale(2.5).to_backend::<Host>(), a.scale(2.5));
     assert_eq!(
@@ -360,7 +354,6 @@ fn elementwise_operators_and_broadcasts_match_the_host_backend() {
     let (gm, gn) = (m.to_backend::<Metal>(), n.to_backend::<Metal>());
     assert_eq!((&gm + &gn).to_backend::<Host>(), m.clone() + n.clone());
     assert_eq!((&gm * &gn).to_backend::<Host>(), m.clone() * n.clone());
-    assert_eq!((&gm % &gn).to_backend::<Host>(), m.clone() % n.clone());
     assert_eq!(gm.scale(-1.0).to_backend::<Host>(), m.scale(-1.0));
 
     // The by-value operators consume their operands, like the host ones.
@@ -392,9 +385,22 @@ fn a_chain_of_operations_stays_in_shared_memory() {
     assert!(a.matvec_add(&v, vector_addend).is_device_resident());
     assert!(a.matmul_add(&b, matrix_addend).is_device_resident());
     assert!((&v * &v).is_device_resident());
+}
 
-    // `%` has no kernel: it round-trips, and the result comes back resident.
-    assert!((&v % &v.broadcast_right(9.0, BinaryOp::Add)).is_device_resident());
+#[test]
+fn unsupported_metal_operations_panic_instead_of_falling_back() {
+    let a = vector(8).to_backend::<Metal>();
+    let b = vector(8)
+        .broadcast_right(9.0, BinaryOp::Add)
+        .to_backend::<Metal>();
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| &a % &b))
+        .expect_err("Metal remainder must not execute on Host");
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or_default();
+    assert!(message.contains("Host fallback is disabled"), "{message}");
 }
 
 #[test]

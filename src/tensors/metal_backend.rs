@@ -7,15 +7,10 @@
 //! operations costs one upload at the start and one download at the end rather
 //! than a pair per call.
 //!
-//! [`Vector::dot`] deliberately is not a GPU dispatch. It reduces on the CPU
-//! over the shared allocations — still copy-free — because a `1×N·N×1` matmul
-//! would put the entire reduction on one GPU thread.
-//!
-//! When a dispatch cannot run at all — no Metal device, or an operation the
-//! shaders do not implement, like `%` — the operands move to the [`Host`]
-//! backend, its kernels produce the result, and the result moves back. That
-//! keeps the answers identical everywhere; it costs the copies this backend
-//! exists to avoid, but only on a machine that could not have avoided them.
+//! When a dispatch cannot run — no Metal device, allocation or compilation
+//! failure, or an unsupported operation such as `%` — the operation panics.
+//! The Metal backend never silently executes a Host kernel. Move tensors to
+//! [`Host`] explicitly when CPU execution is wanted.
 //!
 //! Shape checking is the same here as on the host: the extents live in the
 //! tensor rather than the allocation, so a mismatched product panics before any
@@ -43,7 +38,8 @@ use num_traits::PrimInt;
 
 use super::shape::{assert_inner, assert_ordered_bounds, assert_same_len, assert_same_shape};
 use super::{
-    Analytic, Backend, BinaryOp, Compare, Host, Kernels, Matrix, Metal, Reduce, SortOrder, Vector,
+    Analytic, Backend, BinaryOp, Compare, Host, Matrix, Metal, Reduce, SortOrder, Vector,
+    require_metal,
 };
 use crate::metal::MetalElement;
 
@@ -101,17 +97,12 @@ macro_rules! low_precision_tensors {
             pub fn matmul_f32(&self, other: &Self) -> Matrix<f32, Metal> {
                 assert_inner(self.shape(), other.shape(), "matmul_f32");
                 let (rows, inner, cols) = (self.rows(), self.cols(), other.cols());
-                match self
-                    .storage()
-                    .matmul_f32(other.storage(), rows, inner, cols)
-                {
-                    Some(data) => Matrix::from_storage(rows, cols, data),
-                    None => {
-                        let left = self.to_f32::<Host>();
-                        let right = other.to_f32::<Host>();
-                        left.matmul(&right).to_backend()
-                    }
-                }
+                let data = require_metal(
+                    "widened matrix multiplication",
+                    self.storage()
+                        .matmul_f32(other.storage(), rows, inner, cols),
+                );
+                Matrix::from_storage(rows, cols, data)
             }
         }
     };
@@ -124,8 +115,16 @@ impl<T: Copy + 'static> Vector<T, Metal> {
     /// Whether the elements really are in GPU-shared memory — for any element
     /// type, so an index vector answers too.
     ///
-    /// `false` means the process has no Metal device, so this vector fell back
-    /// to CPU storage and CPU kernels. Results are unaffected.
+    /// `false` means the process has no Metal device. Operations will panic
+    /// rather than run Host kernels implicitly.
+    pub fn is_device_resident(&self) -> bool {
+        self.storage().is_device_resident()
+    }
+}
+
+impl<T: Copy + 'static> Matrix<T, Metal> {
+    /// Whether the elements really are in GPU-shared memory; see
+    /// [`Vector::is_device_resident`].
     pub fn is_device_resident(&self) -> bool {
         self.storage().is_device_resident()
     }
@@ -134,11 +133,8 @@ impl<T: Copy + 'static> Vector<T, Metal> {
 impl<T: MetalElement> Vector<T, Metal> {
     /// Dot product with a vector of the same length.
     ///
-    /// The reduction runs on the CPU, reading both shared allocations in place —
-    /// shared storage is ordinary cached memory from the CPU's side, so this
-    /// still copies nothing. The GPU alternative available here, a `1×N` by
-    /// `N×1` matmul, would run the whole sum on a single thread. The sum
-    /// accumulates in `f32` and rounds to `T` once.
+    /// Multiplication and reduction both run on the GPU. The final scalar is a
+    /// synchronization point and is rounded to `T` once.
     ///
     /// # Panics
     ///
@@ -146,7 +142,15 @@ impl<T: MetalElement> Vector<T, Metal> {
     #[track_caller]
     pub fn dot(&self, other: &Self) -> T {
         assert_same_len(self.len(), other.len(), "dot");
-        reduce_dot(self.as_slice(), other.as_slice())
+        if self.is_empty() {
+            return T::zero();
+        }
+        let products = require_metal(
+            "dot product multiplication",
+            self.storage().elementwise(other.storage(), BinaryOp::Mul),
+        );
+        let total = require_metal("dot product reduction", products.reduce(Reduce::Sum));
+        T::from_f64(f64::from(total))
     }
 
     /// Row vector times matrix: `(1×N)·(N×C) = (1×C)`, on the GPU.
@@ -158,13 +162,11 @@ impl<T: MetalElement> Vector<T, Metal> {
     pub fn vecmat(&self, m: &Matrix<T, Metal>) -> Vector<T, Metal> {
         assert_inner((1, self.len()), m.shape(), "vecmat");
         let (rows, cols) = m.shape();
-        match self.storage().matmul(m.storage(), 1, rows, cols) {
-            Some(data) => Vector::from_storage(cols, data),
-            None => self
-                .to_backend::<Host>()
-                .vecmat(&m.to_backend::<Host>())
-                .to_backend(),
-        }
+        let data = require_metal(
+            "vector-matrix multiplication",
+            self.storage().matmul(m.storage(), 1, rows, cols),
+        );
+        Vector::from_storage(cols, data)
     }
 
     /// Apply an analytic function elementwise, on the GPU.
@@ -175,34 +177,28 @@ impl<T: MetalElement> Vector<T, Metal> {
     /// Both spellings — this and the named methods in
     /// [`analytic`](crate::tensors::analytic) — are the same operation.
     pub fn analytic(&self, f: Analytic) -> Self {
-        match self.storage().unary(f) {
-            Some(data) => Vector::from_storage(self.len(), data),
-            None => Host::vector_unary(&self.to_backend::<Host>(), f).to_backend(),
-        }
+        let data = require_metal("vector analytic operation", self.storage().unary(f));
+        Vector::from_storage(self.len(), data)
     }
 
     /// Elementwise comparison with another resident vector, on the GPU.
     #[track_caller]
     pub fn compare(&self, other: &Self, op: Compare) -> Self {
         assert_same_len(self.len(), other.len(), "compare");
-        match self.storage().compare(other.storage(), op) {
-            Some(data) => Vector::from_storage(self.len(), data),
-            None => {
-                Host::vector_compare(&self.to_backend::<Host>(), &other.to_backend::<Host>(), op)
-                    .to_backend()
-            }
-        }
+        let data = require_metal(
+            "vector comparison",
+            self.storage().compare(other.storage(), op),
+        );
+        Vector::from_storage(self.len(), data)
     }
 
     /// Elementwise comparison against a scalar, on the GPU.
     pub fn compare_scalar(&self, scalar: T, op: Compare, scalar_left: bool) -> Self {
-        match self.storage().compare_scalar(scalar, op, scalar_left) {
-            Some(data) => Vector::from_storage(self.len(), data),
-            None => {
-                Host::vector_compare_scalar(&self.to_backend::<Host>(), scalar, op, scalar_left)
-                    .to_backend()
-            }
-        }
+        let data = require_metal(
+            "vector-scalar comparison",
+            self.storage().compare_scalar(scalar, op, scalar_left),
+        );
+        Vector::from_storage(self.len(), data)
     }
 
     /// Elementwise minimum with another resident vector, on the GPU.
@@ -244,10 +240,8 @@ impl<T: MetalElement> Vector<T, Metal> {
     #[track_caller]
     pub fn clamp(&self, low: T, high: T) -> Self {
         assert_ordered_bounds(&low, &high);
-        match self.storage().clamp(low, high) {
-            Some(data) => Vector::from_storage(self.len(), data),
-            None => Host::vector_clamp(&self.to_backend::<Host>(), low, high).to_backend(),
-        }
+        let data = require_metal("vector clamp", self.storage().clamp(low, high));
+        Vector::from_storage(self.len(), data)
     }
 
     /// Fold the whole vector to one value with a GPU tree reduction. An empty
@@ -257,11 +251,9 @@ impl<T: MetalElement> Vector<T, Metal> {
     /// back to the CPU: it is a synchronization point, unlike the operations
     /// that leave their result resident.
     pub fn reduce(&self, op: Reduce) -> T {
-        match self.storage().reduce(op) {
-            // The fold ran in `f32`; this is its one rounding to `T`.
-            Some(value) => T::from_f64(f64::from(value)),
-            None => Host::vector_reduce(&self.to_backend::<Host>(), op),
-        }
+        let value = require_metal("vector reduction", self.storage().reduce(op));
+        // The fold ran in `f32`; this is its one rounding to `T`.
+        T::from_f64(f64::from(value))
     }
 
     /// The sum of every element.
@@ -285,10 +277,8 @@ impl<T: MetalElement> Vector<T, Metal> {
     /// differently from the host's running total, so the two agree to a
     /// rounding error rather than bit for bit.
     pub fn prefix_sum(&self) -> Self {
-        match self.storage().prefix_sum() {
-            Some(data) => Vector::from_storage(self.len(), data),
-            None => Host::vector_prefix_sum(&self.to_backend::<Host>()).to_backend(),
-        }
+        let data = require_metal("vector prefix sum", self.storage().prefix_sum());
+        Vector::from_storage(self.len(), data)
     }
 
     /// Sort in [`SortOrder`]'s total order, staying resident.
@@ -296,22 +286,16 @@ impl<T: MetalElement> Vector<T, Metal> {
     /// A bitonic sort over integer sort keys, so the result matches a host
     /// total-order sort exactly, NaNs included.
     pub fn sorted(&self, order: SortOrder) -> Self {
-        match self.storage().sort(order) {
-            Some(data) => Vector::from_storage(self.len(), data),
-            None => Host::vector_sort(&self.to_backend::<Host>(), order).to_backend(),
-        }
+        let data = require_metal("vector sort", self.storage().sort(order));
+        Vector::from_storage(self.len(), data)
     }
 
     /// Sort under an arbitrary comparator.
     ///
-    /// A closure cannot cross to the GPU, so this is the one operation here that
-    /// leaves the device: the elements are read out of shared memory, sorted on
-    /// the CPU, and stored back. [`sorted`](Self::sorted) is the resident
-    /// version, and covers everything a total order can express.
-    pub fn sorted_by(&self, compare: impl FnMut(&T, &T) -> Ordering) -> Self {
-        let mut values = self.to_vec();
-        values.sort_by(compare);
-        Vector::new(values).to_backend()
+    /// A closure cannot cross to the GPU, so this operation is unsupported on
+    /// Metal. Transfer explicitly to [`Host`] to use an arbitrary comparator.
+    pub fn sorted_by(&self, _compare: impl FnMut(&T, &T) -> Ordering) -> Self {
+        require_metal("sort with an arbitrary comparator", None)
     }
 
     /// Multiply every element by `scalar`, on the GPU.
@@ -322,35 +306,25 @@ impl<T: MetalElement> Vector<T, Metal> {
     /// Implementation hook used by `math!` for tensor/scalar broadcasting.
     #[doc(hidden)]
     pub fn broadcast_right(&self, scalar: T, op: BinaryOp) -> Self {
-        match self.storage().broadcast(scalar, op, false) {
-            Some(data) => Vector::from_storage(self.len(), data),
-            None => self
-                .to_backend::<Host>()
-                .broadcast_right(scalar, op)
-                .to_backend(),
-        }
+        let data = require_metal(
+            "vector-scalar broadcast",
+            self.storage().broadcast(scalar, op, false),
+        );
+        Vector::from_storage(self.len(), data)
     }
 
     /// Implementation hook used by `math!` for scalar/tensor broadcasting.
     #[doc(hidden)]
     pub fn broadcast_left(&self, scalar: T, op: BinaryOp) -> Self {
-        match self.storage().broadcast(scalar, op, true) {
-            Some(data) => Vector::from_storage(self.len(), data),
-            None => self
-                .to_backend::<Host>()
-                .broadcast_left(scalar, op)
-                .to_backend(),
-        }
+        let data = require_metal(
+            "scalar-vector broadcast",
+            self.storage().broadcast(scalar, op, true),
+        );
+        Vector::from_storage(self.len(), data)
     }
 }
 
 impl<T: MetalElement> Matrix<T, Metal> {
-    /// Whether the elements really are in GPU-shared memory; see
-    /// [`Vector::is_device_resident`].
-    pub fn is_device_resident(&self) -> bool {
-        self.storage().is_device_resident()
-    }
-
     /// Matrix product `(R×K)·(K×C) = (R×C)`, on the GPU, with both operands
     /// and the result staying in shared memory.
     ///
@@ -361,13 +335,11 @@ impl<T: MetalElement> Matrix<T, Metal> {
     pub fn matmul(&self, other: &Matrix<T, Metal>) -> Matrix<T, Metal> {
         assert_inner(self.shape(), other.shape(), "matmul");
         let (rows, inner, cols) = (self.rows(), self.cols(), other.cols());
-        match self.storage().matmul(other.storage(), rows, inner, cols) {
-            Some(data) => Matrix::from_storage(rows, cols, data),
-            None => self
-                .to_backend::<Host>()
-                .matmul(&other.to_backend::<Host>())
-                .to_backend(),
-        }
+        let data = require_metal(
+            "matrix multiplication",
+            self.storage().matmul(other.storage(), rows, inner, cols),
+        );
+        Matrix::from_storage(rows, cols, data)
     }
 
     /// Matrix exponentiation using efficient integer powers.
@@ -419,16 +391,17 @@ impl<T: MetalElement> Matrix<T, Metal> {
             "matmul_add addend",
         );
         let (rows, inner, cols) = (self.rows(), self.cols(), other.cols());
-        if self
-            .storage()
-            .matmul_accumulate(other.storage(), addend.storage_mut(), rows, inner, cols)
-            .is_some()
-        {
-            return addend;
-        }
-        self.to_backend::<Host>()
-            .matmul_add(&other.to_backend::<Host>(), addend.to_backend::<Host>())
-            .to_backend()
+        require_metal(
+            "matrix multiply-add",
+            self.storage().matmul_accumulate(
+                other.storage(),
+                addend.storage_mut(),
+                rows,
+                inner,
+                cols,
+            ),
+        );
+        addend
     }
 
     /// Matrix times column vector: `(R×C)·(C×1) = (R×1)`, on the GPU.
@@ -440,13 +413,11 @@ impl<T: MetalElement> Matrix<T, Metal> {
     pub fn matvec(&self, v: &Vector<T, Metal>) -> Vector<T, Metal> {
         assert_inner(self.shape(), (v.len(), 1), "matvec");
         let (rows, cols) = self.shape();
-        match self.storage().matmul(v.storage(), rows, cols, 1) {
-            Some(data) => Vector::from_storage(rows, data),
-            None => self
-                .to_backend::<Host>()
-                .matvec(&v.to_backend::<Host>())
-                .to_backend(),
-        }
+        let data = require_metal(
+            "matrix-vector multiplication",
+            self.storage().matmul(v.storage(), rows, cols, 1),
+        );
+        Vector::from_storage(rows, data)
     }
 
     /// Fused matrix-vector multiply-add: `self·v + addend`.
@@ -466,35 +437,27 @@ impl<T: MetalElement> Matrix<T, Metal> {
         assert_inner(self.shape(), (v.len(), 1), "matvec_add");
         assert_same_len(addend.len(), self.rows(), "matvec_add addend");
         let (rows, cols) = self.shape();
-        if self
-            .storage()
-            .matmul_accumulate(v.storage(), addend.storage_mut(), rows, cols, 1)
-            .is_some()
-        {
-            return addend;
-        }
-        self.to_backend::<Host>()
-            .matvec_add(&v.to_backend::<Host>(), addend.to_backend::<Host>())
-            .to_backend()
+        require_metal(
+            "matrix-vector multiply-add",
+            self.storage()
+                .matmul_accumulate(v.storage(), addend.storage_mut(), rows, cols, 1),
+        );
+        addend
     }
 
     /// Transpose: an `R×C` matrix becomes `C×R`.
     pub fn transpose(&self) -> Matrix<T, Metal> {
         let (rows, cols) = self.shape();
-        match self.storage().transpose(rows, cols) {
-            Some(data) => Matrix::from_storage(cols, rows, data),
-            None => self.to_backend::<Host>().transpose().to_backend(),
-        }
+        let data = require_metal("matrix transpose", self.storage().transpose(rows, cols));
+        Matrix::from_storage(cols, rows, data)
     }
 
     /// Apply an analytic function elementwise, on the GPU; see
     /// [`Vector::analytic`].
     pub fn analytic(&self, f: Analytic) -> Self {
         let (rows, cols) = self.shape();
-        match self.storage().unary(f) {
-            Some(data) => Matrix::from_storage(rows, cols, data),
-            None => Host::matrix_unary(&self.to_backend::<Host>(), f).to_backend(),
-        }
+        let data = require_metal("matrix analytic operation", self.storage().unary(f));
+        Matrix::from_storage(rows, cols, data)
     }
 
     /// Elementwise comparison with another resident matrix, on the GPU.
@@ -502,25 +465,21 @@ impl<T: MetalElement> Matrix<T, Metal> {
     pub fn compare(&self, other: &Self, op: Compare) -> Self {
         assert_same_shape(self.shape(), other.shape(), "compare");
         let (rows, cols) = self.shape();
-        match self.storage().compare(other.storage(), op) {
-            Some(data) => Matrix::from_storage(rows, cols, data),
-            None => {
-                Host::matrix_compare(&self.to_backend::<Host>(), &other.to_backend::<Host>(), op)
-                    .to_backend()
-            }
-        }
+        let data = require_metal(
+            "matrix comparison",
+            self.storage().compare(other.storage(), op),
+        );
+        Matrix::from_storage(rows, cols, data)
     }
 
     /// Elementwise comparison against a scalar, on the GPU.
     pub fn compare_scalar(&self, scalar: T, op: Compare, scalar_left: bool) -> Self {
         let (rows, cols) = self.shape();
-        match self.storage().compare_scalar(scalar, op, scalar_left) {
-            Some(data) => Matrix::from_storage(rows, cols, data),
-            None => {
-                Host::matrix_compare_scalar(&self.to_backend::<Host>(), scalar, op, scalar_left)
-                    .to_backend()
-            }
-        }
+        let data = require_metal(
+            "matrix-scalar comparison",
+            self.storage().compare_scalar(scalar, op, scalar_left),
+        );
+        Matrix::from_storage(rows, cols, data)
     }
 
     /// Elementwise minimum with another resident matrix.
@@ -562,10 +521,8 @@ impl<T: MetalElement> Matrix<T, Metal> {
     pub fn clamp(&self, low: T, high: T) -> Self {
         assert_ordered_bounds(&low, &high);
         let (rows, cols) = self.shape();
-        match self.storage().clamp(low, high) {
-            Some(data) => Matrix::from_storage(rows, cols, data),
-            None => Host::matrix_clamp(&self.to_backend::<Host>(), low, high).to_backend(),
-        }
+        let data = require_metal("matrix clamp", self.storage().clamp(low, high));
+        Matrix::from_storage(rows, cols, data)
     }
 
     /// Multiply every element by `scalar`, on the GPU.
@@ -577,53 +534,23 @@ impl<T: MetalElement> Matrix<T, Metal> {
     #[doc(hidden)]
     pub fn broadcast_right(&self, scalar: T, op: BinaryOp) -> Self {
         let (rows, cols) = self.shape();
-        match self.storage().broadcast(scalar, op, false) {
-            Some(data) => Matrix::from_storage(rows, cols, data),
-            None => self
-                .to_backend::<Host>()
-                .broadcast_right(scalar, op)
-                .to_backend(),
-        }
+        let data = require_metal(
+            "matrix-scalar broadcast",
+            self.storage().broadcast(scalar, op, false),
+        );
+        Matrix::from_storage(rows, cols, data)
     }
 
     /// Implementation hook used by `math!` for scalar/tensor broadcasting.
     #[doc(hidden)]
     pub fn broadcast_left(&self, scalar: T, op: BinaryOp) -> Self {
         let (rows, cols) = self.shape();
-        match self.storage().broadcast(scalar, op, true) {
-            Some(data) => Matrix::from_storage(rows, cols, data),
-            None => self
-                .to_backend::<Host>()
-                .broadcast_left(scalar, op)
-                .to_backend(),
-        }
+        let data = require_metal(
+            "scalar-matrix broadcast",
+            self.storage().broadcast(scalar, op, true),
+        );
+        Matrix::from_storage(rows, cols, data)
     }
-}
-
-/// Sum of products over two CPU-readable slices, vectorized where possible,
-/// accumulated in `f32` and rounded to `T` once.
-fn reduce_dot<T: MetalElement>(a: &[T], b: &[T]) -> T {
-    if let Some(total) = crate::compact::dot(a, b) {
-        return total;
-    }
-    #[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
-    if let (Some(a), Some(b)) = (as_f32(a), as_f32(b)) {
-        return T::from_f64(f64::from(crate::simd::f32k::dot(a, b)));
-    }
-    let total: f32 = a
-        .iter()
-        .zip(b)
-        .map(|(&x, &y)| x.into_f64() as f32 * y.into_f64() as f32)
-        .sum();
-    T::from_f64(f64::from(total))
-}
-
-/// `values` as `f32`s, when that is what they are.
-#[cfg(all(feature = "simd", any(target_arch = "aarch64", target_arch = "x86_64")))]
-fn as_f32<T: 'static>(values: &[T]) -> Option<&[f32]> {
-    // SAFETY: equal `TypeId`s mean one type, so the layouts are identical.
-    (std::any::TypeId::of::<T>() == std::any::TypeId::of::<f32>())
-        .then(|| unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<f32>(), values.len()) })
 }
 
 /// Elementwise `op` over two resident vectors, in shared memory.
@@ -634,11 +561,11 @@ pub(super) fn vector_elementwise<T: MetalElement>(
     op: BinaryOp,
 ) -> Vector<T, Metal> {
     assert_same_len(a.len(), b.len(), op.name());
-    match a.storage().elementwise(b.storage(), op) {
-        Some(data) => Vector::from_storage(a.len(), data),
-        None => Host::vector_elementwise(&a.to_backend::<Host>(), &b.to_backend::<Host>(), op)
-            .to_backend(),
-    }
+    let data = require_metal(
+        "vector elementwise operation",
+        a.storage().elementwise(b.storage(), op),
+    );
+    Vector::from_storage(a.len(), data)
 }
 
 /// Elementwise `op` over two resident matrices, in shared memory.
@@ -650,11 +577,11 @@ pub(super) fn matrix_elementwise<T: MetalElement>(
 ) -> Matrix<T, Metal> {
     assert_same_shape(a.shape(), b.shape(), op.name());
     let (rows, cols) = a.shape();
-    match a.storage().elementwise(b.storage(), op) {
-        Some(data) => Matrix::from_storage(rows, cols, data),
-        None => Host::matrix_elementwise(&a.to_backend::<Host>(), &b.to_backend::<Host>(), op)
-            .to_backend(),
-    }
+    let data = require_metal(
+        "matrix elementwise operation",
+        a.storage().elementwise(b.storage(), op),
+    );
+    Matrix::from_storage(rows, cols, data)
 }
 
 /// Implements one operator for a resident tensor, by value and by reference.

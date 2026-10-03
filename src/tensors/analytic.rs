@@ -647,7 +647,7 @@ scalar_base_power!(f32, f64, f16, bf16);
 mod resident {
     use super::{Matrix, Metal, Power, Vector};
     use crate::metal::MetalElement;
-    use crate::tensors::Host;
+    use crate::tensors::require_metal;
     use crate::tensors::shape::{assert_same_len, assert_same_shape};
 
     impl<T: MetalElement> Vector<T, Metal> {
@@ -664,29 +664,21 @@ mod resident {
         #[track_caller]
         pub fn pow_elementwise(&self, exponents: &Self) -> Self {
             assert_same_len(self.len(), exponents.len(), "pow");
-            match self.storage().power(exponents.storage()) {
-                Some(data) => Vector::from_storage(self.len(), data),
-                None => self
-                    .to_backend::<Host>()
-                    .pow_elementwise(&exponents.to_backend::<Host>())
-                    .to_backend(),
-            }
+            let data = require_metal(
+                "vector elementwise power",
+                self.storage().power(exponents.storage()),
+            );
+            Vector::from_storage(self.len(), data)
         }
 
         /// Elementwise power with one operand fixed; `scalar_left` selects
         /// `scalar^x` over `x^scalar`.
         pub(crate) fn power_scalar(&self, scalar: T, scalar_left: bool) -> Self {
-            match self.storage().power_scalar(scalar, scalar_left) {
-                Some(data) => Vector::from_storage(self.len(), data),
-                None => {
-                    let host = self.to_backend::<Host>();
-                    if scalar_left {
-                        host.map(|&exponent| scalar.power(exponent)).to_backend()
-                    } else {
-                        host.pow(scalar).to_backend()
-                    }
-                }
-            }
+            let data = require_metal(
+                "vector-scalar power",
+                self.storage().power_scalar(scalar, scalar_left),
+            );
+            Vector::from_storage(self.len(), data)
         }
     }
 
@@ -705,28 +697,20 @@ mod resident {
         pub fn pow_elementwise(&self, exponents: &Self) -> Self {
             assert_same_shape(self.shape(), exponents.shape(), "pow");
             let (rows, cols) = self.shape();
-            match self.storage().power(exponents.storage()) {
-                Some(data) => Matrix::from_storage(rows, cols, data),
-                None => self
-                    .to_backend::<Host>()
-                    .pow_elementwise(&exponents.to_backend::<Host>())
-                    .to_backend(),
-            }
+            let data = require_metal(
+                "matrix elementwise power",
+                self.storage().power(exponents.storage()),
+            );
+            Matrix::from_storage(rows, cols, data)
         }
 
         pub(crate) fn power_scalar(&self, scalar: T, scalar_left: bool) -> Self {
             let (rows, cols) = self.shape();
-            match self.storage().power_scalar(scalar, scalar_left) {
-                Some(data) => Matrix::from_storage(rows, cols, data),
-                None => {
-                    let host = self.to_backend::<Host>();
-                    if scalar_left {
-                        host.map(|&exponent| scalar.power(exponent)).to_backend()
-                    } else {
-                        host.pow(scalar).to_backend()
-                    }
-                }
-            }
+            let data = require_metal(
+                "matrix-scalar power",
+                self.storage().power_scalar(scalar, scalar_left),
+            );
+            Matrix::from_storage(rows, cols, data)
         }
     }
 

@@ -84,15 +84,15 @@ fn main() {
 
     // The backend is explicit, and a switch is the only copy in sight.
     let gpu = a.to_backend::<Metal>();
+    assert!(
+        gpu.is_device_resident(),
+        "Metal device unavailable; Host fallback is disabled"
+    );
+    let gpu_product = gpu.matmul(&gpu);
     println!(
-        "residency: {} (device-resident: {}), and the answers agree: {}",
-        if gpu.is_device_resident() {
-            "GPU-shared memory"
-        } else {
-            "no Metal device, CPU fallback"
-        },
-        gpu.matmul(&gpu).is_device_resident(),
-        gpu.matmul(&gpu).to_backend::<Host>() == a.matmul(&a),
+        "residency: GPU-shared memory (device-resident: {}), and the answers agree: {}",
+        gpu_product.is_device_resident(),
+        gpu_product.to_backend::<Host>() == a.matmul(&a),
     );
     let _ = sink;
 }

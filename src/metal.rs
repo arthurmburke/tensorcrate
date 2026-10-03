@@ -14,10 +14,11 @@
 //! TensorOps for matrix products. Radix-2 FFTs run in `f32`; `f64`, matrix
 //! inversion, and non-radix-2 FFTs stay on the CPU.
 //!
-//! Every entry point returns `Option`: if no Metal device is available or an
-//! operation cannot be encoded, the caller falls back to the CPU kernel. A
-//! failure reported asynchronously by Metal is surfaced as a panic at the next
-//! synchronization point rather than exposing an incomplete output buffer.
+//! Every low-level entry point returns `Option`: if no Metal device is available
+//! or an operation cannot be encoded, the Metal backend rejects the operation.
+//! It never silently invokes a CPU kernel. A failure reported asynchronously by
+//! Metal is surfaced as a panic at the next synchronization point rather than
+//! exposing an incomplete output buffer.
 //!
 //! Input/output buffers are recycled through a small per-thread pool so
 //! repeated calls avoid re-allocating GPU memory.

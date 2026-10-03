@@ -440,8 +440,7 @@ mod resident {
     fn results_stay_in_shared_memory() {
         let resident = vector(64).to_backend::<Metal>();
         if !resident.is_device_resident() {
-            // No Metal device on this machine: the operations above still ran,
-            // on the CPU fallback, and matched.
+            // No Metal device on this machine; Metal operations are unavailable.
             return;
         }
         assert!(resident.clamp(0.0, 1.0).is_device_resident());

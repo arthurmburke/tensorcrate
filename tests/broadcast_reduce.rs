@@ -679,11 +679,12 @@ mod metal {
                 10.0 * tolerance,
                 &what,
             );
-            // The remainder has no shader; it still broadcasts, on the CPU.
-            assert_eq!(
+            let remainder = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 ad.elementwise(&shifted_d, BinaryOp::Rem)
-                    .to_backend::<Host>(),
-                ah.elementwise(&shifted_h, BinaryOp::Rem)
+            }));
+            assert!(
+                remainder.is_err(),
+                "Metal remainder must not fall back to Host"
             );
         }
     }

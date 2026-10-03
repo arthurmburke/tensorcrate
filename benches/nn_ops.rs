@@ -1112,6 +1112,10 @@ fn simd(bench: &mut Bench) {
         if let Some(mut case) = bench.case(G, &format!("dot, n={n}"), bytes(2)) {
             close("simd dot", f32k::dot(&x, &y), reference_dot);
             close("host dot", hx.dot(&hy), reference_dot);
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            let (gx, gy) = (hx.to_backend::<Metal>(), hy.to_backend::<Metal>());
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            close("metal dot", gx.dot(&gy), reference_dot);
             case.row("scalar loop (serial sum)", Drain::None, || {
                 let (x, y) = (black_box(&x), black_box(&y));
                 let mut sum = 0.0f32;
@@ -1124,6 +1128,8 @@ fn simd(bench: &mut Bench) {
                 f32k::dot(black_box(&x), black_box(&y))
             });
             case.row("host API", Drain::None, || hx.dot(&hy));
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            case.row("metal API (latency)", Drain::None, || gx.dot(&gy));
         }
 
         let reference_sum: f64 = x.iter().map(|&v| v as f64).sum();

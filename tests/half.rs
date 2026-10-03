@@ -499,11 +499,8 @@ mod metal {
         assert_eq!(columns.as_slice(), [1.0, 3.0, 2.0, 4.0].map(value));
     }
 
-    /// The resident results above could in principle have been computed on the
-    /// host and uploaded — a fallback leaves its result resident too. The
-    /// dispatch count is what shows the work ran on the GPU: one per operation,
-    /// and no synchronization, which a host fallback would need to read its
-    /// operands.
+    /// The dispatch count shows each operation ran on the GPU: one dispatch per
+    /// operation and no synchronization to read operands on the Host.
     #[cfg(feature = "counters")]
     #[test]
     fn half_precision_operations_dispatch_gpu_kernels() {
