@@ -53,11 +53,12 @@
 //!
 //! # What is differentiable
 //!
-//! Scalars, vectors and matrices of any [`Real`] element type (`f32` by
-//! default), on every backend that implements [`Kernels`] for it — `Host` for
-//! all of them, `Metal` for `f32`:
+//! Scalars, vectors, matrices and N-dimensional tensors of any [`Real`]
+//! element type (`f32` by default), on every backend that implements
+//! [`Kernels`] for it — `Host` for all of them, `Metal` for `f32`, `f16` and
+//! `bf16`. For scalars, vectors and matrices:
 //!
-//! - all thirteen [`Analytic`] functions, elementwise;
+//! - every [`Analytic`] function, elementwise;
 //! - the binary operations `+ - * / %`, elementwise, and as operators on `&Var`;
 //! - the comparisons [`maximum`](VectorVar::maximum) and
 //!   [`minimum`](VectorVar::minimum), against another tensor or a constant, and
@@ -79,15 +80,89 @@
 //! - broadcasting a differentiable scalar across a tensor with
 //!   [`expand`](ScalarVar::expand), whose backward is the sum of the adjoint.
 //!
-//! Everything placed on the tape is a leaf whose gradient can be read
+//! Everything placed on the tape is a leaf whose gradient can be read with
+//! [`grad`](Var::grad) after a backward pass.
+//!
+//! # Tensors
+//!
+//! [`Tape::tensor`] records a [`Tensor`] of any rank as a [`TensorVar`], and
+//! the tensor operations differentiate:
+//!
+//! - `+ - * /` (as methods and as operators on `&TensorVar`),
+//!   [`power`](TensorVar::power), [`maximum`](TensorVar::maximum) and
+//!   [`minimum`](TensorVar::minimum), all broadcasting numpy-style as
+//!   [`Tensor`]'s do. An operand that was broadcast receives its adjoint
+//!   summed back down to its own shape — one reduction over the axes it was
+//!   repeated along — so a `[D]` bias added to `[B, T, D]` activations gets
+//!   the sum over the batch and the positions;
+//! - every [`Analytic`] function, [`power_scalar`](TensorVar::power_scalar),
+//!   negation, scaling and shifting by a constant, and
+//!   [`abs`](TensorVar::abs), [`relu`](TensorVar::relu) and
+//!   [`clamp`](TensorVar::clamp), with ties splitting as for vectors;
+//! - layout: [`reshape`](TensorVar::reshape),
+//!   [`permute`](TensorVar::permute), [`transpose`](TensorVar::transpose),
+//!   [`narrow`](TensorVar::narrow), [`slice`](TensorVar::slice),
+//!   [`select`](TensorVar::select), [`split`](TensorVar::split),
+//!   [`chunk`](TensorVar::chunk), [`concat`](TensorVar::concat),
+//!   [`stack`](TensorVar::stack), [`squeeze`](TensorVar::squeeze),
+//!   [`unsqueeze`](TensorVar::unsqueeze),
+//!   [`broadcast_to`](TensorVar::broadcast_to) and
+//!   [`contiguous`](TensorVar::contiguous);
+//! - reductions: [`sum_axes`](TensorVar::sum_axes),
+//!   [`mean_axes`](TensorVar::mean_axes), [`var_axes`](TensorVar::var_axes)
+//!   under either correction, [`max_axes`](TensorVar::max_axes) and
+//!   [`min_axes`](TensorVar::min_axes) — whose adjoint goes to the extreme
+//!   element, split evenly among elements that tie for it, the many-way form
+//!   of [`Compare::MaxShare`]'s half each — and the whole-tensor
+//!   [`sum`](TensorVar::sum) and [`mean`](TensorVar::mean) to a scalar;
+//! - conversions to and from the matrix and vector variables —
+//!   [`to_matrix`](TensorVar::to_matrix), [`to_vector`](TensorVar::to_vector),
+//!   [`MatrixVar::to_tensor`], [`VectorVar::to_tensor`] — so a tensor
+//!   computation can use [`matmul`](MatrixVar::matmul) and the other matrix
+//!   products.
+//!
+//! A value on the tape is a whole, contiguous tensor, so a layout operation
+//! records a copy of the elements it reads — one strided copy on the backend
+//! — rather than a view. Its adjoint goes back the same way: a permutation's
+//! by the inverse permutation, a concatenation's by narrowing each piece's
+//! part back out, and a slice's — from `narrow`, `slice`, `select`, `split`
+//! or `chunk` — by writing it into the matching part of the parent's
+//! adjoint in place, a strided write that adds to whatever is already there
+//! and leaves the rest untouched. Every rule is a tensor operation on the
+//! backend, so on `Metal` the backward pass stays on the GPU.
+//!
+//! ```
+//! use tensorcrate::tensors::{Tape, Tensor};
+//!
+//! let tape = Tape::new();
+//! // A batch of 2 sequences of 3 positions, each 4 features wide, and a bias.
+//! let features = (0..24).map(|i| i as f32 * 0.1).collect::<Vec<_>>();
+//! let x = tape.tensor(Tensor::from_vec(&[2, 3, 4], features));
+//! let bias = tape.tensor(Tensor::from_vec(&[4], vec![0.5f32, -0.5, 0.25, 0.0]));
+//!
+//! // Two heads of two features, brought forward; the first position dropped.
+//! let heads = (&x + &bias).reshape(&[2, 3, 2, 2]).permute(&[0, 2, 1, 3]);
+//! let tail = heads.narrow(2, 1, 2);
+//! let loss = tail.tanh().max_axes(-1, false).sum();
+//! loss.backward();
+//!
+//! assert_eq!(x.grad().shape(), [2, 3, 4]);
+//! assert_eq!(bias.grad().shape(), [4]); // summed over the batch and positions
+//! // The dropped position receives nothing.
+//! assert!(x.grad().as_slice()[..4].iter().all(|&g| g == 0.0));
+//! ```
 
 use std::cell::{Cell, OnceCell, RefCell};
 use std::marker::PhantomData;
 use std::ops::{Add, Div, Mul, Rem, Sub};
 use std::rc::Rc;
 
-use super::{Analytic, Backend, BinaryOp, Compare, Host, Kernels, Matrix, Transposed, Vector};
+use super::{
+    Analytic, Backend, BinaryOp, Compare, Host, Kernels, Matrix, Tensor, Transposed, Vector,
+};
 use crate::numbers::Real;
+
+mod tensor;
 
 // ---- what a node can hold ---------------------------------------------------
 
@@ -152,6 +227,20 @@ impl<T: Real, B: Kernels<T>> Adjoint<B> for Matrix<T, B> {
 
     fn add(&self, other: &Self) -> Self {
         B::matrix_elementwise(self, other, BinaryOp::Add)
+    }
+}
+
+impl<T: Real, B: Kernels<T>> Adjoint<B> for Tensor<T, B> {
+    fn zeros_like(&self) -> Self {
+        Tensor::filled(self.shape(), T::zero())
+    }
+
+    fn duplicate(&self) -> Self {
+        self.contiguous()
+    }
+
+    fn add(&self, other: &Self) -> Self {
+        self.elementwise(other, BinaryOp::Add)
     }
 }
 
@@ -305,6 +394,14 @@ impl<B: Backend> Tape<B> {
         self.push(value, None)
     }
 
+    /// Record an N-dimensional tensor input.
+    pub fn tensor<T: Real>(&self, value: Tensor<T, B>) -> TensorVar<'_, B, T>
+    where
+        B: Kernels<T>,
+    {
+        self.push(value, None)
+    }
+
     /// How many nodes have been recorded.
     pub fn len(&self) -> usize {
         self.nodes.borrow().len()
@@ -366,6 +463,9 @@ pub type ScalarVar<'t, B = Host, T = f32> = Var<'t, T, B>;
 pub type VectorVar<'t, B = Host, T = f32> = Var<'t, Vector<T, B>, B>;
 /// A recorded matrix.
 pub type MatrixVar<'t, B = Host, T = f32> = Var<'t, Matrix<T, B>, B>;
+/// A recorded N-dimensional tensor; its operations are listed under
+/// [`Var`]'s tensor methods and in the [module documentation](self#tensors).
+pub type TensorVar<'t, B = Host, T = f32> = Var<'t, Tensor<T, B>, B>;
 
 impl<'t, T: Adjoint<B>, B: Backend> Var<'t, T, B> {
     /// The value computed in the forward pass.
@@ -1351,7 +1451,7 @@ binary_methods!(
     rem => BinaryOp::Rem, Rem::rem,
 );
 
-/// The analytic functions, as methods on all three shapes.
+/// The analytic functions, as methods on every shape.
 macro_rules! analytic_methods {
     ($($method:ident => $variant:ident),+ $(,)?) => {
         impl<'t, B: Kernels<E>, E: Real> ScalarVar<'t, B, E> {
@@ -1369,6 +1469,13 @@ macro_rules! analytic_methods {
         }
 
         impl<'t, B: Kernels<E>, E: Real> MatrixVar<'t, B, E> {
+            $(
+                #[doc = concat!("Elementwise `", stringify!($method), "`, differentiated.")]
+                pub fn $method(&self) -> Self { self.analytic(Analytic::$variant) }
+            )+
+        }
+
+        impl<'t, B: Kernels<E>, E: Real> TensorVar<'t, B, E> {
             $(
                 #[doc = concat!("Elementwise `", stringify!($method), "`, differentiated.")]
                 pub fn $method(&self) -> Self { self.analytic(Analytic::$variant) }

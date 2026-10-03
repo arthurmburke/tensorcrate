@@ -67,6 +67,10 @@
 //! [fused program](fused::Program). Shape errors panic, naming the operation
 //! and the shapes, as everywhere in this module.
 //!
+//! Recorded on a [`Tape`] as a [`TensorVar`], a tensor differentiates
+//! through all of these — the broadcasting arithmetic, the layout operations
+//! and the reductions; see the [`tape`] module.
+//!
 //! ```
 //! use tensorcrate::tensors::Tensor;
 //!
@@ -130,7 +134,7 @@ pub use kernels::{
 pub use layout::{AxisIndex, MAX_RANK};
 pub use matrix::Matrix;
 pub use reduction::Axes;
-pub use tape::{MatrixVar, ScalarVar, Tape, Var, VectorVar};
+pub use tape::{MatrixVar, ScalarVar, Tape, TensorVar, Var, VectorVar};
 pub use tensor::Tensor;
 pub use vector::Vector;
 pub use view::TensorView;
