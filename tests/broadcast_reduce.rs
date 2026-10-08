@@ -4,7 +4,7 @@
 
 use tensorcrate::numbers::{Real, bf16, f16};
 use tensorcrate::statistics::Correction;
-use tensorcrate::tensors::fused::{Builder, DType};
+use tensorcrate::tensors::fused::{Builder, DType, Decl};
 use tensorcrate::tensors::{BinaryOp, Compare, Host, Kernels, Tensor, TensorView, Vector};
 
 /// Deterministic, integral, mixed-sign filler, so every backend's sums of it
@@ -219,12 +219,13 @@ fn a_broadcast_view_repeats_with_zero_strides() {
     // fold into one stride-zero axis.
     let x = tensor::<f32>(&[2, 3, 4]);
     let mut builder = Builder::<f32>::new();
-    let (a, b) = (builder.input(DType::F32), builder.input(DType::F32));
+    let tensor = Decl::tensor(DType::F32, &[2, 3, 4]);
+    let (a, b) = (builder.input(tensor.clone()), builder.input(tensor));
     let sum = builder.add(a, b);
     builder.output(sum, DType::F32);
     let program = builder.build().unwrap();
     let fused = program
-        .run((6, 4), &[&x, &repeated], &mut [])
+        .run(&[&x, &repeated], &mut [])
         .remove(0)
         .into_matrix::<f32>();
     assert_eq!(fused.data(), (&x + &bias).to_vec());

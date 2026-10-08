@@ -388,39 +388,18 @@ impl<T: Element, B: Backend> FusableMut<B> for Tensor<T, B> {
     }
 }
 
-/// A view is read by a fused program in place, through its strides, as the
-/// matrix of its rows like a [`Tensor`] — which needs its leading axes to step
-/// through storage as one: any slice, or a permutation that keeps the last
-/// axis last and the others in order. A view of all of a tensor is read as
-/// the tensor.
-///
-/// # Panics
-///
-/// [`source`](Fusable::source) panics for a view whose leading axes do not
-/// fold into one strided axis, such as one that moves the last axis; make it
-/// [`contiguous`](TensorView::contiguous) first.
+/// A view is read by a fused program in place, through its strides, whatever
+/// they are: a slice, a permutation or a broadcast of a tensor. A view of all
+/// of a tensor is read as the tensor.
 impl<T: Element, B: Backend> Fusable<B> for TensorView<'_, T, B> {
     fn source(&self) -> Source<'_, B> {
         let data = T::source::<B>(self.data().storage());
-        if self.is_whole() {
-            return Source {
-                data,
-                len: self.len(),
-                view: None,
-            };
-        }
-        let view = self.matrix_view().unwrap_or_else(|| {
-            panic!(
-                "fused program: a view of shape {:?} with strides {:?} is not a strided matrix; \
-                 make it contiguous first",
-                self.shape(),
-                self.strides()
-            )
-        });
+        let view =
+            (!self.is_whole()).then(|| View::new(self.offset(), self.shape(), self.strides()));
         Source {
             data,
             len: self.len(),
-            view: Some(view),
+            view,
         }
     }
 
@@ -434,33 +413,3 @@ impl<T: Element, B: Backend> Fusable<B> for TensorView<'_, T, B> {
 }
 
 impl<T: Element, B: Backend> FusableOf<T, B> for TensorView<'_, T, B> {}
-
-impl<T, B: Backend> TensorView<'_, T, B> {
-    /// This view as the strided matrix of its rows, if its leading axes fold
-    /// into one.
-    fn matrix_view(&self) -> Option<View> {
-        let (shape, strides) = (self.shape(), self.strides());
-        let (cols, col_stride, leading) = match shape {
-            [] => (1, 0, 0),
-            [.., last] => (*last, strides[shape.len() - 1], shape.len() - 1),
-        };
-        // The leading axes that step at all, outermost first, must each step
-        // over all of the next.
-        let stepping = (0..leading)
-            .filter(|&axis| shape[axis] != 1)
-            .collect::<Vec<_>>();
-        let folds = stepping
-            .windows(2)
-            .all(|pair| strides[pair[0]] == strides[pair[1]] * shape[pair[1]]);
-        if !folds {
-            return None;
-        }
-        Some(View {
-            offset: self.offset(),
-            rows: shape[..leading].iter().product(),
-            cols,
-            row_stride: stepping.last().map_or(0, |&axis| strides[axis]),
-            col_stride,
-        })
-    }
-}

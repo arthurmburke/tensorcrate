@@ -13,7 +13,7 @@ use tensorcrate::numbers::Real;
 use tensorcrate::optim::{AdaGrad, Adam, Momentum, Parameter, RmsProp, Rule, Sgd, minimize};
 use tensorcrate::projections::{project_onto_ball, project_onto_box, project_onto_capped_simplex};
 use tensorcrate::statistics::{AxisStatistics, Correction, Distribution, Statistics};
-use tensorcrate::tensors::fused::{self, Builder, DType, Fusable, Mode, Program};
+use tensorcrate::tensors::fused::{self, Builder, DType, Decl, Fusable, Mode, Program};
 use tensorcrate::tensors::{
     Analytic, BinaryOp, Compare, DualMatrix, DualVector, Host, Kernels, Matrix, Ordered, Reduce,
     SortOrder, Tape, Transcendental, Vector, gradient, tape,
@@ -471,7 +471,8 @@ fn fused_steps_match_unfused_steps_in_every_element_type() {
 fn a_program_can_compute_in_f64() {
     // y = sqrt(a·b + 1e-12): the constant is below f32's resolution of 1.
     let mut b = Builder::<f64>::new();
-    let (x, w) = (b.input(DType::F64), b.input(DType::F64));
+    let vector = Decl::vector(DType::F64, 3);
+    let (x, w) = (b.input(vector.clone()), b.input(vector));
     let product = b.mul(x, w);
     let shifted = b.shift(product, 1e-12);
     let root = b.unary(Analytic::Sqrt, shifted);
@@ -490,7 +491,10 @@ fn a_program_can_compute_in_f64() {
 fn storage_and_arithmetic_types_are_independent() {
     // f64 arithmetic over f32 and f16 storage, narrowed to f32 and bf16.
     let mut b = Builder::<f64>::new();
-    let (x, h) = (b.input(DType::F32), b.input(DType::F16));
+    let (x, h) = (
+        b.input(Decl::vector(DType::F32, 3)),
+        b.input(Decl::vector(DType::F16, 3)),
+    );
     let sum = b.add(x, h);
     let scaled = b.scale(sum, 1e-3);
     b.output(scaled, DType::F32);
@@ -501,7 +505,7 @@ fn storage_and_arithmetic_types_are_independent() {
     let x = Vector::new([1.0f32, 2.0, 3.0]);
     let h = Vector::new([0.5f64, 0.25, 0.125].map(f16::from_f64));
     let inputs: [&dyn Fusable<Host>; 2] = [&x, &h];
-    let mut outputs = program.run::<Host>((1, 3), &inputs, &mut []);
+    let mut outputs = program.run::<Host>(&inputs, &mut []);
     let exact: Vec<f64> = [1.5, 2.25, 3.125].iter().map(|v| v * 1e-3).collect();
 
     let wide = outputs.remove(2).into_vector::<f64>();
@@ -534,7 +538,8 @@ fn f64_programs_match_the_unfused_oracle_bit_for_bit() {
     );
 
     let mut b = Builder::<f64>::new();
-    let (x, y) = (b.input(DType::F64), b.input(DType::F64));
+    let vector = Decl::vector(DType::F64, len);
+    let (x, y) = (b.input(vector.clone()), b.input(vector));
     let ratio = b.div(x, y);
     let kept = b.compare(Compare::Max, ratio, x);
     let mask = b.compare(Compare::Greater, kept, y);
@@ -555,7 +560,7 @@ fn f64_programs_match_the_unfused_oracle_bit_for_bit() {
 #[test]
 fn a_program_with_f64_storage_displays_and_validates() {
     let mut b = Builder::<f64>::new();
-    let x = b.input(DType::F64);
+    let x = b.input(Decl::vector(DType::F64, 10));
     let one = b.constant(0.1);
     let y = b.add(x, one);
     b.output(y, DType::F64);

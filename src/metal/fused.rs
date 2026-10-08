@@ -33,18 +33,31 @@ pub(super) const FUSED_OUTPUT_SLOTS: usize = 8;
 const PLACES: usize = 26;
 const EPILOGUE_PLACES: usize = 28;
 
-/// Bind the table of where each input slot is read through each remap.
+/// Where one load of a fused program reads, as `FusedPlace` in `common.h`
+/// lays it out and `fused::Place` describes it: storage element
+/// `offset + col·col_step` plus, for the row split into the `lead` axes it
+/// folds together, each coordinate times its axis's step.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub(crate) struct FusedPlace {
+    pub(crate) offset: u32,
+    pub(crate) col: u32,
+    pub(crate) lead: u32,
+    pub(crate) dims: [u32; crate::tensors::MAX_RANK - 1],
+    pub(crate) steps: [u32; crate::tensors::MAX_RANK - 1],
+}
+
+/// Bind the table of where each of a program's loads reads.
 fn bind_places(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
-    places: &[[u32; 3]],
+    places: &[FusedPlace],
     index: usize,
 ) {
-    assert_eq!(
-        places.len(),
-        FUSED_INPUT_SLOTS * 4,
-        "one place per slot and remap"
+    assert!(
+        !places.is_empty() && places.len() <= crate::tensors::fused::MAX_LOADS,
+        "one place per load"
     );
-    // SAFETY: the table is `FusedPlace[64]`, twelve bytes each.
+    // SAFETY: the table is `places.len()` `FusedPlace`s, at most 4 KB.
     unsafe {
         encoder.setBytes_length_atIndex(
             NonNull::from(&places[0]).cast(),
@@ -64,7 +77,7 @@ pub(crate) fn fused_elementwise<T: MetalElement>(
     (rows, cols): (usize, usize),
     inputs: &[&ProtocolObject<dyn MTLBuffer>],
     outputs: &[&ProtocolObject<dyn MTLBuffer>],
-    places: &[[u32; 3]],
+    places: &[FusedPlace],
 ) -> Option<()> {
     let len = rows.checked_mul(cols)?;
     if len == 0
@@ -145,7 +158,7 @@ pub(crate) fn matmul_epilogue<T: MetalElement>(
     b: &ProtocolObject<dyn MTLBuffer>,
     inputs: &[&ProtocolObject<dyn MTLBuffer>],
     outputs: &[&ProtocolObject<dyn MTLBuffer>],
-    places: &[[u32; 3]],
+    places: &[FusedPlace],
 ) -> Option<()> {
     if m == 0
         || n == 0
@@ -266,7 +279,7 @@ pub(crate) fn fused_sum<T: MetalElement>(
     code: &[crate::tensors::fused::Encoded],
     (rows, cols): (usize, usize),
     inputs: &[&ProtocolObject<dyn MTLBuffer>],
-    places: &[[u32; 3]],
+    places: &[FusedPlace],
     rows_axis: bool,
     y: &ProtocolObject<dyn MTLBuffer>,
 ) -> Option<()> {
@@ -366,7 +379,7 @@ pub(crate) fn fused_rows<T: MetalElement>(
     (rows, cols): (usize, usize),
     inputs: &[&ProtocolObject<dyn MTLBuffer>],
     outputs: &[&ProtocolObject<dyn MTLBuffer>],
-    places: &[[u32; 3]],
+    places: &[FusedPlace],
     statistics: codegen::RowStatistics,
 ) -> Option<()> {
     if rows == 0

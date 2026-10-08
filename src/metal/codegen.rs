@@ -102,14 +102,15 @@ pub(crate) struct RowStatistics {
     /// The first input slot holding a statistic.
     pub first: u8,
     /// For each statistic, in slot order: the input it is of, that input's
-    /// storage type as the shader numbers it, and whether it is the sum of
-    /// squared deviations rather than the mean.
-    pub statistics: [(u8, u8, bool); 16],
+    /// storage type as the shader numbers it, the place the input is read in
+    /// order through, and whether it is the sum of squared deviations rather
+    /// than the mean.
+    pub statistics: [(u8, u8, u8, bool); 16],
     pub count: usize,
 }
 
 impl RowStatistics {
-    fn each(&self) -> &[(u8, u8, bool)] {
+    fn each(&self) -> &[(u8, u8, u8, bool)] {
         &self.statistics[..self.count]
     }
 }
@@ -137,8 +138,11 @@ pub(super) fn key<T: MetalElement>(code: &[Encoded], kernel: Kernel) -> Vec<u64>
     };
     key.push(discriminant);
     if let Kernel::Rows(rows) = kernel {
-        key.extend(rows.each().iter().map(|&(of, dtype, deviations)| {
-            u64::from(of) | u64::from(dtype) << 8 | u64::from(deviations) << 16
+        key.extend(rows.each().iter().map(|&(of, dtype, place, deviations)| {
+            u64::from(of)
+                | u64::from(dtype) << 8
+                | u64::from(place) << 16
+                | u64::from(deviations) << 24
         }));
     }
     for instr in code {
@@ -174,6 +178,11 @@ pub(super) fn source<T: MetalElement>(code: &[Encoded], kernel: Kernel) -> Optio
         Kernel::Rows(rows) => rows.first..rows.first + rows.count as u8,
         _ => 0..0,
     };
+    let read = match kernel {
+        Kernel::Rows(rows) => rows.each().iter().map(|&(_, _, place, _)| place).collect(),
+        _ => Vec::new(),
+    };
+    let bases = bases(code, product, statistics.clone(), &read);
     let body = body::<T>(code, product, sum, statistics)?;
     let mut source = String::with_capacity(COMMON.len() + body.len() + 4096);
     if product {
@@ -213,6 +222,7 @@ pub(super) fn source<T: MetalElement>(code: &[Encoded], kernel: Kernel) -> Optio
             source
                 .push_str("    const uint row = i / cols;\n    const uint col = i - row * cols;\n");
             source.push_str("    (void)rows; (void)row; (void)col; (void)k; (void)places;\n");
+            source.push_str(&bases);
             source.push_str(&body);
             source.push_str("}\n");
         }
@@ -275,31 +285,31 @@ kernel void fused_program(
 "#
             )
             .ok()?;
+            source.push_str(&bases);
             // Each input's moments once, as `matrix_axis_moments` computes them:
             // the mean, then the squared deviations from it, in `float`. A
             // thread keeps its first `ROW_CACHE` elements of the row in
             // registers for the second pass.
-            let mut inputs: Vec<(u8, u8, bool)> = Vec::new();
-            for &(of, dtype, deviations) in rows.each() {
+            let mut inputs: Vec<(u8, u8, u8, bool)> = Vec::new();
+            for &(of, dtype, place, deviations) in rows.each() {
                 match inputs.iter_mut().find(|(input, ..)| *input == of) {
-                    Some(entry) => entry.2 |= deviations,
-                    None => inputs.push((of, dtype, deviations)),
+                    Some(entry) => entry.3 |= deviations,
+                    None => inputs.push((of, dtype, place, deviations)),
                 }
             }
-            for &(of, dtype, deviations) in &inputs {
+            for &(of, dtype, at, deviations) in &inputs {
                 // The input read in order, as statistics are of it.
-                let at = usize::from(of) * 4;
                 write!(
                     source,
                     r#"    float cache{of}[{ROW_CACHE}];
     float total{of} = 0.0f;
     for (uint j = 0; j < {ROW_CACHE}; j++) {{
         const uint col = t + j * n;
-        cache{of}[j] = col < cols ? fused_load(in{of}, {dtype}u, fused_at(places[{at}], row, col)) : 0.0f;
+        cache{of}[j] = col < cols ? fused_load(in{of}, {dtype}u, base{at} + col * places[{at}].col_step) : 0.0f;
         total{of} += cache{of}[j];
     }}
     for (uint col = t + {ROW_CACHE} * n; col < cols; col += n) {{
-        total{of} += fused_load(in{of}, {dtype}u, fused_at(places[{at}], row, col));
+        total{of} += fused_load(in{of}, {dtype}u, base{at} + col * places[{at}].col_step);
     }}
     const float mean{of} = row_total(total{of}, shared, simd, simds, lane) / float(cols);
 "#
@@ -316,7 +326,7 @@ kernel void fused_program(
         }}
     }}
     for (uint col = t + {ROW_CACHE} * n; col < cols; col += n) {{
-        const float d = fused_load(in{of}, {dtype}u, fused_at(places[{at}], row, col)) - mean{of};
+        const float d = fused_load(in{of}, {dtype}u, base{at} + col * places[{at}].col_step) - mean{of};
         squares{of} += d * d;
     }}
     const float deviations{of} = row_total(squares{of}, shared, simd, simds, lane);
@@ -327,7 +337,7 @@ kernel void fused_program(
             }
             // Rounded to the program's type, as the statistics it would
             // otherwise read are stored.
-            for (k, &(of, _, deviations)) in rows.each().iter().enumerate() {
+            for (k, &(of, _, _, deviations)) in rows.each().iter().enumerate() {
                 let which = if deviations { "deviations" } else { "mean" };
                 writeln!(
                     source,
@@ -374,7 +384,7 @@ kernel void fused_program(
     if (row >= rows) {{
         return;
     }}
-    float acc = 0.0f;
+{bases}    float acc = 0.0f;
     for (uint col = lane; col < cols; col += 32) {{
         const uint i = row * cols + col;
 "#
@@ -407,7 +417,7 @@ kernel void fused_program(
         const uint i = row * cols + col;
 "#,
                 );
-                for line in body.lines() {
+                for line in bases.lines().chain(body.lines()) {
                     writeln!(source, "    {line}").ok()?;
                 }
                 source.push_str("    }\n    partial[ulong(gid.y) * cols + col] = acc;\n}\n");
@@ -479,13 +489,43 @@ kernel void fused_program(
 "#
             )
             .ok()?;
-            for line in body.lines() {
+            for line in bases.lines().chain(body.lines()) {
                 writeln!(source, "    {line}").ok()?;
             }
             source.push_str("    }\n}\n");
         }
     }
     Some(source)
+}
+
+/// Where the current row starts in each place the program loads through, and
+/// in each of `extra`: `base{k}` for place `k`, from the kernel's `row`. A
+/// load whose rows fold no axes together, or one, is read without dividing.
+fn bases(code: &[Encoded], product: bool, statistics: std::ops::Range<u8>, extra: &[u8]) -> String {
+    let mut places: Vec<(u16, u8)> = code
+        .iter()
+        .filter(|instr| {
+            instr.kind == 0 && !(product && instr.a == 0) && !statistics.contains(&instr.a)
+        })
+        .map(|instr| (instr.op, instr.aux))
+        .chain(
+            extra
+                .iter()
+                .map(|&place| (u16::from(place), Encoded::ANY_LEAD)),
+        )
+        .collect();
+    places.sort_unstable();
+    places.dedup_by_key(|&mut (place, _)| place);
+    places
+        .iter()
+        .map(|&(k, lead)| match lead {
+            0 => format!("    const uint base{k} = places[{k}].offset;\n"),
+            1 => format!(
+                "    const uint base{k} = places[{k}].offset + row * places[{k}].steps[0];\n"
+            ),
+            _ => format!("    const uint base{k} = fused_row(places[{k}], row);\n"),
+        })
+        .collect()
 }
 
 /// The straight-line code for one element `i`: one local per value, the
@@ -512,18 +552,17 @@ fn body<T: MetalElement>(
     };
     for (at, instr) in code.iter().enumerate() {
         let value = match instr.kind {
-            // Load: `op` is the remap, `a` the input slot, `b` its storage type.
+            // Load: `op` is the load's place, `a` the input slot, `b` its
+            // storage type.
             0 if product && instr.a == 0 => format!("{t}(product)"),
             // A row statistic, computed above, and read through a column
             // broadcast: the same for the whole row.
             0 if statistics.contains(&instr.a) => format!("stat{}", instr.a),
-            // Where the input is read, from the element's row and column,
-            // which every kernel knows without dividing again per load.
+            // Where the input is read: from where its row starts, which the
+            // kernel computes once per row (see `bases`), and the column.
             0 => format!(
-                "{t}(fused_load(in{}, {}u, fused_at(places[{}], row, col)))",
-                instr.a,
-                instr.b,
-                usize::from(instr.a) * 4 + usize::from(instr.op)
+                "{t}(fused_load(in{}, {}u, base{} + col * places[{}].col_step))",
+                instr.a, instr.b, instr.op, instr.op
             ),
             1 => {
                 constants += 1;

@@ -126,7 +126,7 @@ inline T analytic_value(AnalyticOp op, T x) {
 // Must match `fused::Encoded`: twelve bytes, four-aligned.
 struct FusedInstr {
     ushort kind;   // 0 load, 1 const, 2 binary, 3 unary, 4 compare, 5 store
-    ushort op;     // remap, BinaryOp, AnalyticOp or CompareOp
+    ushort op;     // load's place, BinaryOp, AnalyticOp or CompareOp
     uchar dst;
     uchar a;       // load: input slot; others: register
     uchar b;       // load/store: storage type; binary/compare: register
@@ -172,19 +172,42 @@ inline void fused_store(device uchar* base, uint dtype, uint index, float value)
     }
 }
 
-// Where element `(row, col)` of the space reads an input through one remap:
-// storage element `offset + row·row_step + col·col_step`, matching
-// `fused::Place`. A transpose, a broadcast and a strided view of a matrix are
-// all one of these. Programs find one per input slot and remap, at
-// `places[slot * 4 + remap]`.
+// Where element `(row, col)` of a walk of the space reads one of a program's
+// loads, matching `fused::Place` and `metal::FusedPlace`: storage element
+// `offset + col·col_step`, plus, for the row split into the `lead` axes it
+// folds together (outermost first), each coordinate times its axis's step. A
+// permutation, a broadcast and a strided view of a tensor of any rank are all
+// one of these; most fold their rows into one axis, which needs no division.
+// Programs find load `k`'s at `places[k]`.
+#define FUSED_LEAD 5
+
 struct FusedPlace {
     uint offset;
-    uint row_step;
     uint col_step;
+    uint lead;
+    uint dims[FUSED_LEAD];
+    uint steps[FUSED_LEAD];
 };
 
-inline uint fused_at(FusedPlace place, uint row, uint col) {
-    return place.offset + row * place.row_step + col * place.col_step;
+// The storage element the start of `row` reads; a kernel whose threads stay
+// on one row computes it once.
+inline uint fused_row(constant FusedPlace& place, uint row) {
+    if (place.lead == 0) {
+        return place.offset;
+    }
+    if (place.lead == 1) {
+        return place.offset + row * place.steps[0];
+    }
+    uint at = place.offset;
+    for (uint k = place.lead - 1; k > 0; k--) {
+        at += (row % place.dims[k]) * place.steps[k];
+        row /= place.dims[k];
+    }
+    return at + row * place.steps[0];
+}
+
+inline uint fused_at(constant FusedPlace& place, uint row, uint col) {
+    return fused_row(place, row) + col * place.col_step;
 }
 
 
@@ -225,7 +248,7 @@ inline void fused_run(
                     // one rounding, to `T`.
                     r[instr.dst] = T(fused_load(
                         buffers.inputs[instr.a], instr.b,
-                        fused_at(buffers.places[instr.a * 4 + instr.op], row, col)));
+                        fused_at(buffers.places[instr.op], row, col)));
                 }
                 break;
             case 1:

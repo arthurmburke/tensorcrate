@@ -556,10 +556,10 @@ fn a_matrix_gradient_must_have_the_parameters_shape() {
 #[should_panic(expected = "expected 1 inputs, got 2")]
 fn a_parameter_program_run_by_parts_counts_its_operands() {
     use tensorcrate::optim::run_by_parts;
-    use tensorcrate::tensors::fused::{Builder, DType};
+    use tensorcrate::tensors::fused::{Builder, DType, Decl};
     let mut b = Builder::<f32>::new();
-    let g = b.input(DType::F32);
-    let p = b.update(DType::F32);
+    let g = b.input(Decl::scalar(DType::F32));
+    let p = b.update(Decl::scalar(DType::F32));
     let p = b.sub(p, g);
     b.set(0, p);
     let program = b.build().unwrap();

@@ -4,7 +4,7 @@
 //! `Metal` against `Host`.
 
 use tensorcrate::numbers::{bf16, f16};
-use tensorcrate::tensors::fused::{Builder, DType, Remap};
+use tensorcrate::tensors::fused::{Builder, DType, Decl};
 use tensorcrate::tensors::{
     Analytic, BinaryOp, Compare, Host, Kernels, MAX_RANK, Matrix, Tensor, TensorView, Vector,
 };
@@ -460,8 +460,8 @@ fn integer_tensors_have_the_layout_operations() {
 #[test]
 fn fused_programs_read_tensors_and_strided_views() {
     let mut builder = Builder::<f32>::new();
-    let x = builder.input(DType::F32);
-    let y = builder.input(DType::F32);
+    let x = builder.input(Decl::tensor(DType::F32, &[2, 3, 4]));
+    let y = builder.input(Decl::tensor(DType::F32, &[2, 3, 4]));
     let product = builder.mul(x, y);
     builder.output(product, DType::F32);
     let program = builder.build().unwrap();
@@ -470,7 +470,7 @@ fn fused_programs_read_tensors_and_strided_views() {
     let wide = tensor(&[2, 3, 8]);
     let half = wide.narrow(2, 4, 4); // rows step 8, columns step 1
     let out = program
-        .run((6, 4), &[&a, &half], &mut [])
+        .run(&[&a, &half], &mut [])
         .remove(0)
         .into_matrix::<f32>();
     let expected = naive(a.view())
@@ -480,16 +480,16 @@ fn fused_programs_read_tensors_and_strided_views() {
         .collect::<Vec<_>>();
     assert_eq!(out.data(), expected);
 
-    // A column broadcast from a strided view of one column.
+    // A column broadcast from a strided view of one column, of its own shape.
     let mut builder = Builder::<f32>::new();
-    let x = builder.input(DType::F32);
-    let column = builder.input_remapped(DType::F32, Remap::Column);
+    let x = builder.input(Decl::tensor(DType::F32, &[2, 3, 4]));
+    let column = builder.input(Decl::tensor(DType::F32, &[2, 3, 1]));
     let sum = builder.add(x, column);
     builder.output(sum, DType::F32);
     let program = builder.build().unwrap();
     let firsts = wide.narrow(-1, 0, 1);
     let out = program
-        .run((6, 4), &[&a, &firsts], &mut [])
+        .run(&[&a, &firsts], &mut [])
         .remove(0)
         .into_matrix::<f32>();
     for (row, values) in out.row_iter().enumerate() {
@@ -502,15 +502,34 @@ fn fused_programs_read_tensors_and_strided_views() {
 }
 
 #[test]
-#[should_panic(expected = "is not a strided matrix")]
-fn a_view_that_moves_the_last_axis_is_not_fusable() {
+fn a_view_that_moves_the_last_axis_is_read_in_place() {
     let mut builder = Builder::<f32>::new();
-    let x = builder.input(DType::F32);
+    let x = builder.input(Decl::tensor(DType::F32, &[4, 2, 3]));
+    let y = builder.shift(x, 1.0);
+    builder.output(y, DType::F32);
+    let program = builder.build().unwrap();
+    let a = tensor(&[2, 3, 4]);
+    let moved = a.permute(&[2, 0, 1]);
+    let out = program
+        .run(&[&moved], &mut [])
+        .remove(0)
+        .into_tensor::<f32>();
+    let expected: Vec<f32> = naive(moved).into_iter().map(|v| v + 1.0).collect();
+    assert_eq!(out.shape(), [4, 2, 3]);
+    assert_eq!(out.into_vec(), expected);
+}
+
+#[test]
+#[should_panic(expected = "cannot be read as [8, 3]")]
+fn a_view_that_cannot_be_reshaped_in_place_is_refused() {
+    // Its axes are out of order in storage, so no strides read it as 8 × 3.
+    let mut builder = Builder::<f32>::new();
+    let x = builder.input(Decl::matrix(DType::F32, (8, 3)));
     builder.output(x, DType::F32);
     let program = builder.build().unwrap();
     let a = tensor(&[2, 3, 4]);
     let moved = a.permute(&[2, 0, 1]);
-    program.run((8, 3), &[&moved], &mut []);
+    program.run(&[&moved], &mut []);
 }
 
 #[test]

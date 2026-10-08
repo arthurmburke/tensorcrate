@@ -111,20 +111,21 @@ pub trait Backend: sealed::Sealed + Sized + 'static {
     fn duplicate<T: Copy + 'static>(storage: &Self::Storage<T>) -> Self::Storage<T>;
 
     /// The `rows × cols` matrix whose element `(r, c)` is element
-    /// `place.at(r, c)` of `storage`: a view, a broadcast or a transpose of it,
-    /// copied into order. Every element is copied exactly. This is the
-    /// two-axis [`strided_copy`](Self::strided_copy).
+    /// `place.at(r, c)` of `storage`: a view, a broadcast or a permutation of
+    /// it, copied into order. Every element is copied exactly. This is
+    /// [`strided_copy`](Self::strided_copy) over the axes `place` walks.
     #[doc(hidden)]
     fn gather<T: Copy + 'static>(
         storage: &Self::Storage<T>,
         place: Place,
-        (rows, cols): (usize, usize),
+        (_, cols): (usize, usize),
     ) -> Self::Storage<T> {
+        let (dims, steps) = place.layout(cols);
         let from = Strided {
             offset: place.offset,
-            strides: &[place.row, place.col],
+            strides: &steps,
         };
-        Self::strided_copy(storage, &[rows, cols], from)
+        Self::strided_copy(storage, &dims, from)
     }
 
     /// The elements of `storage` that a layout of `shape` reads at `from`,

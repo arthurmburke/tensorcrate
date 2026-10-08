@@ -188,7 +188,7 @@ mod metal {
     use super::*;
     use tensorcrate::metal::MetalElement;
     use tensorcrate::statistics::{AxisStatistics, Correction, Distribution, Statistics};
-    use tensorcrate::tensors::fused::{self, Builder, DType, Mode};
+    use tensorcrate::tensors::fused::{self, Builder, DType, Decl, Mode};
     use tensorcrate::tensors::{Axis, Metal, Ordered, SortOrder, Tape, Transcendental};
 
     fn close<T: Real>(got: &[T], want: &[T], ulps: f64, what: &str) {
@@ -403,7 +403,8 @@ mod metal {
     fn half_precision_programs_run_resident() {
         // y = (a·b + 1)², computed in f16 registers on the GPU.
         let mut b = Builder::<f16>::new();
-        let (x, w) = (b.input(DType::F16), b.input(DType::F16));
+        let vector = Decl::vector(DType::F16, 777);
+        let (x, w) = (b.input(vector.clone()), b.input(vector));
         let product = b.mul(x, w);
         let shifted = b.shift(product, f16::ONE);
         let squared = b.mul(shifted, shifted);
@@ -581,21 +582,21 @@ mod metal {
         ulps: f64,
     ) {
         use tensorcrate::tensors::Compare;
-        use tensorcrate::tensors::fused::{Fusable, Remap};
-
-        let mut b = Builder::<T>::new();
-        let product = b.input(dtype);
-        let bias = b.input_remapped(dtype, Remap::Row);
-        let shifted = b.add(product, bias);
-        let zero = b.constant(T::zero());
-        let relu = b.compare(Compare::Max, shifted, zero);
-        b.output(relu, dtype);
-        let program = b.build().unwrap();
+        use tensorcrate::tensors::fused::{Decl, Fusable};
 
         let mut rng = Lcg(17);
         for tensorops in [true, false] {
             tensorcrate::metal::set_tensorops(tensorops);
             for (m, k, n) in [(3usize, 5usize, 2usize), (17, 33, 15), (65, 130, 67)] {
+                let mut b = Builder::<T>::new();
+                let product = b.input(Decl::matrix(dtype, (m, n)));
+                let bias = b.input(Decl::vector(dtype, n));
+                let shifted = b.add(product, bias);
+                let zero = b.constant(T::zero());
+                let relu = b.compare(Compare::Max, shifted, zero);
+                b.output(relu, dtype);
+                let program = b.build().unwrap();
+
                 let a = Matrix::<T, Host>::from_flat(m, k, rng.vector::<T>(m * k, -1.0, 1.0));
                 let w = Matrix::<T, Host>::from_flat(k, n, rng.vector::<T>(k * n, -1.0, 1.0));
                 let bias = Vector::<T, Host>::new(rng.vector::<T>(n, -1.0, 1.0));

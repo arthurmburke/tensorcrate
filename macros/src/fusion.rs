@@ -1040,14 +1040,38 @@ fn metal_program(
     let fused = quote!(::tensorcrate::tensors::fused);
     let element = site.element_type();
     let dtype = site.backend.dtype.fused_dtype();
+    // The space, and each input's shape: the space's, or a transposed leaf's
+    // own, which the load permutes back.
+    let (space, rank) = match shape {
+        Shape::Vector(n) => (quote!([#n]), 1usize),
+        _ => {
+            let (rows, cols) = extent(shape);
+            (quote!([#rows, #cols]), 2)
+        }
+    };
+    let decls = inputs.iter().enumerate().map(|(slot, &leaf)| {
+        let dims = match shape {
+            Shape::Vector(n) => quote!([#n]),
+            _ if slot > 0 || !epilogue => {
+                let (rows, cols) = extent(shape);
+                if site.leaves[leaf].transposed {
+                    quote!([#cols, #rows])
+                } else {
+                    quote!([#rows, #cols])
+                }
+            }
+            _ => space.clone(),
+        };
+        quote!(#fused::Decl::of(#dtype, &#dims))
+    });
     let instructions = code.iter().map(|instr| match *instr {
         opt::Instr::Load { dst, slot, remap } => {
             let remap = if remap == 1 {
-                quote!(Transpose)
+                quote!(#fused::Remap::permute(&[1, 0]))
             } else {
-                quote!(Identity)
+                quote!(#fused::Remap::identity(#rank))
             };
-            quote!(#fused::Instr::<#element>::Load { dst: #dst, input: #slot, remap: #fused::Remap::#remap })
+            quote!(#fused::Instr::<#element>::Load { dst: #dst, input: #slot, remap: #remap })
         }
         opt::Instr::Const { dst, ref value } => {
             let value = scalar_tokens(value, site);
@@ -1079,8 +1103,7 @@ fn metal_program(
             quote!(#fused::Instr::<#element>::Store { src: #src, output: #output })
         }
     });
-    let (rows, cols) = extent(shape);
-    let (input_count, output_count) = (inputs.len(), outputs.len());
+    let output_count = outputs.len();
     let operands = inputs.iter().skip(usize::from(epilogue)).map(|&i| {
         let ident = &site.leaves[i].ident;
         quote!(#ident as &dyn #fused::Fusable<::tensorcrate::tensors::Metal>)
@@ -1101,12 +1124,13 @@ fn metal_program(
         let (left, right) = operand_idents(&site.leaves[inputs[0]].ident);
         quote!(__fused_program.run_matmul::<::tensorcrate::tensors::Metal>(#left, #right, &[#(#operands),*]))
     } else {
-        quote!(__fused_program.run::<::tensorcrate::tensors::Metal>((#rows, #cols), &[#(#operands),*], &mut []))
+        quote!(__fused_program.run::<::tensorcrate::tensors::Metal>(&[#(#operands),*], &mut []))
     };
     quote! {
         let __fused_program = #fused::Program::<#element>::new(
+            &#space,
             ::std::vec![#(#instructions),*],
-            ::std::vec![#dtype; #input_count],
+            ::std::vec![#(#decls),*],
             ::std::vec![#dtype; #output_count],
             0,
         )

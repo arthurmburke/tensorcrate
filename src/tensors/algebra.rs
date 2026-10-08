@@ -23,7 +23,7 @@
 use super::{
     DualMatrix, DualVector, Host, Kernels, Matrix, MatrixVar, SparseMatrix, Vector, VectorVar,
 };
-use crate::numbers::{Coefficient, Real};
+use crate::numbers::{Coefficient, Complex, Conj, Real};
 
 /// Matrix multiplication, `self · rhs`.
 ///
@@ -132,6 +132,22 @@ impl<T: Coefficient> Transpose for Matrix<T, Host> {
 
     fn transpose(&self) -> Self {
         Matrix::<T, Host>::transpose(self)
+    }
+}
+
+impl<T: Real> Conj for Matrix<Complex<T>, Host> {
+    type Output = Matrix<Complex<T>, Host>;
+
+    fn conj(&self) -> Self::Output {
+        self.map(|value| value.conj())
+    }
+}
+
+impl<T: Real> Conj for Vector<Complex<T>, Host> {
+    type Output = Vector<Complex<T>, Host>;
+
+    fn conj(&self) -> Self::Output {
+        self.map(|value| value.conj())
     }
 }
 

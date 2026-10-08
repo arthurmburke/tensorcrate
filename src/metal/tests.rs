@@ -573,7 +573,7 @@ fn relaxed_matmul_stays_close_to_the_exact_product() {
 fn specialized_kernels_match_the_interpreter() {
     use super::codegen::set_fused_codegen;
     use super::device::Specialized;
-    use crate::tensors::fused::{Builder, DType, Element, Fusable, Remap};
+    use crate::tensors::fused::{Builder, DType, Decl, Element, Fusable};
     use crate::tensors::{Analytic, Compare, Host, Matrix, Metal, Vector};
 
     fn check<T: super::MetalElement + Element>(tolerance: f64) {
@@ -597,10 +597,11 @@ fn specialized_kernels_match_the_interpreter() {
         let start = Matrix::<T>::from_flat(ROWS, COLS, values(4, len)).to_backend::<Metal>();
 
         let mut b = Builder::<T>::new();
-        let xv = b.input(T::DTYPE);
-        let tv = b.input_remapped(T::DTYPE, Remap::Transpose);
-        let rv = b.input_remapped(T::DTYPE, Remap::Row);
-        let acc = b.update(T::DTYPE);
+        let xv = b.input(Decl::matrix(T::DTYPE, (ROWS, COLS)));
+        let tv = b.input(Decl::matrix(T::DTYPE, (COLS, ROWS)));
+        let tv = b.transpose(tv, 0, 1);
+        let rv = b.input(Decl::vector(T::DTYPE, COLS));
+        let acc = b.update(Decl::matrix(T::DTYPE, (ROWS, COLS)));
         let product = b.mul(xv, tv);
         let shifted = b.add(product, rv);
         let squashed = b.unary(Analytic::Tanh, shifted);
@@ -616,7 +617,7 @@ fn specialized_kernels_match_the_interpreter() {
             set_fused_codegen(codegen);
             let mut state = start.clone();
             let inputs: [&dyn Fusable<Metal>; 3] = [&x, &t, &row];
-            let mut out = program.run((ROWS, COLS), &inputs, &mut [&mut state]);
+            let mut out = program.run(&inputs, &mut [&mut state]);
             let fresh = out.remove(0).into_matrix::<f32>().to_backend::<Host>();
             set_fused_codegen(true);
             (state.to_backend::<Host>(), fresh)
@@ -798,36 +799,38 @@ fn generated_kernels_compile_for_every_type_and_tile() {
     use super::codegen::Kernel;
     use super::device::with_gpu;
     use crate::tensors::Compare;
-    use crate::tensors::fused::{Builder, DType, Element, Remap};
+    use crate::tensors::fused::{Builder, DType, Decl, Element};
 
     fn check<T: super::MetalElement + Element>() {
+        let matrix = |dtype| Decl::matrix(dtype, (4, 4));
+        let row = |dtype| Decl::vector(dtype, 4);
         let mut b = Builder::<T>::new();
-        let product = b.input(T::DTYPE);
-        let bias = b.input_remapped(T::DTYPE, Remap::Row);
+        let product = b.input(matrix(T::DTYPE));
+        let bias = b.input(row(T::DTYPE));
         let shifted = b.add(product, bias);
         let zero = b.constant(T::from_f64(0.0));
         let activated = b.compare(Compare::Max, shifted, zero);
         b.output(activated, DType::F32);
-        let code = b.build().unwrap().encode();
+        let code = b.build().unwrap().encode(None);
         let mut sum = Builder::<T>::new();
-        let x = sum.input(T::DTYPE);
-        let row = sum.input_remapped(T::DTYPE, Remap::Row);
+        let x = sum.input(matrix(T::DTYPE));
+        let row = sum.input(row(T::DTYPE));
         let e = sum.unary(crate::tensors::Analytic::Exp, x);
         let y = sum.mul(e, row);
         sum.output(y, T::DTYPE);
-        let sum_code = sum.build().unwrap().encode();
+        let sum_code = sum.build().unwrap().encode(None);
         // A layer norm's statistics, of an input stored as `f16` whatever `T`.
         let mut norm = Builder::<T>::new();
-        let x = norm.input(DType::F16);
+        let x = norm.input(matrix(DType::F16));
         let mean = norm.row_statistic(x, crate::tensors::fused::RowStatistic::Mean);
         let deviations = norm.row_statistic(x, crate::tensors::fused::RowStatistic::Deviations);
         let centered = norm.sub(x, mean);
         let scaled = norm.div(centered, deviations);
         norm.output(scaled, T::DTYPE);
         let norm = norm.build().unwrap();
-        let mut statistics = [(0u8, 0u8, false); 16];
-        statistics[0] = (0, DType::F16 as u8, false);
-        statistics[1] = (0, DType::F16 as u8, true);
+        let mut statistics = [(0u8, 0u8, 0u8, false); 16];
+        statistics[0] = (0, DType::F16 as u8, 0, false);
+        statistics[1] = (0, DType::F16 as u8, 0, true);
         let rows = Kernel::Rows(super::codegen::RowStatistics {
             first: 1,
             statistics,
@@ -836,7 +839,7 @@ fn generated_kernels_compile_for_every_type_and_tile() {
         assert_eq!(norm.row_statistics().len(), 2);
         for kernel in [Kernel::RowSums, Kernel::ColumnSums, rows] {
             let code = if kernel == rows {
-                norm.encode()
+                norm.encode(None)
             } else {
                 sum_code.clone()
             };

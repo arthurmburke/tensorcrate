@@ -55,7 +55,7 @@ use std::time::{Duration, Instant};
 
 use tensorcrate::optim::{Adam, Rule};
 use tensorcrate::tensors::fused::{
-    self, Builder, DType, Fusable, Mode, Program, Remap, RowStatistic,
+    self, Builder, DType, Decl, Fusable, Mode, Program, RowStatistic, Var,
 };
 use tensorcrate::tensors::{
     Analytic, Axis, Backend, BinaryOp, Compare, Host, Kernels, Matrix, Tape, Vector,
@@ -500,24 +500,24 @@ macro_rules! fusion_case {
     };
 }
 
-fn program(build: impl FnOnce(&mut Builder, fused::FusedValue) -> fused::FusedValue) -> Program {
+fn program(input: Decl, build: impl FnOnce(&mut Builder, Var) -> Var) -> Program {
     let mut b = Builder::new();
-    let x = b.input(DType::F32);
+    let x = b.input(input);
     let y = build(&mut b, x);
     b.output(y, DType::F32);
     b.build().unwrap()
 }
 
-fn relu() -> Program {
-    program(|b, x| {
+fn relu(len: usize) -> Program {
+    program(Decl::vector(DType::F32, len), |b, x| {
         let zero = b.constant(0.0);
         b.compare(Compare::Max, x, zero)
     })
 }
 
 /// `1 / (1 + exp(-x))`.
-fn sigmoid() -> Program {
-    program(|b, x| {
+fn sigmoid(len: usize) -> Program {
+    program(Decl::vector(DType::F32, len), |b, x| {
         let negated = b.scale(x, -1.0);
         let e = b.unary(Analytic::Exp, negated);
         let denominator = b.shift(e, 1.0);
@@ -527,8 +527,8 @@ fn sigmoid() -> Program {
 }
 
 /// The tanh approximation of GELU: `0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))`.
-fn gelu() -> Program {
-    program(|b, x| {
+fn gelu(len: usize) -> Program {
+    program(Decl::vector(DType::F32, len), |b, x| {
         let square = b.mul(x, x);
         let cube = b.mul(square, x);
         let cubic = b.scale(cube, 0.044715);
@@ -542,9 +542,9 @@ fn gelu() -> Program {
 }
 
 /// `len` dependent elementwise operations that keep values bounded.
-fn chain(len: usize) -> Program {
-    program(|b, x| {
-        (0..len).fold(x, |v, i| {
+fn chain(ops: usize, len: usize) -> Program {
+    program(Decl::vector(DType::F32, len), |b, x| {
+        (0..ops).fold(x, |v, i| {
             if i % 2 == 0 {
                 b.scale(v, 0.999)
             } else {
@@ -557,11 +557,11 @@ fn chain(len: usize) -> Program {
 /// `scale·(x − mean) / sqrt(variance + ε) + shift`, per row: the mean and the
 /// sum of squared deviations are statistics the program computes of its input,
 /// and the learned scale and shift are read across the rows.
-fn layer_norm_program(cols: usize) -> Program {
+fn layer_norm_program(rows: usize, cols: usize) -> Program {
     let mut b = Builder::new();
-    let x = b.input(DType::F32);
-    let gamma = b.input_remapped(DType::F32, Remap::Row);
-    let beta = b.input_remapped(DType::F32, Remap::Row);
+    let x = b.input(Decl::matrix(DType::F32, (rows, cols)));
+    let gamma = b.input(Decl::vector(DType::F32, cols));
+    let beta = b.input(Decl::vector(DType::F32, cols));
     let mean = b.row_statistic(x, RowStatistic::Mean);
     let deviations = b.row_statistic(x, RowStatistic::Deviations);
     let variance = b.scale(deviations, 1.0 / cols as f32);
@@ -576,16 +576,18 @@ fn layer_norm_program(cols: usize) -> Program {
 }
 
 /// `exp(x)`, whose column sums are the softmax denominators.
-fn exp_program() -> Program {
-    program(|b, x| b.unary(Analytic::Exp, x))
+fn exp_program(features: usize, batch: usize) -> Program {
+    program(Decl::matrix(DType::F32, (features, batch)), |b, x| {
+        b.unary(Analytic::Exp, x)
+    })
 }
 
 /// `exp(x) / s`: normalizes `exp(x)` by each column's sum, computing it again
 /// rather than reading it back.
-fn normalize_program() -> Program {
+fn normalize_program(features: usize, batch: usize) -> Program {
     let mut b = Builder::new();
-    let x = b.input(DType::F32);
-    let sums = b.input_remapped(DType::F32, Remap::Row);
+    let x = b.input(Decl::matrix(DType::F32, (features, batch)));
+    let sums = b.input(Decl::vector(DType::F32, batch));
     let e = b.unary(Analytic::Exp, x);
     let softmax = b.div(e, sums);
     b.output(softmax, DType::F32);
@@ -593,10 +595,10 @@ fn normalize_program() -> Program {
 }
 
 /// `relu(x·w + bias)`, the product's epilogue.
-fn dense_program() -> Program {
+fn dense_program(batch: usize, outputs: usize) -> Program {
     let mut b = Builder::new();
-    let product = b.input(DType::F32);
-    let bias = b.input_remapped(DType::F32, Remap::Row);
+    let product = b.input(Decl::matrix(DType::F32, (batch, outputs)));
+    let bias = b.input(Decl::vector(DType::F32, outputs));
     let shifted = b.add(product, bias);
     let zero = b.constant(0.0);
     let activated = b.compare(Compare::Max, shifted, zero);
@@ -638,11 +640,11 @@ impl Activation {
         }
     }
 
-    fn program(self) -> Program {
+    fn program(self, len: usize) -> Program {
         match self {
-            Activation::Relu => relu(),
-            Activation::Sigmoid => sigmoid(),
-            Activation::Gelu => gelu(),
+            Activation::Relu => relu(len),
+            Activation::Sigmoid => sigmoid(len),
+            Activation::Gelu => gelu(len),
         }
     }
 
@@ -720,7 +722,7 @@ fn activation_case(bench: &mut Bench, activation: Activation, len: usize) {
     let Some(mut case) = bench.case("fusion", &title, Work::Elements(len)) else {
         return;
     };
-    let program = activation.program();
+    let program = activation.program(len);
 
     let host = vector::<Host>(len, 1);
     let direct = activation.direct(&host).flat();
@@ -757,10 +759,7 @@ fn layer_norm<B: Kernels>(
     let beta = vector::<B>(cols, 3);
     move || {
         let inputs: [&dyn Fusable<B>; 3] = [&x, &gamma, &beta];
-        program
-            .run((rows, cols), &inputs, &mut [])
-            .remove(0)
-            .into_matrix::<f32>()
+        program.run(&inputs, &mut []).remove(0).into_matrix::<f32>()
     }
 }
 
@@ -775,10 +774,10 @@ fn softmax<B: Kernels>(
 ) -> impl FnMut() -> Matrix<f32, B> {
     let x = matrix::<B>(features, batch, 1);
     move || {
-        let sums = exp.run_sum((features, batch), &[&x], Axis::Columns);
+        let sums = exp.run_sum(&[&x], Axis::Columns);
         let inputs: [&dyn Fusable<B>; 2] = [&x, &sums];
         normalize
-            .run((features, batch), &inputs, &mut [])
+            .run(&inputs, &mut [])
             .remove(0)
             .into_matrix::<f32>()
     }
@@ -869,7 +868,7 @@ fn fusion(bench: &mut Bench) {
     }
 
     for (rows, cols) in bench.cfg.pick(&[(64, 256), (256, 1024), (1024, 1024)]) {
-        let program = layer_norm_program(cols);
+        let program = layer_norm_program(rows, cols);
         let title = format!("layer norm, {rows}×{cols}");
         fusion_case!(bench, G, title, Work::Elements(rows * cols), 2e-3, |B| {
             layer_norm::<B>(&program, rows, cols)
@@ -894,8 +893,11 @@ fn fusion(bench: &mut Bench) {
         }
     }
 
-    let (exp, normalize) = (exp_program(), normalize_program());
     for (features, batch) in bench.cfg.pick(&[(128, 128), (1024, 256), (4096, 512)]) {
+        let (exp, normalize) = (
+            exp_program(features, batch),
+            normalize_program(features, batch),
+        );
         let title = format!("softmax, {features} classes × {batch} samples");
         fusion_case!(
             bench,
@@ -917,12 +919,12 @@ fn fusion(bench: &mut Bench) {
         }
     }
 
-    let dense = dense_program();
     for (batch, inputs, outputs) in
         bench
             .cfg
             .pick(&[(32, 256, 256), (128, 512, 512), (512, 1024, 1024)])
     {
+        let dense = dense_program(batch, outputs);
         let title = format!("dense relu(X·W+b), {batch}×{inputs}×{outputs}");
         let flops = 2.0 * (batch * inputs * outputs) as f64;
         fusion_case!(
@@ -1327,7 +1329,7 @@ fn dispatch(bench: &mut Bench) {
     // unfused rows is the cost of one more operation.
     let len = 16_384;
     for ops in bench.cfg.pick(&[1, 4, 16, 64]) {
-        let program = chain(ops);
+        let program = chain(ops, len);
         let title = format!(
             "chain of {ops} operation{}, n={len}",
             if ops == 1 { "" } else { "s" }

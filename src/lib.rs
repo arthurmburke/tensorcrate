@@ -34,6 +34,7 @@
 pub use tensorcrate_macros::math;
 
 mod compact;
+pub mod core;
 pub mod counters;
 pub mod errors;
 #[cfg(all(feature = "metal", target_os = "macos"))]

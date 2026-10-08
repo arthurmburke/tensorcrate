@@ -130,7 +130,8 @@ impl Scalar {
 /// One single-assignment operation.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Node {
-    /// Read input `slot` through remap code `remap` (`fused::Remap`).
+    /// Read input `slot` through remap code `remap`, which the optimizer only
+    /// compares: the library numbers a program's distinct loads with it.
     Load {
         slot: u8,
         remap: u8,

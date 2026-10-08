@@ -8,9 +8,9 @@
 use half::{bf16, f16};
 use tensorcrate::optim::{AdaGrad, Adam, Momentum, Parameter, RmsProp, Rule, Sgd};
 use tensorcrate::tensors::fused::{
-    self, Algebra, Builder, DType, Fusable, Instr, Mode, Program, ProgramError, Remap, FusedValue,
+    self, Algebra, Builder, DType, Decl, Fusable, Instr, Mode, Program, ProgramError, Remap, Var,
 };
-use tensorcrate::tensors::{Analytic, BinaryOp, Compare, Host, Kernels, Matrix, Vector};
+use tensorcrate::tensors::{Analytic, BinaryOp, Compare, Host, Kernels, Matrix, Tensor, Vector};
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 use tensorcrate::tensors::Metal;
@@ -305,13 +305,21 @@ const BINARIES: [BinaryOp; 5] = [
     BinaryOp::Rem,
 ];
 
-/// A random program over `inputs` `f32` inputs with `outputs` outputs.
-fn random_program(rng: &mut Lcg, inputs: usize, outputs: usize, metal: bool) -> Program {
+/// A random program over `inputs` `f32` vectors of `len` with `outputs` outputs.
+fn random_program(
+    rng: &mut Lcg,
+    len: usize,
+    inputs: usize,
+    outputs: usize,
+    metal: bool,
+) -> Program {
     loop {
         let mut b = Builder::new();
-        let mut values: Vec<FusedValue> = (0..inputs).map(|_| b.input(DType::F32)).collect();
+        let mut values: Vec<Var> = (0..inputs)
+            .map(|_| b.input(Decl::vector(DType::F32, len)))
+            .collect();
         for _ in 0..rng.below(24) + 2 {
-            let pick = |rng: &mut Lcg, values: &[FusedValue]| values[rng.below(values.len())];
+            let pick = |rng: &mut Lcg, values: &[Var]| values[rng.below(values.len())];
             let value = match rng.below(10) {
                 0 => b.constant(rng.uniform(-2.0, 2.0)),
                 1 | 2 => {
@@ -344,15 +352,11 @@ fn random_program(rng: &mut Lcg, inputs: usize, outputs: usize, metal: bool) -> 
     }
 }
 
-fn run_on<B: Kernels>(
-    program: &Program,
-    shape: (usize, usize),
-    inputs: &[Vector<f32>],
-) -> Vec<Vec<f32>> {
+fn run_on<B: Kernels>(program: &Program, inputs: &[Vector<f32>]) -> Vec<Vec<f32>> {
     let inputs: Vec<Vector<f32, B>> = inputs.iter().map(|v| v.to_backend::<B>()).collect();
     let refs: Vec<&dyn Fusable<B>> = inputs.iter().map(|v| v as &dyn Fusable<B>).collect();
     program
-        .run(shape, &refs, &mut [])
+        .run(&refs, &mut [])
         .into_iter()
         .map(|output| output.into_vector::<f32>().to_vec())
         .collect()
@@ -364,16 +368,14 @@ fn random_programs_agree_with_their_unfused_evaluation_bit_for_bit() {
     for case in 0..120 {
         let inputs = rng.below(4) + 1;
         let outputs = rng.below(3) + 1;
-        let program = random_program(&mut rng, inputs, outputs, false);
         let len = LENGTHS[case % LENGTHS.len()];
+        let program = random_program(&mut rng, len, inputs, outputs, false);
         let values: Vec<Vector<f32>> = (0..inputs)
             .map(|_| Vector::new(rng.vector(len, -3.0, 3.0)))
             .collect();
 
-        let fused = run_on::<Host>(&program, (1, len), &values);
-        let unfused = fused::with_mode(Mode::Unfused, || {
-            run_on::<Host>(&program, (1, len), &values)
-        });
+        let fused = run_on::<Host>(&program, &values);
+        let unfused = fused::with_mode(Mode::Unfused, || run_on::<Host>(&program, &values));
         for (k, (f, u)) in fused.iter().zip(&unfused).enumerate() {
             assert_bits_eq(
                 f,
@@ -388,10 +390,11 @@ fn random_programs_agree_with_their_unfused_evaluation_bit_for_bit() {
 fn remapped_loads_read_transposed_and_broadcast_operands() {
     // out[r][c] = a[r][c] + bᵀ[r][c] · row[c] − col[r], over a 3×4 space.
     let mut b = Builder::<f32>::new();
-    let a = b.input(DType::F32);
-    let t = b.input_remapped(DType::F32, Remap::Transpose);
-    let row = b.input_remapped(DType::F32, Remap::Row);
-    let col = b.input_remapped(DType::F32, Remap::Column);
+    let a = b.input(Decl::matrix(DType::F32, (3, 4)));
+    let t = b.input(Decl::matrix(DType::F32, (4, 3)));
+    let t = b.transpose(t, 0, 1);
+    let row = b.input(Decl::vector(DType::F32, 4));
+    let col = b.input(Decl::matrix(DType::F32, (3, 1)));
     let product = b.mul(t, row);
     let sum = b.add(a, product);
     let out = b.sub(sum, col);
@@ -412,18 +415,12 @@ fn remapped_loads_read_transposed_and_broadcast_operands() {
         .collect();
 
     let inputs: [&dyn Fusable<Host>; 4] = [&a, &bt, &row, &col];
-    let fused = program
-        .run((3, 4), &inputs, &mut [])
-        .remove(0)
-        .into_matrix::<f32>();
+    let fused = program.run(&inputs, &mut []).remove(0).into_matrix::<f32>();
     assert_eq!(fused.shape(), (3, 4));
     assert_bits_eq(fused.as_slice(), &expected, "remapped");
 
     let unfused = fused::with_mode(Mode::Unfused, || {
-        program
-            .run((3, 4), &inputs, &mut [])
-            .remove(0)
-            .into_matrix::<f32>()
+        program.run(&inputs, &mut []).remove(0).into_matrix::<f32>()
     });
     assert_bits_eq(unfused.as_slice(), &expected, "remapped, unfused");
 }
@@ -434,9 +431,10 @@ fn remaps_survive_tile_boundaries() {
     let mut rng = Lcg(5);
     let (rows, cols) = (300, 7);
     let mut b = Builder::<f32>::new();
-    let t = b.input_remapped(DType::F32, Remap::Transpose);
-    let row = b.input_remapped(DType::F32, Remap::Row);
-    let col = b.input_remapped(DType::F32, Remap::Column);
+    let t = b.input(Decl::matrix(DType::F32, (cols, rows)));
+    let t = b.transpose(t, 0, 1);
+    let row = b.input(Decl::vector(DType::F32, cols));
+    let col = b.input(Decl::matrix(DType::F32, (rows, 1)));
     let x = b.mul(t, row);
     let y = b.add(x, col);
     b.output(y, DType::F32);
@@ -446,15 +444,9 @@ fn remaps_survive_tile_boundaries() {
     let row = Vector::new(rng.vector(cols, -1.0, 1.0));
     let col = Vector::new(rng.vector(rows, -1.0, 1.0));
     let inputs: [&dyn Fusable<Host>; 3] = [&t, &row, &col];
-    let fused = program
-        .run((rows, cols), &inputs, &mut [])
-        .remove(0)
-        .into_vector::<f32>();
+    let fused = program.run(&inputs, &mut []).remove(0).into_vector::<f32>();
     let unfused = fused::with_mode(Mode::Unfused, || {
-        program
-            .run((rows, cols), &inputs, &mut [])
-            .remove(0)
-            .into_vector::<f32>()
+        program.run(&inputs, &mut []).remove(0).into_vector::<f32>()
     });
     assert_bits_eq(fused.as_slice(), unfused.as_slice(), "tall remap");
 }
@@ -475,12 +467,13 @@ fn programs_split_across_threads_match_one_thread_bit_for_bit() {
     let (rows, cols) = (997, 601);
     let len = rows * cols;
     let mut b = Builder::<f32>::new();
-    let a = b.input(DType::F32);
-    let t = b.input_remapped(DType::F32, Remap::Transpose);
-    let row = b.input_remapped(DType::F32, Remap::Row);
-    let col = b.input_remapped(DType::F32, Remap::Column);
-    let half = b.input(DType::F16);
-    let x = b.update(DType::F32);
+    let a = b.input(Decl::matrix(DType::F32, (rows, cols)));
+    let t = b.input(Decl::matrix(DType::F32, (cols, rows)));
+    let t = b.transpose(t, 0, 1);
+    let row = b.input(Decl::vector(DType::F32, cols));
+    let col = b.input(Decl::matrix(DType::F32, (rows, 1)));
+    let half = b.input(Decl::matrix(DType::F16, (rows, cols)));
+    let x = b.update(Decl::matrix(DType::F32, (rows, cols)));
     let product = b.mul(t, row);
     let sum = b.add(a, product);
     let shifted = b.sub(sum, col);
@@ -508,7 +501,7 @@ fn programs_split_across_threads_match_one_thread_bit_for_bit() {
             fused::with_mode(mode, || {
                 let mut x = start.clone();
                 let inputs: [&dyn Fusable<Host>; 5] = [&a, &t, &row, &col, &half];
-                let mut outputs = program.run((rows, cols), &inputs, &mut [&mut x]);
+                let mut outputs = program.run(&inputs, &mut [&mut x]);
                 let narrow = outputs.pop().unwrap().into_vector::<f16>();
                 let wide = outputs.pop().unwrap().into_vector::<f32>();
                 let narrow: Vec<f32> = narrow.as_slice().iter().map(|h| h.to_f32()).collect();
@@ -532,16 +525,14 @@ fn long_random_programs_agree_with_their_unfused_evaluation_bit_for_bit() {
     for case in 0..12 {
         let inputs = rng.below(3) + 1;
         let outputs = rng.below(3) + 1;
-        let program = random_program(&mut rng, inputs, outputs, false);
         let len = 300_001 + case * 4099;
+        let program = random_program(&mut rng, len, inputs, outputs, false);
         let values: Vec<Vector<f32>> = (0..inputs)
             .map(|_| Vector::new(rng.vector(len, -3.0, 3.0)))
             .collect();
-        let fused = run_on::<Host>(&program, (1, len), &values);
-        let one = on_threads(1, || run_on::<Host>(&program, (1, len), &values));
-        let unfused = fused::with_mode(Mode::Unfused, || {
-            run_on::<Host>(&program, (1, len), &values)
-        });
+        let fused = run_on::<Host>(&program, &values);
+        let one = on_threads(1, || run_on::<Host>(&program, &values));
+        let unfused = fused::with_mode(Mode::Unfused, || run_on::<Host>(&program, &values));
         for (k, ((f, o), u)) in fused.iter().zip(&one).zip(&unfused).enumerate() {
             let what = format!("case {case}, output {k}, len {len}\n{program}");
             assert_bits_eq(f, o, &format!("{what}\nagainst one thread"));
@@ -550,16 +541,15 @@ fn long_random_programs_agree_with_their_unfused_evaluation_bit_for_bit() {
     }
 }
 
-#[test]
-fn single_operation_programs_match_their_unfused_evaluation_bit_for_bit() {
-    // Each shape of program the host runs as one direct kernel: a function of
-    // the input, an operation with a constant on either side, and an operation
-    // on two inputs in either order.
-    let mut rng = Lcg(404);
+/// Each shape of program the host runs as one direct kernel, over vectors of
+/// `len`: a function of the input, an operation with a constant on either side,
+/// and an operation on two inputs in either order. With each, its input count.
+fn single_operation_programs(len: usize) -> Vec<(Program, usize)> {
+    let vector = Decl::vector(DType::F32, len);
     let mut programs: Vec<(Program, usize)> = Vec::new();
     for &op in &UNARIES {
         let mut b = Builder::<f32>::new();
-        let x = b.input(DType::F32);
+        let x = b.input(vector.clone());
         let y = b.unary(op, x);
         b.output(y, DType::F32);
         programs.push((b.build().unwrap(), 1));
@@ -567,7 +557,7 @@ fn single_operation_programs_match_their_unfused_evaluation_bit_for_bit() {
     for constant_left in [false, true] {
         for &op in &BINARIES {
             let mut b = Builder::<f32>::new();
-            let x = b.input(DType::F32);
+            let x = b.input(vector.clone());
             let c = b.constant(1.75);
             let y = if constant_left {
                 b.binary(op, c, x)
@@ -579,7 +569,7 @@ fn single_operation_programs_match_their_unfused_evaluation_bit_for_bit() {
         }
         for op in Compare::ALL {
             let mut b = Builder::<f32>::new();
-            let x = b.input(DType::F32);
+            let x = b.input(vector.clone());
             let c = b.constant(0.5);
             let y = if constant_left {
                 b.compare(op, c, x)
@@ -591,7 +581,7 @@ fn single_operation_programs_match_their_unfused_evaluation_bit_for_bit() {
         }
         for &op in &BINARIES {
             let mut b = Builder::<f32>::new();
-            let (x, y) = (b.input(DType::F32), b.input(DType::F32));
+            let (x, y) = (b.input(vector.clone()), b.input(vector.clone()));
             let z = if constant_left {
                 b.binary(op, y, x)
             } else {
@@ -601,14 +591,19 @@ fn single_operation_programs_match_their_unfused_evaluation_bit_for_bit() {
             programs.push((b.build().unwrap(), 2));
         }
     }
-    for (program, inputs) in &programs {
-        for len in [0, 15, 17, 1025, 200_003] {
+    programs
+}
+
+#[test]
+fn single_operation_programs_match_their_unfused_evaluation_bit_for_bit() {
+    let mut rng = Lcg(404);
+    for len in [0, 15, 17, 1025, 200_003] {
+        for (program, inputs) in &single_operation_programs(len) {
             let values: Vec<Vector<f32>> = (0..*inputs)
                 .map(|_| Vector::new(rng.vector(len, -3.0, 3.0)))
                 .collect();
-            let fused = run_on::<Host>(program, (1, len), &values);
-            let unfused =
-                fused::with_mode(Mode::Unfused, || run_on::<Host>(program, (1, len), &values));
+            let fused = run_on::<Host>(program, &values);
+            let unfused = fused::with_mode(Mode::Unfused, || run_on::<Host>(program, &values));
             assert_bits_eq(&fused[0], &unfused[0], &format!("len {len}\n{program}"));
         }
     }
@@ -618,8 +613,8 @@ fn single_operation_programs_match_their_unfused_evaluation_bit_for_bit() {
 fn in_place_tensors_are_read_then_overwritten() {
     // x ← x·2 + y and y ← x − y, both from the *old* x.
     let mut b = Builder::new();
-    let x = b.update(DType::F32);
-    let y = b.update(DType::F32);
+    let x = b.update(Decl::vector(DType::F32, 2000));
+    let y = b.update(Decl::vector(DType::F32, 2000));
     let doubled = b.scale(x, 2.0);
     let new_x = b.add(doubled, y);
     let new_y = b.sub(x, y);
@@ -632,7 +627,7 @@ fn in_place_tensors_are_read_then_overwritten() {
     let mut x = Vector::new((0..2000).map(|i| i as f32).collect::<Vec<_>>());
     let mut y = Vector::new(vec![1.0f32; 2000]);
     let (old_x, old_y) = (x.to_vec(), y.to_vec());
-    let outputs = program.run((1, 2000), &[], &mut [&mut x, &mut y]);
+    let outputs = program.run(&[], &mut [&mut x, &mut y]);
     assert!(outputs.is_empty());
     for i in 0..2000 {
         assert_eq!(x[i], old_x[i] * 2.0 + old_y[i]);
@@ -643,8 +638,8 @@ fn in_place_tensors_are_read_then_overwritten() {
 #[test]
 fn compact_types_widen_on_load_and_narrow_on_store() {
     let mut b = Builder::<f32>::new();
-    let h = b.input(DType::F16);
-    let bf = b.input(DType::Bf16);
+    let h = b.input(Decl::vector(DType::F16, 100));
+    let bf = b.input(Decl::vector(DType::Bf16, 100));
     let sum = b.add(h, bf);
     b.output(sum, DType::F32);
     b.output(sum, DType::F16);
@@ -667,8 +662,7 @@ fn compact_types_widen_on_load_and_narrow_on_store() {
     let inputs: [&dyn Fusable<Host>; 2] = [&av, &cv];
 
     for mode in [Mode::Fused, Mode::Unfused] {
-        let mut outputs =
-            fused::with_mode(mode, || program.run((1, 100), &inputs, &mut [])).into_iter();
+        let mut outputs = fused::with_mode(mode, || program.run(&inputs, &mut [])).into_iter();
         let wide = outputs.next().unwrap().into_vector::<f32>();
         let half = outputs.next().unwrap().into_vector::<f16>();
         let brain = outputs.next().unwrap().into_vector::<bf16>();
@@ -686,14 +680,14 @@ fn compact_types_widen_on_load_and_narrow_on_store() {
 #[test]
 fn a_program_disassembles() {
     let mut b = Builder::new();
-    let x = b.input(DType::F32);
+    let x = b.input(Decl::vector(DType::F32, 4));
     let y = b.unary(Analytic::Sqrt, x);
     let z = b.shift(y, 1.0);
     b.output(z, DType::Bf16);
     let program = b.build().unwrap();
     assert_eq!(
         program.to_string(),
-        "program(f32) -> (bf16), 0 in place, 2 registers\n\
+        "program(f32) -> (bf16) over [4], 0 in place, 2 registers\n\
          \x20   0: r0 = in0\n\
          \x20   1: r0 = Sqrt r0\n\
          \x20   2: r1 = 1.0\n\
@@ -705,14 +699,14 @@ fn a_program_disassembles() {
 #[test]
 fn a_trace_exposes_every_intermediate() {
     let mut b = Builder::new();
-    let x = b.input(DType::F32);
+    let x = b.input(Decl::vector(DType::F32, 3));
     let y = b.mul(x, x);
     let z = b.shift(y, 1.0);
     b.output(z, DType::F32);
     let program = b.build().unwrap();
 
     let v = Vector::new([1.0f32, 2.0, 3.0]);
-    let trace = program.trace::<Host>((1, 3), &[&v]);
+    let trace = program.trace::<Host>(&[&v]);
     assert_eq!(trace.len(), program.code().len());
     let values: Vec<Option<Vec<f32>>> = trace
         .into_iter()
@@ -751,8 +745,18 @@ fn turning_fusion_off_is_scoped_and_restored() {
 fn malformed_programs_are_rejected() {
     use Instr::*;
     let f = DType::F32;
-    let check = |code: Vec<Instr>, inputs: Vec<DType>, outputs: Vec<DType>, updated, err| {
-        assert_eq!(Program::new(code, inputs, outputs, updated), Err(err));
+    let m = || Decl::matrix(f, (2, 2));
+    let identity = Remap::identity(2);
+    let check = |code: Vec<Instr>, inputs: Vec<Decl>, outputs: Vec<DType>, updated, err| {
+        assert_eq!(
+            Program::new(&[2, 2], code, inputs, outputs, updated),
+            Err(err)
+        );
+    };
+    let load = |input, remap| Load {
+        dst: 0,
+        input,
+        remap,
     };
 
     check(
@@ -763,15 +767,8 @@ fn malformed_programs_are_rejected() {
         ProgramError::Undefined { at: 0, reg: 0 },
     );
     check(
-        vec![
-            Load {
-                dst: 0,
-                input: 1,
-                remap: Remap::Identity,
-            },
-            Store { src: 0, output: 0 },
-        ],
-        vec![f],
+        vec![load(1, identity), Store { src: 0, output: 0 }],
+        vec![m()],
         vec![f],
         0,
         ProgramError::BadInput { at: 0 },
@@ -804,17 +801,42 @@ fn malformed_programs_are_rejected() {
         0,
         ProgramError::OutputNotStoredOnce { output: 0 },
     );
+    // A remap must walk the space's axes over the input's.
+    check(
+        vec![load(0, Remap::identity(1)), Store { src: 0, output: 0 }],
+        vec![m()],
+        vec![f],
+        0,
+        ProgramError::BadRemap { at: 0 },
+    );
+    check(
+        vec![
+            load(0, Remap::new(&[None, Some(0)])),
+            Store { src: 0, output: 0 },
+        ],
+        vec![Decl::vector(f, 3)],
+        vec![f],
+        0,
+        ProgramError::BadRemap { at: 0 },
+    );
+    // An axis it does not walk must have length one.
+    check(
+        vec![
+            load(0, Remap::new(&[Some(0), None])),
+            Store { src: 0, output: 0 },
+        ],
+        vec![m()],
+        vec![f],
+        0,
+        ProgramError::BadRemap { at: 0 },
+    );
     // An in-place tensor read through a remap would race other threads.
     check(
         vec![
-            Load {
-                dst: 0,
-                input: 0,
-                remap: Remap::Transpose,
-            },
+            load(0, Remap::permute(&[1, 0])),
             Store { src: 0, output: 0 },
         ],
-        vec![f],
+        vec![m()],
         vec![f],
         1,
         ProgramError::RemappedUpdate { at: 0 },
@@ -827,18 +849,26 @@ fn malformed_programs_are_rejected() {
             Load {
                 dst: 1,
                 input: 0,
-                remap: Remap::Identity,
+                remap: identity,
             },
         ],
-        vec![f],
+        vec![m()],
         vec![f],
         1,
         ProgramError::LoadAfterStore { at: 2 },
     );
+    // ... and it must have the space's shape.
+    check(
+        vec![Const { dst: 0, value: 1.0 }, Store { src: 0, output: 0 }],
+        vec![Decl::vector(f, 2)],
+        vec![f],
+        1,
+        ProgramError::ShapeMismatch { slot: 0 },
+    );
     check(vec![], vec![], vec![], 0, ProgramError::NoOutputs);
     check(
         vec![Const { dst: 0, value: 1.0 }, Store { src: 0, output: 0 }],
-        vec![DType::F16],
+        vec![Decl::matrix(DType::F16, (2, 2))],
         vec![f],
         1,
         ProgramError::UpdateTypeMismatch { slot: 0 },
@@ -846,10 +876,61 @@ fn malformed_programs_are_rejected() {
 }
 
 #[test]
+fn a_hand_written_program_permutes_and_broadcasts() {
+    use Instr::*;
+    // y[i, j, k] = x[k, i, j] + bias[k], over a 2×3×4 space.
+    let f = DType::F32;
+    let code = vec![
+        Load {
+            dst: 0,
+            input: 0,
+            remap: Remap::permute(&[1, 2, 0]),
+        },
+        Load {
+            dst: 1,
+            input: 1,
+            remap: Remap::new(&[None, None, Some(0)]),
+        },
+        Binary {
+            dst: 0,
+            op: BinaryOp::Add,
+            a: 0,
+            b: 1,
+        },
+        Store { src: 0, output: 0 },
+    ];
+    let program = Program::<f32>::new(
+        &[2, 3, 4],
+        code,
+        vec![Decl::tensor(f, &[4, 2, 3]), Decl::vector(f, 4)],
+        vec![f],
+        0,
+    )
+    .unwrap();
+    let x = Tensor::<f32>::from_vec(&[4, 2, 3], (0..24).map(|v| v as f32).collect::<Vec<_>>());
+    let bias = Vector::new([100.0f32, 200.0, 300.0, 400.0]);
+    for mode in [Mode::Fused, Mode::Unfused] {
+        let y = fused::with_mode(mode, || program.run::<Host>(&[&x, &bias], &mut []))
+            .remove(0)
+            .into_tensor::<f32>();
+        assert_eq!(y.shape(), [2, 3, 4]);
+        for (i, j, k) in indices(2, 3, 4) {
+            let want = x.get(&[k, i, j]).unwrap() + bias[k];
+            assert_eq!(y.get(&[i, j, k]), Some(want), "{mode:?} at {i} {j} {k}");
+        }
+    }
+}
+
+/// Every index of a `a × b × c` space, in row-major order.
+fn indices(a: usize, b: usize, c: usize) -> impl Iterator<Item = (usize, usize, usize)> {
+    (0..a).flat_map(move |i| (0..b).flat_map(move |j| (0..c).map(move |k| (i, j, k))))
+}
+
+#[test]
 fn the_builder_reuses_registers_once_values_die() {
     // A forty-step chain only ever has two values live.
     let mut b = Builder::new();
-    let mut x = b.input(DType::F32);
+    let mut x = b.input(Decl::vector(DType::F32, 4));
     for _ in 0..40 {
         x = b.shift(x, 1.0);
     }
@@ -862,8 +943,9 @@ fn the_builder_reuses_registers_once_values_die() {
     // other one, so all seventeen are live at once and cannot fit.
     let build = |algebra: Algebra| {
         let mut b = Builder::<f32>::new();
-        let inputs: Vec<FusedValue> = (0..16).map(|_| b.input(DType::F32)).collect();
-        let mut values: Vec<FusedValue> = inputs.iter().map(|&x| b.unary(Analytic::Sqrt, x)).collect();
+        let vector = Decl::vector(DType::F32, 4);
+        let inputs: Vec<Var> = (0..16).map(|_| b.input(vector.clone())).collect();
+        let mut values: Vec<Var> = inputs.iter().map(|&x| b.unary(Analytic::Sqrt, x)).collect();
         let both = b.mul(inputs[0], inputs[1]);
         values.push(b.unary(Analytic::Sqrt, both));
         let mut sum = values[0];
@@ -889,11 +971,261 @@ fn the_builder_reuses_registers_once_values_die() {
 #[should_panic(expected = "needs 4")]
 fn a_short_input_is_caught_before_running() {
     let mut b = Builder::<f32>::new();
-    let x = b.input(DType::F32);
+    let x = b.input(Decl::matrix(DType::F32, (2, 2)));
     b.output(x, DType::F32);
     let program = b.build().unwrap();
     let short = Vector::new([1.0f32; 3]);
-    program.run::<Host>((2, 2), &[&short], &mut []);
+    program.run::<Host>(&[&short], &mut []);
+}
+
+// ---- shapes, permutations and broadcasts ------------------------------------------
+
+#[test]
+fn a_var_knows_its_shape() {
+    let mut b = Builder::<f32>::new();
+    let matrix = b.input(Decl::matrix(DType::F32, (3, 4)));
+    let row = b.input(Decl::vector(DType::F32, 4));
+    let column = b.input(Decl::matrix(DType::F32, (3, 1)));
+    let transposed = b.input(Decl::matrix(DType::F16, (4, 3)));
+    let transposed = b.transpose(transposed, 0, 1);
+    let two = b.constant(2.0);
+
+    assert!(matches!(matrix, Var::Matrix(_)));
+    assert_eq!(matrix.shape(), [3, 4]);
+    assert_eq!(matrix.dtype(), DType::F32);
+    assert_eq!(row.shape(), [4]);
+    assert_eq!(column.shape(), [3, 1]);
+    assert_eq!(transposed.shape(), [3, 4]);
+    assert_eq!(transposed.dtype(), DType::F16);
+    assert!(matches!(two, Var::Scalar(_)));
+    assert_eq!(two.shape(), Vec::<usize>::new());
+
+    // NumPy broadcasting: a scalar against anything, a row down a matrix, and
+    // a column against a row.
+    assert_eq!(b.scale(row, 3.0).shape(), [4]);
+    assert_eq!(b.add(matrix, row).shape(), [3, 4]);
+    assert_eq!(b.mul(column, row).shape(), [3, 4]);
+    assert_eq!(b.unary(Analytic::Exp, transposed).shape(), [3, 4]);
+    assert_eq!(b.broadcast_to(row, &[2, 3, 4]).shape(), [2, 3, 4]);
+    // Computed values are in the program's own type.
+    assert_eq!(b.add(matrix, transposed).dtype(), DType::F32);
+}
+
+#[test]
+fn a_tensor_var_keeps_its_axes() {
+    let mut b = Builder::<f32>::new();
+    let x = b.input(Decl::tensor(DType::F32, &[2, 3, 4]));
+    let bias = b.input(Decl::vector(DType::F32, 4));
+    assert!(matches!(x, Var::Tensor(_)));
+    assert_eq!(x.shape(), [2, 3, 4]);
+    let y = b.add(x, bias);
+    assert!(matches!(y, Var::Tensor(_)));
+    assert_eq!(y.shape(), [2, 3, 4]);
+    let moved = b.permute(y, &[2, 0, 1]);
+    assert_eq!(moved.shape(), [4, 2, 3]);
+    b.output(moved, DType::F32);
+    assert_eq!(b.build().unwrap().space(), [4, 2, 3]);
+}
+
+#[test]
+#[should_panic(expected = "do not broadcast together")]
+fn shapes_that_do_not_broadcast_are_refused_when_combined() {
+    let mut b = Builder::<f32>::new();
+    let x = b.input(Decl::tensor(DType::F32, &[2, 3, 4]));
+    let y = b.input(Decl::tensor(DType::F32, &[3, 2, 4]));
+    b.add(x, y);
+}
+
+#[test]
+#[should_panic(expected = "is not a permutation")]
+fn a_permutation_must_name_every_axis_once() {
+    let mut b = Builder::<f32>::new();
+    let x = b.input(Decl::tensor(DType::F32, &[2, 3, 4]));
+    b.permute(x, &[0, 0, 1]);
+}
+
+#[test]
+fn the_space_is_what_the_stored_values_broadcast_to() {
+    let mut b = Builder::<f32>::new();
+    let x = b.input(Decl::matrix(DType::F32, (3, 4)));
+    let row = b.input(Decl::vector(DType::F32, 4));
+    let y = b.add(x, row);
+    b.output(y, DType::F32);
+    // A value smaller than the space is repeated over it.
+    b.output(row, DType::F32);
+    let program = b.build().unwrap();
+    assert_eq!(program.space(), [3, 4]);
+
+    let x = Matrix::from_flat(3, 4, (0..12).map(|v| v as f32).collect::<Vec<_>>());
+    let row = Vector::new([1.0f32, 2.0, 3.0, 4.0]);
+    for mode in [Mode::Fused, Mode::Unfused] {
+        let mut out = fused::with_mode(mode, || program.run::<Host>(&[&x, &row], &mut []));
+        let repeated = out.pop().unwrap().into_matrix::<f32>();
+        let sum = out.pop().unwrap().into_matrix::<f32>();
+        for r in 0..3 {
+            for c in 0..4 {
+                assert_eq!(sum[(r, c)], x[(r, c)] + row[c]);
+                assert_eq!(repeated[(r, c)], row[c]);
+            }
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "needs 12")]
+fn an_input_of_the_wrong_size_is_refused() {
+    let mut b = Builder::<f32>::new();
+    let x = b.input(Decl::matrix(DType::F32, (3, 4)));
+    b.output(x, DType::F32);
+    let program = b.build().unwrap();
+    let m = Matrix::from_flat(4, 4, vec![0.0f32; 16]);
+    program.run::<Host>(&[&m], &mut []);
+}
+
+#[test]
+fn a_row_or_column_view_reads_as_a_vector() {
+    let mut b = Builder::<f32>::new();
+    let x = b.input(Decl::vector(DType::F32, 3));
+    let y = b.shift(x, 1.0);
+    b.output(y, DType::F32);
+    let program = b.build().unwrap();
+    let m = Matrix::from_rows([[0.0f32, 1.0, 2.0], [3.0, 4.0, 5.0], [6.0, 7.0, 8.0]]);
+    let row = program.run::<Host>(&[&m.row_view(1)], &mut []).remove(0);
+    assert_eq!(row.into_vector::<f32>().to_vec(), [4.0, 5.0, 6.0]);
+    let column = program.run::<Host>(&[&m.column_view(2)], &mut []).remove(0);
+    assert_eq!(column.into_vector::<f32>().to_vec(), [3.0, 6.0, 9.0]);
+}
+
+/// `relu(xᵀ⁽³¹⁰²⁾ · w + v)`: a four-axis input read through a permutation that
+/// keeps no axis next to its neighbour, a smaller tensor broadcast over the
+/// axes it lacks, and a vector made a column by permuting its broadcast.
+fn permuted_program() -> Program {
+    let mut b = Builder::<f32>::new();
+    let x = b.input(Decl::tensor(DType::F32, &[2, 3, 4, 5]));
+    let w = b.input(Decl::tensor(DType::F32, &[3, 1, 4]));
+    let v = b.input(Decl::vector(DType::F32, 5));
+    // [5, 3, 2, 4]
+    let x = b.permute(x, &[3, 1, 0, 2]);
+    let xw = b.mul(x, w);
+    // v along the first axis: broadcast to [4, 2, 3, 5], then moved first.
+    let v = b.broadcast_to(v, &[4, 2, 3, 5]);
+    let v = b.permute(v, &[3, 2, 1, 0]);
+    let sum = b.add(xw, v);
+    let zero = b.constant(0.0);
+    let y = b.compare(Compare::Max, sum, zero);
+    b.output(y, DType::F32);
+    b.build().unwrap()
+}
+
+type Operands4 = (Tensor<f32>, Tensor<f32>, Vector<f32>);
+
+fn permuted_operands(rng: &mut Lcg) -> Operands4 {
+    (
+        Tensor::from_vec(&[2, 3, 4, 5], rng.vector(120, -1.0, 1.0)),
+        Tensor::from_vec(&[3, 1, 4], rng.vector(12, -1.0, 1.0)),
+        Vector::new(rng.vector(5, -1.0, 1.0)),
+    )
+}
+
+/// `permuted_program`'s result at `[i, j, k, l]`, element by element.
+fn permuted_expected((x, w, v): &Operands4) -> Vec<f32> {
+    let mut out = Vec::new();
+    for i in 0..5 {
+        for j in 0..3 {
+            for k in 0..2 {
+                for l in 0..4 {
+                    let xw = x.get(&[k, j, l, i]).unwrap() * w.get(&[j, 0, l]).unwrap();
+                    out.push((xw + v[i]).max(0.0));
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn permutations_and_broadcasts_of_any_rank_read_in_place() {
+    let program = permuted_program();
+    assert_eq!(program.space(), [5, 3, 2, 4]);
+    let operands = permuted_operands(&mut Lcg(17));
+    let (x, w, v) = &operands;
+    let want = permuted_expected(&operands);
+    let run = |mode| {
+        fused::with_mode(mode, || program.run::<Host>(&[x, w, v], &mut []))
+            .remove(0)
+            .into_tensor::<f32>()
+    };
+    let fused = run(Mode::Fused);
+    assert_eq!(fused.shape(), [5, 3, 2, 4]);
+    assert_bits_eq(&fused.to_vec(), &want, "fused");
+    assert_bits_eq(&run(Mode::Unfused).to_vec(), &want, "unfused");
+    let one = on_threads(1, || run(Mode::Fused));
+    assert_bits_eq(&one.to_vec(), &want, "one thread");
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+fn metal_permutations_and_broadcasts_of_any_rank_match_the_host() {
+    let program = permuted_program();
+    let operands = permuted_operands(&mut Lcg(18));
+    let want = permuted_expected(&operands);
+    let (x, w, v) = (
+        operands.0.to_backend::<Metal>(),
+        operands.1.to_backend::<Metal>(),
+        operands.2.to_backend::<Metal>(),
+    );
+    for codegen in [false, true] {
+        tensorcrate::metal::set_fused_codegen(codegen);
+        // Interpreted, then compiled once the program has been seen.
+        for round in 0..3 {
+            let got = program
+                .run::<Metal>(&[&x, &w, &v], &mut [])
+                .remove(0)
+                .into_vector::<f32>()
+                .to_backend::<Host>();
+            assert_close(
+                got.as_slice(),
+                &want,
+                &format!("codegen {codegen}, round {round}"),
+            );
+        }
+    }
+    tensorcrate::metal::set_fused_codegen(true);
+}
+
+#[test]
+fn a_permuted_view_is_read_in_place() {
+    // The same program, fed a view that is itself a permutation: the two
+    // compose.
+    let mut b = Builder::<f32>::new();
+    let x = b.input(Decl::tensor(DType::F32, &[4, 2, 3]));
+    let x = b.permute(x, &[1, 2, 0]);
+    let y = b.shift(x, 0.5);
+    b.output(y, DType::F32);
+    let program = b.build().unwrap();
+    let base = Tensor::<f32>::from_vec(&[2, 3, 4], (0..24).map(|v| v as f32).collect::<Vec<_>>());
+    // A view of shape [4, 2, 3]: element [l, i, j] is base[i, j, l].
+    let view = base.permute(&[2, 0, 1]);
+    let y = program
+        .run::<Host>(&[&view], &mut [])
+        .remove(0)
+        .into_tensor::<f32>();
+    assert_eq!(y.shape(), [2, 3, 4]);
+    for (i, j, l) in indices(2, 3, 4) {
+        assert_eq!(y.get(&[i, j, l]), Some(base.get(&[i, j, l]).unwrap() + 0.5));
+    }
+}
+
+#[test]
+fn a_rule_follows_its_parameters_to_a_new_shape() {
+    use tensorcrate::optim::Sgd;
+    let mut rule = Sgd::new(0.5f32);
+    let mut small = Vector::new([1.0f32, 2.0]);
+    rule.update(&mut small, &Vector::new([2.0, 2.0]));
+    assert_eq!(small.to_vec(), [0.0, 1.0]);
+    let mut large = Vector::new([1.0f32, 2.0, 3.0]);
+    rule.update(&mut large, &Vector::new([2.0, 2.0, 2.0]));
+    assert_eq!(large.to_vec(), [0.0, 1.0, 2.0]);
 }
 
 // ---- work counts ------------------------------------------------------------------
@@ -967,18 +1299,16 @@ fn metal_programs_agree_with_the_host_within_tolerance() {
     for case in 0..60 {
         let inputs = rng.below(4) + 1;
         let outputs = rng.below(3) + 1;
-        let program = random_program(&mut rng, inputs, outputs, true);
         // Keep the analytic functions on their well-conditioned domains so the
         // comparison measures fusion, not the GPU's transcendental accuracy.
         let len = LENGTHS[case % LENGTHS.len()];
+        let program = random_program(&mut rng, len, inputs, outputs, true);
         let values: Vec<Vector<f32>> = (0..inputs)
             .map(|_| Vector::new(rng.vector(len, 0.5, 1.5)))
             .collect();
-        let host = run_on::<Host>(&program, (1, len), &values);
-        let metal = run_on::<Metal>(&program, (1, len), &values);
-        let unfused = fused::with_mode(Mode::Unfused, || {
-            run_on::<Metal>(&program, (1, len), &values)
-        });
+        let host = run_on::<Host>(&program, &values);
+        let metal = run_on::<Metal>(&program, &values);
+        let unfused = fused::with_mode(Mode::Unfused, || run_on::<Metal>(&program, &values));
         for (k, ((m, u), h)) in metal.iter().zip(&unfused).zip(&host).enumerate() {
             for (i, ((&m, &u), &h)) in m.iter().zip(u).zip(h).enumerate() {
                 // Fast-math shaders already differ from the host in places —
@@ -1020,10 +1350,11 @@ fn metal_remaps_in_place_updates_and_compact_types() {
     let (rows, cols) = (33, 70);
 
     let mut b = Builder::<f32>::new();
-    let t = b.input_remapped(DType::F32, Remap::Transpose);
-    let row = b.input_remapped(DType::Bf16, Remap::Row);
-    let col = b.input_remapped(DType::F16, Remap::Column);
-    let acc = b.update(DType::F32);
+    let t = b.input(Decl::matrix(DType::F32, (cols, rows)));
+    let t = b.transpose(t, 0, 1);
+    let row = b.input(Decl::vector(DType::Bf16, cols));
+    let col = b.input(Decl::matrix(DType::F16, (rows, 1)));
+    let acc = b.update(Decl::matrix(DType::F32, (rows, cols)));
     let x = b.mul(t, row);
     let y = b.add(x, col);
     let z = b.add(acc, y);
@@ -1049,7 +1380,7 @@ fn metal_remaps_in_place_updates_and_compact_types() {
     let (row_h, col_h) = (Vector::new(row.clone()), Vector::new(col.clone()));
     let mut acc_h = acc.clone();
     let mut host = program
-        .run::<Host>((rows, cols), &[&t, &row_h, &col_h], &mut [&mut acc_h])
+        .run::<Host>(&[&t, &row_h, &col_h], &mut [&mut acc_h])
         .into_iter();
     let host_half = host.next().unwrap().into_vector::<f16>();
     let host_brain = host.next().unwrap().into_vector::<bf16>();
@@ -1059,7 +1390,7 @@ fn metal_remaps_in_place_updates_and_compact_types() {
     let (row_m, col_m) = (row_h.to_backend::<Metal>(), col_h.to_backend::<Metal>());
     let mut acc_m = acc.to_backend::<Metal>();
     let mut metal = program
-        .run::<Metal>((rows, cols), &[&t_m, &row_m, &col_m], &mut [&mut acc_m])
+        .run::<Metal>(&[&t_m, &row_m, &col_m], &mut [&mut acc_m])
         .into_iter();
     let metal_half = metal.next().unwrap().into_vector::<f16>();
     let metal_brain = metal.next().unwrap().into_vector::<bf16>();
@@ -1093,20 +1424,22 @@ fn metal_remaps_in_place_updates_and_compact_types() {
 
 /// Three epilogues: a dense layer (`relu(xw + bias)`), a gated one that keeps
 /// the product too (`[p, tanh(0.5·p + c)·g]`), and one that reads a whole
-/// second matrix (`exp(−p²)·m`).
-fn epilogues() -> Vec<(Program, Vec<Remap>)> {
+/// second matrix (`exp(−p²)·m`), for a product of `m × n`.
+fn epilogues((m, n): (usize, usize)) -> Vec<Program> {
+    let product = Decl::matrix(DType::F32, (m, n));
     let mut layer = Builder::new();
-    let p = layer.input(DType::F32);
-    let bias = layer.input_remapped(DType::F32, Remap::Row);
+    let p = layer.input(product.clone());
+    let bias = layer.input(Decl::vector(DType::F32, n));
     let shifted = layer.add(p, bias);
     let zero = layer.constant(0.0);
     let relu = layer.compare(Compare::Max, shifted, zero);
     layer.output(relu, DType::F32);
 
     let mut gated = Builder::new();
-    let p = gated.input(DType::F32);
-    let c = gated.input_remapped(DType::F32, Remap::Column);
-    let g = gated.input_remapped(DType::F32, Remap::Transpose);
+    let p = gated.input(product.clone());
+    let c = gated.input(Decl::matrix(DType::F32, (m, 1)));
+    let g = gated.input(Decl::matrix(DType::F32, (n, m)));
+    let g = gated.transpose(g, 0, 1);
     let half = gated.scale(p, 0.5);
     let shifted = gated.add(half, c);
     let squashed = gated.unary(Analytic::Tanh, shifted);
@@ -1115,21 +1448,18 @@ fn epilogues() -> Vec<(Program, Vec<Remap>)> {
     gated.output(out, DType::F32);
 
     let mut bump = Builder::new();
-    let p = bump.input(DType::F32);
-    let m = bump.input(DType::F32);
+    let p = bump.input(product.clone());
+    let second = bump.input(product);
     let square = bump.mul(p, p);
     let negated = bump.scale(square, -1.0);
     let e = bump.unary(Analytic::Exp, negated);
-    let out = bump.mul(e, m);
+    let out = bump.mul(e, second);
     bump.output(out, DType::F32);
 
     vec![
-        (layer.build().unwrap(), vec![Remap::Row]),
-        (
-            gated.build().unwrap(),
-            vec![Remap::Column, Remap::Transpose],
-        ),
-        (bump.build().unwrap(), vec![Remap::Identity]),
+        layer.build().unwrap(),
+        gated.build().unwrap(),
+        bump.build().unwrap(),
     ]
 }
 
@@ -1144,16 +1474,19 @@ const PRODUCTS: [(usize, usize, usize); 7] = [
     (128, 7, 200),
 ];
 
+/// The product's operands, and an input of each declared shape besides it.
 fn epilogue_operands(
     rng: &mut Lcg,
     (m, k, n): (usize, usize, usize),
-    remaps: &[Remap],
+    program: &Program,
 ) -> (Matrix<f32>, Matrix<f32>, Vec<Vector<f32>>) {
     let a = Matrix::from_flat(m, k, rng.vector(m * k, -1.0, 1.0));
     let b = Matrix::from_flat(k, n, rng.vector(k * n, -1.0, 1.0));
-    let inputs = remaps
-        .iter()
-        .map(|remap| Vector::new(rng.vector(remap.input_len((m, n)), -1.0, 1.0)))
+    let inputs = (1..program.given_inputs())
+        .map(|slot| {
+            let len = program.input_shape(slot).iter().product();
+            Vector::new(rng.vector(len, -1.0, 1.0))
+        })
         .collect();
     (a, b, inputs)
 }
@@ -1176,9 +1509,9 @@ fn run_matmul_on<B: Kernels>(
 #[test]
 fn a_matmul_epilogue_is_the_product_then_the_program_bit_for_bit() {
     let mut rng = Lcg(31);
-    for (program, remaps) in epilogues() {
-        for shape in PRODUCTS {
-            let (a, b, inputs) = epilogue_operands(&mut rng, shape, &remaps);
+    for shape in PRODUCTS {
+        for program in epilogues((shape.0, shape.2)) {
+            let (a, b, inputs) = epilogue_operands(&mut rng, shape, &program);
             let fused = run_matmul_on::<Host>(&program, &a, &b, &inputs);
             let unfused = fused::with_mode(Mode::Unfused, || {
                 run_matmul_on::<Host>(&program, &a, &b, &inputs)
@@ -1187,7 +1520,7 @@ fn a_matmul_epilogue_is_the_product_then_the_program_bit_for_bit() {
             let product = Vector::new(a.matmul(&b).data().to_vec());
             let mut operands = vec![product];
             operands.extend(inputs.iter().cloned());
-            let by_hand = run_on::<Host>(&program, (shape.0, shape.2), &operands);
+            let by_hand = run_on::<Host>(&program, &operands);
             for (k, ((f, u), h)) in fused.iter().zip(&unfused).zip(&by_hand).enumerate() {
                 assert_bits_eq(f, u, &format!("{shape:?} output {k} against unfused"));
                 assert_bits_eq(f, h, &format!("{shape:?} output {k} against by hand"));
@@ -1200,9 +1533,9 @@ fn a_matmul_epilogue_is_the_product_then_the_program_bit_for_bit() {
 #[test]
 fn a_matmul_epilogue_is_one_kernel_that_never_writes_the_product() {
     use tensorcrate::counters;
-    let (program, remaps) = epilogues().remove(0);
     let (m, k, n) = (32, 48, 64);
-    let (a, b, inputs) = epilogue_operands(&mut Lcg(5), (m, k, n), &remaps);
+    let program = epilogues((m, n)).remove(0);
+    let (a, b, inputs) = epilogue_operands(&mut Lcg(5), (m, k, n), &program);
     counters::reset();
     run_matmul_on::<Host>(&program, &a, &b, &inputs);
     let counts = counters::snapshot();
@@ -1216,7 +1549,8 @@ fn a_matmul_epilogue_is_one_kernel_that_never_writes_the_product() {
 #[should_panic(expected = "the product is read through")]
 fn a_matmul_epilogue_reads_the_product_unremapped() {
     let mut b = Builder::new();
-    let p = b.input_remapped(DType::F32, Remap::Transpose);
+    let p = b.input(Decl::matrix(DType::F32, (2, 2)));
+    let p = b.transpose(p, 0, 1);
     b.output(p, DType::F32);
     let program = b.build().unwrap();
     let square = Matrix::from_flat(2, 2, vec![1.0f32; 4]);
@@ -1232,9 +1566,9 @@ fn metal_matmul_epilogues_agree_with_the_host_on_both_product_kernels() {
     for (tensorops, codegen) in [(true, false), (true, true), (false, true)] {
         tensorcrate::metal::set_tensorops(tensorops);
         tensorcrate::metal::set_fused_codegen(codegen);
-        for (program, remaps) in epilogues() {
-            for (m, k, n) in PRODUCTS {
-                let (a, b, inputs) = epilogue_operands(&mut rng, (m, k, n), &remaps);
+        for (m, k, n) in PRODUCTS {
+            for program in epilogues((m, n)) {
+                let (a, b, inputs) = epilogue_operands(&mut rng, (m, k, n), &program);
                 let host = run_matmul_on::<Host>(&program, &a, &b, &inputs);
                 for _ in 0..2 {
                     run_matmul_on::<Metal>(&program, &a, &b, &inputs);
@@ -1269,10 +1603,10 @@ fn metal_matmul_epilogues_agree_with_the_host_on_both_product_kernels() {
 
 /// `exp(x · (u − 1)) · u + c`: one uniform read directly, and folded with
 /// constants into another constant.
-fn uniform_program(u: f32) -> (Program, Program) {
+fn uniform_program(u: f32, len: usize) -> (Program, Program) {
     let build = |uniform: bool| {
         let mut b = Builder::<f32>::new();
-        let x = b.input(DType::F32);
+        let x = b.input(Decl::vector(DType::F32, len));
         let u = if uniform { b.uniform(u) } else { b.constant(u) };
         let one = b.constant(1.0);
         let less = b.sub(u, one);
@@ -1289,12 +1623,12 @@ fn uniform_program(u: f32) -> (Program, Program) {
 #[test]
 fn a_uniform_set_after_building_matches_a_program_built_with_it() {
     let x = Vector::new(Lcg(3).vector(100, -1.0, 1.0));
-    let (mut program, _) = uniform_program(0.5);
+    let (mut program, _) = uniform_program(0.5, 100);
     assert_eq!(program.uniforms(), [0.5]);
     for value in [0.5f32, 2.0, -3.25, 1.0, 0.0] {
         program.set_uniform(0, value);
         assert_eq!(program.uniforms(), [value]);
-        let (_, constant) = uniform_program(value);
+        let (_, constant) = uniform_program(value, 100);
         let got = program.run_vectors(&[&x]).remove(0);
         let want = constant.run_vectors(&[&x]).remove(0);
         assert_bits_eq(got.as_slice(), want.as_slice(), &format!("uniform {value}"));
@@ -1304,7 +1638,7 @@ fn a_uniform_set_after_building_matches_a_program_built_with_it() {
 #[test]
 #[should_panic(expected = "uniform 1 out of 1")]
 fn setting_a_missing_uniform_panics() {
-    let (mut program, _) = uniform_program(0.5);
+    let (mut program, _) = uniform_program(0.5, 4);
     program.set_uniform(1, 2.0);
 }
 
@@ -1341,7 +1675,7 @@ fn a_uniform_set_after_building_reaches_the_gpu() {
     if !x.is_device_resident() {
         return;
     }
-    let (mut program, _) = uniform_program(0.5);
+    let (mut program, _) = uniform_program(0.5, 4096);
     // Several runs per value, so the specialized kernel is compiled and reused
     // across values.
     for value in [0.5f32, 2.0, -3.25] {
@@ -1359,11 +1693,11 @@ fn a_uniform_set_after_building_reaches_the_gpu() {
 // ---- sums of a program's output ----------------------------------------------------
 
 /// `exp(x − row) · col`, a program over a broadcast row and column.
-fn exp_program() -> Program {
+fn exp_program((rows, cols): (usize, usize)) -> Program {
     let mut b = Builder::<f32>::new();
-    let x = b.input(DType::F32);
-    let row = b.input_remapped(DType::F32, Remap::Row);
-    let col = b.input_remapped(DType::F32, Remap::Column);
+    let x = b.input(Decl::matrix(DType::F32, (rows, cols)));
+    let row = b.input(Decl::vector(DType::F32, cols));
+    let col = b.input(Decl::matrix(DType::F32, (rows, 1)));
     let shifted = b.sub(x, row);
     let e = b.unary(Analytic::Exp, shifted);
     let y = b.mul(e, col);
@@ -1388,22 +1722,19 @@ const SUM_SHAPES: [(usize, usize); 6] =
 #[test]
 fn host_sums_of_a_program_are_its_output_summed_bit_for_bit() {
     use tensorcrate::tensors::Axis;
-    let program = exp_program();
     let mut rng = Lcg(91);
     for shape in SUM_SHAPES {
+        let program = exp_program(shape);
         let (x, row, col) = sum_operands(&mut rng, shape);
         let inputs: [&dyn Fusable<Host>; 3] = [&x, &row, &col];
-        let output = program
-            .run(shape, &inputs, &mut [])
-            .remove(0)
-            .into_matrix::<f32>();
+        let output = program.run(&inputs, &mut []).remove(0).into_matrix::<f32>();
         for axis in [Axis::Rows, Axis::Columns] {
             let want = match axis {
                 Axis::Rows => Host::matvec(&output, &Vector::filled(shape.1, 1.0)),
                 Axis::Columns => Host::vecmat(&Vector::filled(shape.0, 1.0), &output),
             };
-            let fused = program.run_sum(shape, &inputs, axis);
-            let unfused = fused::with_mode(Mode::Unfused, || program.run_sum(shape, &inputs, axis));
+            let fused = program.run_sum(&inputs, axis);
+            let unfused = fused::with_mode(Mode::Unfused, || program.run_sum(&inputs, axis));
             assert_bits_eq(
                 fused.as_slice(),
                 want.as_slice(),
@@ -1422,9 +1753,9 @@ fn host_sums_of_a_program_are_its_output_summed_bit_for_bit() {
 #[test]
 fn metal_sums_of_a_program_match_the_host() {
     use tensorcrate::tensors::Axis;
-    let program = exp_program();
     let mut rng = Lcg(92);
     for shape in SUM_SHAPES {
+        let program = exp_program(shape);
         let (x, row, col) = sum_operands(&mut rng, shape);
         let host_inputs: [&dyn Fusable<Host>; 3] = [&x, &row, &col];
         let (gx, grow, gcol) = (
@@ -1434,10 +1765,10 @@ fn metal_sums_of_a_program_match_the_host() {
         );
         let inputs: [&dyn Fusable<Metal>; 3] = [&gx, &grow, &gcol];
         for axis in [Axis::Rows, Axis::Columns] {
-            let want = program.run_sum(shape, &host_inputs, axis);
+            let want = program.run_sum(&host_inputs, axis);
             // Interpreted, then compiled once the program has been seen.
             for round in 0..3 {
-                let got = program.run_sum(shape, &inputs, axis).to_backend::<Host>();
+                let got = program.run_sum(&inputs, axis).to_backend::<Host>();
                 let terms = match axis {
                     Axis::Rows => shape.1,
                     Axis::Columns => shape.0,
@@ -1457,16 +1788,6 @@ fn metal_sums_of_a_program_match_the_host() {
 /// the broadcast value exactly, a negative zero included, for counts with
 /// every pattern of bits.
 fn broadcasts_copy_exactly_on<B: Kernels>() {
-    let mut b = Builder::<f32>::new();
-    let row = b.input_remapped(DType::F32, Remap::Row);
-    let col = b.input_remapped(DType::F32, Remap::Column);
-    let x = b.input(DType::F32);
-    let shifted = b.add(x, row);
-    b.output(shifted, DType::F32);
-    b.output(col, DType::F32);
-    let program = b
-        .build_with(&fused::CostModel::BALANCED, Algebra::Exact)
-        .unwrap();
     for (rows, cols) in [
         (1, 1),
         (2, 3),
@@ -1477,6 +1798,16 @@ fn broadcasts_copy_exactly_on<B: Kernels>() {
         (65, 1),
         (1, 65),
     ] {
+        let mut b = Builder::<f32>::new();
+        let row = b.input(Decl::vector(DType::F32, cols));
+        let col = b.input(Decl::matrix(DType::F32, (rows, 1)));
+        let x = b.input(Decl::matrix(DType::F32, (rows, cols)));
+        let shifted = b.add(x, row);
+        b.output(shifted, DType::F32);
+        b.output(col, DType::F32);
+        let program = b
+            .build_with(&fused::CostModel::BALANCED, Algebra::Exact)
+            .unwrap();
         let row: Vec<f32> = (0..cols)
             .map(|c| if c % 2 == 0 { -0.0 } else { c as f32 })
             .collect();
@@ -1490,9 +1821,7 @@ fn broadcasts_copy_exactly_on<B: Kernels>() {
         );
         let xv = Matrix::from_flat(rows, cols, zeros).to_backend::<B>();
         let inputs: [&dyn Fusable<B>; 3] = [&rv, &cv, &xv];
-        let mut out = fused::with_mode(Mode::Unfused, || {
-            program.run((rows, cols), &inputs, &mut [])
-        });
+        let mut out = fused::with_mode(Mode::Unfused, || program.run(&inputs, &mut []));
         let columns = out.pop().unwrap().into_matrix::<f32>().to_backend::<Host>();
         let rows_added = out.pop().unwrap().into_matrix::<f32>().to_backend::<Host>();
         for (r, &col_value) in col.iter().enumerate() {
@@ -1525,13 +1854,13 @@ fn unfused_broadcasts_copy_exactly() {
 
 /// A layer norm over an `f32` input and an `f16` one, updating an accumulator
 /// in place: `acc += γ·(x − mean)/√(dev/n + ε) + mean(h)`.
-fn normalize_program(cols: usize) -> Program {
+fn normalize_program((rows, cols): (usize, usize)) -> Program {
     use tensorcrate::tensors::fused::RowStatistic;
     let mut b = Builder::<f32>::new();
-    let x = b.input(DType::F32);
-    let gamma = b.input_remapped(DType::F32, Remap::Row);
-    let h = b.input(DType::F16);
-    let acc = b.update(DType::F32);
+    let x = b.input(Decl::matrix(DType::F32, (rows, cols)));
+    let gamma = b.input(Decl::vector(DType::F32, cols));
+    let h = b.input(Decl::matrix(DType::F16, (rows, cols)));
+    let acc = b.update(Decl::matrix(DType::F32, (rows, cols)));
     let mean = b.row_statistic(x, RowStatistic::Mean);
     let deviations = b.row_statistic(x, RowStatistic::Deviations);
     let other = b.row_statistic(h, RowStatistic::Mean);
@@ -1557,7 +1886,6 @@ type Normalized = (Vec<f32>, Vec<f32>);
 
 fn run_normalize<B: Kernels>(
     program: &Program,
-    (rows, cols): (usize, usize),
     x: &Matrix<f32>,
     gamma: &Vector<f32>,
     h: &Matrix<f16>,
@@ -1570,9 +1898,7 @@ fn run_normalize<B: Kernels>(
     );
     let mut acc = start.to_backend::<B>();
     let inputs: [&dyn Fusable<B>; 3] = [&x, &gamma, &h];
-    let fresh = program
-        .run((rows, cols), &inputs, &mut [&mut acc])
-        .remove(0);
+    let fresh = program.run(&inputs, &mut [&mut acc]).remove(0);
     (
         acc.to_backend::<Host>().as_slice().to_vec(),
         fresh
@@ -1604,12 +1930,12 @@ fn statistic_operands(
 fn row_statistics_are_the_axis_moments_bit_for_bit_on_the_host() {
     let mut rng = Lcg(5150);
     for shape in STATISTIC_SHAPES {
-        let program = normalize_program(shape.1);
+        let program = normalize_program(shape);
         assert_eq!(program.given_inputs(), 3);
         let (x, gamma, h, start) = statistic_operands(&mut rng, shape);
-        let fused = run_normalize::<Host>(&program, shape, &x, &gamma, &h, &start);
+        let fused = run_normalize::<Host>(&program, &x, &gamma, &h, &start);
         let unfused = fused::with_mode(Mode::Unfused, || {
-            run_normalize::<Host>(&program, shape, &x, &gamma, &h, &start)
+            run_normalize::<Host>(&program, &x, &gamma, &h, &start)
         });
         assert_bits_eq(&fused.0, &unfused.0, &format!("{shape:?}, updated"));
         assert_bits_eq(&fused.1, &unfused.1, &format!("{shape:?}, output"));
@@ -1647,10 +1973,10 @@ fn row_statistics_are_the_axis_moments_bit_for_bit_on_the_host() {
 #[test]
 fn a_trace_computes_the_row_statistics_too() {
     let shape = (4, 6);
-    let program = normalize_program(shape.1);
+    let program = normalize_program(shape);
     let (x, gamma, h, start) = statistic_operands(&mut Lcg(8), shape);
     let inputs: [&dyn Fusable<Host>; 4] = [&x, &gamma, &h, &start];
-    let trace = program.trace(shape, &inputs);
+    let trace = program.trace(&inputs);
     assert_eq!(trace.len(), program.code().len());
 }
 
@@ -1659,7 +1985,7 @@ fn a_trace_computes_the_row_statistics_too() {
 fn a_row_statistic_is_of_an_input() {
     use tensorcrate::tensors::fused::RowStatistic;
     let mut b = Builder::<f32>::new();
-    let x = b.input(DType::F32);
+    let x = b.input(Decl::vector(DType::F32, 4));
     let y = b.scale(x, 2.0);
     b.row_statistic(y, RowStatistic::Mean);
 }
@@ -1671,12 +1997,12 @@ fn metal_row_statistics_match_the_host() {
     for codegen in [false, true] {
         tensorcrate::metal::set_fused_codegen(codegen);
         for shape in STATISTIC_SHAPES {
-            let program = normalize_program(shape.1);
+            let program = normalize_program(shape);
             let (x, gamma, h, start) = statistic_operands(&mut rng, shape);
-            let want = run_normalize::<Host>(&program, shape, &x, &gamma, &h, &start);
+            let want = run_normalize::<Host>(&program, &x, &gamma, &h, &start);
             // Interpreted, then compiled once the program has been seen.
             for round in 0..3 {
-                let got = run_normalize::<Metal>(&program, shape, &x, &gamma, &h, &start);
+                let got = run_normalize::<Metal>(&program, &x, &gamma, &h, &start);
                 for (what, got, want) in [("updated", &got.0, &want.0), ("output", &got.1, &want.1)]
                 {
                     for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
@@ -1697,15 +2023,17 @@ fn metal_row_statistics_match_the_host() {
 /// `a + bᵀ·w − c + r·s + h`: a block, a view read transposed, a transposed
 /// view, a column broadcast across rows from a matrix's column, a row broadcast
 /// from a matrix's row, a row broadcast from a column, and an `f16` block.
-fn view_program() -> Program {
+fn view_program((rows, cols): (usize, usize)) -> Program {
     let mut b = Builder::<f32>::new();
-    let a = b.input(DType::F32);
-    let bt = b.input_remapped(DType::F32, Remap::Transpose);
-    let w = b.input(DType::F32);
-    let c = b.input_remapped(DType::F32, Remap::Column);
-    let r = b.input_remapped(DType::F32, Remap::Row);
-    let s = b.input_remapped(DType::F32, Remap::Row);
-    let h = b.input(DType::F16);
+    let block = Decl::matrix(DType::F32, (rows, cols));
+    let a = b.input(block.clone());
+    let bt = b.input(Decl::matrix(DType::F32, (cols, rows)));
+    let bt = b.transpose(bt, 0, 1);
+    let w = b.input(block);
+    let c = b.input(Decl::matrix(DType::F32, (rows, 1)));
+    let r = b.input(Decl::vector(DType::F32, cols));
+    let s = b.input(Decl::vector(DType::F32, cols));
+    let h = b.input(Decl::matrix(DType::F16, (rows, cols)));
     let bw = b.mul(bt, w);
     let sum = b.add(a, bw);
     let less = b.sub(sum, c);
@@ -1751,7 +2079,7 @@ fn run_views<B: Kernels>(p: &ViewParents, (rows, cols): (usize, usize), copied: 
         p.tall.to_backend::<B>(),
         p.halves.to_backend::<B>(),
     );
-    let program = view_program();
+    let program = view_program((rows, cols));
     let a = big.view(1..1 + rows, 2..2 + cols);
     // Read transposed: stored cols × rows.
     let bt = big.view(3..3 + cols, 1..1 + rows);
@@ -1763,7 +2091,7 @@ fn run_views<B: Kernels>(p: &ViewParents, (rows, cols): (usize, usize), copied: 
     let h = halves.view(2..2 + rows, 1..1 + cols);
     let run = |inputs: &[&dyn Fusable<B>]| {
         program
-            .run((rows, cols), inputs, &mut [])
+            .run(inputs, &mut [])
             .remove(0)
             .into_matrix::<f32>()
             .to_backend::<Host>()
@@ -1819,17 +2147,17 @@ fn views_read_in_place_match_their_copies_bit_for_bit() {
 }
 
 #[test]
-#[should_panic(expected = "cannot read through Identity")]
+#[should_panic(expected = "a view of shape [2, 3], which cannot be read as [3, 2]")]
 fn a_view_of_the_wrong_shape_is_refused() {
     let m = Matrix::from_flat(4, 4, vec![0.0f32; 16]);
-    let program = program_adding_one();
+    let program = program_adding_one((3, 2));
     // 2×3 holds six elements, as a 3×2 space needs, but is not 3×2.
-    let _ = program.run((3, 2), &[&m.view(0..2, 0..3)], &mut []);
+    let _ = program.run(&[&m.view(0..2, 0..3)], &mut []);
 }
 
-fn program_adding_one() -> Program {
+fn program_adding_one(shape: (usize, usize)) -> Program {
     let mut b = Builder::<f32>::new();
-    let x = b.input(DType::F32);
+    let x = b.input(Decl::matrix(DType::F32, shape));
     let y = b.shift(x, 1.0);
     b.output(y, DType::F32);
     b.build().unwrap()
@@ -1850,10 +2178,10 @@ fn views_feed_sums_epilogues_and_row_statistics() {
     let big = Matrix::from_flat(40, 50, rng.vector(2000, -1.0, 1.0));
     let (block, copy) = (big.view(3..23, 5..35), big.view(3..23, 5..35).to_matrix());
 
-    let sum = program_adding_one();
+    let sum = program_adding_one((20, 30));
     for axis in [Axis::Rows, Axis::Columns] {
-        let viewed = sum.run_sum((20, 30), &[&block], axis);
-        let copied = sum.run_sum((20, 30), &[&copy], axis);
+        let viewed = sum.run_sum(&[&block], axis);
+        let copied = sum.run_sum(&[&copy], axis);
         assert_bits_eq(
             viewed.as_slice(),
             copied.as_slice(),
@@ -1862,29 +2190,23 @@ fn views_feed_sums_epilogues_and_row_statistics() {
     }
 
     let mut b = Builder::<f32>::new();
-    let x = b.input(DType::F32);
+    let x = b.input(Decl::matrix(DType::F32, (20, 30)));
     let mean = b.row_statistic(x, RowStatistic::Mean);
     let deviations = b.row_statistic(x, RowStatistic::Deviations);
     let centered = b.sub(x, mean);
     let y = b.mul(centered, deviations);
     b.output(y, DType::F32);
     let norm = b.build().unwrap();
-    let viewed = norm
-        .run((20, 30), &[&block], &mut [])
-        .remove(0)
-        .into_vector::<f32>();
-    let copied = norm
-        .run((20, 30), &[&copy], &mut [])
-        .remove(0)
-        .into_vector::<f32>();
+    let viewed = norm.run(&[&block], &mut []).remove(0).into_vector::<f32>();
+    let copied = norm.run(&[&copy], &mut []).remove(0).into_vector::<f32>();
     assert_bits_eq(viewed.as_slice(), copied.as_slice(), "row statistics");
 
     // An epilogue's bias, one row of a matrix.
     let x = Matrix::from_flat(9, 12, rng.vector(108, -1.0, 1.0));
     let w = Matrix::from_flat(12, 30, rng.vector(360, -1.0, 1.0));
     let mut b = Builder::<f32>::new();
-    let product = b.input(DType::F32);
-    let bias = b.input_remapped(DType::F32, Remap::Row);
+    let product = b.input(Decl::matrix(DType::F32, (9, 30)));
+    let bias = b.input(Decl::vector(DType::F32, 30));
     let y = b.add(product, bias);
     b.output(y, DType::F32);
     let dense = b.build().unwrap();
@@ -1934,9 +2256,9 @@ fn metal_views_feed_sums_epilogues_and_row_statistics() {
     let host = Matrix::from_flat(40, 50, rng.vector(2000, -1.0, 1.0));
     let big = host.to_backend::<Metal>();
     let shape = (20, 30);
-    let sum = program_adding_one();
+    let sum = program_adding_one(shape);
     let mut b = Builder::<f32>::new();
-    let x = b.input(DType::F32);
+    let x = b.input(Decl::matrix(DType::F32, shape));
     let mean = b.row_statistic(x, RowStatistic::Mean);
     let centered = b.sub(x, mean);
     b.output(centered, DType::F32);
@@ -1945,8 +2267,8 @@ fn metal_views_feed_sums_epilogues_and_row_statistics() {
         let block = big.view(3..23, 5..35);
         let host_block = host.view(3..23, 5..35);
         for axis in [Axis::Rows, Axis::Columns] {
-            let got = sum.run_sum(shape, &[&block], axis).to_backend::<Host>();
-            let want = sum.run_sum(shape, &[&host_block], axis);
+            let got = sum.run_sum(&[&block], axis).to_backend::<Host>();
+            let want = sum.run_sum(&[&host_block], axis);
             assert_close(
                 got.as_slice(),
                 want.as_slice(),
@@ -1954,12 +2276,12 @@ fn metal_views_feed_sums_epilogues_and_row_statistics() {
             );
         }
         let got = norm
-            .run(shape, &[&block], &mut [])
+            .run(&[&block], &mut [])
             .remove(0)
             .into_vector::<f32>()
             .to_backend::<Host>();
         let want = norm
-            .run(shape, &[&host_block], &mut [])
+            .run(&[&host_block], &mut [])
             .remove(0)
             .into_vector::<f32>();
         assert_close(

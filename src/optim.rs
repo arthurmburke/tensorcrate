@@ -53,7 +53,8 @@ use num_traits::Float;
 
 use crate::numbers::Real;
 use crate::tensors::fused::{
-    Builder, Element, Fusable, FusableMut, FusableOf, Instr, Output, Program, Remap,
+    self, Algebra, Builder, CostModel, Decl, Element, Fusable, FusableMut, FusableOf, Instr,
+    Output, Program,
 };
 use crate::tensors::tape::Adjoint;
 use crate::tensors::{
@@ -103,6 +104,16 @@ pub trait Parameter: Sized + 'static {
 
     /// A second copy on the same backend.
     fn duplicate(&self) -> Self;
+
+    /// The lengths of this parameter's axes: none for a scalar.
+    ///
+    /// The rules declare the shape of their fused step with it, so a program
+    /// can be checked against, and optimized for, the parameters it updates.
+    /// A parameter type of your own that runs programs with [`run_by_parts`]
+    /// has no shape to declare, and may leave the default.
+    fn dims(&self) -> Vec<usize> {
+        Vec::new()
+    }
 
     fn add(&self, other: &Self) -> Self;
     fn subtract(&self, other: &Self) -> Self;
@@ -235,7 +246,7 @@ pub fn run_by_parts<P: Parameter>(
         let get = |reg: u8| registers[usize::from(reg)].as_ref().expect("validated");
         let (dst, value) = match *instr {
             Instr::Load { dst, input, remap } => {
-                assert_eq!(remap, Remap::Identity, "parameter programs read unremapped");
+                assert!(remap.is_identity(), "parameter programs read unremapped");
                 let slot = usize::from(input);
                 let source: &P = if slot < given {
                     inputs[slot]
@@ -308,10 +319,9 @@ pub fn run_by_parts<P: Parameter>(
     outputs.collect()
 }
 
-/// Run `program` over a `shape` space, which is every parameter program's.
+/// Run `program`, which is over the parameters' shape.
 fn run_fused<E: Element, B: Kernels<E>, T: FusableMut<B>>(
     program: &Program<E>,
-    shape: (usize, usize),
     inputs: &[&(dyn FusableOf<E, B> + '_)],
     updated: &mut [&mut T],
 ) -> Vec<Output<B>> {
@@ -323,7 +333,7 @@ fn run_fused<E: Element, B: Kernels<E>, T: FusableMut<B>>(
         .iter_mut()
         .map(|target| &mut **target as &mut dyn FusableMut<B>)
         .collect();
-    program.run(shape, &inputs, &mut updated)
+    program.run(&inputs, &mut updated)
 }
 
 /// A scalar parameter — a learned temperature, or a log-variance. It carries no
@@ -387,7 +397,7 @@ impl<T: Element> Parameter for T {
                 .map(|x| x as &dyn FusableOf<T, Host>)
                 .collect();
             let mut targets: Vec<&mut Vector<T>> = targets.iter_mut().collect();
-            run_fused(program, (1, 1), &inputs, &mut targets)
+            run_fused(program, &inputs, &mut targets)
         };
         for (target, value) in updated.iter_mut().zip(&targets) {
             **target = value[0];
@@ -410,6 +420,10 @@ impl<T: Element, B: Kernels<T>> Parameter for Vector<T, B> {
 
     fn zeros_like(&self) -> Self {
         Vector::filled(self.len(), T::zero())
+    }
+
+    fn dims(&self) -> Vec<usize> {
+        vec![self.len()]
     }
 
     fn duplicate(&self) -> Self {
@@ -469,7 +483,7 @@ impl<T: Element, B: Kernels<T>> Parameter for Vector<T, B> {
                 );
             }
         }
-        run_fused(program, (1, len), inputs, updated)
+        run_fused(program, inputs, updated)
             .into_iter()
             .map(Output::into_vector)
             .collect()
@@ -488,6 +502,11 @@ impl<T: Element, B: Kernels<T>> Parameter for Matrix<T, B> {
     fn zeros_like(&self) -> Self {
         let (rows, cols) = self.shape();
         Matrix::filled(rows, cols, T::zero())
+    }
+
+    fn dims(&self) -> Vec<usize> {
+        let (rows, cols) = self.shape();
+        vec![rows, cols]
     }
 
     fn duplicate(&self) -> Self {
@@ -549,7 +568,7 @@ impl<T: Element, B: Kernels<T>> Parameter for Matrix<T, B> {
                 );
             }
         }
-        run_fused(program, shape, inputs, updated)
+        run_fused(program, inputs, updated)
             .into_iter()
             .map(Output::into_matrix)
             .collect()
@@ -571,6 +590,10 @@ impl<T: Element, B: Kernels<T>> Parameter for Tensor<T, B> {
 
     fn zeros_like(&self) -> Self {
         Tensor::filled(self.shape(), T::zero())
+    }
+
+    fn dims(&self) -> Vec<usize> {
+        self.shape().to_vec()
     }
 
     fn duplicate(&self) -> Self {
@@ -641,7 +664,7 @@ impl<T: Element, B: Kernels<T>> Parameter for Tensor<T, B> {
             }
         }
         let dims = dims.unwrap_or_else(|| vec![len]);
-        run_fused(program, space, inputs, updated)
+        run_fused(program, inputs, updated)
             .into_iter()
             .map(|output| Tensor::from_vector(&dims, output.into_vector()))
             .collect()
@@ -690,13 +713,49 @@ pub trait Rule<P: Parameter> {
     fn reset(&mut self);
 }
 
+/// A rule's fused step, built for the shape of the parameters it updates.
+///
+/// A rule belongs to one parameter tensor, so the step is built by the first
+/// update, and again only if the parameter changes shape. It is optimized under
+/// the thread's [`Algebra`] when the rule is created.
+#[derive(Clone, Debug)]
+struct Step<T> {
+    algebra: Algebra,
+    built: Option<(Vec<usize>, Program<T>)>,
+}
+
+impl<T> Default for Step<T> {
+    fn default() -> Self {
+        Step {
+            algebra: fused::algebra(),
+            built: None,
+        }
+    }
+}
+
+impl<T: Element + Real> Step<T> {
+    /// The program for parameters of `dims`, built from the declaration `build`
+    /// is given if there is none yet.
+    fn of(&mut self, dims: &[usize], build: impl FnOnce(Decl) -> Builder<T>) -> &mut Program<T> {
+        if self.built.as_ref().is_none_or(|(built, _)| built != dims) {
+            let builder = build(Decl::of(T::DTYPE, dims));
+            let program = builder
+                .build_with(&CostModel::BALANCED, self.algebra)
+                .expect("the rule's program is valid");
+            self.built = Some((dims.to_vec(), program));
+        }
+        &mut self.built.as_mut().expect("built above").1
+    }
+}
+
 /// Plain gradient descent: `p ← p − rate·g`.
 ///
 /// The step size is the whole algorithm, and it has to respect the curvature:
 /// descent diverges above `2/λmax` of the loss's Hessian.
 #[derive(Clone, Debug)]
 pub struct Sgd<T = f32> {
-    program: Program<T>,
+    rate: T,
+    step: Step<T>,
 }
 
 impl<T> Sgd<T>
@@ -704,21 +763,26 @@ where
     T: Element + Real,
 {
     pub fn new(rate: T) -> Self {
-        let dtype = T::DTYPE;
-        let mut b = Builder::new();
-        let g = b.input(dtype);
-        let p = b.update(dtype);
-        let step = b.scale(g, rate);
-        let p = b.sub(p, step);
-        b.set(0, p);
-        let program = b.build().expect("the rule's program is valid");
-        Sgd { program }
+        Sgd {
+            rate,
+            step: Step::default(),
+        }
     }
 }
 
 impl<P: Parameter> Rule<P> for Sgd<P::Elem> {
     fn update(&mut self, parameters: &mut P, gradient: &P::Gradient<'_>) {
-        P::fused(&self.program, &[gradient], &mut [parameters]);
+        let rate = self.rate;
+        let program = self.step.of(&parameters.dims(), |decl| {
+            let mut b = Builder::new();
+            let g = b.input(decl.clone());
+            let p = b.update(decl);
+            let step = b.scale(g, rate);
+            let p = b.sub(p, step);
+            b.set(0, p);
+            b
+        });
+        P::fused(program, &[gradient], &mut [parameters]);
     }
 
     fn reset(&mut self) {}
@@ -735,53 +799,51 @@ impl<P: Parameter> Rule<P> for Sgd<P::Elem> {
 /// be rather than where they are.
 #[derive(Clone, Debug)]
 pub struct Momentum<P: Parameter> {
-    program: Program<P::Elem>,
+    rate: P::Elem,
+    momentum: P::Elem,
+    nesterov: bool,
+    step: Step<P::Elem>,
     velocity: Option<P>,
 }
 
 impl<P: Parameter> Momentum<P> {
     /// Classical momentum; `0.9` is the usual coefficient.
     pub fn new(rate: P::Elem, momentum: P::Elem) -> Self {
-        let dtype = <P::Elem as Element>::DTYPE;
-        let mut b = Builder::new();
-        let g = b.input(dtype);
-        let p = b.update(dtype);
-        let previous = b.update(dtype);
-        let decayed = b.scale(previous, momentum);
-        let velocity = b.add(decayed, g);
-        let step = b.scale(velocity, rate);
-        let p = b.sub(p, step);
-        b.set(0, p);
-        b.set(1, velocity);
-        let program = b.build().expect("the rule's program is valid");
-
         Momentum {
-            program,
+            rate,
+            momentum,
+            nesterov: false,
+            step: Step::default(),
             velocity: None,
         }
     }
 
     /// The look-ahead variant.
     pub fn nesterov(rate: P::Elem, momentum: P::Elem) -> Self {
-        let dtype = <P::Elem as Element>::DTYPE;
+        Momentum {
+            nesterov: true,
+            ..Self::new(rate, momentum)
+        }
+    }
+
+    fn program(decl: Decl, rate: P::Elem, momentum: P::Elem, nesterov: bool) -> Builder<P::Elem> {
         let mut b = Builder::new();
-        let g = b.input(dtype);
-        let p = b.update(dtype);
-        let previous = b.update(dtype);
+        let g = b.input(decl.clone());
+        let p = b.update(decl.clone());
+        let previous = b.update(decl);
         let decayed = b.scale(previous, momentum);
         let velocity = b.add(decayed, g);
-        let ahead = b.scale(velocity, momentum);
-        let step = b.add(g, ahead);
+        let step = if nesterov {
+            let ahead = b.scale(velocity, momentum);
+            b.add(g, ahead)
+        } else {
+            velocity
+        };
         let step = b.scale(step, rate);
         let p = b.sub(p, step);
         b.set(0, p);
         b.set(1, velocity);
-        let program = b.build().expect("the rule's program is valid");
-
-        Momentum {
-            program,
-            velocity: None,
-        }
+        b
     }
 }
 
@@ -794,7 +856,11 @@ impl<P: Parameter> Rule<P> for Momentum<P> {
             self.velocity.insert(parameters.zeros_like())
         };
 
-        P::fused(&self.program, &[gradient], &mut [parameters, velocity]);
+        let (rate, momentum, nesterov) = (self.rate, self.momentum, self.nesterov);
+        let program = self.step.of(&parameters.dims(), |decl| {
+            Self::program(decl, rate, momentum, nesterov)
+        });
+        P::fused(program, &[gradient], &mut [parameters, velocity]);
     }
 
     fn reset(&mut self) {
@@ -809,29 +875,32 @@ impl<P: Parameter> Rule<P> for Momentum<P> {
 /// grows, so the steps only shrink — which is why [`RmsProp`] exists.
 #[derive(Clone, Debug)]
 pub struct AdaGrad<P: Parameter> {
-    program: Program<P::Elem>,
+    rate: P::Elem,
+    step: Step<P::Elem>,
     total: Option<P>,
 }
 
 impl<P: Parameter> AdaGrad<P> {
     pub fn new(rate: P::Elem) -> Self {
-        let dtype = <P::Elem as Element>::DTYPE;
+        AdaGrad {
+            rate,
+            step: Step::default(),
+            total: None,
+        }
+    }
+
+    fn program(decl: Decl, rate: P::Elem) -> Builder<P::Elem> {
         let mut b = Builder::new();
-        let g = b.input(dtype);
-        let p = b.update(dtype);
+        let g = b.input(decl.clone());
+        let p = b.update(decl.clone());
         let squared = b.mul(g, g);
-        let previous = b.update(dtype);
+        let previous = b.update(decl);
         let total = b.add(previous, squared);
         let epsilon = <P::Elem as Real>::from_f64(1e-8);
         let p = descend(&mut b, p, g, total, epsilon, rate);
         b.set(0, p);
         b.set(1, total);
-        let program = b.build().expect("the rule's program is valid");
-
-        AdaGrad {
-            program,
-            total: None,
-        }
+        b
     }
 }
 
@@ -843,7 +912,11 @@ impl<P: Parameter> Rule<P> for AdaGrad<P> {
         } else {
             self.total.insert(parameters.zeros_like())
         };
-        P::fused(&self.program, &[gradient], &mut [parameters, total]);
+        let rate = self.rate;
+        let program = self
+            .step
+            .of(&parameters.dims(), |decl| Self::program(decl, rate));
+        P::fused(program, &[gradient], &mut [parameters, total]);
     }
 
     fn reset(&mut self) {
@@ -858,32 +931,35 @@ impl<P: Parameter> Rule<P> for AdaGrad<P> {
 /// the effective step size adapts instead of decaying to nothing.
 #[derive(Clone, Debug)]
 pub struct RmsProp<P: Parameter> {
-    program: Program<P::Elem>,
+    rate: P::Elem,
+    step: Step<P::Elem>,
     mean_square: Option<P>,
 }
 
 impl<P: Parameter> RmsProp<P> {
     pub fn new(rate: P::Elem) -> Self {
-        let dtype = <P::Elem as Element>::DTYPE;
+        RmsProp {
+            rate,
+            step: Step::default(),
+            mean_square: None,
+        }
+    }
+
+    fn program(decl: Decl, rate: P::Elem) -> Builder<P::Elem> {
         let mut b = Builder::new();
-        let g = b.input(dtype);
-        let p = b.update(dtype);
+        let g = b.input(decl.clone());
+        let p = b.update(decl.clone());
         let squared = b.mul(g, g);
         let decay = <P::Elem as Real>::from_f64(0.9);
         let epsilon = <P::Elem as Real>::from_f64(1e-8);
         let squared = b.scale(squared, <P::Elem as num_traits::One>::one() - decay);
-        let previous = b.update(dtype);
+        let previous = b.update(decl);
         let decayed = b.scale(previous, decay);
         let mean_square = b.add(decayed, squared);
         let p = descend(&mut b, p, g, mean_square, epsilon, rate);
         b.set(0, p);
         b.set(1, mean_square);
-        let program = b.build().expect("the rule's program is valid");
-
-        RmsProp {
-            program,
-            mean_square: None,
-        }
+        b
     }
 }
 
@@ -895,7 +971,11 @@ impl<P: Parameter> Rule<P> for RmsProp<P> {
         } else {
             self.mean_square.insert(parameters.zeros_like())
         };
-        P::fused(&self.program, &[gradient], &mut [parameters, mean_square]);
+        let rate = self.rate;
+        let program = self
+            .step
+            .of(&parameters.dims(), |decl| Self::program(decl, rate));
+        P::fused(program, &[gradient], &mut [parameters, mean_square]);
     }
 
     fn reset(&mut self) {
@@ -910,12 +990,13 @@ impl<P: Parameter> Rule<P> for RmsProp<P> {
 /// their zero initialization, `p ← p − rate·m̂/(√v̂ + ε)`.
 ///
 /// Its two fused programs — the first step's, which creates the moments, and
-/// every later step's, which updates them in place — are built once, by
-/// [`new`](Self::new). The coefficients and the bias corrections are their
+/// every later step's, which updates them in place — are built for the
+/// parameters' shape, each by the first update that needs it. The coefficients
+/// and the bias corrections are their
 /// [uniforms](crate::tensors::fused::Builder::uniform), set before each run, so
-/// an update builds nothing; changing a coefficient field between updates
+/// later updates build nothing; changing a coefficient field between updates
 /// takes effect at the next one. The programs are optimized under the thread's
-/// [`Algebra`](crate::tensors::fused::Algebra) when the rule is created.
+/// [`Algebra`](crate::tensors::fused::Algebra) when they are built.
 #[derive(Clone, Debug)]
 pub struct Adam<P: Parameter> {
     pub rate: P::Elem,
@@ -926,9 +1007,9 @@ pub struct Adam<P: Parameter> {
     second: Option<P>,
     steps: u32,
     /// The first step: the moments are fresh outputs.
-    start: Program<P::Elem>,
+    start: Step<P::Elem>,
     /// Every later step: the moments are updated in place.
-    resume: Program<P::Elem>,
+    resume: Step<P::Elem>,
 }
 
 /// The uniforms of Adam's programs, by index.
@@ -954,8 +1035,8 @@ impl<P: Parameter> Adam<P> {
             first: None,
             second: None,
             steps: 0,
-            start: Self::program(false),
-            resume: Self::program(true),
+            start: Step::default(),
+            resume: Step::default(),
         }
     }
 
@@ -964,8 +1045,8 @@ impl<P: Parameter> Adam<P> {
     /// returned as fresh outputs otherwise. Every coefficient is a uniform, its
     /// placeholder value one, so the program's structure is the same whatever
     /// the coefficients turn out to be.
-    fn program(resumed: bool) -> Program<P::Elem> {
-        let dtype = <P::Elem as Element>::DTYPE;
+    fn program(resumed: bool, decl: Decl) -> Builder<P::Elem> {
+        let dtype = decl.dtype();
         let one = <P::Elem as num_traits::One>::one();
         let mut b = Builder::new();
         // In the order of the indices in `adam`.
@@ -975,8 +1056,8 @@ impl<P: Parameter> Adam<P> {
         let epsilon = b.uniform(one);
         let first_correction = b.uniform(one);
         let second_correction = b.uniform(one);
-        let g = b.input(dtype);
-        let p = b.update(dtype);
+        let g = b.input(decl.clone());
+        let p = b.update(decl.clone());
         // `1 − β` involves only a constant and a uniform, so it is folded into
         // the program's constants and computed once per run, in the element
         // type, exactly as `one - decay` was.
@@ -988,7 +1069,7 @@ impl<P: Parameter> Adam<P> {
         let squared = b.mul(g, g);
         let fresh_second = b.mul(squared, second_share);
         let (first, second) = if resumed {
-            let (m, v) = (b.update(dtype), b.update(dtype));
+            let (m, v) = (b.update(decl.clone()), b.update(decl));
             let m = b.mul(m, first_decay);
             let v = b.mul(v, second_decay);
             (b.add(m, fresh_first), b.add(v, fresh_second))
@@ -1014,7 +1095,7 @@ impl<P: Parameter> Adam<P> {
             b.output(first, dtype);
             b.output(second, dtype);
         }
-        b.build().expect("the rule's program is valid")
+        b
     }
 }
 
@@ -1029,11 +1110,12 @@ impl<P: Parameter> Rule<P> for Adam<P> {
         let first_correction = one - self.first_decay.powi(self.steps as i32);
         let second_correction = one - self.second_decay.powi(self.steps as i32);
         let resumed = self.first.is_some() && self.second.is_some();
-        let program = if resumed {
+        let step = if resumed {
             &mut self.resume
         } else {
             &mut self.start
         };
+        let program = step.of(&parameters.dims(), |decl| Self::program(resumed, decl));
         program.set_uniform(adam::RATE, self.rate);
         program.set_uniform(adam::FIRST_DECAY, self.first_decay);
         program.set_uniform(adam::SECOND_DECAY, self.second_decay);
@@ -1063,12 +1145,12 @@ impl<P: Parameter> Rule<P> for Adam<P> {
 /// `p − rate · g / (√s + ε)`, the step the adaptive rules share.
 fn descend<T: Real>(
     b: &mut Builder<T>,
-    p: crate::tensors::fused::FusedValue,
-    g: crate::tensors::fused::FusedValue,
-    scale: crate::tensors::fused::FusedValue,
+    p: crate::tensors::fused::Var,
+    g: crate::tensors::fused::Var,
+    scale: crate::tensors::fused::Var,
     epsilon: T,
     rate: T,
-) -> crate::tensors::fused::FusedValue {
+) -> crate::tensors::fused::Var {
     let root = b.unary(Analytic::Sqrt, scale);
     let denominator = b.shift(root, epsilon);
     let step = b.div(g, denominator);
@@ -1180,9 +1262,10 @@ mod tests {
     #[test]
     fn the_provided_parameter_runner_matches_the_fused_one() {
         let mut b = Builder::new();
-        let g = b.input(DType::F32);
-        let p = b.update(DType::F32);
-        let m = b.update(DType::F32);
+        let vector = Decl::vector(DType::F32, 100);
+        let g = b.input(vector.clone());
+        let p = b.update(vector.clone());
+        let m = b.update(vector);
         let decayed = b.scale(m, 0.9f32);
         let m = b.add(decayed, g);
         let root = b.unary(Analytic::Sqrt, m);

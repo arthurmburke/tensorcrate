@@ -16,7 +16,7 @@
 
 use std::cmp::Ordering;
 
-use super::fused::{self, Fresh, Program, Sink, Source};
+use super::fused::{self, Fresh, Place, Program, Sink, Source, Space};
 use super::strided;
 use super::{Backend, Host, Matrix, TensorView, Vector};
 use crate::counters;
@@ -1069,27 +1069,30 @@ pub trait Kernels<T: Real = f32>: Backend {
         second: &Vector<T, Self>,
     ) -> Matrix<T, Self>;
 
-    /// Run a fused elementwise program as one kernel. Reach this through
+    /// Run a fused elementwise program as one kernel over `space`, the
+    /// program's space as the kernels walk it. Reach this through
     /// [`Program::run`](super::fused::Program::run), which checks the operands
     /// against the program first.
     #[doc(hidden)]
     fn fused(
         program: &Program<T>,
-        shape: (usize, usize),
+        space: &Space,
         inputs: &[Source<'_, Self>],
         updated: &mut [Sink<'_, Self>],
     ) -> Vec<Fresh<Self>>;
 
-    /// The mean and the sum of squared deviations of each row of a program's
-    /// input, as [`matrix_axis_moments`](Self::matrix_axis_moments) along
-    /// [`Axis::Rows`] gives them for the input converted to `T`. By default
-    /// the input is copied into a matrix first.
+    /// The mean and the sum of squared deviations of each row of the
+    /// `rows × cols` matrix `place` reads of a program's input, as
+    /// [`matrix_axis_moments`](Self::matrix_axis_moments) along [`Axis::Rows`]
+    /// gives them for the input converted to `T`. By default the input is
+    /// copied into a matrix first.
     #[doc(hidden)]
     fn row_moments(
         input: &Source<'_, Self>,
+        place: Place,
         shape: (usize, usize),
     ) -> (Vector<T, Self>, Vector<T, Self>) {
-        Self::matrix_axis_moments(&fused::input_matrix(input, shape), Axis::Rows)
+        Self::matrix_axis_moments(&fused::input_matrix(input, place, shape), Axis::Rows)
     }
 
     /// Run a fused program that computes row statistics of its inputs (see
@@ -1099,14 +1102,14 @@ pub trait Kernels<T: Real = f32>: Backend {
     #[doc(hidden)]
     fn fused_with_statistics(
         program: &Program<T>,
-        shape: (usize, usize),
+        space: &Space,
         inputs: &[Source<'_, Self>],
         updated: &mut [Sink<'_, Self>],
     ) -> Vec<Fresh<Self>> {
-        let statistics = fused::row_statistics(program, shape, inputs);
+        let statistics = fused::row_statistics(program, space, inputs);
         let mut all: Vec<Source<'_, Self>> = inputs.iter().map(Source::reborrow).collect();
         all.extend(statistics.iter().map(fused::source_of));
-        Self::fused(program, shape, &all, updated)
+        Self::fused(program, space, &all, updated)
     }
 
     /// Run a fused program with one output of type `T` and sum that output
@@ -1116,15 +1119,19 @@ pub trait Kernels<T: Real = f32>: Backend {
     #[doc(hidden)]
     fn fused_sum(
         program: &Program<T>,
-        shape: (usize, usize),
+        space: &Space,
         inputs: &[Source<'_, Self>],
         axis: Axis,
     ) -> Vector<T, Self>
     where
         T: fused::Element,
     {
-        let data = Self::fused(program, shape, inputs, &mut []).remove(0);
-        fused::axis_sum(fused::Output::new(shape, data).into_matrix::<T>(), axis)
+        let data = Self::fused(program, space, inputs, &mut []).remove(0);
+        let (rows, cols) = space.shape;
+        fused::axis_sum(
+            fused::Output::new(&[rows, cols], data).into_matrix::<T>(),
+            axis,
+        )
     }
 
     /// Run a fused elementwise program as the epilogue of `a·b`: the product
@@ -1134,6 +1141,7 @@ pub trait Kernels<T: Real = f32>: Backend {
     #[doc(hidden)]
     fn matmul_epilogue(
         program: &Program<T>,
+        space: &Space,
         a: &Matrix<T, Self>,
         b: &Matrix<T, Self>,
         inputs: &[Source<'_, Self>],
@@ -1654,15 +1662,16 @@ impl<T: Real> Kernels<T> for Host {
 
     fn fused(
         program: &Program<T>,
-        shape: (usize, usize),
+        space: &Space,
         inputs: &[Source<'_, Self>],
         updated: &mut [Sink<'_, Self>],
     ) -> Vec<Fresh<Self>> {
-        fused::host(program, shape, inputs, updated)
+        fused::host(program, space, inputs, updated)
     }
 
     fn matmul_epilogue(
         program: &Program<T>,
+        space: &Space,
         a: &Matrix<T, Self>,
         b: &Matrix<T, Self>,
         inputs: &[Source<'_, Self>],
@@ -1670,14 +1679,15 @@ impl<T: Real> Kernels<T> for Host {
     where
         T: fused::Element,
     {
-        fused::host_matmul(program, a, b, inputs)
+        fused::host_matmul(program, space, a, b, inputs)
     }
 
     fn row_moments(
         input: &Source<'_, Self>,
+        place: Place,
         shape: (usize, usize),
     ) -> (Vector<T, Self>, Vector<T, Self>) {
-        fused::host_row_moments(input, shape)
+        fused::host_row_moments(input, place, shape)
     }
 
     fn strided_binary(
@@ -1844,8 +1854,8 @@ pub(crate) fn correlation_shape(input: (usize, usize), window: (usize, usize)) -
 mod gpu {
     use super::{
         Analytic, Axis, AxisReduction, BinaryOp, Compare, Family, Fresh, Kernels, Matrix, Pairwise,
-        Program, Reduce, Sink, SortOrder, Source, Statistic, TensorView, Transposed, Vector,
-        correlation_shape, fused,
+        Place, Program, Reduce, Sink, SortOrder, Source, Space, Statistic, TensorView, Transposed,
+        Vector, correlation_shape, fused,
     };
     use crate::counters;
     use crate::metal::MetalElement;
@@ -2329,15 +2339,16 @@ mod gpu {
 
         fn fused(
             program: &Program<T>,
-            shape: (usize, usize),
+            space: &Space,
             inputs: &[Source<'_, Self>],
             updated: &mut [Sink<'_, Self>],
         ) -> Vec<Fresh<Self>> {
-            fused::metal(program, shape, inputs, updated)
+            fused::metal(program, space, inputs, updated)
         }
 
         fn matmul_epilogue(
             program: &Program<T>,
+            space: &Space,
             a: &Matrix<T, Self>,
             b: &Matrix<T, Self>,
             inputs: &[Source<'_, Self>],
@@ -2345,35 +2356,36 @@ mod gpu {
         where
             T: fused::Element,
         {
-            fused::metal_matmul(program, a, b, inputs)
+            fused::metal_matmul(program, space, a, b, inputs)
         }
 
         fn fused_sum(
             program: &Program<T>,
-            shape: (usize, usize),
+            space: &Space,
             inputs: &[Source<'_, Self>],
             axis: Axis,
         ) -> Vector<T, Self>
         where
             T: fused::Element,
         {
-            fused::metal_sum(program, shape, inputs, axis)
+            fused::metal_sum(program, space, inputs, axis)
         }
 
         fn row_moments(
             input: &Source<'_, Self>,
+            place: Place,
             shape: (usize, usize),
         ) -> (Vector<T, Self>, Vector<T, Self>) {
-            fused::metal_row_moments(input, shape)
+            fused::metal_row_moments(input, place, shape)
         }
 
         fn fused_with_statistics(
             program: &Program<T>,
-            shape: (usize, usize),
+            space: &Space,
             inputs: &[Source<'_, Self>],
             updated: &mut [Sink<'_, Self>],
         ) -> Vec<Fresh<Self>> {
-            fused::metal_with_statistics(program, shape, inputs, updated)
+            fused::metal_with_statistics(program, space, inputs, updated)
         }
 
         // The three strided operations run one GPU dispatch each, reading the

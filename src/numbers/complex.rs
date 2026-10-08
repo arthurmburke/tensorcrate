@@ -5,6 +5,8 @@ use std::ops::{Add, Div, Mul, Neg, Rem, Sub};
 
 use num_traits::{Float, Num, One, Zero};
 
+use crate::numbers::Conj;
+
 use super::{
     Arccos, Arcsin, Arctan, Coefficient, Cos, Cosh, Csc, Exp, Ln, Power, Recip, Sec, Sin, Sinh,
     Sqrt, Tan, Tanh,
@@ -69,9 +71,11 @@ impl<T: Coefficient> Complex<T> {
     }
 }
 
-impl<T: Copy + Neg<Output = T>> Complex<T> {
+impl<T: Copy + Neg<Output = T>> Conj for Complex<T> {
+    type Output = Self;
+
     /// The complex conjugate `a − b·i`.
-    pub fn conj(self) -> Self {
+    fn conj(&self) -> Self {
         Complex::new(self.real, -self.im)
     }
 }

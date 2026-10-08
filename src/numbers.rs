@@ -203,3 +203,10 @@ pub trait Recip {
 
     fn recip(self) -> <Self as Recip>::Output;
 }
+
+/// A numeric type usable for taking a conjugate.
+pub trait Conj {
+    type Output;
+
+    fn conj(&self) -> Self::Output;
+}

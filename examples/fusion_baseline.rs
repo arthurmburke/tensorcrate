@@ -23,7 +23,7 @@ use std::time::Instant;
 
 use tensorcrate::counters::{self, Counts};
 use tensorcrate::optim::{Adam, Rule};
-use tensorcrate::tensors::fused::{self, Builder, DType, Mode, Remap};
+use tensorcrate::tensors::fused::{self, Builder, DType, Decl, Mode};
 use tensorcrate::tensors::{Compare, Host, Kernels, Matrix, Tape, Vector};
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
@@ -176,8 +176,8 @@ fn dense_layer<B: Kernels>() -> impl FnMut() {
     let w = Matrix::from_flat(WIDTH, WIDTH, values(WIDTH * WIDTH, 12)).to_backend::<B>();
     let bias = Vector::new(values(WIDTH, 13)).to_backend::<B>();
     let mut b = Builder::new();
-    let product = b.input(DType::F32);
-    let row = b.input_remapped(DType::F32, Remap::Row);
+    let product = b.input(Decl::matrix(DType::F32, (BATCH, WIDTH)));
+    let row = b.input(Decl::vector(DType::F32, WIDTH));
     let shifted = b.add(product, row);
     let zero = b.constant(0.0);
     let relu = b.compare(Compare::Max, shifted, zero);

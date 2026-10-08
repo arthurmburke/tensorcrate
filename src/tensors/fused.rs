@@ -12,16 +12,18 @@
 //!
 //! # Writing a program
 //!
-//! [`Builder`] is the usual way in. It hands out [`Value`]s, which are
-//! single-assignment and allocates registers itself:
+//! [`Builder`] is the usual way in. Inputs are declared with their shapes, and it
+//! hands out [`Var`]s, which are single-assignment, and allocates registers
+//! itself:
 //!
 //! ```
-//! use tensorcrate::tensors::fused::{Builder, DType};
+//! use tensorcrate::tensors::fused::{Builder, DType, Decl};
 //! use tensorcrate::tensors::{Analytic, Vector};
 //!
 //! // y = sqrt(a·b + 1), in one pass.
 //! let mut b = Builder::new();
-//! let (x, w) = (b.input(DType::F32), b.input(DType::F32));
+//! let vector = Decl::vector(DType::F32, 2);
+//! let (x, w) = (b.input(vector.clone()), b.input(vector));
 //! let product = b.mul(x, w);
 //! let one = b.constant(1.0);
 //! let shifted = b.add(product, one);
@@ -106,6 +108,7 @@ use std::ops::Range;
 
 use half::{bf16, f16};
 
+use super::layout::{Dims, MAX_RANK};
 use super::{Analytic, Axis, Backend, BinaryOp, Compare, Host, Kernels, Matrix, Vector};
 use crate::counters;
 use crate::numbers::Real;
@@ -166,43 +169,116 @@ impl DType {
     }
 }
 
-/// Where a load reads, relative to the element being computed.
+/// Where a load reads its input, relative to the element being computed.
 ///
-/// A program iterates over a `rows × cols` space in row-major order, and element
-/// `(r, c)` of each input comes from:
+/// A program iterates over a space of up to [`MAX_RANK`] axes in row-major
+/// order. A remap says, for each axis of the space, which axis of the input it
+/// walks, or that it walks none and the input repeats along it. Element
+/// `[i₀, …]` of the space reads the input where the walked axes say, and at
+/// zero along the input's other axes, which must have length one. An input
+/// axis of length one that the space walks repeats too, as NumPy broadcasts.
 ///
-/// The representation is part of the Metal shader ABI.
-#[repr(u16)]
+/// So the identity reads an input of the space's own shape, a permutation
+/// reads one with its axes reordered, never moving it, and a broadcast repeats
+/// one along the axes it lacks.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum Remap {
-    /// `(r, c)` of a `rows × cols` input.
-    Identity = 0,
-    /// `(c, r)` of a `cols × rows` input — a transpose that is never
-    /// materialized.
-    Transpose = 1,
-    /// Element `c` of a `cols`-long vector, repeated down every row.
-    Row = 2,
-    /// Element `r` of a `rows`-long vector, repeated across every column.
-    Column = 3,
+pub struct Remap {
+    rank: u8,
+    /// The input axis each axis of the space walks, or [`Remap::NONE`].
+    axes: [u8; MAX_RANK],
 }
 
 impl Remap {
-    /// How many elements an input read this way must hold.
-    pub fn input_len(self, (rows, cols): (usize, usize)) -> usize {
-        match self {
-            Remap::Identity | Remap::Transpose => rows * cols,
-            Remap::Row => cols,
-            Remap::Column => rows,
+    /// An axis of the space that walks no axis of the input.
+    const NONE: u8 = u8::MAX;
+
+    /// Each axis of a space of `rank` axes walks the same axis of the input.
+    ///
+    /// # Panics
+    ///
+    /// If `rank` is more than [`MAX_RANK`].
+    #[track_caller]
+    pub fn identity(rank: usize) -> Self {
+        let axes: Vec<usize> = (0..rank).collect();
+        Self::permute(&axes)
+    }
+
+    /// Axis `k` of the space walks axis `axes[k]` of the input, as
+    /// [`Tensor::permute`](super::Tensor::permute) reorders a tensor's axes.
+    ///
+    /// # Panics
+    ///
+    /// If there are more than [`MAX_RANK`] axes.
+    #[track_caller]
+    pub fn permute(axes: &[usize]) -> Self {
+        let axes: Vec<Option<usize>> = axes.iter().copied().map(Some).collect();
+        Self::new(&axes)
+    }
+
+    /// Axis `k` of the space walks axis `axes[k]` of the input, or, where it
+    /// is `None`, no axis: the input repeats along it.
+    ///
+    /// # Panics
+    ///
+    /// If there are more than [`MAX_RANK`] axes.
+    #[track_caller]
+    pub fn new(axes: &[Option<usize>]) -> Self {
+        assert!(
+            axes.len() <= MAX_RANK,
+            "remap: {} axes, more than the {MAX_RANK} a space may have",
+            axes.len()
+        );
+        let mut stored = [Self::NONE; MAX_RANK];
+        for (k, axis) in axes.iter().enumerate() {
+            stored[k] = axis.map_or(Self::NONE, |axis| {
+                u8::try_from(axis)
+                    .ok()
+                    .filter(|&axis| usize::from(axis) < MAX_RANK)
+                    .unwrap_or_else(|| panic!("remap: input axis {axis} out of range"))
+            });
+        }
+        Remap {
+            rank: axes.len() as u8,
+            axes: stored,
         }
     }
 
-    fn name(self) -> &'static str {
-        match self {
-            Remap::Identity => "",
-            Remap::Transpose => ".T",
-            Remap::Row => ".row",
-            Remap::Column => ".col",
+    /// The axes of the space.
+    pub fn rank(&self) -> usize {
+        usize::from(self.rank)
+    }
+
+    /// The input axis that axis `k` of the space walks, if any.
+    pub fn axis(&self, k: usize) -> Option<usize> {
+        let axis = self.axes[..self.rank()][k];
+        (axis != Self::NONE).then_some(usize::from(axis))
+    }
+
+    /// Whether every axis of the space walks its own axis of the input.
+    pub fn is_identity(&self) -> bool {
+        (0..self.rank()).all(|k| self.axis(k) == Some(k))
+    }
+
+    /// The input axis each axis of a space walks, when its axis `k` walks axis
+    /// `map.axis(k)` of this remap's space: this remap read through `map`.
+    fn through(&self, map: Remap) -> Self {
+        let axes: Vec<Option<usize>> = (0..map.rank())
+            .map(|k| map.axis(k).and_then(|axis| self.axis(axis)))
+            .collect();
+        Self::new(&axes)
+    }
+
+    fn name(&self) -> String {
+        if self.is_identity() {
+            return String::new();
         }
+        let axes: Vec<String> = (0..self.rank())
+            .map(|k| {
+                self.axis(k)
+                    .map_or("_".to_string(), |axis| axis.to_string())
+            })
+            .collect();
+        format!("[{}]", axes.join(" "))
     }
 }
 
@@ -267,6 +343,11 @@ pub enum ProgramError {
     TooManyInstructions(usize),
     TooManyInputs(usize),
     TooManyOutputs(usize),
+    /// More distinct loads — an input slot read through a remap — than
+    /// [`MAX_LOADS`].
+    TooManyLoads(usize),
+    /// A space or an input of more axes than [`MAX_RANK`].
+    TooManyAxes(usize),
     /// More registers are live at once than [`REGISTERS`].
     TooManyRegisters,
     /// Instruction `at` names a register outside [`REGISTERS`].
@@ -280,6 +361,11 @@ pub enum ProgramError {
     },
     /// Instruction `at` loads an input slot the program does not declare.
     BadInput {
+        at: usize,
+    },
+    /// Instruction `at` reads its input through a remap that does not fit the
+    /// space or the input's shape.
+    BadRemap {
         at: usize,
     },
     /// Instruction `at` stores to an output slot the program does not declare.
@@ -303,6 +389,15 @@ pub enum ProgramError {
     UpdateTypeMismatch {
         slot: usize,
     },
+    /// Input `slot` must have the space's shape — an in-place tensor, or one
+    /// whose row statistics the program reads — and does not.
+    ShapeMismatch {
+        slot: usize,
+    },
+    /// The value stored to `output` does not broadcast to the space.
+    OutputShape {
+        output: u8,
+    },
     /// More in-place tensors than inputs or outputs.
     BadUpdateCount,
     /// A program with no outputs does nothing.
@@ -319,6 +414,8 @@ impl fmt::Display for ProgramError {
             ProgramError::TooManyOutputs(n) => {
                 write!(f, "{n} outputs, over the {MAX_OUTPUTS} limit")
             }
+            ProgramError::TooManyLoads(n) => write!(f, "{n} loads, over the {MAX_LOADS} limit"),
+            ProgramError::TooManyAxes(n) => write!(f, "{n} axes, over the {MAX_RANK} limit"),
             ProgramError::TooManyRegisters => {
                 write!(f, "more than {REGISTERS} values are live at once")
             }
@@ -329,6 +426,12 @@ impl fmt::Display for ProgramError {
                 write!(f, "instruction {at}: r{reg} is read before it is written")
             }
             ProgramError::BadInput { at } => write!(f, "instruction {at}: no such input"),
+            ProgramError::BadRemap { at } => {
+                write!(
+                    f,
+                    "instruction {at}: the remap does not fit the space or the input"
+                )
+            }
             ProgramError::BadOutput { at } => write!(f, "instruction {at}: no such output"),
             ProgramError::OutputNotStoredOnce { output } => {
                 write!(f, "output {output} must be stored exactly once")
@@ -351,6 +454,12 @@ impl fmt::Display for ProgramError {
                     "in-place tensor {slot} is read and written as different types"
                 )
             }
+            ProgramError::ShapeMismatch { slot } => {
+                write!(f, "input {slot} must have the shape of the space")
+            }
+            ProgramError::OutputShape { output } => {
+                write!(f, "output {output} does not broadcast to the space")
+            }
             ProgramError::BadUpdateCount => {
                 write!(f, "more in-place tensors than inputs or outputs")
             }
@@ -361,7 +470,16 @@ impl fmt::Display for ProgramError {
 
 impl std::error::Error for ProgramError {}
 
+/// Distinct loads — an input slot read through one remap — a program may
+/// make. The Metal shaders receive where each one reads as inline constant
+/// data, which is capped at 4 KB.
+pub const MAX_LOADS: usize = 64;
+
 /// A validated elementwise program.
+///
+/// A program runs over a space of up to [`MAX_RANK`] axes, and every one of its
+/// inputs has a shape of its own, which a [`Remap`] relates to the space. Its
+/// outputs have the space's shape.
 ///
 /// Its inputs are numbered `0..inputs().len()`, and the last
 /// [`updated`](Self::updated) of them are tensors the program also *writes*, in
@@ -377,7 +495,14 @@ impl std::error::Error for ProgramError {}
 pub struct Program<T = f32> {
     code: Vec<Instr<T>>,
     inputs: Vec<DType>,
+    /// Each input slot's shape.
+    shapes: Vec<Dims>,
     outputs: Vec<DType>,
+    /// The shape of the space, and of every output.
+    space: Dims,
+    /// Every distinct slot and remap the program loads, in order of first
+    /// load: where the kernels find where each reads (see [`Space`]).
+    loads: Vec<(u8, Remap)>,
     updated: usize,
     registers: usize,
     /// How many uniforms the program has: the first entries of `named`.
@@ -390,6 +515,10 @@ pub struct Program<T = f32> {
     /// (see [`Builder::row_statistic`]): input slot `given_inputs() + k` is
     /// statistic `derived[k].1` of each row of input `derived[k].0`.
     derived: Vec<(u8, RowStatistic)>,
+    /// The space as the kernels walk it when every operand is read in order —
+    /// the usual case, which then costs a run nothing to work out — without
+    /// and with the last axis kept as the row.
+    in_order: [Space; 2],
 }
 
 /// The storage type that holds a `T` exactly.
@@ -405,8 +534,8 @@ fn dtype_of<T: 'static>() -> DType {
     }
 }
 
-/// A statistic of each row of a program's input, which the program reads as
-/// one value per row — see [`Builder::row_statistic`].
+/// A statistic of each row of a program's input — along its last axis — which
+/// the program reads as one value per row — see [`Builder::row_statistic`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RowStatistic {
     /// The row's mean.
@@ -416,14 +545,37 @@ pub enum RowStatistic {
     Deviations,
 }
 
+/// Whether `remap` reads an input of shape `input` over a space of shape
+/// `space`: it has the space's axes, walks each input axis at most once and
+/// only where the two agree in length or the input's is one, and every input
+/// axis it does not walk has length one.
+fn fits(remap: Remap, space: &[usize], input: &[usize]) -> bool {
+    if remap.rank() != space.len() {
+        return false;
+    }
+    let mut walked = [false; MAX_RANK];
+    for (k, &extent) in space.iter().enumerate() {
+        if let Some(axis) = remap.axis(k) {
+            if axis >= input.len() || walked[axis] || (input[axis] != extent && input[axis] != 1) {
+                return false;
+            }
+            walked[axis] = true;
+        }
+    }
+    (0..input.len()).all(|axis| walked[axis] || input[axis] == 1)
+}
+
 impl<T: Real> Program<T> {
-    /// Check a hand-written program.
+    /// Check a hand-written program over a space of shape `space`.
     ///
-    /// `inputs` and `outputs` give each slot's storage type; the last `updated`
-    /// inputs and the first `updated` outputs are the same in-place tensors.
+    /// `inputs` declare each input slot's storage type and shape, and `outputs`
+    /// each output slot's storage type; every output has the space's shape. The
+    /// last `updated` inputs and the first `updated` outputs are the same
+    /// in-place tensors, which must have the space's shape.
     pub fn new(
+        space: &[usize],
         code: Vec<Instr<T>>,
-        inputs: Vec<DType>,
+        inputs: Vec<Decl<'_>>,
         outputs: Vec<DType>,
         updated: usize,
     ) -> Result<Self, ProgramError> {
@@ -442,16 +594,29 @@ impl<T: Real> Program<T> {
         if updated > inputs.len() || updated > outputs.len() {
             return Err(ProgramError::BadUpdateCount);
         }
+        let deepest = inputs.iter().map(Decl::rank).chain([space.len()]).max();
+        if let Some(rank) = deepest.filter(|&rank| rank > MAX_RANK) {
+            return Err(ProgramError::TooManyAxes(rank));
+        }
+        let space = Dims::new(space, "fused program");
+        let shapes: Vec<Dims> = inputs.iter().map(Decl::dims).collect();
+        let inputs: Vec<DType> = inputs.iter().map(Decl::dtype).collect();
         let fresh_inputs = inputs.len() - updated;
         for slot in 0..updated {
             if inputs[fresh_inputs + slot] != outputs[slot] {
                 return Err(ProgramError::UpdateTypeMismatch { slot });
+            }
+            if shapes[fresh_inputs + slot] != space {
+                return Err(ProgramError::ShapeMismatch {
+                    slot: fresh_inputs + slot,
+                });
             }
         }
 
         let mut defined = [false; REGISTERS];
         let mut stored = vec![0usize; outputs.len()];
         let mut registers = 0;
+        let mut loads: Vec<(u8, Remap)> = Vec::new();
         for (at, instr) in code.iter().enumerate() {
             for reg in instr.sources() {
                 if usize::from(reg) >= REGISTERS {
@@ -463,17 +628,23 @@ impl<T: Real> Program<T> {
             }
             match *instr {
                 Instr::Load { input, remap, .. } => {
-                    let input = usize::from(input);
-                    if input >= inputs.len() {
+                    let slot = usize::from(input);
+                    if slot >= inputs.len() {
                         return Err(ProgramError::BadInput { at });
                     }
-                    if input >= fresh_inputs {
-                        if remap != Remap::Identity {
+                    if slot >= fresh_inputs {
+                        if !remap.is_identity() {
                             return Err(ProgramError::RemappedUpdate { at });
                         }
-                        if stored[input - fresh_inputs] > 0 {
+                        if stored[slot - fresh_inputs] > 0 {
                             return Err(ProgramError::LoadAfterStore { at });
                         }
+                    }
+                    if !fits(remap, &space, &shapes[slot]) {
+                        return Err(ProgramError::BadRemap { at });
+                    }
+                    if !loads.contains(&(input, remap)) {
+                        loads.push((input, remap));
                     }
                 }
                 Instr::Store { output, .. } => {
@@ -498,18 +669,59 @@ impl<T: Real> Program<T> {
                 output: output as u8,
             });
         }
+        if loads.len() > MAX_LOADS {
+            return Err(ProgramError::TooManyLoads(loads.len()));
+        }
 
-        Ok(Program {
+        let mut program = Program {
             code,
             inputs,
+            shapes,
             outputs,
+            space,
+            loads,
             updated,
             registers,
             uniforms: 0,
             named: Vec::new(),
             bound: Vec::new(),
             derived: Vec::new(),
-        })
+            in_order: Default::default(),
+        };
+        program.in_order = [program.walk(&[], false), program.walk(&[], true)];
+        Ok(program)
+    }
+
+    /// Read row statistics of inputs into the slots after the given ones (see
+    /// [`Builder::row_statistic`]). Each input a statistic is of must have the
+    /// space's shape, which needs an axis, and each statistic's slot the
+    /// space's shape with a last axis of one.
+    fn with_statistics(mut self, derived: Vec<(u8, RowStatistic)>) -> Result<Self, ProgramError> {
+        let given = self.inputs.len() - self.updated - derived.len();
+        let rank = self.space.len();
+        for (index, &(of, _)) in derived.iter().enumerate() {
+            if rank == 0 || self.shapes[usize::from(of)] != self.space {
+                return Err(ProgramError::ShapeMismatch {
+                    slot: usize::from(of),
+                });
+            }
+            if self.shapes[given + index] != self.space.with(rank - 1, 1) {
+                return Err(ProgramError::ShapeMismatch {
+                    slot: given + index,
+                });
+            }
+            // The kernels read the input in order to compute the statistics.
+            let read = (of, Remap::identity(rank));
+            if !self.loads.contains(&read) {
+                self.loads.push(read);
+            }
+        }
+        if self.loads.len() > MAX_LOADS {
+            return Err(ProgramError::TooManyLoads(self.loads.len()));
+        }
+        self.derived = derived;
+        self.in_order = [self.walk(&[], false), self.walk(&[], true)];
+        Ok(self)
     }
 
     /// The current value of every uniform, in declaration order (see
@@ -536,6 +748,17 @@ impl<T: Real> Program<T> {
                 *value = evaluate(scalar, &self.named);
             }
         }
+    }
+
+    /// The shape of the space the program runs over, which is every output's
+    /// shape.
+    pub fn space(&self) -> &[usize] {
+        &self.space
+    }
+
+    /// The shape of input `slot`.
+    pub fn input_shape(&self, slot: usize) -> &[usize] {
+        &self.shapes[slot]
     }
 
     /// The instructions.
@@ -586,6 +809,16 @@ impl<T: Real> Program<T> {
         self.registers
     }
 
+    /// The elements of the space: of every output.
+    pub fn len(&self) -> usize {
+        self.space.iter().product()
+    }
+
+    /// Whether the space has no elements.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Bytes one run over `len` elements moves: every input read once, every
     /// output written once. Remapped broadcasts are charged their full length,
     /// since that is the number of loads, even though most hit cache.
@@ -595,20 +828,129 @@ impl<T: Real> Program<T> {
         (read + written) * len
     }
 
-    /// Run the program over a `rows × cols` iteration space.
+    /// The index among the program's distinct loads (see [`Space::places`])
+    /// of input `slot` read through `remap`.
+    pub(crate) fn load_index(&self, slot: u8, remap: Remap) -> usize {
+        self.loads
+            .iter()
+            .position(|&load| load == (slot, remap))
+            .expect("every load is listed")
+    }
+
+    /// The space as the kernels walk it, given where each input slot's
+    /// elements lie (`None`: in order). With `rows`, the last axis stays the
+    /// row, as row statistics, sums and matrix products need; otherwise the
+    /// axes are merged wherever every load steps across a pair of them as
+    /// across one, and axes of length one dropped, so that most programs walk
+    /// one or two axes whatever their rank.
+    pub(crate) fn walk(&self, views: &[Option<View>], rows: bool) -> Space {
+        let space = self.space.as_slice();
+        let rank = space.len();
+        // Where each load starts, and how far it steps along each axis.
+        let reads: Vec<(usize, [usize; MAX_RANK])> = self
+            .loads
+            .iter()
+            .map(|&(slot, remap)| {
+                let slot = usize::from(slot);
+                let dims = &self.shapes[slot];
+                let (offset, strides) = match views.get(slot).copied().flatten() {
+                    Some(view) => (view.offset, view.read_as(dims).expect("checked")),
+                    None => (0, super::layout::contiguous_strides(dims)),
+                };
+                let mut steps = [0; MAX_RANK];
+                for (k, step) in steps.iter_mut().enumerate().take(rank) {
+                    if let Some(axis) = remap.axis(k).filter(|&axis| dims[axis] != 1) {
+                        *step = strides[axis];
+                    }
+                }
+                (offset, steps)
+            })
+            .collect();
+
+        let mut extents = [0usize; MAX_RANK];
+        let mut steps = vec![[0usize; MAX_RANK]; reads.len()];
+        let mut axes = 0;
+        for (k, &extent) in space.iter().enumerate() {
+            let kept = rows && k + 1 == rank;
+            if extent == 1 && !kept {
+                continue;
+            }
+            let joins = axes > 0
+                && !kept
+                && reads
+                    .iter()
+                    .zip(&steps)
+                    .all(|((_, read), merged)| merged[axes - 1] == read[k] * extent);
+            if !joins {
+                axes += 1;
+                extents[axes - 1] = 1;
+            }
+            extents[axes - 1] *= extent;
+            for ((_, read), merged) in reads.iter().zip(&mut steps) {
+                merged[axes - 1] = read[k];
+            }
+        }
+        if axes == 0 {
+            axes = 1;
+            extents[0] = 1;
+        }
+        let lead = axes - 1;
+        let places = reads
+            .iter()
+            .zip(&steps)
+            .map(|(&(offset, _), steps)| {
+                let mut place = Place {
+                    offset,
+                    col: steps[lead],
+                    lead: lead as u8,
+                    ..Place::default()
+                };
+                place.dims[..lead].copy_from_slice(&extents[..lead]);
+                place.steps[..lead].copy_from_slice(&steps[..lead]);
+                place
+            })
+            .collect();
+        Space {
+            shape: (extents[..lead].iter().product(), extents[lead]),
+            places,
+        }
+    }
+
+    /// The space as the kernels walk it, given the inputs a caller passes
+    /// from slot `first` on: every other slot — a product, a statistic, a
+    /// tensor updated in place — is read in order. See [`walk`](Self::walk).
+    fn walk_for<B: Backend>(
+        &self,
+        first: usize,
+        sources: &[Source<'_, B>],
+        rows: bool,
+    ) -> std::borrow::Cow<'_, Space> {
+        if sources.iter().all(|source| source.view.is_none()) {
+            return std::borrow::Cow::Borrowed(&self.in_order[usize::from(rows)]);
+        }
+        let mut views = vec![None; self.inputs.len()];
+        for (index, source) in sources.iter().enumerate() {
+            views[first + index] = source.view;
+        }
+        std::borrow::Cow::Owned(self.walk(&views, rows))
+    }
+
+    /// Run the program over its space.
     ///
     /// `inputs` are the read-only inputs, in slot order; `updated` are the
     /// in-place tensors, which are read as the last input slots and overwritten
-    /// as the first output slots. The fresh outputs come back in slot order.
+    /// as the first output slots. The fresh outputs come back in slot order,
+    /// each of the space's shape.
+    ///
+    /// An input is read in place through its strides, whatever they are: a
+    /// view of a matrix or a tensor, a permuted or broadcast one included.
     ///
     /// # Panics
     ///
-    /// If the counts, storage types or lengths disagree with the program and
-    /// its remaps.
+    /// If the counts, storage types or shapes disagree with the program.
     #[track_caller]
     pub fn run<B: Kernels<T>>(
         &self,
-        shape: (usize, usize),
         inputs: &[&dyn Fusable<B>],
         updated: &mut [&mut dyn FusableMut<B>],
     ) -> Vec<Output<B>> {
@@ -626,49 +968,45 @@ impl<T: Real> Program<T> {
             self.updated,
             updated.len()
         );
-        let len = shape.0 * shape.1;
+        let len = self.len();
         let sources: Vec<Source<'_, B>> = inputs.iter().map(|input| input.source()).collect();
         for (slot, source) in sources.iter().enumerate() {
-            self.check_input(slot, source.dtype(), source.len, source.view, shape);
+            self.check_input(slot, source.dtype(), source.len, source.view);
         }
         let mut sinks: Vec<Sink<'_, B>> = updated.iter_mut().map(|target| target.sink()).collect();
         for (slot, sink) in sinks.iter().enumerate() {
-            self.check_input(
-                self.fresh_inputs() + slot,
-                sink.dtype(),
-                sink.len,
-                None,
-                shape,
-            );
+            self.check_input(self.fresh_inputs() + slot, sink.dtype(), sink.len, None);
         }
+        let space = self.walk_for(0, &sources, !self.derived.is_empty());
 
         let fresh = match mode() {
             Mode::Fused if self.derived.is_empty() => {
                 counters::kernel(self.bytes(len), self.fresh_outputs());
-                B::fused(self, shape, &sources, &mut sinks)
+                B::fused(self, &space, &sources, &mut sinks)
             }
             Mode::Fused => {
                 // The statistics are computed from the inputs, not read.
-                let statistics = self.derived.len() * shape.0 * size_of::<T>();
+                let statistics = self.derived.len() * space.shape.0 * size_of::<T>();
                 counters::kernel(self.bytes(len) - statistics, self.fresh_outputs());
-                B::fused_with_statistics(self, shape, &sources, &mut sinks)
+                B::fused_with_statistics(self, &space, &sources, &mut sinks)
             }
             Mode::Unfused => {
-                let statistics = row_statistics(self, shape, &sources);
+                let statistics = row_statistics(self, &space, &sources);
                 let mut all: Vec<Source<'_, B>> = sources.iter().map(Source::reborrow).collect();
                 all.extend(statistics.iter().map(source_of));
-                unfused(self, shape, &all, &mut sinks)
+                unfused(self, &space, &all, &mut sinks)
             }
         };
         fresh
             .into_iter()
-            .map(|data| Output { shape, data })
+            .map(|data| Output::new(&self.space, data))
             .collect()
     }
 
     /// Run a program with one output of its own type, and sum that output
     /// along `axis` — [`Axis::Rows`] totals each row, [`Axis::Columns`] each
-    /// column — without keeping it.
+    /// column — without keeping it. A row runs along the space's last axis,
+    /// and the others are folded together into rows.
     ///
     /// The result is what running the program and summing its output with
     /// [`Kernels::matvec`] or [`Kernels::vecmat`] against ones gives: on the
@@ -678,18 +1016,18 @@ impl<T: Real> Program<T> {
     /// the normalized values, with nothing in between.
     ///
     /// ```
-    /// use tensorcrate::tensors::fused::{Builder, DType};
+    /// use tensorcrate::tensors::fused::{Builder, DType, Decl};
     /// use tensorcrate::tensors::{Analytic, Axis, Matrix};
     ///
     /// // Σⱼ exp(xᵢⱼ), each row.
     /// let mut b = Builder::<f32>::new();
-    /// let x = b.input(DType::F32);
+    /// let x = b.input(Decl::matrix(DType::F32, (2, 2)));
     /// let e = b.unary(Analytic::Exp, x);
     /// b.output(e, DType::F32);
     /// let exp = b.build().unwrap();
     ///
     /// let x = Matrix::from_rows([[0.0f32, 0.0], [1.0, 0.0]]);
-    /// let sums = exp.run_sum((2, 2), &[&x], Axis::Rows);
+    /// let sums = exp.run_sum(&[&x], Axis::Rows);
     /// assert_eq!(sums[0], 2.0);
     /// assert_eq!(sums[1], 1.0f32.exp() + 1.0);
     /// ```
@@ -700,12 +1038,7 @@ impl<T: Real> Program<T> {
     /// output, or that output is not of type `T`; or if `inputs` disagree with
     /// the program as in [`run`](Self::run).
     #[track_caller]
-    pub fn run_sum<B: Kernels<T>>(
-        &self,
-        shape: (usize, usize),
-        inputs: &[&dyn Fusable<B>],
-        axis: Axis,
-    ) -> Vector<T, B>
+    pub fn run_sum<B: Kernels<T>>(&self, inputs: &[&dyn Fusable<B>], axis: Axis) -> Vector<T, B>
     where
         T: Element,
     {
@@ -724,36 +1057,37 @@ impl<T: Real> Program<T> {
         );
         let sources: Vec<Source<'_, B>> = inputs.iter().map(|input| input.source()).collect();
         for (slot, source) in sources.iter().enumerate() {
-            self.check_input(slot, source.dtype(), source.len, source.view, shape);
+            self.check_input(slot, source.dtype(), source.len, source.view);
         }
+        let space = self.walk_for(0, &sources, true);
+        let (rows, cols) = space.shape;
         match mode() {
             Mode::Fused => {
                 let read: usize = self.inputs.iter().map(|dtype| dtype.size()).sum();
                 let total = match axis {
-                    Axis::Rows => shape.0,
-                    Axis::Columns => shape.1,
+                    Axis::Rows => rows,
+                    Axis::Columns => cols,
                 };
-                counters::kernel(read * shape.0 * shape.1 + total * size_of::<T>(), 1);
-                B::fused_sum(self, shape, &sources, axis)
+                counters::kernel(read * rows * cols + total * size_of::<T>(), 1);
+                B::fused_sum(self, &space, &sources, axis)
             }
             Mode::Unfused => {
-                let data = unfused(self, shape, &sources, &mut []).remove(0);
-                axis_sum(Output { shape, data }.into_matrix::<T>(), axis)
+                let data = unfused(self, &space, &sources, &mut []).remove(0);
+                axis_sum(Output::new(&[rows, cols], data).into_matrix::<T>(), axis)
             }
         }
     }
 
-    /// [`run`](Self::run) for the common case: vectors of one length, all of the
-    /// program's own element type, nothing updated in place, every output of
-    /// that type too.
+    /// [`run`](Self::run) for the common case: inputs of the program's own
+    /// element type, nothing updated in place, every output of that type too,
+    /// each returned flat.
     #[track_caller]
     pub fn run_vectors<B: Kernels<T>>(&self, inputs: &[&Vector<T, B>]) -> Vec<Vector<T, B>>
     where
         T: Element,
     {
-        let len = inputs.first().map_or(0, |input| input.len());
         let inputs: Vec<&dyn Fusable<B>> = inputs.iter().map(|&v| v as &dyn Fusable<B>).collect();
-        self.run((1, len), &inputs, &mut [])
+        self.run(&inputs, &mut [])
             .into_iter()
             .map(Output::into_vector)
             .collect()
@@ -761,20 +1095,20 @@ impl<T: Real> Program<T> {
 
     /// Run the program as the epilogue of the matrix product `a·b`.
     ///
-    /// The product is the program's input 0 and is consumed as it is computed:
-    /// on Metal the product and the program are one dispatch, and the product
-    /// is never written to memory unless the program stores it. `inputs` fill
-    /// slots 1 on. The iteration space is the product's shape, so a bias added
-    /// to every row is an input read through [`Remap::Row`].
+    /// The product is the program's input 0, read without a remap, and is
+    /// consumed as it is computed: on Metal the product and the program are one
+    /// dispatch, and the product is never written to memory unless the program
+    /// stores it. `inputs` fill slots 1 on. The space is the product's shape,
+    /// so a bias added to every row is a vector the program broadcasts.
     ///
     /// ```
-    /// use tensorcrate::tensors::fused::{Builder, DType, Remap};
+    /// use tensorcrate::tensors::fused::{Builder, DType, Decl};
     /// use tensorcrate::tensors::{Compare, Matrix, Vector};
     ///
     /// // relu(x·w + bias), one kernel.
     /// let mut b = Builder::new();
-    /// let product = b.input(DType::F32);
-    /// let bias = b.input_remapped(DType::F32, Remap::Row);
+    /// let product = b.input(Decl::matrix(DType::F32, (2, 2)));
+    /// let bias = b.input(Decl::vector(DType::F32, 2));
     /// let shifted = b.add(product, bias);
     /// let zero = b.constant(0.0);
     /// let relu = b.compare(Compare::Max, shifted, zero);
@@ -794,9 +1128,10 @@ impl<T: Real> Program<T> {
     ///
     /// # Panics
     ///
-    /// If the inner dimensions disagree, if input 0 is not stored as `T` or is
-    /// read through a remap, if the program updates tensors in place, or if
-    /// `inputs` disagree with the program as in [`run`](Self::run).
+    /// If the inner dimensions disagree, if the program's space is not the
+    /// product's shape, if input 0 is not of that shape, stored as `T` and read
+    /// without a remap, if the program updates tensors in place, or if `inputs`
+    /// disagree with the program as in [`run`](Self::run).
     #[track_caller]
     pub fn run_matmul<B: Kernels<T>>(
         &self,
@@ -813,6 +1148,15 @@ impl<T: Real> Program<T> {
             "fused matmul: inner dimensions {} and {} disagree",
             a.cols(),
             b.rows()
+        );
+        let shape = (a.rows(), b.cols());
+        assert_eq!(
+            self.space(),
+            [shape.0, shape.1],
+            "fused matmul: the program is over {:?}, the product {}×{}",
+            self.space(),
+            shape.0,
+            shape.1
         );
         assert_eq!(
             self.updated, 0,
@@ -833,25 +1177,19 @@ impl<T: Real> Program<T> {
             self.fresh_inputs() - 1,
             inputs.len()
         );
-        for instr in &self.code {
-            if let Instr::Load {
-                input: 0, remap, ..
-            } = *instr
-            {
-                assert_eq!(
-                    remap,
-                    Remap::Identity,
-                    "fused matmul: the product is read through {remap:?}"
-                );
-            }
+        for &(slot, remap) in &self.loads {
+            assert!(
+                slot != 0 || remap.is_identity(),
+                "fused matmul: the product is read through {remap:?}"
+            );
         }
-        let shape = (a.rows(), b.cols());
         let len = shape.0 * shape.1;
-        self.check_input(0, T::DTYPE, len, None, shape);
+        self.check_input(0, T::DTYPE, len, None);
         let sources: Vec<Source<'_, B>> = inputs.iter().map(|input| input.source()).collect();
         for (slot, source) in sources.iter().enumerate() {
-            self.check_input(slot + 1, source.dtype(), source.len, source.view, shape);
+            self.check_input(slot + 1, source.dtype(), source.len, source.view);
         }
+        let space = self.walk_for(1, &sources, true);
 
         let fresh = match mode() {
             Mode::Fused => {
@@ -861,17 +1199,17 @@ impl<T: Real> Program<T> {
                     self.bytes(len) - len * T::DTYPE.size() + operands,
                     self.fresh_outputs(),
                 );
-                B::matmul_epilogue(self, a, b, &sources)
+                B::matmul_epilogue(self, &space, a, b, &sources)
             }
             Mode::Unfused => {
                 let product = B::matmul(a, b);
                 let sources = with_product(&product, &sources);
-                unfused(self, shape, &sources, &mut [])
+                unfused(self, &space, &sources, &mut [])
             }
         };
         fresh
             .into_iter()
-            .map(|data| Output { shape, data })
+            .map(|data| Output::new(&self.space, data))
             .collect()
     }
 
@@ -880,13 +1218,10 @@ impl<T: Real> Program<T> {
     ///
     /// `inputs` covers every input slot, in-place tensors included; nothing is
     /// written. Step `k` of the result holds the value instruction `k` produced
-    /// (as `T`, before any narrowing), or `None` for a store.
+    /// (as `T`, before any narrowing), or `None` for a store: a matrix of the
+    /// space's last axis by the others folded together.
     #[track_caller]
-    pub fn trace<B: Kernels<T>>(
-        &self,
-        shape: (usize, usize),
-        inputs: &[&dyn Fusable<B>],
-    ) -> Vec<Option<Matrix<T, B>>> {
+    pub fn trace<B: Kernels<T>>(&self, inputs: &[&dyn Fusable<B>]) -> Vec<Option<Matrix<T, B>>> {
         let expected = self.inputs.len() - self.derived.len();
         assert_eq!(
             inputs.len(),
@@ -897,16 +1232,19 @@ impl<T: Real> Program<T> {
         let mut sources: Vec<Source<'_, B>> = inputs.iter().map(|input| input.source()).collect();
         // Statistics come before any in-place tensors among the input slots.
         let given = self.given_inputs();
+        let mut views = vec![None; self.inputs.len()];
         for (index, source) in sources.iter().enumerate() {
             let slot = if index < given {
                 index
             } else {
                 index + self.derived.len()
             };
-            self.check_input(slot, source.dtype(), source.len, source.view, shape);
+            self.check_input(slot, source.dtype(), source.len, source.view);
+            views[slot] = source.view;
         }
+        let space = self.walk(&views, !self.derived.is_empty());
         let updated: Vec<Source<'_, B>> = sources.drain(given..).collect();
-        let statistics = row_statistics(self, shape, &sources);
+        let statistics = row_statistics(self, &space, &sources);
         sources.extend(statistics.iter().map(source_of));
         sources.extend(updated);
         let mut registers: Vec<Option<Register<B, T>>> = (0..REGISTERS).map(|_| None).collect();
@@ -914,22 +1252,18 @@ impl<T: Real> Program<T> {
             .iter()
             .map(|instr| {
                 step::<B, T>(instr, &mut registers, |slot, remap| {
-                    load_unfused(&sources[slot], shape, remap)
+                    let place = space.places[self.load_index(slot as u8, remap)];
+                    load_unfused(&sources[slot], space.shape, place)
                 })
-                .map(|value| value.materialize(shape))
+                .map(|value| value.materialize(space.shape))
             })
             .collect()
     }
 
+    /// Check an operand for input `slot`: its storage type, and its length,
+    /// or the shape of its view, against the slot's declared shape.
     #[track_caller]
-    fn check_input(
-        &self,
-        slot: usize,
-        dtype: DType,
-        len: usize,
-        view: Option<View>,
-        shape: (usize, usize),
-    ) {
+    fn check_input(&self, slot: usize, dtype: DType, len: usize, view: Option<View>) {
         assert_eq!(
             dtype,
             self.inputs[slot],
@@ -937,66 +1271,44 @@ impl<T: Real> Program<T> {
             dtype.name(),
             self.inputs[slot].name()
         );
-        for instr in &self.code {
-            if let Instr::Load { input, remap, .. } = *instr
-                && usize::from(input) == slot
-            {
-                let expected = remap.input_len(shape);
-                assert_eq!(
-                    len, expected,
-                    "fused program: input {slot} holds {len} elements, but a {}×{} space \
-                     read through {remap:?} needs {expected}",
-                    shape.0, shape.1
-                );
-                // A view has a shape of its own, which the remap must read
-                // whole.
-                if let Some(v) = view {
-                    let (rows, cols) = shape;
-                    let fits = match remap {
-                        // A one-row or one-column view read as a vector, in a
-                        // space that is one: in order along it.
-                        Remap::Identity => {
-                            (v.rows, v.cols) == (rows, cols)
-                                || ((rows == 1 || cols == 1) && v.along().is_some())
-                        }
-                        Remap::Transpose => (v.rows, v.cols) == (cols, rows),
-                        Remap::Row | Remap::Column => v.along().is_some() || len <= 1,
-                    };
-                    assert!(
-                        fits,
-                        "fused program: input {slot} is a {}×{} view, which a {rows}×{cols} \
-                         space cannot read through {remap:?}",
-                        v.rows, v.cols
-                    );
-                }
-            }
-        }
-        if slot >= self.fresh_inputs() {
-            assert_eq!(
-                len,
-                shape.0 * shape.1,
-                "fused program: in-place tensor {} holds {len} elements, not {}",
-                slot - self.fresh_inputs(),
-                shape.0 * shape.1
+        let dims = self.shapes[slot].as_slice();
+        if let Some(view) = view {
+            assert!(
+                view.read_as(dims).is_some(),
+                "fused program: input {slot} is a view of shape {:?}, which cannot be read \
+                 as {dims:?}",
+                view.dims.as_slice()
             );
         }
+        let expected: usize = dims.iter().product();
+        assert_eq!(
+            len, expected,
+            "fused program: input {slot} holds {len} elements, but its shape {dims:?} needs \
+             {expected}"
+        );
     }
 
-    /// The fixed-width encoding the Metal shader interprets.
+    /// The fixed-width encoding the Metal shader interprets, for a run over
+    /// `space`, which says how many axes each load's rows fold together; a
+    /// kernel compiled for the program reads the common one or none without
+    /// dividing. With no space the count is left open.
     #[cfg_attr(not(all(feature = "metal", target_os = "macos")), allow(dead_code))]
-    pub(crate) fn encode(&self) -> Vec<Encoded> {
+    pub(crate) fn encode(&self, space: Option<&Space>) -> Vec<Encoded> {
         self.code
             .iter()
             .map(|instr| match *instr {
-                Instr::Load { dst, input, remap } => Encoded {
-                    kind: 0,
-                    op: remap as u16,
-                    dst,
-                    a: input,
-                    b: self.inputs[usize::from(input)] as u8,
-                    aux: 0,
-                    value: 0.0,
-                },
+                Instr::Load { dst, input, remap } => {
+                    let load = self.load_index(input, remap);
+                    Encoded {
+                        kind: 0,
+                        op: load as u16,
+                        dst,
+                        a: input,
+                        b: self.inputs[usize::from(input)] as u8,
+                        aux: space.map_or(Encoded::ANY_LEAD, |space| space.places[load].lead),
+                        value: 0.0,
+                    }
+                }
                 Instr::Const { dst, value } => Encoded {
                     kind: 1,
                     op: 0,
@@ -1065,11 +1377,13 @@ impl<T: Real> Program<T> {
     }
 }
 
-/// An instruction as the Metal shader reads it: twelve bytes, four-aligned.
+/// An instruction as the Metal shader reads it: twelve bytes, four-aligned. A
+/// load's `op` is its index among the program's distinct loads, which is where
+/// the shader finds where it reads (see [`Space::places`]).
 ///
 /// | kind | op          | dst | a      | b      | aux    | value |
 /// |------|-------------|-----|--------|--------|--------|-------|
-/// | 0 load  | remap    | reg | input  | dtype  |        |       |
+/// | 0 load  | load     | reg | input  | dtype  | lead   |       |
 /// | 1 const |          | reg |        |        |        | value |
 /// | 2 binary| BinaryOp | reg | reg    | reg    |        |       |
 /// | 3 unary | Analytic | reg | reg    |        |        |       |
@@ -1088,6 +1402,11 @@ pub(crate) struct Encoded {
     pub value: f32,
 }
 
+impl Encoded {
+    /// A load's `aux` when the axes its rows fold together are not known.
+    pub(crate) const ANY_LEAD: u8 = u8::MAX;
+}
+
 impl<T: Real + fmt::Debug> fmt::Display for Program<T> {
     /// A disassembly: one instruction per line.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1100,9 +1419,10 @@ impl<T: Real + fmt::Debug> fmt::Display for Program<T> {
         };
         writeln!(
             f,
-            "program({}) -> ({}), {} in place, {} registers",
+            "program({}) -> ({}) over {:?}, {} in place, {} registers",
             types(&self.inputs),
             types(&self.outputs),
+            self.space,
             self.updated,
             self.registers
         )?;
@@ -1127,19 +1447,221 @@ impl<T: Real + fmt::Debug> fmt::Display for Program<T> {
 
 // ---- building programs --------------------------------------------------------
 
-/// A value inside a [`Builder`]: written once, read any number of times.
+/// A scalar value inside a [`Builder`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct FusedValue(usize);
+pub struct ScalarVar {
+    id: usize,
+    dtype: DType,
+}
+
+/// A vector value inside a [`Builder`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct VectorVar {
+    id: usize,
+    shape: usize,
+    dtype: DType,
+}
+
+/// A matrix value inside a [`Builder`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct MatrixVar {
+    id: usize,
+    shape: (usize, usize),
+    dtype: DType,
+}
+
+/// A tensor value inside a [`Builder`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TensorVar {
+    id: usize,
+    shape: Dims,
+    dtype: DType,
+}
+
+/// The declaration of an input or an in-place tensor: its storage type and
+/// its shape.
+///
+/// A program runs over the shape its outputs have, which the shapes of the
+/// values it stores broadcast to. [`Program::run`] checks every operand
+/// against its declaration.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Decl<'a> {
+    /// One element.
+    Scalar { dtype: DType },
+    /// `shape` elements along one axis.
+    Vector { dtype: DType, shape: usize },
+    /// A `rows × cols` matrix.
+    Matrix { dtype: DType, shape: (usize, usize) },
+    /// A tensor of up to [`MAX_RANK`] axes.
+    Tensor { dtype: DType, shape: &'a [usize] },
+}
+
+impl<'a> Decl<'a> {
+    /// The declaration for a tensor of `dims`: a scalar for none, a vector for
+    /// one, a matrix for two and a tensor beyond.
+    pub fn of(dtype: DType, dims: &'a [usize]) -> Self {
+        match *dims {
+            [] => Decl::Scalar { dtype },
+            [len] => Decl::Vector { dtype, shape: len },
+            [rows, cols] => Decl::Matrix {
+                dtype,
+                shape: (rows, cols),
+            },
+            _ => Decl::Tensor { dtype, shape: dims },
+        }
+    }
+
+    pub fn scalar(dtype: DType) -> Self {
+        Decl::Scalar { dtype }
+    }
+
+    pub fn vector(dtype: DType, len: usize) -> Self {
+        Decl::Vector { dtype, shape: len }
+    }
+
+    pub fn matrix(dtype: DType, shape: (usize, usize)) -> Self {
+        Decl::Matrix { dtype, shape }
+    }
+
+    pub fn tensor(dtype: DType, shape: &'a [usize]) -> Self {
+        Decl::Tensor { dtype, shape }
+    }
+
+    /// The storage type.
+    pub fn dtype(&self) -> DType {
+        match *self {
+            Decl::Scalar { dtype }
+            | Decl::Vector { dtype, .. }
+            | Decl::Matrix { dtype, .. }
+            | Decl::Tensor { dtype, .. } => dtype,
+        }
+    }
+
+    /// How many axes the declared tensor has.
+    pub fn rank(&self) -> usize {
+        match *self {
+            Decl::Scalar { .. } => 0,
+            Decl::Vector { .. } => 1,
+            Decl::Matrix { .. } => 2,
+            Decl::Tensor { shape, .. } => shape.len(),
+        }
+    }
+
+    /// How many elements the declared tensor holds.
+    pub fn elements(&self) -> usize {
+        self.dims().iter().product()
+    }
+
+    /// The axes' lengths.
+    #[track_caller]
+    fn dims(&self) -> Dims {
+        match *self {
+            Decl::Scalar { .. } => Dims::default(),
+            Decl::Vector { shape, .. } => Dims::new(&[shape], "declaration"),
+            Decl::Matrix { shape, .. } => Dims::new(&[shape.0, shape.1], "declaration"),
+            Decl::Tensor { shape, .. } => Dims::new(shape, "declaration"),
+        }
+    }
+}
+
+/// A value inside a [`Builder`]: written once, read any number of times.
+///
+/// It knows its shape. A declared input has the shape it was declared with.
+/// The result of an operation on two values has the shape they broadcast to,
+/// as NumPy broadcasts: aligned at their last axes, where a missing axis or an
+/// axis of one repeats. [`Builder::permute`] and [`Builder::broadcast_to`]
+/// reshape one explicitly. Shapes that cannot be combined panic when the
+/// operation is built, not when the program is run.
+///
+/// The variant follows the shape's axes: none is a scalar, one a vector, two a
+/// matrix and more a tensor. A value computed from a declared tensor stays a
+/// tensor whatever its axes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Var {
+    Scalar(ScalarVar),
+    Vector(VectorVar),
+    Matrix(MatrixVar),
+    Tensor(TensorVar),
+}
+
+impl Var {
+    fn new(id: usize, meta: Meta) -> Var {
+        let Meta {
+            dims,
+            dtype,
+            tensor,
+        } = meta;
+        match *dims {
+            _ if tensor || dims.len() > 2 => Var::Tensor(TensorVar {
+                id,
+                shape: dims,
+                dtype,
+            }),
+            [] => Var::Scalar(ScalarVar { id, dtype }),
+            [len] => Var::Vector(VectorVar {
+                id,
+                shape: len,
+                dtype,
+            }),
+            [rows, cols] => Var::Matrix(MatrixVar {
+                id,
+                shape: (rows, cols),
+                dtype,
+            }),
+            _ => unreachable!("matched above"),
+        }
+    }
+
+    fn id(&self) -> usize {
+        match *self {
+            Var::Scalar(v) => v.id,
+            Var::Vector(v) => v.id,
+            Var::Matrix(v) => v.id,
+            Var::Tensor(v) => v.id,
+        }
+    }
+
+    /// The type the value is read in: the storage type it was declared with,
+    /// or for a computed value the program's own element type.
+    pub fn dtype(&self) -> DType {
+        match *self {
+            Var::Scalar(v) => v.dtype,
+            Var::Vector(v) => v.dtype,
+            Var::Matrix(v) => v.dtype,
+            Var::Tensor(v) => v.dtype,
+        }
+    }
+
+    /// The axes' lengths: none for a scalar.
+    pub fn shape(&self) -> Vec<usize> {
+        match *self {
+            Var::Scalar(_) => Vec::new(),
+            Var::Vector(v) => vec![v.shape],
+            Var::Matrix(v) => vec![v.shape.0, v.shape.1],
+            Var::Tensor(v) => v.shape.to_vec(),
+        }
+    }
+}
+
+/// What the builder knows of a value.
+#[derive(Copy, Clone, Debug)]
+struct Meta {
+    dims: Dims,
+    dtype: DType,
+    /// Whether the value is of a declared tensor.
+    tensor: bool,
+}
 
 #[derive(Copy, Clone, Debug)]
 enum Node<T> {
+    /// Input `slot` read through a remap from the value's axes to the input's.
     Load(u8, Remap),
     Const(T),
     /// Uniform number `k`, in declaration order.
     Uniform(usize),
-    Binary(BinaryOp, FusedValue, FusedValue),
-    Unary(Analytic, FusedValue),
-    Cmp(Compare, FusedValue, FusedValue),
+    Binary(BinaryOp, usize, usize),
+    Unary(Analytic, usize),
+    Cmp(Compare, usize, usize),
 }
 
 /// Assembles a [`Program`] from single-assignment values, allocating registers.
@@ -1148,17 +1670,32 @@ enum Node<T> {
 /// [`update`](Self::update) — which returns the tensor's current value, to be
 /// given its new one with [`set`](Self::set) — and fresh outputs with
 /// [`output`](Self::output). The operations are emitted in the order they were
-/// built; loads of the same slot and remap are shared.
+/// built; loads of the same input through the same remap are shared.
+///
+/// Every value has a shape (see [`Var`]). The program runs over the shape its
+/// stored values broadcast to, and an operand is read in place however it is
+/// permuted or broadcast: [`permute`](Self::permute) and
+/// [`broadcast_to`](Self::broadcast_to) only change where each element is
+/// read from.
 ///
 /// `T` is the element type the program will compute in, and is normally inferred
 /// from the first constant or the tensors the program runs over.
 #[derive(Clone, Debug)]
 pub struct Builder<T = f32> {
     nodes: Vec<Node<T>>,
-    inputs: Vec<DType>,
-    updates: Vec<(DType, Option<FusedValue>)>,
-    outputs: Vec<(DType, FusedValue)>,
-    loads: Vec<((u8, Remap), FusedValue)>,
+    /// What is known of each node's value.
+    meta: Vec<Meta>,
+    /// Each given input's storage type and shape.
+    inputs: Vec<(DType, Dims)>,
+    /// Each in-place tensor's storage type, shape and new value.
+    updates: Vec<(DType, Dims, Option<Var>)>,
+    outputs: Vec<(DType, Var)>,
+    /// The node each slot is loaded by through each remap, as a value of each
+    /// shape.
+    loads: std::collections::HashMap<(u8, Remap, Dims), usize>,
+    /// The node each node is when its axes are read through a remap as a
+    /// value of a shape.
+    reindexed: std::collections::HashMap<(usize, Remap, Dims), usize>,
     /// Each uniform's initial value, in declaration order.
     uniforms: Vec<T>,
     /// The row statistics the program reads, in declaration order: the input
@@ -1170,10 +1707,12 @@ impl<T: Real> Default for Builder<T> {
     fn default() -> Self {
         Builder {
             nodes: Vec::new(),
+            meta: Vec::new(),
             inputs: Vec::new(),
             updates: Vec::new(),
             outputs: Vec::new(),
-            loads: Vec::new(),
+            loads: std::collections::HashMap::new(),
+            reindexed: std::collections::HashMap::new(),
             uniforms: Vec::new(),
             derived: Vec::new(),
         }
@@ -1185,45 +1724,71 @@ impl<T: Real> Builder<T> {
         Self::default()
     }
 
-    fn push(&mut self, node: Node<T>) -> FusedValue {
+    fn node(&mut self, node: Node<T>, meta: Meta) -> usize {
         self.nodes.push(node);
-        FusedValue(self.nodes.len() - 1)
+        self.meta.push(meta);
+        self.nodes.len() - 1
     }
 
-    /// Declare a read-only input and load it unremapped.
-    ///
-    /// Inputs are numbered in declaration order.
-    pub fn input(&mut self, dtype: DType) -> FusedValue {
-        self.input_remapped(dtype, Remap::Identity)
+    fn var(&self, id: usize) -> Var {
+        Var::new(id, self.meta[id])
     }
 
-    /// Declare a read-only input read through `remap`.
-    pub fn input_remapped(&mut self, dtype: DType, remap: Remap) -> FusedValue {
-        self.inputs.push(dtype);
+    /// A value the same everywhere, in the program's own type.
+    fn everywhere(&self) -> Meta {
+        Meta {
+            dims: Dims::default(),
+            dtype: dtype_of::<T>(),
+            tensor: false,
+        }
+    }
+
+    /// The node loading `slot` through `remap`, made if there is none yet.
+    fn load(&mut self, slot: u8, remap: Remap, meta: Meta) -> usize {
+        if let Some(&id) = self.loads.get(&(slot, remap, meta.dims)) {
+            return id;
+        }
+        let id = self.node(Node::Load(slot, remap), meta);
+        self.loads.insert((slot, remap, meta.dims), id);
+        id
+    }
+
+    /// Declare a read-only input. Inputs are numbered in declaration order.
+    #[track_caller]
+    pub fn input(&mut self, decl: Decl) -> Var {
+        let dims = decl.dims();
+        self.inputs.push((decl.dtype(), dims));
         let slot = (self.inputs.len() - 1) as u8;
-        self.load(slot, remap)
+        let meta = Meta {
+            dims,
+            dtype: decl.dtype(),
+            tensor: matches!(decl, Decl::Tensor { .. }),
+        };
+        let id = self.load(slot, Remap::identity(dims.len()), meta);
+        self.var(id)
     }
 
-    /// A statistic of each row of `input` — which must be a value an
-    /// [`input`](Self::input) returned, read without a remap — as one value
-    /// per row, broadcast along it.
+    /// A statistic of each row of `input` — the values along its last axis —
+    /// as a value with that axis of length one, which repeats along the row
+    /// when combined with one of the input's shape. `input` must be a value an
+    /// [`input`](Self::input) returned, of the program's whole space.
     ///
     /// The program computes it from the input itself: running the program is
     /// running [`Kernels::matrix_axis_moments`] along [`Axis::Rows`] on the
-    /// input, converted to `T`, and passing the result as an input read
-    /// through [`Remap::Column`]. On the host that is what happens, so the
+    /// input, its leading axes folded into rows, converted to `T`, and passing
+    /// the result as another input. On the host that is what happens, so the
     /// program fused and unfused agree bit for bit. On Metal a program that has
     /// run before is one kernel, with each row's statistics and then its
     /// elements computed by one SIMD group — so a layer norm reads its input
     /// once, and writes only its result.
     ///
     /// ```
-    /// use tensorcrate::tensors::fused::{Builder, DType, RowStatistic};
+    /// use tensorcrate::tensors::fused::{Builder, DType, Decl, RowStatistic};
     /// use tensorcrate::tensors::Matrix;
     ///
     /// // (x − mean) / sqrt(deviations / n), each row.
     /// let mut b = Builder::<f32>::new();
-    /// let x = b.input(DType::F32);
+    /// let x = b.input(Decl::matrix(DType::F32, (2, 2)));
     /// let mean = b.row_statistic(x, RowStatistic::Mean);
     /// let deviations = b.row_statistic(x, RowStatistic::Deviations);
     /// let variance = b.scale(deviations, 0.5);
@@ -1234,23 +1799,26 @@ impl<T: Real> Builder<T> {
     /// let program = b.build().unwrap();
     ///
     /// let x = Matrix::from_rows([[1.0f32, 3.0], [10.0, 20.0]]);
-    /// let y = program.run((2, 2), &[&x], &mut []).remove(0).into_matrix::<f32>();
+    /// let y = program.run(&[&x], &mut []).remove(0).into_matrix::<f32>();
     /// assert_eq!(y.to_rows(), [[-1.0, 1.0], [-1.0, 1.0]]);
     /// ```
     ///
     /// # Panics
     ///
-    /// If `input` is not an input read without a remap.
+    /// If `input` is not a value an [`input`](Self::input) returned, or has no
+    /// axes.
     #[track_caller]
-    pub fn row_statistic(&mut self, input: FusedValue, statistic: RowStatistic) -> FusedValue {
-        let slot = self
-            .loads
-            .iter()
-            .find(|&&((slot, remap), value)| {
-                value == input && remap == Remap::Identity && usize::from(slot) < MAX_INPUTS
-            })
-            .map(|&((slot, _), _)| slot)
-            .expect("a row statistic is of a value `input` returned");
+    pub fn row_statistic(&mut self, input: Var, statistic: RowStatistic) -> Var {
+        let slot = match self.nodes[input.id()] {
+            Node::Load(slot, remap)
+                if usize::from(slot) < MAX_INPUTS
+                    && remap.is_identity()
+                    && !self.meta[input.id()].dims.is_empty() =>
+            {
+                slot
+            }
+            _ => panic!("fused builder: a row statistic is of a value `input` returned"),
+        };
         let index = match self.derived.iter().position(|&d| d == (slot, statistic)) {
             Some(index) => index,
             None => {
@@ -1258,43 +1826,58 @@ impl<T: Real> Builder<T> {
                 self.derived.len() - 1
             }
         };
+        let of = self.meta[input.id()];
+        let dims = of.dims.with(of.dims.len() - 1, 1);
+        let meta = Meta {
+            dims,
+            dtype: dtype_of::<T>(),
+            tensor: of.tensor,
+        };
         // Numbered after the given inputs in `build`, once their count is known.
-        self.load((2 * MAX_INPUTS + index) as u8, Remap::Column)
+        let id = self.load(
+            (2 * MAX_INPUTS + index) as u8,
+            Remap::identity(dims.len()),
+            meta,
+        );
+        self.var(id)
     }
 
-    /// Declare a tensor updated in place and return its current value.
-    pub fn update(&mut self, dtype: DType) -> FusedValue {
-        self.updates.push((dtype, None));
+    /// Declare a tensor updated in place and return its current value. It
+    /// must have the shape of the program's space.
+    #[track_caller]
+    pub fn update(&mut self, decl: Decl) -> Var {
+        let dims = decl.dims();
+        self.updates.push((decl.dtype(), dims, None));
         // The final slot number is only known once every input is declared, so
         // update slots are numbered from the top of the range and renumbered in
         // `build`.
         let slot = (MAX_INPUTS + self.updates.len() - 1) as u8;
-        self.load(slot, Remap::Identity)
+        let meta = Meta {
+            dims,
+            dtype: decl.dtype(),
+            tensor: matches!(decl, Decl::Tensor { .. }),
+        };
+        let id = self.load(slot, Remap::identity(dims.len()), meta);
+        self.var(id)
     }
 
     /// Give in-place tensor `index` (in [`update`](Self::update) order) its
-    /// new value.
-    pub fn set(&mut self, index: usize, value: FusedValue) {
-        self.updates[index].1 = Some(value);
+    /// new value, which broadcasts to its shape.
+    pub fn set(&mut self, index: usize, value: Var) {
+        self.updates[index].2 = Some(value);
     }
 
-    /// Store `value` to a fresh output of type `dtype`. Outputs are numbered in
-    /// declaration order, after the in-place tensors.
-    pub fn output(&mut self, value: FusedValue, dtype: DType) {
+    /// Store `value` to a fresh output of type `dtype`, of the program's space,
+    /// which `value` broadcasts to. Outputs are numbered in declaration order,
+    /// after the in-place tensors.
+    pub fn output(&mut self, value: Var, dtype: DType) {
         self.outputs.push((dtype, value));
     }
 
-    fn load(&mut self, slot: u8, remap: Remap) -> FusedValue {
-        if let Some(&(_, value)) = self.loads.iter().find(|(key, _)| *key == (slot, remap)) {
-            return value;
-        }
-        let value = self.push(Node::Load(slot, remap));
-        self.loads.push(((slot, remap), value));
-        value
-    }
-
-    pub fn constant(&mut self, value: T) -> FusedValue {
-        self.push(Node::Const(value))
+    pub fn constant(&mut self, value: T) -> Var {
+        let meta = self.everywhere();
+        let id = self.node(Node::Const(value), meta);
+        self.var(id)
     }
 
     /// A constant that can be changed after the program is built: the same for
@@ -1308,50 +1891,239 @@ impl<T: Real> Builder<T> {
     /// into the program's constants, so it runs once per
     /// [`set_uniform`](Program::set_uniform), in the program's element type,
     /// rather than once per element.
-    pub fn uniform(&mut self, value: T) -> FusedValue {
+    pub fn uniform(&mut self, value: T) -> Var {
         self.uniforms.push(value);
         let index = self.uniforms.len() - 1;
-        self.push(Node::Uniform(index))
+        let meta = self.everywhere();
+        let id = self.node(Node::Uniform(index), meta);
+        self.var(id)
     }
 
-    pub fn binary(&mut self, op: BinaryOp, a: FusedValue, b: FusedValue) -> FusedValue {
-        self.push(Node::Binary(op, a, b))
+    /// What a value computed from `a` and `b` is: of the shape they broadcast
+    /// to.
+    #[track_caller]
+    fn join(&self, a: Var, b: Var) -> Meta {
+        let (x, y) = (self.meta[a.id()], self.meta[b.id()]);
+        let dims = super::layout::broadcast_shape(&x.dims, &y.dims).unwrap_or_else(|| {
+            panic!(
+                "fused builder: shapes {:?} and {:?} do not broadcast together",
+                x.dims, y.dims
+            )
+        });
+        Meta {
+            dims,
+            dtype: dtype_of::<T>(),
+            tensor: x.tensor || y.tensor,
+        }
     }
 
-    pub fn add(&mut self, a: FusedValue, b: FusedValue) -> FusedValue {
+    #[track_caller]
+    pub fn binary(&mut self, op: BinaryOp, a: Var, b: Var) -> Var {
+        let meta = self.join(a, b);
+        let id = self.node(Node::Binary(op, a.id(), b.id()), meta);
+        self.var(id)
+    }
+
+    #[track_caller]
+    pub fn add(&mut self, a: Var, b: Var) -> Var {
         self.binary(BinaryOp::Add, a, b)
     }
 
-    pub fn sub(&mut self, a: FusedValue, b: FusedValue) -> FusedValue {
+    #[track_caller]
+    pub fn sub(&mut self, a: Var, b: Var) -> Var {
         self.binary(BinaryOp::Sub, a, b)
     }
 
-    pub fn mul(&mut self, a: FusedValue, b: FusedValue) -> FusedValue {
+    #[track_caller]
+    pub fn mul(&mut self, a: Var, b: Var) -> Var {
         self.binary(BinaryOp::Mul, a, b)
     }
 
-    pub fn div(&mut self, a: FusedValue, b: FusedValue) -> FusedValue {
+    #[track_caller]
+    pub fn div(&mut self, a: Var, b: Var) -> Var {
         self.binary(BinaryOp::Div, a, b)
     }
 
     /// `a · factor`, the fused form of a scalar broadcast.
-    pub fn scale(&mut self, a: FusedValue, factor: T) -> FusedValue {
+    pub fn scale(&mut self, a: Var, factor: T) -> Var {
         let factor = self.constant(factor);
         self.mul(a, factor)
     }
 
     /// `a + offset`.
-    pub fn shift(&mut self, a: FusedValue, offset: T) -> FusedValue {
+    pub fn shift(&mut self, a: Var, offset: T) -> Var {
         let offset = self.constant(offset);
         self.add(a, offset)
     }
 
-    pub fn unary(&mut self, op: Analytic, a: FusedValue) -> FusedValue {
-        self.push(Node::Unary(op, a))
+    pub fn unary(&mut self, op: Analytic, a: Var) -> Var {
+        let meta = Meta {
+            dtype: dtype_of::<T>(),
+            ..self.meta[a.id()]
+        };
+        let id = self.node(Node::Unary(op, a.id()), meta);
+        self.var(id)
     }
 
-    pub fn compare(&mut self, op: Compare, a: FusedValue, b: FusedValue) -> FusedValue {
-        self.push(Node::Cmp(op, a, b))
+    #[track_caller]
+    pub fn compare(&mut self, op: Compare, a: Var, b: Var) -> Var {
+        let meta = self.join(a, b);
+        let id = self.node(Node::Cmp(op, a.id(), b.id()), meta);
+        self.var(id)
+    }
+
+    /// `x` with its axes reordered: axis `k` of the result is axis `axes[k]`
+    /// of `x`, as [`Tensor::permute`](super::Tensor::permute) reorders a
+    /// tensor's. Nothing moves: every input `x` is computed from is read
+    /// through the permutation instead.
+    ///
+    /// ```
+    /// use tensorcrate::tensors::fused::{Builder, DType, Decl};
+    /// use tensorcrate::tensors::Tensor;
+    ///
+    /// // y[i, j, k] = x[j, k, i] + 1.
+    /// let mut b = Builder::<f32>::new();
+    /// let x = b.input(Decl::tensor(DType::F32, &[2, 3, 4]));
+    /// let moved = b.permute(x, &[2, 0, 1]);
+    /// let y = b.shift(moved, 1.0);
+    /// b.output(y, DType::F32);
+    /// let program = b.build().unwrap();
+    /// assert_eq!(program.space(), [4, 2, 3]);
+    ///
+    /// let x = Tensor::<f32>::from_vec(&[2, 3, 4], (0..24).map(|v| v as f32).collect::<Vec<_>>());
+    /// let y = program.run(&[&x], &mut []).remove(0).into_tensor::<f32>();
+    /// assert_eq!(y.get(&[3, 1, 2]), Some(x.get(&[1, 2, 3]).unwrap() + 1.0));
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// If `axes` is not a permutation of `x`'s axes.
+    #[track_caller]
+    pub fn permute(&mut self, x: Var, axes: &[usize]) -> Var {
+        let dims = self.meta[x.id()].dims;
+        let mut seen = [false; MAX_RANK];
+        let permutation = axes.len() == dims.len()
+            && axes
+                .iter()
+                .all(|&axis| axis < dims.len() && !std::mem::replace(&mut seen[axis], true));
+        assert!(
+            permutation,
+            "fused builder: {axes:?} is not a permutation of the axes of a {dims:?} value"
+        );
+        let shape: Vec<usize> = axes.iter().map(|&axis| dims[axis]).collect();
+        let id = self.reindex(
+            x.id(),
+            Remap::permute(axes),
+            Dims::new(&shape, "fused builder"),
+        );
+        self.var(id)
+    }
+
+    /// `x` with axes `a` and `b` swapped: a matrix's transpose for `(0, 1)`.
+    ///
+    /// # Panics
+    ///
+    /// If either axis is not one of `x`'s.
+    #[track_caller]
+    pub fn transpose(&mut self, x: Var, a: usize, b: usize) -> Var {
+        let rank = self.meta[x.id()].dims.len();
+        assert!(
+            a < rank && b < rank,
+            "fused builder: axes {a} and {b} of a value of {rank} axes"
+        );
+        let mut axes: Vec<usize> = (0..rank).collect();
+        axes.swap(a, b);
+        self.permute(x, &axes)
+    }
+
+    /// `x` repeated to `shape`, as NumPy broadcasts: aligned at the last axes,
+    /// where every axis `x` lacks, and every axis of one it has, repeats.
+    ///
+    /// Operations broadcast their operands to a common shape anyway; this is
+    /// for a value that should take a shape it would not otherwise, such as a
+    /// column vector stored as a vector: `broadcast_to(permute(…))`, or an
+    /// output larger than everything it is computed from.
+    ///
+    /// # Panics
+    ///
+    /// If `x` does not broadcast to `shape`.
+    #[track_caller]
+    pub fn broadcast_to(&mut self, x: Var, shape: &[usize]) -> Var {
+        let dims = self.meta[x.id()].dims;
+        let fits = super::layout::broadcast_shape(&dims, shape)
+            .is_some_and(|common| common.as_slice() == shape);
+        assert!(
+            fits,
+            "fused builder: a {dims:?} value does not broadcast to {shape:?}"
+        );
+        let shift = shape.len() - dims.len();
+        let axes: Vec<Option<usize>> = (0..shape.len()).map(|k| k.checked_sub(shift)).collect();
+        let id = self.reindex(x.id(), Remap::new(&axes), Dims::new(shape, "fused builder"));
+        self.var(id)
+    }
+
+    /// Node `id` as a value of shape `dims`, its axis `k` being axis `map[k]`
+    /// of the node's own value or, where `map` names none, repeating it: every
+    /// load it is computed from read through `map`.
+    fn reindex(&mut self, id: usize, map: Remap, dims: Dims) -> usize {
+        if let Some(&found) = self.reindexed.get(&(id, map, dims)) {
+            return found;
+        }
+        let meta = Meta {
+            dims,
+            ..self.meta[id]
+        };
+        let found = match self.nodes[id] {
+            Node::Load(slot, remap) => self.load(slot, remap.through(map), meta),
+            Node::Const(_) | Node::Uniform(_) => id,
+            Node::Binary(op, a, b) => {
+                let (a, b) = (
+                    self.operand(a, id, map, dims),
+                    self.operand(b, id, map, dims),
+                );
+                self.rebuilt(id, Node::Binary(op, a, b), meta)
+            }
+            Node::Unary(op, a) => {
+                let a = self.operand(a, id, map, dims);
+                self.rebuilt(id, Node::Unary(op, a), meta)
+            }
+            Node::Cmp(op, a, b) => {
+                let (a, b) = (
+                    self.operand(a, id, map, dims),
+                    self.operand(b, id, map, dims),
+                );
+                self.rebuilt(id, Node::Cmp(op, a, b), meta)
+            }
+        };
+        self.reindexed.insert((id, map, dims), found);
+        found
+    }
+
+    /// Operand `a` of node `of`, reindexed as `of` is by `map` to `dims`. The
+    /// operand's axes are aligned with the last of `of`'s, as broadcasting
+    /// aligns them.
+    fn operand(&mut self, a: usize, of: usize, map: Remap, dims: Dims) -> usize {
+        let shift = self.meta[of].dims.len() - self.meta[a].dims.len();
+        let axes: Vec<Option<usize>> = (0..map.rank())
+            .map(|k| map.axis(k).and_then(|axis| axis.checked_sub(shift)))
+            .collect();
+        self.reindex(a, Remap::new(&axes), dims)
+    }
+
+    /// `node` in place of node `id`: `id` itself if `node` is what it already
+    /// is.
+    fn rebuilt(&mut self, id: usize, node: Node<T>, meta: Meta) -> usize {
+        let same = match (self.nodes[id], node) {
+            (Node::Binary(_, a, b), Node::Binary(_, x, y))
+            | (Node::Cmp(_, a, b), Node::Cmp(_, x, y)) => (a, b) == (x, y),
+            (Node::Unary(_, a), Node::Unary(_, x)) => a == x,
+            _ => false,
+        };
+        if same && self.meta[id].dims == meta.dims {
+            id
+        } else {
+            self.node(node, meta)
+        }
     }
 
     /// Optimize, allocate registers and validate, with this thread's
@@ -1382,7 +2154,7 @@ impl<T: Real> Builder<T> {
     /// structure, with constants as placeholders, so a program rebuilt every
     /// step with new constants — an optimizer's — is optimized once.
     pub fn build_with(
-        self,
+        mut self,
         model: &CostModel,
         algebra: Algebra,
     ) -> Result<Program<T>, ProgramError> {
@@ -1401,9 +2173,9 @@ impl<T: Real> Builder<T> {
         };
 
         // Stores, in-place tensors first.
-        let mut stores: Vec<(FusedValue, u8)> = Vec::new();
-        for (index, (_, value)) in self.updates.iter().enumerate() {
-            let Some(value) = *value else {
+        let mut stores: Vec<(Var, u8)> = Vec::new();
+        for (index, &(_, _, value)) in self.updates.iter().enumerate() {
+            let Some(value) = value else {
                 return Err(ProgramError::OutputNotStoredOnce {
                     output: index as u8,
                 });
@@ -1414,56 +2186,132 @@ impl<T: Real> Builder<T> {
             stores.push((value, (self.updates.len() + index) as u8));
         }
 
-        let mut inputs = self.inputs;
-        inputs.extend(self.derived.iter().map(|_| dtype_of::<T>()));
-        inputs.extend(self.updates.iter().map(|&(dtype, _)| dtype));
-        let mut outputs: Vec<DType> = self.updates.iter().map(|&(dtype, _)| dtype).collect();
+        // The space: the shape every stored value and in-place tensor
+        // broadcasts to.
+        let mut space = Dims::default();
+        for (index, &(_, dims, _)) in self.updates.iter().enumerate() {
+            space = super::layout::broadcast_shape(&space, &dims).ok_or(
+                ProgramError::ShapeMismatch {
+                    slot: fresh_inputs + index,
+                },
+            )?;
+        }
+        for &(value, output) in &stores {
+            space = super::layout::broadcast_shape(&space, &self.meta[value.id()].dims)
+                .ok_or(ProgramError::OutputShape { output })?;
+        }
+
+        // Every stored value as a value of the space, so that each load reads
+        // its input through a remap from the space's axes.
+        let roots: Vec<(usize, u8)> = stores
+            .iter()
+            .map(|&(value, output)| {
+                let rank = self.meta[value.id()].dims.len();
+                let shift = space.len() - rank;
+                let axes: Vec<Option<usize>> =
+                    (0..space.len()).map(|k| k.checked_sub(shift)).collect();
+                (self.reindex(value.id(), Remap::new(&axes), space), output)
+            })
+            .collect();
+
+        // The nodes the stores read, in order: operands come before the nodes
+        // that read them.
+        let mut reached = vec![false; self.nodes.len()];
+        let mut pending: Vec<usize> = roots.iter().map(|&(id, _)| id).collect();
+        while let Some(id) = pending.pop() {
+            if std::mem::replace(&mut reached[id], true) {
+                continue;
+            }
+            match self.nodes[id] {
+                Node::Binary(_, a, b) | Node::Cmp(_, a, b) => pending.extend([a, b]),
+                Node::Unary(_, a) => pending.push(a),
+                Node::Load(..) | Node::Const(_) | Node::Uniform(_) => {}
+            }
+        }
+
+        let mut dtypes: Vec<DType> = self.inputs.iter().map(|&(dtype, _)| dtype).collect();
+        let mut dims: Vec<Dims> = self.inputs.iter().map(|&(_, dims)| dims).collect();
+        for _ in &self.derived {
+            dtypes.push(dtype_of::<T>());
+            dims.push(space.with(space.len().saturating_sub(1), 1));
+        }
+        for &(dtype, shape, _) in &self.updates {
+            dtypes.push(dtype);
+            dims.push(shape);
+        }
+        let mut outputs: Vec<DType> = self.updates.iter().map(|&(dtype, ..)| dtype).collect();
         outputs.extend(self.outputs.iter().map(|&(dtype, _)| dtype));
-        if inputs.len() > MAX_INPUTS {
-            return Err(ProgramError::TooManyInputs(inputs.len()));
+        if dtypes.len() > MAX_INPUTS {
+            return Err(ProgramError::TooManyInputs(dtypes.len()));
         }
 
         // Uniforms are the first named constants, each its own name whatever
-        // its value; the ordinary constants are named after them.
+        // its value; the ordinary constants are named after them. Each distinct
+        // slot and remap is a load of its own, which the optimizer sees as a
+        // remap code.
         let uniforms = self.uniforms.len();
         let mut constants: Vec<T> = self.uniforms.clone();
-        let nodes = self
-            .nodes
-            .iter()
-            .map(|node| match *node {
-                Node::Load(slot, remap) => optimizer::Node::Load {
-                    slot: slot_of(slot),
-                    remap: remap as u8,
-                },
+        let mut loads: Vec<(u8, Remap)> = Vec::new();
+        let mut position = vec![usize::MAX; self.nodes.len()];
+        let mut nodes = Vec::new();
+        for id in (0..self.nodes.len()).filter(|&id| reached[id]) {
+            let at = |operand: usize| position[operand];
+            let node = match self.nodes[id] {
+                Node::Load(slot, remap) => {
+                    let load = (slot_of(slot), remap);
+                    let code = match loads.iter().position(|&known| known == load) {
+                        Some(code) => code,
+                        None => {
+                            loads.push(load);
+                            loads.len() - 1
+                        }
+                    };
+                    let code = u8::try_from(code).map_err(|_| ProgramError::TooManyLoads(code))?;
+                    optimizer::Node::Load {
+                        slot: load.0,
+                        remap: code,
+                    }
+                }
                 Node::Const(value) => {
                     optimizer::Node::Const(placeholder(value, &mut constants, uniforms))
                 }
                 Node::Uniform(index) => {
                     optimizer::Node::Const(optimizer::Scalar::Named(index as u32))
                 }
-                Node::Binary(op, a, b) => optimizer::Node::Binary(bin(op), a.0, b.0),
-                Node::Unary(op, a) => optimizer::Node::Unary(optimizer::Function(op as u16), a.0),
-                Node::Cmp(op, a, b) => optimizer::Node::Cmp(cmp(op), a.0, b.0),
-            })
-            .collect();
+                Node::Binary(op, a, b) => optimizer::Node::Binary(bin(op), at(a), at(b)),
+                Node::Unary(op, a) => optimizer::Node::Unary(optimizer::Function(op as u16), at(a)),
+                Node::Cmp(op, a, b) => optimizer::Node::Cmp(cmp(op), at(a), at(b)),
+            };
+            position[id] = nodes.len();
+            nodes.push(node);
+        }
+        if loads.len() > MAX_LOADS {
+            return Err(ProgramError::TooManyLoads(loads.len()));
+        }
         let graph = optimizer::Graph {
             nodes,
-            stores: stores
+            stores: roots
                 .iter()
-                .map(|&(value, output)| optimizer::Store {
-                    value: value.0,
+                .map(|&(id, output)| optimizer::Store {
+                    value: position[id],
                     output,
                 })
                 .collect(),
-            input_bytes: inputs.iter().map(|dtype| dtype.size() as u8).collect(),
+            input_bytes: dtypes.iter().map(|dtype| dtype.size() as u8).collect(),
             output_bytes: outputs.iter().map(|dtype| dtype.size() as u8).collect(),
         };
         let optimized = optimized(graph, model, algebra)?;
         let code = optimized
             .iter()
-            .map(|instr| lower(instr, &constants))
+            .map(|instr| lower(instr, &constants, &loads))
             .collect();
-        let mut program = Program::new(code, inputs, outputs, self.updates.len())?;
+        let decls: Vec<Decl<'_>> = dtypes
+            .iter()
+            .zip(&dims)
+            .map(|(&dtype, dims)| Decl::of(dtype, dims))
+            .collect();
+        let program = Program::new(&space, code, decls, outputs, self.updates.len())?;
+        let mut program = program.with_statistics(self.derived)?;
         // The constants that depend on a uniform, to compute again when one is set.
         program.bound = optimized
             .iter()
@@ -1477,7 +2325,6 @@ impl<T: Real> Builder<T> {
             .collect();
         program.named = constants;
         program.uniforms = uniforms;
-        program.derived = self.derived;
         Ok(program)
     }
 }
@@ -1659,19 +2506,14 @@ fn cmp(op: Compare) -> optimizer::Cmp {
     optimizer::Cmp::from_code(op as u16).expect("the comparison codes agree")
 }
 
-/// An optimized instruction as one of ours.
-fn lower<T: Real>(instr: &optimizer::Instr, constants: &[T]) -> Instr<T> {
+/// An optimized instruction as one of ours. A load's remap code is its index
+/// in `loads`.
+fn lower<T: Real>(instr: &optimizer::Instr, constants: &[T], loads: &[(u8, Remap)]) -> Instr<T> {
     match *instr {
         optimizer::Instr::Load { dst, slot, remap } => Instr::Load {
             dst,
             input: slot,
-            remap: match remap {
-                0 => Remap::Identity,
-                1 => Remap::Transpose,
-                2 => Remap::Row,
-                3 => Remap::Column,
-                _ => unreachable!("the remap codes agree"),
-            },
+            remap: loads[usize::from(remap)].1,
         },
         optimizer::Instr::Const { dst, ref value } => Instr::Const {
             dst,
@@ -1710,7 +2552,7 @@ impl<T: Real> Program<T> {
             let node = match *instr {
                 Instr::Load { input, remap, .. } => optimizer::Node::Load {
                     slot: input,
-                    remap: remap as u8,
+                    remap: self.load_index(input, remap) as u8,
                 },
                 Instr::Const { .. } => optimizer::Node::Const(optimizer::Scalar::Named(0)),
                 Instr::Binary { op, a, b, .. } => {
@@ -2025,30 +2867,39 @@ impl<T: Element, B: Backend> FusableMut<B> for Matrix<T, B> {
 
 // ---- views ----------------------------------------------------------------------
 
-/// Where the elements of a strided source lie in its storage: element `(r, c)`
-/// of the `rows × cols` view is element `offset + r·row_stride + c·col_stride`
-/// of the storage.
+/// Where the elements of a strided source lie in its storage: element
+/// `[i₀, …]` of a source of shape `dims` is storage element
+/// `offset + Σ iₖ·strides[k]`.
 #[doc(hidden)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct View {
-    pub offset: usize,
-    pub rows: usize,
-    pub cols: usize,
-    pub row_stride: usize,
-    pub col_stride: usize,
+    pub(crate) offset: usize,
+    pub(crate) dims: Dims,
+    pub(crate) strides: Dims,
 }
 
 impl View {
-    /// The `(row, column)` strides of the view read as a vector: along its one
-    /// row or its one column. `None` if it is neither.
-    fn along(&self) -> Option<usize> {
-        if self.rows == 1 {
-            Some(self.col_stride)
-        } else if self.cols == 1 {
-            Some(self.row_stride)
-        } else {
-            None
+    pub(crate) fn new(offset: usize, dims: &[usize], strides: &[usize]) -> Self {
+        View {
+            offset,
+            dims: Dims::new(dims, "view"),
+            strides: Dims::new(strides, "view"),
         }
+    }
+
+    /// The strides that read this view as a tensor of shape `dims`: its own,
+    /// or — for a shape of as many elements — those of the view reshaped to
+    /// it, when it can be without moving an element, as a view of whole rows
+    /// can, or one that differs only in axes of length one. `None` otherwise.
+    pub(crate) fn read_as(&self, dims: &[usize]) -> Option<Dims> {
+        if self.dims.as_slice() == dims {
+            return Some(self.strides);
+        }
+        let len = |dims: &[usize]| dims.iter().product::<usize>();
+        if len(&self.dims) != len(dims) {
+            return None;
+        }
+        super::layout::reshape_strides(&self.dims, &self.strides, dims)
     }
 }
 
@@ -2056,26 +2907,26 @@ impl View {
 /// a single row or column, or the whole matrix transposed — without copying
 /// it.
 ///
-/// A view is an input to a [`Program`] like any tensor: as a matrix, a
-/// transposed one, or, when it is one row or one column, a vector to broadcast.
-/// It is read through its strides on both backends, so a fused program over
-/// part of a matrix costs what it would over a matrix of that part's size.
+/// A view is an input to a [`Program`] like any tensor, read through its
+/// strides on both backends, so a fused program over part of a matrix costs
+/// what it would over a matrix of that part's size. A view of one row or one
+/// column also reads as a vector.
 ///
 /// ```
-/// use tensorcrate::tensors::fused::{Builder, DType, Remap};
+/// use tensorcrate::tensors::fused::{Builder, DType, Decl};
 /// use tensorcrate::tensors::Matrix;
 ///
 /// // The middle two columns of each row, plus the matrix's last column.
 /// let m = Matrix::from_rows([[1.0f32, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]);
 /// let mut b = Builder::<f32>::new();
-/// let block = b.input(DType::F32);
-/// let last = b.input_remapped(DType::F32, Remap::Column);
+/// let block = b.input(Decl::matrix(DType::F32, (2, 2)));
+/// let last = b.input(Decl::matrix(DType::F32, (2, 1)));
 /// let sum = b.add(block, last);
 /// b.output(sum, DType::F32);
 /// let program = b.build().unwrap();
 ///
 /// let y = program
-///     .run((2, 2), &[&m.view(.., 1..3), &m.column_view(3)], &mut [])
+///     .run(&[&m.view(.., 1..3), &m.column_view(3)], &mut [])
 ///     .remove(0)
 ///     .into_matrix::<f32>();
 /// assert_eq!(y.to_rows(), [[6.0, 7.0], [14.0, 15.0]]);
@@ -2100,13 +2951,11 @@ impl<T: Copy + 'static, B: Backend> Matrix<T, B> {
         let (rows, cols) = (bounds(rows, self.rows()), bounds(cols, self.cols()));
         MatrixView {
             matrix: self,
-            view: View {
-                offset: rows.start * self.cols() + cols.start,
-                rows: rows.len(),
-                cols: cols.len(),
-                row_stride: self.cols(),
-                col_stride: 1,
-            },
+            view: View::new(
+                rows.start * self.cols() + cols.start,
+                &[rows.len(), cols.len()],
+                &[self.cols(), 1],
+            ),
         }
     }
 
@@ -2151,15 +3000,15 @@ fn bounds(range: impl std::ops::RangeBounds<usize>, len: usize) -> Range<usize> 
 
 impl<'a, T: Copy + 'static, B: Backend> MatrixView<'a, T, B> {
     pub fn rows(&self) -> usize {
-        self.view.rows
+        self.view.dims[0]
     }
 
     pub fn cols(&self) -> usize {
-        self.view.cols
+        self.view.dims[1]
     }
 
     pub fn shape(&self) -> (usize, usize) {
-        (self.view.rows, self.view.cols)
+        (self.rows(), self.cols())
     }
 
     /// The rows `rows` and columns `cols` of this view, read in place.
@@ -2174,15 +3023,14 @@ impl<'a, T: Copy + 'static, B: Backend> MatrixView<'a, T, B> {
         cols: impl std::ops::RangeBounds<usize>,
     ) -> MatrixView<'a, T, B> {
         let v = self.view;
-        let (rows, cols) = (bounds(rows, v.rows), bounds(cols, v.cols));
+        let (rows, cols) = (bounds(rows, self.rows()), bounds(cols, self.cols()));
         MatrixView {
             matrix: self.matrix,
-            view: View {
-                offset: v.offset + rows.start * v.row_stride + cols.start * v.col_stride,
-                rows: rows.len(),
-                cols: cols.len(),
-                ..v
-            },
+            view: View::new(
+                v.offset + rows.start * v.strides[0] + cols.start * v.strides[1],
+                &[rows.len(), cols.len()],
+                &v.strides,
+            ),
         }
     }
 
@@ -2191,26 +3039,21 @@ impl<'a, T: Copy + 'static, B: Backend> MatrixView<'a, T, B> {
         let v = self.view;
         MatrixView {
             matrix: self.matrix,
-            view: View {
-                rows: v.cols,
-                cols: v.rows,
-                row_stride: v.col_stride,
-                col_stride: v.row_stride,
-                ..v
-            },
+            view: View::new(
+                v.offset,
+                &[v.dims[1], v.dims[0]],
+                &[v.strides[1], v.strides[0]],
+            ),
         }
     }
 
     /// The view's elements, copied into a matrix of their own.
     pub fn to_matrix(&self) -> Matrix<T, B> {
-        let place = Place {
-            offset: self.view.offset,
-            row: self.view.row_stride,
-            col: self.view.col_stride,
-        };
+        let v = self.view;
+        let place = Place::grid(v.offset, v.strides[0], v.strides[1], self.rows());
         Matrix::from_storage(
-            self.view.rows,
-            self.view.cols,
+            self.rows(),
+            self.cols(),
             B::gather(self.matrix.storage(), place, self.shape()),
         )
     }
@@ -2220,107 +3063,145 @@ impl<T: Element, B: Backend> Fusable<B> for MatrixView<'_, T, B> {
     fn source(&self) -> Source<'_, B> {
         Source {
             data: T::source::<B>(self.matrix.storage()),
-            len: self.view.rows * self.view.cols,
+            len: self.rows() * self.cols(),
             view: Some(self.view),
         }
     }
 
     fn shape(&self) -> Option<(usize, usize)> {
-        Some((self.view.rows, self.view.cols))
+        Some(MatrixView::shape(self))
     }
 }
 
-/// Where element `(row, col)` of an iteration space reads a source through a
-/// remap: storage element `offset + row·self.row + col·self.col`. Every remap
-/// of every source, viewed or not, is one of these.
+/// Where element `(row, col)` of a `rows × cols` walk of a space reads a
+/// source: storage element `offset + col·self.col` plus, for the row index
+/// split into the axes it folds together, each coordinate times its axis's
+/// step. A remap, a view, a permutation and a broadcast of any source are
+/// all one of these.
 #[doc(hidden)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Place {
     pub offset: usize,
-    pub row: usize,
+    /// The step along a row.
     pub col: usize,
+    /// The axes the row index folds together, outermost first: their extents,
+    /// whose product is the rows, and their steps.
+    pub(crate) lead: u8,
+    pub(crate) dims: [usize; MAX_RANK - 1],
+    pub(crate) steps: [usize; MAX_RANK - 1],
 }
 
 impl Place {
-    /// Read through `remap` over a `rows × cols` space, a source stored in
-    /// order, or `view` of it. The source is assumed checked against the
-    /// remap (see [`Program::check_input`]).
-    pub(crate) fn of(view: Option<View>, remap: Remap, (rows, cols): (usize, usize)) -> Place {
-        match view {
-            None => match remap {
-                Remap::Identity => Place {
-                    offset: 0,
-                    row: cols,
-                    col: 1,
-                },
-                Remap::Transpose => Place {
-                    offset: 0,
-                    row: 1,
-                    col: rows,
-                },
-                Remap::Row => Place {
-                    offset: 0,
-                    row: 0,
-                    col: 1,
-                },
-                Remap::Column => Place {
-                    offset: 0,
-                    row: 1,
-                    col: 0,
-                },
-            },
-            Some(v) => {
-                let along = v.along().unwrap_or(0);
-                let (row, col) = match remap {
-                    // A vector view read in a vector space of another
-                    // orientation steps along itself.
-                    Remap::Identity if (v.rows, v.cols) != (rows, cols) && rows == 1 => (0, along),
-                    Remap::Identity if (v.rows, v.cols) != (rows, cols) => (along, 0),
-                    Remap::Identity => (v.row_stride, v.col_stride),
-                    Remap::Transpose => (v.col_stride, v.row_stride),
-                    Remap::Row => (0, along),
-                    Remap::Column => (along, 0),
-                };
-                Place {
-                    offset: v.offset,
-                    row,
-                    col,
-                }
-            }
-        }
+    /// `rows` rows a step of `row` apart, each a step of `col` along.
+    pub(crate) fn grid(offset: usize, row: usize, col: usize, rows: usize) -> Place {
+        let mut place = Place {
+            offset,
+            col,
+            lead: 1,
+            ..Place::default()
+        };
+        place.dims[0] = rows;
+        place.steps[0] = row;
+        place
     }
 
     /// The storage element `(row, col)` reads.
     #[inline]
     pub(crate) fn at(&self, row: usize, col: usize) -> usize {
-        self.offset + row * self.row + col * self.col
+        let mut at = self.offset + col * self.col;
+        let lead = usize::from(self.lead);
+        if lead > 0 {
+            let mut row = row;
+            for k in (1..lead).rev() {
+                at += (row % self.dims[k]) * self.steps[k];
+                row /= self.dims[k];
+            }
+            at += row * self.steps[0];
+        }
+        at
+    }
+
+    /// The extents and steps of the walk over a space `cols` wide, as a
+    /// strided copy takes them.
+    pub(crate) fn layout(&self, cols: usize) -> (Dims, Dims) {
+        let lead = usize::from(self.lead);
+        let (mut dims, mut steps) = ([0; MAX_RANK], [0; MAX_RANK]);
+        dims[..lead].copy_from_slice(&self.dims[..lead]);
+        steps[..lead].copy_from_slice(&self.steps[..lead]);
+        (dims[lead], steps[lead]) = (cols, self.col);
+        (
+            Dims::new(&dims[..=lead], "fused load"),
+            Dims::new(&steps[..=lead], "fused load"),
+        )
     }
 
     /// Whether the elements of a space `cols` wide lie in order from
-    /// `offset`, as an unviewed tensor read without a remap does.
+    /// `offset`, as an unviewed tensor read without a remap does. The tile
+    /// interpreter asks for every tile, so this allocates nothing.
+    #[inline]
     pub(crate) fn in_order(&self, cols: usize) -> bool {
-        self.col == 1 && (self.row == cols || cols == 0)
+        let lead = usize::from(self.lead);
+        if cols == 0 || self.dims[..lead].contains(&0) {
+            return true;
+        }
+        if cols != 1 && self.col != 1 {
+            return false;
+        }
+        let mut step = cols;
+        for k in (0..lead).rev() {
+            if self.dims[k] != 1 && self.steps[k] != step {
+                return false;
+            }
+            step *= self.dims[k];
+        }
+        true
     }
 
     /// The last storage element a `rows × cols` space reads, plus one.
     pub(crate) fn end(&self, (rows, cols): (usize, usize)) -> usize {
         if rows == 0 || cols == 0 {
-            self.offset
-        } else {
-            self.at(rows - 1, cols - 1) + 1
+            return self.offset;
         }
+        let (dims, steps) = self.layout(cols);
+        self.offset
+            + dims
+                .iter()
+                .zip(steps.iter())
+                .map(|(&extent, &step)| (extent - 1) * step)
+                .sum::<usize>()
+            + 1
     }
 }
 
-/// A fresh result of a [`Program`], shaped like the iteration space.
+/// The space a program runs over as its kernels walk it: `rows × cols`, every
+/// axis but the last folded into the rows — fewer when merging axes allows —
+/// and where each of the program's distinct loads reads, in the program's
+/// order of them.
+#[doc(hidden)]
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Space {
+    pub shape: (usize, usize),
+    pub places: Vec<Place>,
+}
+
+impl Space {
+    pub(crate) fn len(&self) -> usize {
+        self.shape.0 * self.shape.1
+    }
+}
+
+/// A fresh result of a [`Program`], of the shape of its space.
 pub struct Output<B: Backend> {
-    shape: (usize, usize),
+    shape: Dims,
     data: Fresh<B>,
 }
 
 impl<B: Backend> Output<B> {
-    pub(crate) fn new(shape: (usize, usize), data: Fresh<B>) -> Self {
-        Output { shape, data }
+    pub(crate) fn new(shape: &[usize], data: Fresh<B>) -> Self {
+        Output {
+            shape: Dims::new(shape, "fused output"),
+            data,
+        }
     }
 
     pub fn dtype(&self) -> DType {
@@ -2332,6 +3213,11 @@ impl<B: Backend> Output<B> {
         }
     }
 
+    /// The axes' lengths.
+    pub fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
     /// The result as a flat vector.
     ///
     /// # Panics
@@ -2340,19 +3226,29 @@ impl<B: Backend> Output<B> {
     #[track_caller]
     pub fn into_vector<T: Element>(self) -> Vector<T, B> {
         let dtype = self.dtype();
-        let len = self.shape.0 * self.shape.1;
+        let len = self.shape.iter().product();
         match T::unwrap::<B>(self.data) {
             Some(storage) => Vector::from_storage(len, storage),
             None => panic!("fused output is {}, not {}", dtype.name(), T::DTYPE.name()),
         }
     }
 
-    /// The result as a matrix of the iteration space's shape.
+    /// The result as a matrix of its last axis by the rest folded together.
     #[track_caller]
     pub fn into_matrix<T: Element>(self) -> Matrix<T, B> {
-        let (rows, cols) = self.shape;
+        let (rows, cols) = match *self.shape {
+            [] => (1, 1),
+            [ref leading @ .., last] => (leading.iter().product(), last),
+        };
         let storage = self.into_vector::<T>().into_storage();
         Matrix::from_storage(rows, cols, storage)
+    }
+
+    /// The result as a tensor of its shape.
+    #[track_caller]
+    pub fn into_tensor<T: Element>(self) -> super::Tensor<T, B> {
+        let shape = self.shape;
+        super::Tensor::from_vector(&shape, self.into_vector())
     }
 }
 
@@ -2474,14 +3370,14 @@ fn step<'r, B: Kernels<T>, T: Real>(
     registers[dst].as_ref()
 }
 
-/// A load as unfused kernels: convert if needed, then materialize the remap —
-/// a transpose kernel, or a stack of copies for a broadcast.
+/// A load as unfused kernels: convert if needed, then copy the elements
+/// `place` reads into order — a transpose, a permutation, or a stack of copies
+/// for a broadcast.
 fn load_unfused<B: Kernels<T>, T: Real>(
     source: &Source<'_, B>,
-    shape: (usize, usize),
-    remap: Remap,
+    (rows, cols): (usize, usize),
+    place: Place,
 ) -> Matrix<T, B> {
-    let (rows, cols) = shape;
     // An input already of the program's type is copied on its own backend —
     // on Metal, on the GPU — rather than read back through the CPU, which on a
     // device would wait for every queued kernel.
@@ -2493,13 +3389,12 @@ fn load_unfused<B: Kernels<T>, T: Real>(
         .as_ref()
         .or(source.typed::<T>())
         .expect("one of the two");
-    let place = Place::of(source.view, remap, shape);
-    let stored = if source.view.is_none() && place.in_order(cols) {
+    let stored = if source.view.is_none() && place.offset == 0 && place.in_order(cols) {
         B::duplicate(storage)
     } else {
-        // A view, a transpose or a broadcast: every element copied into
+        // A view, a permutation or a broadcast: every element copied into
         // place, exactly.
-        B::gather(storage, place, shape)
+        B::gather(storage, place, (rows, cols))
     };
     Matrix::from_storage(rows, cols, stored)
 }
@@ -2553,10 +3448,11 @@ fn narrow<B: Kernels<T>, T: Real>(tensor: Matrix<T, B>, dtype: DType) -> Fresh<B
 /// Run a program as one existing kernel per instruction.
 fn unfused<B: Kernels<T>, T: Real>(
     program: &Program<T>,
-    shape: (usize, usize),
+    space: &Space,
     inputs: &[Source<'_, B>],
     updated: &mut [Sink<'_, B>],
 ) -> Vec<Fresh<B>> {
+    let shape = space.shape;
     let fresh_inputs = program.fresh_inputs();
     let mut registers: Vec<Option<Register<B, T>>> = (0..REGISTERS).map(|_| None).collect();
     let mut stored: Vec<Option<Fresh<B>>> = (0..program.outputs.len()).map(|_| None).collect();
@@ -2571,10 +3467,11 @@ fn unfused<B: Kernels<T>, T: Real>(
             continue;
         }
         step::<B, T>(instr, &mut registers, |slot, remap| {
+            let place = space.places[program.load_index(slot as u8, remap)];
             if slot < fresh_inputs {
-                load_unfused(&inputs[slot], shape, remap)
+                load_unfused(&inputs[slot], shape, place)
             } else {
-                load_unfused(&updated[slot - fresh_inputs].as_source(), shape, remap)
+                load_unfused(&updated[slot - fresh_inputs].as_source(), shape, place)
             }
         });
     }
@@ -2936,13 +3833,14 @@ pub(crate) fn source_of<B: Backend, T: Real>(vector: &Vector<T, B>) -> Source<'_
     }
 }
 
-/// The input as a `rows × cols` matrix of `T`: a copy, converted if it is
-/// stored as another type.
+/// The input as the `rows × cols` matrix `place` reads of it, in `T`: a copy,
+/// converted if it is stored as another type.
 pub(crate) fn input_matrix<B: Kernels<T>, T: Real>(
     source: &Source<'_, B>,
+    place: Place,
     shape: (usize, usize),
 ) -> Matrix<T, B> {
-    load_unfused(source, shape, Remap::Identity)
+    load_unfused(source, shape, place)
 }
 
 /// The row statistics a program computes for itself, from its given
@@ -2950,15 +3848,17 @@ pub(crate) fn input_matrix<B: Kernels<T>, T: Real>(
 /// once, by [`Kernels::row_moments`].
 pub(crate) fn row_statistics<B: Kernels<T>, T: Real>(
     program: &Program<T>,
-    shape: (usize, usize),
+    space: &Space,
     inputs: &[Source<'_, B>],
 ) -> Vec<Vector<T, B>> {
+    let identity = Remap::identity(program.space.len());
     // Each input's mean and deviations, taken as the statistics read them.
     type Moments<T, B> = (u8, Option<Vector<T, B>>, Option<Vector<T, B>>);
     let mut moments: Vec<Moments<T, B>> = Vec::new();
     for &(slot, _) in &program.derived {
         if !moments.iter().any(|&(of, ..)| of == slot) {
-            let (mean, deviations) = B::row_moments(&inputs[usize::from(slot)], shape);
+            let place = space.places[program.load_index(slot, identity)];
+            let (mean, deviations) = B::row_moments(&inputs[usize::from(slot)], place, space.shape);
             moments.push((slot, Some(mean), Some(deviations)));
         }
     }
@@ -2983,11 +3883,13 @@ pub(crate) fn row_statistics<B: Kernels<T>, T: Real>(
 /// input is stored as `T`.
 pub(crate) fn host_row_moments<T: Real>(
     source: &Source<'_, Host>,
+    place: Place,
     shape: (usize, usize),
 ) -> (Vector<T, Host>, Vector<T, Host>) {
-    let moments = match source.typed::<T>().filter(|_| source.view.is_none()) {
+    let in_order = source.view.is_none() && place.offset == 0 && place.in_order(shape.1);
+    let moments = match source.typed::<T>().filter(|_| in_order) {
         Some(values) => crate::statistics::axis_moments_of(&values[..], shape, Axis::Rows),
-        None => input_matrix::<Host, T>(source, shape).moments_axis(Axis::Rows),
+        None => input_matrix::<Host, T>(source, place, shape).moments_axis(Axis::Rows),
     };
     (moments.means, moments.sum_squared_deviations)
 }
@@ -3006,20 +3908,23 @@ pub(crate) fn axis_sum<T: Real, B: Kernels<T>>(matrix: Matrix<T, B>, axis: Axis)
 /// This is the [`Host`] implementation.
 pub(crate) fn interpret_on<B: Backend, T: Real>(
     program: &Program<T>,
-    shape: (usize, usize),
+    space: &Space,
     inputs: &[Source<'_, B>],
     updated: &mut [Sink<'_, B>],
 ) -> Vec<Fresh<B>> {
-    let len = shape.0 * shape.1;
-    let mut fresh = allocate(program, len);
+    let mut fresh = allocate(program, space.len());
     {
-        let views: Vec<Option<View>> = inputs.iter().map(|input| input.view).collect();
         let inputs: Vec<Slice<'_>> = inputs.iter().map(Source::slice).collect();
         let mut outputs: Vec<SliceMut<'_>> = updated.iter_mut().map(Sink::slice).collect();
         outputs.extend(fresh.iter_mut().map(Owned::slice));
-        let viewed = views.iter().any(Option::is_some);
-        if viewed || !single_operation(program, &inputs, &mut outputs) {
-            interpret(program, shape, &inputs, &views, &mut outputs);
+        // A lone operation reads its operands whole, so each must be read in
+        // order from its start.
+        let ordered = space
+            .places
+            .iter()
+            .all(|place| place.offset == 0 && place.in_order(space.shape.1));
+        if !ordered || !single_operation(program, &inputs, &mut outputs) {
+            interpret(program, space, &inputs, &mut outputs);
         }
     }
     fresh.into_iter().map(Owned::store).collect()
@@ -3063,11 +3968,7 @@ fn single_operation<T: Real>(
     };
     match program.code[..] {
         [
-            Instr::Load {
-                dst: x,
-                input,
-                remap: Remap::Identity,
-            },
+            Instr::Load { dst: x, input, .. },
             Instr::Unary { dst, op, a },
             Instr::Store { src, output: 0 },
         ] if a == x && src == dst => {
@@ -3078,11 +3979,7 @@ fn single_operation<T: Real>(
             true
         }
         [
-            Instr::Load {
-                dst: x,
-                input,
-                remap: Remap::Identity,
-            },
+            Instr::Load { dst: x, input, .. },
             Instr::Const { dst: c, value },
             ref operation,
             Instr::Store { src, output: 0 },
@@ -3104,12 +4001,12 @@ fn single_operation<T: Real>(
             Instr::Load {
                 dst: x,
                 input: first,
-                remap: Remap::Identity,
+                ..
             },
             Instr::Load {
                 dst: y,
                 input: second,
-                remap: Remap::Identity,
+                ..
             },
             ref operation,
             Instr::Store { src, output: 0 },
@@ -3152,13 +4049,12 @@ fn single_operation<T: Real>(
 /// `program.updated()` input slots read them.
 fn interpret<T: Real>(
     program: &Program<T>,
-    shape: (usize, usize),
+    space: &Space,
     inputs: &[Slice<'_>],
-    views: &[Option<View>],
     outputs: &mut [SliceMut<'_>],
 ) {
-    let len = shape.0 * shape.1;
-    let plan = Plan::new(program, shape, inputs, views, outputs);
+    let (shape, len) = (space.shape, space.len());
+    let plan = Plan::new(program, space, inputs, outputs);
     // One physical tile per register, plus a spare that receives each result
     // so an instruction may overwrite one of its own operands.
     let physical = program.registers + 1;
@@ -3440,11 +4336,11 @@ struct Plan {
 impl Plan {
     fn new<T: Real>(
         program: &Program<T>,
-        shape: (usize, usize),
+        space: &Space,
         inputs: &[Slice<'_>],
-        views: &[Option<View>],
         outputs: &mut [SliceMut<'_>],
     ) -> Self {
+        let shape = space.shape;
         let code = &program.code;
         let fresh_inputs = program.fresh_inputs();
         let places: Vec<Place> = code
@@ -3452,7 +4348,7 @@ impl Plan {
             .map(|instr| match *instr {
                 Instr::Load { input, remap, .. } if usize::from(input) < fresh_inputs => {
                     let slot = usize::from(input);
-                    let place = Place::of(views.get(slot).copied().flatten(), remap, shape);
+                    let place = space.places[program.load_index(input, remap)];
                     assert!(
                         shape.0 * shape.1 == 0 || place.end(shape) <= inputs[slot].len(),
                         "fused program: input {slot} is read past its storage"
@@ -3711,23 +4607,24 @@ fn with_product<'a, T: Element, B: Backend>(
 /// two kernels.
 pub(crate) fn host_matmul<T: Element>(
     program: &Program<T>,
+    space: &Space,
     a: &Matrix<T, Host>,
     b: &Matrix<T, Host>,
     inputs: &[Source<'_, Host>],
 ) -> Vec<Fresh<Host>> {
     let product = a.matmul(b);
     let sources = with_product(&product, inputs);
-    interpret_on(program, product.shape(), &sources, &mut [])
+    interpret_on(program, space, &sources, &mut [])
 }
 
 /// The [`Host`] entry point for [`Kernels::fused`].
 pub(crate) fn host<T: Real>(
     program: &Program<T>,
-    shape: (usize, usize),
+    space: &Space,
     inputs: &[Source<'_, Host>],
     updated: &mut [Sink<'_, Host>],
 ) -> Vec<Fresh<Host>> {
-    interpret_on(program, shape, inputs, updated)
+    interpret_on(program, space, inputs, updated)
 }
 
 /// The [`Metal`](super::Metal) entry point for [`Kernels::fused`]: one
@@ -3741,11 +4638,11 @@ pub(crate) fn host<T: Real>(
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub(crate) fn metal<T: crate::metal::MetalElement>(
     program: &Program<T>,
-    shape: (usize, usize),
+    space: &Space,
     inputs: &[Source<'_, super::Metal>],
     updated: &mut [Sink<'_, super::Metal>],
 ) -> Vec<Fresh<super::Metal>> {
-    super::require_metal("fused program", resident(program, shape, inputs, updated))
+    super::require_metal("fused program", resident(program, space, inputs, updated))
 }
 
 /// The [`Metal`](super::Metal) entry point for
@@ -3755,26 +4652,27 @@ pub(crate) fn metal<T: crate::metal::MetalElement>(
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub(crate) fn metal_with_statistics<T: crate::metal::MetalElement>(
     program: &Program<T>,
-    shape: (usize, usize),
+    space: &Space,
     inputs: &[Source<'_, super::Metal>],
     updated: &mut [Sink<'_, super::Metal>],
 ) -> Vec<Fresh<super::Metal>> {
-    if let Some(fresh) = resident_rows(program, shape, inputs, updated) {
+    if let Some(fresh) = resident_rows(program, space, inputs, updated) {
         return fresh;
     }
-    let statistics = row_statistics(program, shape, inputs);
+    let statistics = row_statistics(program, space, inputs);
     let mut all: Vec<Source<'_, super::Metal>> = inputs.iter().map(Source::reborrow).collect();
     all.extend(statistics.iter().map(source_of));
-    metal(program, shape, &all, updated)
+    metal(program, space, &all, updated)
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 fn resident_rows<T: crate::metal::MetalElement>(
     program: &Program<T>,
-    shape: (usize, usize),
+    space: &Space,
     inputs: &[Source<'_, super::Metal>],
     updated: &[Sink<'_, super::Metal>],
 ) -> Option<Vec<Fresh<super::Metal>>> {
+    let shape = space.shape;
     if !program.runs_on_metal() || program.derived.len() > 16 {
         return None;
     }
@@ -3791,11 +4689,13 @@ fn resident_rows<T: crate::metal::MetalElement>(
     let fresh = device::allocate(program, shape.0 * shape.1)?;
     written.extend(fresh.iter().map(device::Allocation::raw));
 
-    let mut statistics = [(0u8, 0u8, false); 16];
+    let mut statistics = [(0u8, 0u8, 0u8, false); 16];
+    let identity = Remap::identity(program.space.len());
     for (entry, &(of, statistic)) in statistics.iter_mut().zip(&program.derived) {
         *entry = (
             of,
             program.inputs[usize::from(of)] as u8,
+            program.load_index(of, identity) as u8,
             statistic == RowStatistic::Deviations,
         );
     }
@@ -3804,9 +4704,9 @@ fn resident_rows<T: crate::metal::MetalElement>(
         statistics,
         count: program.derived.len(),
     };
-    let places = shader_places(program, shape, inputs, 0)?;
+    let places = shader_places(program, space, inputs, 0)?;
     crate::metal::fused_rows::<T>(
-        &program.encode(),
+        &program.encode(Some(space)),
         shape,
         &read,
         &written,
@@ -3826,9 +4726,11 @@ fn resident_rows<T: crate::metal::MetalElement>(
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub(crate) fn metal_row_moments<T: crate::metal::MetalElement>(
     source: &Source<'_, super::Metal>,
+    place: Place,
     (rows, cols): (usize, usize),
 ) -> (Vector<T, super::Metal>, Vector<T, super::Metal>) {
-    let resident = (rows != 0 && cols != 0 && source.view.is_none())
+    let in_order = source.view.is_none() && place.offset == 0 && place.in_order(cols);
+    let resident = (rows != 0 && cols != 0 && in_order)
         .then(|| source.typed::<T>()?.axis_moments(rows, cols, Axis::Rows))
         .flatten();
     match resident {
@@ -3836,7 +4738,10 @@ pub(crate) fn metal_row_moments<T: crate::metal::MetalElement>(
             Vector::from_storage(rows, means),
             Vector::from_storage(rows, deviations),
         ),
-        None => super::Metal::matrix_axis_moments(&input_matrix(source, (rows, cols)), Axis::Rows),
+        None => super::Metal::matrix_axis_moments(
+            &input_matrix(source, place, (rows, cols)),
+            Axis::Rows,
+        ),
     }
 }
 
@@ -3846,23 +4751,25 @@ pub(crate) fn metal_row_moments<T: crate::metal::MetalElement>(
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub(crate) fn metal_sum<T: crate::metal::MetalElement + Element>(
     program: &Program<T>,
-    shape: (usize, usize),
+    space: &Space,
     inputs: &[Source<'_, super::Metal>],
     axis: Axis,
 ) -> Vector<T, super::Metal> {
-    resident_sum(program, shape, inputs, axis).unwrap_or_else(|| {
-        let data = metal(program, shape, inputs, &mut []).remove(0);
-        axis_sum(Output { shape, data }.into_matrix::<T>(), axis)
+    resident_sum(program, space, inputs, axis).unwrap_or_else(|| {
+        let data = metal(program, space, inputs, &mut []).remove(0);
+        let (rows, cols) = space.shape;
+        axis_sum(Output::new(&[rows, cols], data).into_matrix::<T>(), axis)
     })
 }
 
 #[cfg(all(feature = "metal", target_os = "macos"))]
 fn resident_sum<T: crate::metal::MetalElement + Element>(
     program: &Program<T>,
-    shape: (usize, usize),
+    space: &Space,
     inputs: &[Source<'_, super::Metal>],
     axis: Axis,
 ) -> Option<Vector<T, super::Metal>> {
+    let shape = space.shape;
     use crate::metal::MetalBuffer;
     use crate::tensors::MetalStorage;
 
@@ -3874,10 +4781,10 @@ fn resident_sum<T: crate::metal::MetalElement + Element>(
         Axis::Rows => shape.0,
         Axis::Columns => shape.1,
     };
-    let places = shader_places(program, shape, inputs, 0)?;
+    let places = shader_places(program, space, inputs, 0)?;
     let sums = MetalBuffer::<T>::allocate(len)?;
     crate::metal::fused_sum::<T>(
-        &program.encode(),
+        &program.encode(Some(space)),
         shape,
         &read,
         &places,
@@ -3893,14 +4800,15 @@ fn resident_sum<T: crate::metal::MetalElement + Element>(
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub(crate) fn metal_matmul<T: crate::metal::MetalElement + Element>(
     program: &Program<T>,
+    space: &Space,
     a: &Matrix<T, super::Metal>,
     b: &Matrix<T, super::Metal>,
     inputs: &[Source<'_, super::Metal>],
 ) -> Vec<Fresh<super::Metal>> {
-    resident_matmul(program, a, b, inputs).unwrap_or_else(|| {
+    resident_matmul(program, space, a, b, inputs).unwrap_or_else(|| {
         let product = a.matmul(b);
         let sources = with_product(&product, inputs);
-        metal(program, product.shape(), &sources, &mut [])
+        metal(program, space, &sources, &mut [])
     })
 }
 
@@ -3999,14 +4907,14 @@ mod device {
 #[cfg(all(feature = "metal", target_os = "macos"))]
 fn resident<T: crate::metal::MetalElement>(
     program: &Program<T>,
-    shape: (usize, usize),
+    space: &Space,
     inputs: &[Source<'_, super::Metal>],
     updated: &[Sink<'_, super::Metal>],
 ) -> Option<Vec<Fresh<super::Metal>>> {
     if !program.runs_on_metal() {
         return None;
     }
-    let len = shape.0 * shape.1;
+    let (shape, len) = (space.shape, space.len());
     let mut read = device::sources(inputs)?;
     let mut written = Vec::with_capacity(program.outputs.len());
     for target in updated {
@@ -4029,8 +4937,14 @@ fn resident<T: crate::metal::MetalElement>(
         );
     }
 
-    let places = shader_places(program, shape, inputs, 0)?;
-    crate::metal::fused_elementwise::<T>(&program.encode(), shape, &read, &written, &places)?;
+    let places = shader_places(program, space, inputs, 0)?;
+    crate::metal::fused_elementwise::<T>(
+        &program.encode(Some(space)),
+        shape,
+        &read,
+        &written,
+        &places,
+    )?;
     Some(
         fresh
             .into_iter()
@@ -4039,42 +4953,44 @@ fn resident<T: crate::metal::MetalElement>(
     )
 }
 
-/// Where each input slot of `program` is read through each remap, for the
-/// shaders: entry `slot·4 + remap` is `[offset, row step, column step]` (see
-/// [`Place`]). `inputs` are the given inputs from slot `first` on; every other
-/// slot — a product, a statistic, a tensor updated in place — is read in
-/// order. `None` if a read would reach past its buffer, or an index does not
-/// fit the shaders' 32 bits.
+/// Where each of `program`'s distinct loads reads, for the shaders: entry `k`
+/// is load `k`'s [`Place`] as `FusedPlace` lays it out in `common.h`. `inputs`
+/// are the given inputs from slot `first` on; every other slot — a product, a
+/// statistic, a tensor updated in place — is read in order. `None` if a read
+/// would reach past its buffer, or an index does not fit the shaders' 32 bits.
 #[cfg(all(feature = "metal", target_os = "macos"))]
 fn shader_places<T>(
     program: &Program<T>,
-    shape: (usize, usize),
+    space: &Space,
     inputs: &[Source<'_, super::Metal>],
     first: usize,
-) -> Option<Vec<[u32; 3]>> {
-    let mut table = vec![[0u32; 3]; MAX_INPUTS * 4];
-    // Every load, and every input a row statistic is of — which the kernel
-    // reads in order, whether or not the program loads it otherwise.
-    let loads = program.code.iter().filter_map(|instr| match *instr {
-        Instr::Load { input, remap, .. } => Some((input, remap)),
-        _ => None,
-    });
-    let statistics = program.derived.iter().map(|&(of, _)| (of, Remap::Identity));
-    for (input, remap) in loads.chain(statistics) {
-        let slot = usize::from(input);
-        let source = slot.checked_sub(first).and_then(|index| inputs.get(index));
-        let place = Place::of(source.and_then(|source| source.view), remap, shape);
+) -> Option<Vec<crate::metal::FusedPlace>> {
+    let mut table = Vec::with_capacity(program.loads.len().max(1));
+    for (&(slot, _), place) in program.loads.iter().zip(&space.places) {
+        let source = usize::from(slot)
+            .checked_sub(first)
+            .and_then(|index| inputs.get(index));
         if let Some(source) = source
-            && shape.0 * shape.1 != 0
-            && place.end(shape) > device::stored_len(source)?
+            && space.len() != 0
+            && place.end(space.shape) > device::stored_len(source)?
         {
             return None;
         }
-        table[slot * 4 + remap as usize] = [
-            u32::try_from(place.offset).ok()?,
-            u32::try_from(place.row).ok()?,
-            u32::try_from(place.col).ok()?,
-        ];
+        let word = |value: usize| u32::try_from(value).ok();
+        let mut entry = crate::metal::FusedPlace {
+            offset: word(place.offset)?,
+            col: word(place.col)?,
+            lead: u32::from(place.lead),
+            ..Default::default()
+        };
+        for k in 0..usize::from(place.lead) {
+            entry.dims[k] = word(place.dims[k])?;
+            entry.steps[k] = word(place.steps[k])?;
+        }
+        table.push(entry);
+    }
+    if table.is_empty() {
+        table.push(crate::metal::FusedPlace::default());
     }
     Some(table)
 }
@@ -4082,6 +4998,7 @@ fn shader_places<T>(
 #[cfg(all(feature = "metal", target_os = "macos"))]
 fn resident_matmul<T: crate::metal::MetalElement>(
     program: &Program<T>,
+    space: &Space,
     a: &Matrix<T, super::Metal>,
     b: &Matrix<T, super::Metal>,
     inputs: &[Source<'_, super::Metal>],
@@ -4097,9 +5014,9 @@ fn resident_matmul<T: crate::metal::MetalElement>(
     let written: Vec<&device::Raw> = fresh.iter().map(device::Allocation::raw).collect();
 
     // The product is input 0, and the given inputs follow it.
-    let places = shader_places(program, (m, n), inputs, 1)?;
+    let places = shader_places(program, space, inputs, 1)?;
     crate::metal::matmul_epilogue::<T>(
-        &program.encode(),
+        &program.encode(Some(space)),
         (m, k, n),
         left,
         right,
