@@ -400,6 +400,9 @@ pub enum ProgramError {
     },
     /// More in-place tensors than inputs or outputs.
     BadUpdateCount,
+    /// The builder multiplies matrices or takes dot products, which one
+    /// elementwise kernel cannot: build it with [`Builder::build_graph`].
+    NotElementwise,
     /// A program with no outputs does nothing.
     NoOutputs,
 }
@@ -463,6 +466,10 @@ impl fmt::Display for ProgramError {
             ProgramError::BadUpdateCount => {
                 write!(f, "more in-place tensors than inputs or outputs")
             }
+            ProgramError::NotElementwise => write!(
+                f,
+                "the program has matrix or dot products, which need `Builder::build_graph`"
+            ),
             ProgramError::NoOutputs => write!(f, "the program has no outputs"),
         }
     }
@@ -1662,6 +1669,15 @@ enum Node<T> {
     Binary(BinaryOp, usize, usize),
     Unary(Analytic, usize),
     Cmp(Compare, usize, usize),
+    /// The matrix product of two matrices.
+    MatMul(usize, usize),
+    /// The dot products of two values along their last axis, after they
+    /// broadcast together.
+    Dot(usize, usize),
+    /// A product's value — a [`MatMul`](Node::MatMul) or a
+    /// [`Dot`](Node::Dot) — read through a remap from this value's axes to
+    /// the product's.
+    View(usize, Remap),
 }
 
 /// Assembles a [`Program`] from single-assignment values, allocating registers.
@@ -1677,6 +1693,11 @@ enum Node<T> {
 /// permuted or broadcast: [`permute`](Self::permute) and
 /// [`broadcast_to`](Self::broadcast_to) only change where each element is
 /// read from.
+///
+/// [`matmul`](Self::matmul) and [`dot`](Self::dot) are not elementwise: a
+/// builder that uses them builds a [`Graph`] of several kernels with
+/// [`build_graph`](Self::build_graph), the elementwise work around each
+/// product fused into it.
 ///
 /// `T` is the element type the program will compute in, and is normally inferred
 /// from the first constant or the tensors the program runs over.
@@ -1972,6 +1993,107 @@ impl<T: Real> Builder<T> {
         self.var(id)
     }
 
+    /// The matrix product `a·b` of an `m × k` matrix and a `k × n` one: an
+    /// `m × n` matrix.
+    ///
+    /// A product is not elementwise, so a builder that uses one builds a
+    /// [`Graph`] with [`build_graph`](Self::build_graph). Elementwise work
+    /// that reads the product is fused into the product's kernel as its
+    /// epilogue, and an operand computed elementwise is computed by a kernel
+    /// of its own first — or by the epilogue of the product it is computed
+    /// from.
+    ///
+    /// ```
+    /// use tensorcrate::tensors::fused::{Builder, DType, Decl};
+    /// use tensorcrate::tensors::{Compare, Matrix, Vector};
+    ///
+    /// // relu(x·w + bias): one product, the rest its epilogue.
+    /// let mut b = Builder::<f32>::new();
+    /// let x = b.input(Decl::matrix(DType::F32, (2, 2)));
+    /// let w = b.input(Decl::matrix(DType::F32, (2, 2)));
+    /// let bias = b.input(Decl::vector(DType::F32, 2));
+    /// let product = b.matmul(x, w);
+    /// let shifted = b.add(product, bias);
+    /// let zero = b.constant(0.0);
+    /// let relu = b.compare(Compare::Max, shifted, zero);
+    /// b.output(relu, DType::F32);
+    /// let layer = b.build_graph().unwrap();
+    /// assert_eq!(layer.kernels(), 1);
+    ///
+    /// let x = Matrix::from_rows([[1.0f32, 2.0], [3.0, 4.0]]);
+    /// let w = Matrix::from_rows([[1.0f32, -1.0], [0.0, 1.0]]);
+    /// let bias = Vector::new([0.5f32, -2.5]);
+    /// let y = layer.run(&[&x, &w, &bias], &mut []).remove(0).into_matrix::<f32>();
+    /// assert_eq!(y.to_rows(), [[1.5, 0.0], [3.5, 0.0]]);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// If either operand is not a matrix, or their inner dimensions differ.
+    #[track_caller]
+    pub fn matmul(&mut self, a: Var, b: Var) -> Var {
+        let (x, y) = (self.meta[a.id()], self.meta[b.id()]);
+        let fits = x.dims.len() == 2 && y.dims.len() == 2 && x.dims[1] == y.dims[0];
+        assert!(
+            fits,
+            "fused builder: cannot multiply a {:?} value by a {:?} one as matrices",
+            x.dims, y.dims
+        );
+        let meta = Meta {
+            dims: Dims::new(&[x.dims[0], y.dims[1]], "fused builder"),
+            dtype: dtype_of::<T>(),
+            tensor: x.tensor || y.tensor,
+        };
+        let id = self.node(Node::MatMul(a.id(), b.id()), meta);
+        self.var(id)
+    }
+
+    /// The dot products of `a` and `b` along their last axis, after they
+    /// broadcast together: of two vectors, a scalar; of a `rows × n` matrix
+    /// and an `n`-vector, the `rows` dot products of each row with it.
+    ///
+    /// A dot product is not elementwise, so a builder that uses one builds a
+    /// [`Graph`] with [`build_graph`](Self::build_graph). The products of the
+    /// elements, and the elementwise work they are computed from, are fused
+    /// into the kernel that sums them: on Metal they are never stored.
+    ///
+    /// ```
+    /// use tensorcrate::tensors::fused::{Builder, DType, Decl};
+    /// use tensorcrate::tensors::{Matrix, Vector};
+    ///
+    /// // Each row of x, scaled by two, dotted with v.
+    /// let mut b = Builder::<f32>::new();
+    /// let x = b.input(Decl::matrix(DType::F32, (2, 3)));
+    /// let v = b.input(Decl::vector(DType::F32, 3));
+    /// let doubled = b.scale(x, 2.0);
+    /// let dots = b.dot(doubled, v);
+    /// b.output(dots, DType::F32);
+    /// let graph = b.build_graph().unwrap();
+    ///
+    /// let x = Matrix::from_rows([[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0]]);
+    /// let v = Vector::new([1.0f32, 0.0, -1.0]);
+    /// let y = graph.run(&[&x, &v], &mut []).remove(0).into_vector::<f32>();
+    /// assert_eq!(y.to_vec(), [-4.0, -4.0]);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// If `a` and `b` do not broadcast together, or broadcast to a scalar.
+    #[track_caller]
+    pub fn dot(&mut self, a: Var, b: Var) -> Var {
+        let joined = self.join(a, b);
+        assert!(
+            !joined.dims.is_empty(),
+            "fused builder: a dot product needs an axis to sum along"
+        );
+        let meta = Meta {
+            dims: joined.dims.removed(joined.dims.len() - 1),
+            ..joined
+        };
+        let id = self.node(Node::Dot(a.id(), b.id()), meta);
+        self.var(id)
+    }
+
     /// `x` with its axes reordered: axis `k` of the result is axis `axes[k]`
     /// of `x`, as [`Tensor::permute`](super::Tensor::permute) reorders a
     /// tensor's. Nothing moves: every input `x` is computed from is read
@@ -2094,6 +2216,10 @@ impl<T: Real> Builder<T> {
                 );
                 self.rebuilt(id, Node::Cmp(op, a, b), meta)
             }
+            // A product's value is computed whole, then read through the
+            // remap like an input.
+            Node::MatMul(..) | Node::Dot(..) => self.node(Node::View(id, map), meta),
+            Node::View(of, remap) => self.node(Node::View(of, remap.through(map)), meta),
         };
         self.reindexed.insert((id, map, dims), found);
         found
@@ -2226,6 +2352,9 @@ impl<T: Real> Builder<T> {
                 Node::Binary(_, a, b) | Node::Cmp(_, a, b) => pending.extend([a, b]),
                 Node::Unary(_, a) => pending.push(a),
                 Node::Load(..) | Node::Const(_) | Node::Uniform(_) => {}
+                Node::MatMul(..) | Node::Dot(..) | Node::View(..) => {
+                    return Err(ProgramError::NotElementwise);
+                }
             }
         }
 
@@ -2281,6 +2410,9 @@ impl<T: Real> Builder<T> {
                 Node::Binary(op, a, b) => optimizer::Node::Binary(bin(op), at(a), at(b)),
                 Node::Unary(op, a) => optimizer::Node::Unary(optimizer::Function(op as u16), at(a)),
                 Node::Cmp(op, a, b) => optimizer::Node::Cmp(cmp(op), at(a), at(b)),
+                Node::MatMul(..) | Node::Dot(..) | Node::View(..) => {
+                    unreachable!("refused above")
+                }
             };
             position[id] = nodes.len();
             nodes.push(node);
@@ -2328,6 +2460,9 @@ impl<T: Real> Builder<T> {
         Ok(program)
     }
 }
+
+mod graph;
+pub use graph::Graph;
 
 // ---- optimization -----------------------------------------------------------------
 
@@ -2801,6 +2936,13 @@ pub trait Fusable<B: Backend> {
     fn shape(&self) -> Option<(usize, usize)> {
         None
     }
+
+    /// The tensor itself, for a [`Graph`] to hand to a product kernel that
+    /// takes a [`Matrix`] — when it is one. Anything else is copied into one.
+    #[doc(hidden)]
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
 }
 
 /// A tensor a [`Program`] can also update in place: a [`Vector`], a
@@ -2852,6 +2994,10 @@ impl<T: Element, B: Backend> Fusable<B> for Matrix<T, B> {
 
     fn shape(&self) -> Option<(usize, usize)> {
         Some(Matrix::shape(self))
+    }
+
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
     }
 }
 

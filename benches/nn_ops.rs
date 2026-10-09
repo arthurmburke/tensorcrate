@@ -800,6 +800,68 @@ fn dense_layer<B: Kernels>(
     }
 }
 
+/// `relu(X·W₁ + b₁)·W₂ + b₂` as a [`fused::Graph`]: two products, each with
+/// the elementwise work after it as its epilogue.
+fn two_layer_graph(batch: usize, inputs: usize, hidden: usize, outputs: usize) -> fused::Graph {
+    let f = DType::F32;
+    let mut b = Builder::new();
+    let x = b.input(Decl::matrix(f, (batch, inputs)));
+    let w1 = b.input(Decl::matrix(f, (inputs, hidden)));
+    let b1 = b.input(Decl::vector(f, hidden));
+    let w2 = b.input(Decl::matrix(f, (hidden, outputs)));
+    let b2 = b.input(Decl::vector(f, outputs));
+    let first = b.matmul(x, w1);
+    let shifted = b.add(first, b1);
+    let zero = b.constant(0.0);
+    let hidden_layer = b.compare(Compare::Max, shifted, zero);
+    let second = b.matmul(hidden_layer, w2);
+    let y = b.add(second, b2);
+    b.output(y, f);
+    b.build_graph().unwrap()
+}
+
+fn two_layers<B: Kernels>(
+    graph: &fused::Graph,
+    (batch, inputs, hidden, outputs): (usize, usize, usize, usize),
+) -> impl FnMut() -> Matrix<f32, B> {
+    let x = matrix::<B>(batch, inputs, 1);
+    let w1 = matrix::<B>(inputs, hidden, 2);
+    let b1 = vector::<B>(hidden, 3);
+    let w2 = matrix::<B>(hidden, outputs, 4);
+    let b2 = vector::<B>(outputs, 5);
+    move || {
+        let operands: [&dyn Fusable<B>; 5] = [&x, &w1, &b1, &w2, &b2];
+        graph.run(&operands, &mut []).remove(0).into_matrix::<f32>()
+    }
+}
+
+/// `(2X + 1)·v` for each row of X, as a [`fused::Graph`]: one kernel that
+/// computes the products and sums them.
+fn row_dot_graph(rows: usize, cols: usize) -> fused::Graph {
+    let f = DType::F32;
+    let mut b = Builder::new();
+    let x = b.input(Decl::matrix(f, (rows, cols)));
+    let v = b.input(Decl::vector(f, cols));
+    let doubled = b.scale(x, 2.0);
+    let shifted = b.shift(doubled, 1.0);
+    let dots = b.dot(shifted, v);
+    b.output(dots, f);
+    b.build_graph().unwrap()
+}
+
+fn row_dots<B: Kernels>(
+    graph: &fused::Graph,
+    rows: usize,
+    cols: usize,
+) -> impl FnMut() -> Vector<f32, B> {
+    let x = matrix::<B>(rows, cols, 1);
+    let v = vector::<B>(cols, 2);
+    move || {
+        let operands: [&dyn Fusable<B>; 2] = [&x, &v];
+        graph.run(&operands, &mut []).remove(0).into_vector::<f32>()
+    }
+}
+
 fn adam_step<B: Kernels>(len: usize) -> impl FnMut() {
     let gradient = vector::<B>(len, 1);
     let mut parameters = vector::<B>(len, 2);
@@ -935,6 +997,37 @@ fn fusion(bench: &mut Bench) {
             1e-2,
             |B| dense_layer::<B>(&dense, batch, inputs, outputs)
         );
+    }
+
+    // A graph of two layers: the same products, with the bias, the
+    // activation and the hidden layer's store fused into the first.
+    for shape in bench.cfg.pick(&[
+        (32, 256, 256, 10),
+        (128, 512, 512, 64),
+        (512, 1024, 1024, 128),
+    ]) {
+        let (batch, inputs, hidden, outputs) = shape;
+        let graph = two_layer_graph(batch, inputs, hidden, outputs);
+        let title = format!("graph relu(X·W₁+b₁)·W₂+b₂, {batch}×{inputs}×{hidden}×{outputs}");
+        let flops = 2.0 * (batch * hidden * (inputs + outputs)) as f64;
+        fusion_case!(
+            bench,
+            G,
+            title,
+            Work::Flops(flops),
+            1e-2,
+            |B| two_layers::<B>(&graph, shape)
+        );
+    }
+
+    // Dot products whose operands are computed: the products are summed as
+    // they are computed, never stored.
+    for (rows, cols) in bench.cfg.pick(&[(256, 1024), (4096, 512), (512, 8192)]) {
+        let graph = row_dot_graph(rows, cols);
+        let title = format!("graph row dots (2X+1)·v, {rows}×{cols}");
+        fusion_case!(bench, G, title, Work::Elements(rows * cols), 1e-3, |B| {
+            row_dots::<B>(&graph, rows, cols)
+        });
     }
 
     for len in bench.cfg.pick(&[65_536, 1 << 20]) {

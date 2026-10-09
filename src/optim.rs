@@ -996,7 +996,7 @@ impl<P: Parameter> Rule<P> for RmsProp<P> {
 /// [uniforms](crate::tensors::fused::Builder::uniform), set before each run, so
 /// later updates build nothing; changing a coefficient field between updates
 /// takes effect at the next one. The programs are optimized under the thread's
-/// [`Algebra`](crate::tensors::fused::Algebra) when they are built.
+/// [`Algebra`] when they are built.
 #[derive(Clone, Debug)]
 pub struct Adam<P: Parameter> {
     pub rate: P::Elem,

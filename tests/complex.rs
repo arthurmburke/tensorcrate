@@ -1,5 +1,6 @@
 use tensorcrate::numbers::{
-    Arccos, Arcsin, Arctan, Complex, Cos, Cosh, Csc, Exp, Ln, Power, Sec, Sin, Sinh, Tan, Tanh,
+    Arccos, Arcsin, Arctan, Complex, Conj, Cos, Cosh, Csc, Exp, Ln, Power, Sec, Sin, Sinh, Tan,
+    Tanh,
 };
 
 fn close(a: f64, b: f64) -> bool {

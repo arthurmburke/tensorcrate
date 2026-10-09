@@ -446,7 +446,7 @@ fn call(
             let inner = lower(&args[0], target, env, backend)?;
             if !target.dual {
                 return Ok(elementwise(
-                    quote!(::tensorcrate::numbers::Complex::conj),
+                    quote!(::tensorcrate::__private::conj),
                     inner,
                     target,
                 ));
@@ -455,8 +455,8 @@ fn call(
                 quote!({
                     let __dual = #value;
                     ::tensorcrate::numbers::Dual::new(
-                        ::tensorcrate::numbers::Complex::conj(__dual.real),
-                        ::tensorcrate::numbers::Complex::conj(__dual.dual),
+                        ::tensorcrate::__private::conj(__dual.real),
+                        ::tensorcrate::__private::conj(__dual.dual),
                     )
                 })
             };

@@ -56,6 +56,13 @@ mod vmath;
 /// names here may change with the macro.
 #[doc(hidden)]
 pub mod __private {
+    /// `value`'s conjugate, taken by value as `math!` applies a function to
+    /// each element.
+    #[inline(always)]
+    pub fn conj<T: crate::numbers::Conj>(value: T) -> T::Output {
+        value.conj()
+    }
+
     /// Record one kernel a `math!` block fused on the host, so the
     /// [`counters`](crate::counters) see it like any other kernel.
     #[inline(always)]
