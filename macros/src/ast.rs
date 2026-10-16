@@ -132,6 +132,7 @@ pub(crate) enum Builtin {
     Transpose,
     Conj,
     Dotc,
+    Cross,
     Adjoint,
     Analytic(Function),
 }
@@ -153,6 +154,7 @@ impl Builtin {
             ("pow", 2) => Builtin::Pow,
             ("dot", 2) => Builtin::Dot,
             ("dotc", 2) => Builtin::Dotc,
+            ("cross", 2) => Builtin::Cross,
             ("matmul", 2) => Builtin::MatMul,
             ("det", 1) => Builtin::Det,
             ("inv", 1) => Builtin::Inv,
@@ -178,6 +180,7 @@ impl Builtin {
             Builtin::Pow => "pow",
             Builtin::Dot => "dot",
             Builtin::Dotc => "dotc",
+            Builtin::Cross => "cross",
             Builtin::Adjoint => "adjoint",
             Builtin::MatMul => "matmul",
             Builtin::Det => "det",

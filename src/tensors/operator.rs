@@ -25,6 +25,9 @@ pub struct Apply<T> {
 /// not require ordered arithmetic or analytic functions. Metal supports `f32`
 /// and `Complex<f32>`; Host also supports their `f64` counterparts.
 pub trait OperatorBackend<T: Field>: Backend {
+    /// Whether the backend benefits from packed, batched orthogonalization.
+    #[doc(hidden)]
+    const BATCHED_ARNOLDI: bool = false;
     #[doc(hidden)]
     fn dense(
         a: &Self::Storage<T>,
@@ -63,6 +66,22 @@ pub trait OperatorBackend<T: Field>: Backend {
     fn inner(x: &Self::Storage<T>, y: &Self::Storage<T>, len: usize) -> T;
     #[doc(hidden)]
     fn norm(x: &Self::Storage<T>, len: usize) -> f64;
+    /// Two passes of classical Gram-Schmidt. Basis vectors are contiguous rows.
+    /// Returns accumulated projections, the original norm, and the final norm.
+    #[doc(hidden)]
+    fn orthogonalize(
+        basis: &Self::Storage<T>,
+        n: usize,
+        count: usize,
+        work: &mut Self::Storage<T>,
+    ) -> (Vec<T>, f64, f64);
+    #[doc(hidden)]
+    fn triangular(
+        a: &super::TriangularOperator<T, Self>,
+        x: &Self::Storage<T>,
+        y: &mut Self::Storage<T>,
+        p: Apply<T>,
+    );
 }
 
 /// An object-safe linear map, including rectangular and matrix-free maps.
@@ -439,5 +458,74 @@ impl<T: Field> OperatorBackend<T> for Host {
         x[..len]
             .iter()
             .fold(0.0, |n: f64, x| n.hypot(x.magnitude()))
+    }
+    fn orthogonalize(
+        basis: &Vec<T>,
+        n: usize,
+        count: usize,
+        work: &mut Vec<T>,
+    ) -> (Vec<T>, f64, f64) {
+        assert!(count.checked_mul(n).is_some_and(|size| size <= basis.len()));
+        assert_eq!(work.len(), n);
+        let before = Self::norm(work, n);
+        let mut total = vec![T::zero(); count];
+        for _ in 0..2 {
+            let projections: Vec<T> = (0..count)
+                .map(|k| {
+                    basis[k * n..(k + 1) * n]
+                        .iter()
+                        .zip(&*work)
+                        .fold(T::zero(), |s, (v, w)| s + v.conj() * *w)
+                })
+                .collect();
+            for (sum, &value) in total.iter_mut().zip(&projections) {
+                *sum = *sum + value;
+            }
+            for (i, w) in work.iter_mut().enumerate() {
+                let sum = (0..count).fold(T::zero(), |s, k| s + basis[k * n + i] * projections[k]);
+                *w = *w - sum;
+            }
+        }
+        let after = Self::norm(work, n);
+        (total, before, after)
+    }
+    fn triangular(a: &super::TriangularOperator<T>, x: &Vec<T>, y: &mut Vec<T>, p: Apply<T>) {
+        let mut result = vec![T::zero(); a.matrix.rows()];
+        let (offsets, columns, order) = if p.adjoint {
+            (
+                &a.matrix.adjoint_offsets,
+                &a.matrix.adjoint_columns,
+                &a.adjoint_rows,
+            )
+        } else {
+            (&a.matrix.offsets, &a.matrix.columns, &a.rows)
+        };
+        for &row in order {
+            let row = row as usize;
+            let mut rhs = x[p.input + row];
+            let mut diagonal = T::one();
+            let start = offsets[row] as usize;
+            let end = offsets[row + 1] as usize;
+            for (local, &col) in columns[start..end].iter().enumerate() {
+                let k = start + local;
+                let col = col as usize;
+                let value = if p.adjoint {
+                    a.matrix.values[a.matrix.adjoint_positions[k] as usize].conj()
+                } else {
+                    a.matrix.values[k]
+                };
+                if col == row {
+                    if !a.unit_diagonal {
+                        diagonal = value;
+                    }
+                } else if !value.is_zero() {
+                    rhs = rhs - value * result[col];
+                }
+            }
+            result[row] = rhs / diagonal;
+        }
+        for (i, &value) in result.iter().enumerate() {
+            store(y, i, value, p);
+        }
     }
 }

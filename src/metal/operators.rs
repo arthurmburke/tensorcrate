@@ -27,14 +27,14 @@ impl OperatorElement for Complex<f32> {
     const OPERATOR_INDEX: usize = 1;
 }
 
-fn device<T: Copy + 'static>(storage: &MetalStorage<T>) -> &MetalBuffer<T> {
+pub(super) fn device<T: Copy + 'static>(storage: &MetalStorage<T>) -> &MetalBuffer<T> {
     storage
         .device()
         .expect("Metal operator requires device-resident storage")
 }
 
 #[allow(clippy::too_many_arguments)]
-fn dispatch<T: OperatorElement>(
+pub(super) fn dispatch<T: OperatorElement>(
     values: &MetalBuffer<T>,
     indices: [Option<&MetalBuffer<u32>>; 3],
     x: &MetalBuffer<T>,
@@ -130,6 +130,23 @@ fn dispatch<T: OperatorElement>(
 }
 
 impl<T: OperatorElement> OperatorBackend<T> for Metal {
+    const BATCHED_ARNOLDI: bool = true;
+    fn orthogonalize(
+        basis: &MetalStorage<T>,
+        n: usize,
+        count: usize,
+        work: &mut MetalStorage<T>,
+    ) -> (Vec<T>, f64, f64) {
+        super::krylov::orthogonalize(basis, n, count, work)
+    }
+    fn triangular(
+        a: &crate::tensors::TriangularOperator<T, Self>,
+        x: &MetalStorage<T>,
+        y: &mut MetalStorage<T>,
+        p: Apply<T>,
+    ) {
+        super::krylov::triangular(a, x, y, p);
+    }
     fn dense(
         a: &MetalStorage<T>,
         shape: (usize, usize),
@@ -374,6 +391,37 @@ mod tests {
                 Complex::new(2.0, -1.0),
                 Complex::new(3.0, 1.0)
             ]
+        );
+    }
+
+    #[test]
+    fn repeated_operator_calls_share_command_buffers() {
+        let a = CsrMatrix::from_triplets(2, 2, [(0, 0, 2.0f32), (1, 1, 3.0)]).to_backend::<Metal>();
+        let x = Vector::new([1.0f32, 1.0]).to_backend::<Metal>();
+        let mut y = Vector::<f32>::zeros(2).to_backend::<Metal>();
+        super::super::synchronize();
+        let before =
+            with_gpu(|gpu| Some((gpu.committed.get(), gpu.operations.get(), gpu.waits.get())))
+                .unwrap();
+        for _ in 0..70 {
+            a.apply_add(1.0, &x, 1.0, &mut y);
+        }
+        let queued =
+            with_gpu(|gpu| Some((gpu.committed.get(), gpu.operations.get(), gpu.waits.get())))
+                .unwrap();
+        assert_eq!(
+            queued.0 - before.0,
+            2,
+            "70 small dispatches should submit two full batches before the final read"
+        );
+        assert_eq!(queued.1 - before.1, 70);
+        assert_eq!(queued.2, before.2);
+        assert_eq!(y.as_slice(), [140.0, 210.0]);
+        let committed = with_gpu(|gpu| Some(gpu.committed.get())).unwrap();
+        assert_eq!(
+            committed - before.0,
+            3,
+            "final read should submit the remaining six dispatches once"
         );
     }
 }

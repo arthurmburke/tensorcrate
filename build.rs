@@ -7,6 +7,7 @@ fn main() {
     println!("cargo:rerun-if-changed=metal/tensorops.metal");
     println!("cargo:rerun-if-changed=metal/common.h");
     println!("cargo:rerun-if-changed=metal/operators.metal");
+    println!("cargo:rerun-if-changed=metal/krylov.metal");
     println!("cargo:rerun-if-env-changed=DEVELOPER_DIR");
 
     if env::var_os("CARGO_FEATURE_METAL").is_none()

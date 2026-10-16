@@ -8,7 +8,7 @@
 //! cargo test --release --benches                   # smoke run: one pass of each case
 //! ```
 //!
-//! Five groups, each comparing one axis of the design:
+//! Groups comparing execution strategies and finite-element building blocks:
 //!
 //! | group           | compares                                                           |
 //! |-----------------|--------------------------------------------------------------------|
@@ -17,6 +17,9 @@
 //! | `simd`          | scalar loop, direct SIMD kernel and the Host API, per kernel       |
 //! | `dispatch`      | launch latency, pipelined launches, and host↔device transfers      |
 //! | `training`      | a whole MLP step (forward, backward, Adam), fused and unfused      |
+//! | `fem`           | assembled, element, and mixed block operators                    |
+//! | `solver`        | GMRES synchronization and triangular dependency schedules       |
+//! | `geometry`      | stack values and reusable element calculations                  |
 //!
 //! # Reading the tables
 //!
@@ -1511,6 +1514,8 @@ fn main() {
     dispatch(&mut bench);
     training(&mut bench);
     fem_operators(&mut bench);
+    solver_efficiency(&mut bench);
+    small_geometry(&mut bench);
 
     if bench.cases == 0 {
         println!("\nno case matches {:?}", bench.cfg.filters);
@@ -1647,5 +1652,143 @@ fn fem_operators(bench: &mut Bench) {
             assert_eq!(report.reason, StopReason::Converged);
             black_box(x)
         });
+    }
+}
+
+fn small_geometry(bench: &mut Bench) {
+    use tensorcrate::geometry::{AffineTetrahedron, Cross, Mat3, QuadratureRule, Vec3};
+    if let Some(mut case) = bench.case("geometry", "3D cross product", Work::Steps) {
+        let a = Vec3::new([1.0f64, 2.0, 3.0]);
+        let b = Vec3::new([-2.0f64, 1.0, 4.0]);
+        let av = Vector::new(a.0);
+        let bv = Vector::new(b.0);
+        assert_eq!(a.cross(&b).0, av.cross(&bv).as_slice());
+        case.row("dynamic vector (allocating)", Drain::None, || {
+            black_box(&av).cross(black_box(&bv))
+        });
+        case.row("stack vector", Drain::None, || {
+            black_box(&a).cross(black_box(&b))
+        });
+    }
+    if let Some(mut case) = bench.case("geometry", "pivoted 3x3 solve", Work::Steps) {
+        let a = Mat3::new([[0.0f64, 2.0, 1.0], [1.0, -2.0, 0.0], [3.0, 1.0, 2.0]]);
+        let rhs = Vec3::new([1.0, 2.0, 3.0]);
+        let lu = a.lu().unwrap();
+        let want = lu.solve(&rhs).unwrap();
+        for (a, b) in a.matvec(&want).0.into_iter().zip(rhs.0) {
+            assert!((a - b).abs() < 1e-12);
+        }
+        case.row("factor and solve", Drain::None, || {
+            black_box(&a).solve(black_box(&rhs)).unwrap()
+        });
+        case.row("reused LU factors", Drain::None, || {
+            black_box(&lu).solve(black_box(&rhs)).unwrap()
+        });
+    }
+    if let Some(mut case) = bench.case("geometry", "tetrahedral degree-2 integration", Work::Steps)
+    {
+        let cell = AffineTetrahedron::from_vertices([
+            Vec3::new([0.0f64; 3]),
+            Vec3::new([2.0, 0.0, 0.0]),
+            Vec3::new([0.0, 3.0, 0.0]),
+            Vec3::new([0.0, 0.0, 4.0]),
+        ])
+        .unwrap();
+        let rule = QuadratureRule::<f64, 3>::tetrahedron(2).unwrap();
+        assert!((rule.integrate_mapped(&cell, |_| 1.0) - 4.0).abs() < 1e-12);
+        case.row("cached rule and Jacobian", Drain::None, || {
+            rule.integrate_mapped(black_box(&cell), |p| p[0] * p[1] + p[2])
+        });
+    }
+}
+
+fn solver_efficiency(bench: &mut Bench) {
+    use tensorcrate::solvers::{
+        GmresOptions, Orthogonalization, StopReason, gmres_with_orthogonalization,
+    };
+    use tensorcrate::tensors::{CsrMatrix, LinearOperator, Triangle, TriangularOperator};
+    if let Some(mut case) = bench.case("solver", "GMRES synchronization, n=128", Work::Steps) {
+        let a =
+            CsrMatrix::from_triplets(128, 128, (0..128).map(|i| (i, i, 2.0f32 + i as f32 / 64.0)));
+        let b = Vector::new(
+            (0..128)
+                .map(|i| 1.0f32 + (i % 3) as f32)
+                .collect::<Vec<_>>(),
+        );
+        let options = GmresOptions {
+            relative_tolerance: 1e-5,
+            restart: 24,
+            ..Default::default()
+        };
+        case.row("Host MGS2", Drain::None, || {
+            let mut x = Vector::zeros(128);
+            let report =
+                gmres_with_orthogonalization(&a, &b, &mut x, options, Orthogonalization::Backend)
+                    .unwrap();
+            assert_eq!(report.reason, StopReason::Converged);
+            black_box(x)
+        });
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            let a = a.to_backend::<Metal>();
+            let b = b.to_backend::<Metal>();
+            for (label, method) in [
+                (
+                    "Metal MGS2 reference",
+                    Orthogonalization::ModifiedGramSchmidt,
+                ),
+                ("Metal batched CGS2", Orthogonalization::Backend),
+            ] {
+                case.row(label, Drain::PerCall, || {
+                    let mut x = Vector::<f32, Metal>::filled(128, 0.0);
+                    let report =
+                        gmres_with_orthogonalization(&a, &b, &mut x, options, method).unwrap();
+                    assert_eq!(report.reason, StopReason::Converged);
+                    black_box(x)
+                });
+            }
+        }
+    }
+    for (n, width) in bench.cfg.pick(&[(128, 128), (4096, 8)]) {
+        let Some(mut case) = bench.case(
+            "solver",
+            &format!("triangular solve, n={n}, chain={width}"),
+            Work::Elements(n),
+        ) else {
+            continue;
+        };
+        let entries = (0..n).flat_map(|i| {
+            let mut row = vec![(i, i, 2.0f32)];
+            if i % width != 0 {
+                row.push((i, i - 1, -0.5));
+            }
+            row
+        });
+        let a = TriangularOperator::new(
+            CsrMatrix::from_triplets(n, n, entries),
+            Triangle::Lower,
+            false,
+        )
+        .unwrap();
+        assert_eq!(a.level_count(), width);
+        let x = Vector::filled(n, 1.0f32);
+        let mut y = Vector::zeros(n);
+        a.apply(&x, &mut y);
+        case.row("Host triangular", Drain::None, || {
+            a.apply(&x, &mut y);
+            black_box(&mut y);
+        });
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            let a = a.to_backend::<Metal>();
+            let x = x.to_backend::<Metal>();
+            let expected = y.to_vec();
+            let mut y = y.to_backend::<Metal>();
+            a.apply(&x, &mut y);
+            assert_close("triangular host vs GPU", y.as_slice(), &expected, 1e-5);
+            case.row("Metal level schedule (pipelined)", Drain::PerBatch, || {
+                a.apply(&x, &mut y)
+            });
+        }
     }
 }

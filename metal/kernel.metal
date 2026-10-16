@@ -1,5 +1,6 @@
 #include "common.h"
 #include "operators.metal"
+#include "krylov.metal"
 
 #define TILE 16
 #define REDUCE_GROUP 256

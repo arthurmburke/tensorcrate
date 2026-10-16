@@ -37,6 +37,7 @@ mod compact;
 pub mod core;
 pub mod counters;
 pub mod errors;
+pub mod geometry;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal;
 pub mod numbers;

@@ -454,6 +454,15 @@ fn call(builtin: Builtin, args: &[Expr<Ty>], span: Span) -> syn::Result<Ty> {
             }
             Ok(a.unify(b))
         }
+        Builtin::Cross => {
+            let (a, b) = (args[0].ty, args[1].ty);
+            if a.shape != b.shape || !matches!(a.shape, Shape::Vector(3) | Shape::Matrix(_, 3)) {
+                return Err(error(
+                    "`cross` expects matching vectors or matrices with last extent three".into(),
+                ));
+            }
+            Ok(a.unify(b))
+        }
         Builtin::Dot | Builtin::Dotc => {
             let (a, b) = (args[0].ty, args[1].ty);
             match (a.shape, b.shape) {

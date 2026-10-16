@@ -97,7 +97,9 @@ pub mod tape;
 
 mod algebra;
 mod chain;
+mod cross;
 mod csr;
+pub use crate::geometry::Cross;
 mod fft;
 mod hermitian;
 mod host_inplace;
@@ -112,6 +114,7 @@ mod sparse;
 mod strided;
 mod tensor;
 mod tensor_ops;
+mod triangular;
 mod vector;
 mod view;
 
@@ -153,6 +156,7 @@ pub use reduction::Axes;
 pub use sparse::SparseMatrix;
 pub use tape::{MatrixVar, ScalarVar, Tape, TensorVar, Var, VectorVar};
 pub use tensor::Tensor;
+pub use triangular::{Triangle, TriangularFactors, TriangularOperator};
 pub use vector::Vector;
 pub use view::TensorView;
 

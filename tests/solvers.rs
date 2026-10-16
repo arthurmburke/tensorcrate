@@ -34,6 +34,67 @@ fn check<T: Field>(a: &impl LinearOperator<T>, expected: Vector<T>, opts: GmresO
     }
 }
 
+#[cfg(all(feature = "metal", target_os = "macos"))]
+#[test]
+fn batched_gmres_matches_reference_on_a_nonnormal_complex_system() {
+    use tensorcrate::solvers::{Orthogonalization, gmres_with_orthogonalization};
+    use tensorcrate::tensors::Metal;
+    type C = Complex<f32>;
+    const N: usize = 24;
+    let a = CsrMatrix::from_triplets(
+        N,
+        N,
+        (0..N).flat_map(|i| {
+            let mut row = vec![(i, i, C::new(2.0, 0.2))];
+            if i > 0 {
+                row.push((i, i - 1, C::new(-0.8, 0.1)));
+            }
+            for j in i + 1..=(i + 3).min(N - 1) {
+                row.push((i, j, C::new(0.7, -0.2)));
+            }
+            row
+        }),
+    );
+    let expected = Vector::new(
+        (0..N)
+            .map(|i| C::new((i % 5) as f32 - 2.0, (i % 3) as f32 - 1.0))
+            .collect::<Vec<_>>(),
+    );
+    let mut rhs = Vector::zeros(N);
+    a.apply(&expected, &mut rhs);
+    let gpu = a.to_backend::<Metal>();
+    let b = rhs.to_backend::<Metal>();
+    let opts = GmresOptions {
+        restart: 16,
+        max_iterations: 300,
+        relative_tolerance: 2e-5,
+        ..Default::default()
+    };
+    for method in [
+        Orthogonalization::ModifiedGramSchmidt,
+        Orthogonalization::Backend,
+    ] {
+        let mut x = Vector::<C>::zeros(N).to_backend::<Metal>();
+        let report = gmres_with_orthogonalization(&gpu, &b, &mut x, opts, method).unwrap();
+        assert_eq!(report.reason, StopReason::Converged);
+        let mut actual = Vector::zeros(N);
+        a.apply(&x.to_backend(), &mut actual);
+        let residual = rhs
+            .as_slice()
+            .iter()
+            .zip(actual.as_slice())
+            .fold(0.0f64, |s, (&b, &ax)| s.hypot((b - ax).magnitude()));
+        let norm = rhs
+            .as_slice()
+            .iter()
+            .fold(0.0f64, |s, v| s.hypot(v.magnitude()));
+        assert!(residual <= 3e-5 * norm);
+        for (&actual, &expected) in x.as_slice().iter().zip(expected.as_slice()) {
+            assert!((actual - expected).magnitude() < 3e-3);
+        }
+    }
+}
+
 #[test]
 fn nonsymmetric_real_and_complex_systems_converge() {
     check(

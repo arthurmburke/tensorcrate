@@ -142,10 +142,19 @@ assert_eq!(report.reason, StopReason::Converged);
 # Ok::<(), tensorcrate::errors::Error>(())
 ```
 
-GMRES uses right preconditioning, two passes of modified Gram-Schmidt, complex
-unitary rotations, and true residual checks before reporting convergence.
+GMRES uses right preconditioning, reorthogonalization, complex unitary
+rotations, and true residual checks before reporting convergence. Host uses
+two passes of modified Gram-Schmidt. Metal uses two passes of classical
+Gram-Schmidt with packed basis vectors, returning coefficients and norms in
+one read per Arnoldi step. `gmres_with_orthogonalization` can select the
+modified Gram-Schmidt reference path for comparison.
 `gmres_preconditioned` accepts Host `Jacobi`, `Ilu0`, or custom preconditioners.
 ILU(0) preserves the CSR pattern and rejects zero pivots; it does not pivot.
+`Ilu0::operator::<Metal>()` transfers its factors and dependency schedules once
+for resident triangular solves. `TriangularOperator` also supports standalone
+lower, upper, unit-diagonal, and adjoint solves. Independent rows execute per
+level, with no CPU synchronization between levels. Long dependency chains
+remain inefficient on a GPU.
 `gmres_preconditioned_operator` accepts an inverse operator, including a block
 preconditioner. `Jacobi::operator::<B>()` produces a diagonal inverse map.
 
@@ -172,6 +181,49 @@ program instructions.
 Run `cargo run --release --example fem_operators` for a complex block solve
 on Host and Metal, or `cargo bench --bench nn_ops -- fem` for the operator
 benchmarks. See [performance notes](docs/fem-performance.md).
+
+## Small geometry and integration
+
+`geometry::{Vec2, Vec3, Mat2, Mat3}` are aliases for stack-allocated
+`SmallVector<T, N>` and `SmallMatrix<T, R, C>` values. The default type is
+`f64`. Their algebra supports real, complex and dual coefficients where
+appropriate. `SmallLu` provides reusable scaled-partial-pivoting factors for
+real floating-point matrices. Its relative pivot tolerance rejects singular
+or numerically singular inputs; it never silently perturbs a pivot.
+
+```rust
+use tensorcrate::geometry::{AffineTetrahedron, QuadratureRule, Vec3};
+
+let cell = AffineTetrahedron::from_vertices([
+    Vec3::new([0.0, 0.0, 0.0]), Vec3::new([2.0, 0.0, 0.0]),
+    Vec3::new([0.0, 3.0, 0.0]), Vec3::new([0.0, 0.0, 4.0]),
+])?;
+let rule = QuadratureRule::<f64, 3>::tetrahedron(2)?;
+let integral = rule.integrate_mapped(&cell, |x| x[0] + x[1] + x[2]);
+assert!((integral - 9.0).abs() < 1e-12);
+# Ok::<(), tensorcrate::errors::Error>(())
+```
+
+`Jacobian` maps vectors, gradients, curls, and covariant/contravariant Piola
+fields. It retains the signed determinant for differential mappings and uses
+its absolute value for integration. `AffineTriangle` and `AffineTetrahedron`
+provide coordinate and barycentric maps. `Triangle3` handles planar boundary
+triangles embedded in 3D. These are affine maps; curved cells are not included.
+
+Quadrature supports Gauss-Legendre rules on `[0, 1]` (orders 1 through 16),
+triangles (total degree up to 30), and tetrahedra (up to 29). Low-order simplex
+rules are symmetric; higher degrees use tensor Gauss rules under a Duffy
+mapping. Weights include reference measure: `1`, `1/2`, or `1/6`. Polynomial
+exactness refers to exact arithmetic; floating-point evaluation rounds.
+
+`Cross` applies a three-dimensional cross product to fixed-size vectors,
+dynamic vectors, and the last axis of matrices/tensors. Host supports generic
+coefficients; Metal has a single fused kernel for `f32`, `f16`, `bf16`, and
+`Complex<f32>`. `math!` supports `cross(a, b)` on matching vectors or matrices
+with a last extent of three. Products do not broadcast.
+
+Run `cargo run --release --example geometry_and_gpu` for mapped integration
+and a resident ILU-preconditioned solve.
 
 ## N-dimensional tensors
 

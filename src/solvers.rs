@@ -1,16 +1,27 @@
 //! Restarted GMRES with right preconditioning for real and complex systems.
 //!
 //! The convergence test always checks the true residual `b - A x`. Arnoldi
-//! uses two passes of modified Gram-Schmidt and complex unitary rotations.
+//! uses reorthogonalization and complex unitary rotations. Metal batches both
+//! classical Gram-Schmidt passes and their norms into one read per Arnoldi step.
 //! Krylov vectors stay on their backend. Metal reductions return small partial
 //! sums to the CPU; Hessenberg matrices and convergence decisions run there.
-//! ILU(0) executes on Host; diagonal and block inverse operators can run on GPU.
+//! ILU(0) setup executes on Host; its level-scheduled inverse can run on GPU.
 
 use crate::errors::Error;
 use crate::numbers::Field;
 use crate::tensors::{
-    Backend, CsrMatrix, DiagonalOperator, LinearOperator, OperatorBackend, Vector,
+    Backend, CsrMatrix, DiagonalOperator, LinearOperator, Matrix, OperatorBackend, Triangle,
+    TriangularFactors, TriangularOperator, Vector,
 };
+
+/// `Backend` uses batched CGS2 on Metal and MGS2 on Host. The reference option
+/// retains sequential modified Gram-Schmidt for validation and benchmarking.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Orthogonalization {
+    #[default]
+    Backend,
+    ModifiedGramSchmidt,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct GmresOptions {
@@ -126,6 +137,33 @@ fn check_pivot<T: Field>(value: T) -> Result<(), Error> {
 }
 
 impl<T: Field> Ilu0<T> {
+    /// Transfer the factored inverse to a backend once. No CPU readbacks are
+    /// required between triangular dependency levels during application.
+    pub fn operator<B: Backend>(&self) -> Result<TriangularFactors<T, B>, Error> {
+        let n = self.diagonal.len();
+        let mut lower = Vec::new();
+        let mut upper = Vec::new();
+        for row in 0..n {
+            lower.push((row, row, T::one()));
+            for k in self.offsets[row] as usize..self.offsets[row + 1] as usize {
+                let entry = (row, self.columns[k] as usize, self.factors[k]);
+                if entry.1 < row {
+                    lower.push(entry);
+                } else {
+                    upper.push(entry);
+                }
+            }
+        }
+        Ok(TriangularFactors::new(
+            TriangularOperator::new(CsrMatrix::from_triplets(n, n, lower), Triangle::Lower, true)?,
+            TriangularOperator::new(
+                CsrMatrix::from_triplets(n, n, upper),
+                Triangle::Upper,
+                false,
+            )?,
+        )?
+        .to_backend::<B>())
+    }
     pub fn new(matrix: &CsrMatrix<T>) -> Result<Self, Error> {
         if matrix.rows() != matrix.cols() {
             return Err(Error::shape("ILU requires a square matrix"));
@@ -220,7 +258,23 @@ pub fn gmres<T: Field, B: OperatorBackend<T>, O: LinearOperator<T, B> + ?Sized>(
     x: &mut Vector<T, B>,
     options: GmresOptions,
 ) -> Result<SolveReport, Error> {
-    solve(a, b, x, options, |input, output| {
+    gmres_with_orthogonalization(a, b, x, options, Orthogonalization::Backend)
+}
+
+/// Solve with an explicit Arnoldi strategy. `Backend` uses batched CGS2 on
+/// Metal; `ModifiedGramSchmidt` retains the sequential reference path.
+pub fn gmres_with_orthogonalization<
+    T: Field,
+    B: OperatorBackend<T>,
+    O: LinearOperator<T, B> + ?Sized,
+>(
+    a: &O,
+    b: &Vector<T, B>,
+    x: &mut Vector<T, B>,
+    options: GmresOptions,
+    orthogonalization: Orthogonalization,
+) -> Result<SolveReport, Error> {
+    solve(a, b, x, options, orthogonalization, |input, output| {
         B::axpby(
             input.storage(),
             output.storage_mut(),
@@ -247,9 +301,14 @@ pub fn gmres_preconditioned<
     if preconditioner.size() != b.len() {
         return Err(Error::shape("GMRES preconditioner has incompatible size"));
     }
-    solve(a, b, x, options, |input, output| {
-        preconditioner.apply(input.as_slice(), output.data_mut())
-    })
+    solve(
+        a,
+        b,
+        x,
+        options,
+        Orthogonalization::Backend,
+        |input, output| preconditioner.apply(input.as_slice(), output.data_mut()),
+    )
 }
 
 /// Solve using a backend-resident inverse preconditioning operator.
@@ -273,9 +332,14 @@ pub fn gmres_preconditioned_operator<
             "GMRES inverse preconditioner has incompatible shape",
         ));
     }
-    solve(a, b, x, options, |input, output| {
-        inverse.apply(input, output)
-    })
+    solve(
+        a,
+        b,
+        x,
+        options,
+        Orthogonalization::Backend,
+        |input, output| inverse.apply(input, output),
+    )
 }
 
 fn solve<T: Field, B: OperatorBackend<T>, O: LinearOperator<T, B> + ?Sized>(
@@ -283,6 +347,7 @@ fn solve<T: Field, B: OperatorBackend<T>, O: LinearOperator<T, B> + ?Sized>(
     b: &Vector<T, B>,
     x: &mut Vector<T, B>,
     options: GmresOptions,
+    orthogonalization: Orthogonalization,
     precondition: impl Fn(&Vector<T, B>, &mut Vector<T, B>),
 ) -> Result<SolveReport, Error> {
     let n = b.len();
@@ -343,6 +408,8 @@ fn solve<T: Field, B: OperatorBackend<T>, O: LinearOperator<T, B> + ?Sized>(
             .min(options.max_iterations - report.iterations)
             .min(n);
         let mut basis = Vec::with_capacity(m + 1);
+        let mut packed = (B::BATCHED_ARNOLDI && orthogonalization == Orthogonalization::Backend)
+            .then(|| Matrix::<T, B>::filled(m + 1, n, T::zero()));
         let mut first = work.to_backend::<B>();
         B::scale(first.storage_mut(), 0, n, T::one() / T::from_real(length));
         basis.push(first);
@@ -356,24 +423,50 @@ fn solve<T: Field, B: OperatorBackend<T>, O: LinearOperator<T, B> + ?Sized>(
         let mut count = 0;
         let mut breakdown = false;
         for j in 0..m {
-            precondition(&basis[j], &mut input);
+            let current = basis.last().unwrap();
+            precondition(current, &mut input);
+            if let Some(packed) = &mut packed {
+                use crate::tensors::backend::{Region, Strided};
+                B::strided_write(
+                    packed.storage_mut(),
+                    Region {
+                        source: current.storage(),
+                        shape: &[n],
+                        from: Strided {
+                            offset: 0,
+                            strides: &[1],
+                        },
+                        to: Strided {
+                            offset: j * n,
+                            strides: &[1],
+                        },
+                    },
+                );
+            }
             preconditioned.push(input.to_backend::<B>());
             a.apply(&input, &mut work);
-            let before = B::norm(work.storage(), n);
-            for _ in 0..2 {
-                for i in 0..=j {
-                    let projection = B::inner(basis[i].storage(), work.storage(), n);
-                    h[j][i] = h[j][i] + projection;
-                    B::axpby(
-                        basis[i].storage(),
-                        work.storage_mut(),
-                        n,
-                        -projection,
-                        T::one(),
-                    );
+            let (before, next) = if let Some(packed) = &packed {
+                let (coefficients, before, after) =
+                    B::orthogonalize(packed.storage(), n, j + 1, work.storage_mut());
+                h[j][..j + 1].copy_from_slice(&coefficients);
+                (before, after)
+            } else {
+                let before = B::norm(work.storage(), n);
+                for _ in 0..2 {
+                    for i in 0..=j {
+                        let projection = B::inner(basis[i].storage(), work.storage(), n);
+                        h[j][i] = h[j][i] + projection;
+                        B::axpby(
+                            basis[i].storage(),
+                            work.storage_mut(),
+                            n,
+                            -projection,
+                            T::one(),
+                        );
+                    }
                 }
-            }
-            let next = B::norm(work.storage(), n);
+                (before, B::norm(work.storage(), n))
+            };
             if !before.is_finite() || !next.is_finite() {
                 report.reason = StopReason::NonFinite;
                 return Ok(report);
@@ -388,6 +481,9 @@ fn solve<T: Field, B: OperatorBackend<T>, O: LinearOperator<T, B> + ?Sized>(
                     n,
                     T::one() / T::from_real(next),
                 );
+                if packed.is_some() {
+                    basis.clear();
+                }
                 basis.push(next_basis);
             }
             for i in 0..j {

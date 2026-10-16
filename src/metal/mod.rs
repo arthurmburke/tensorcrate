@@ -32,10 +32,14 @@
 
 mod buffer;
 mod codegen;
+mod cross;
 mod device;
 mod encode;
 mod fused;
+mod krylov;
 mod operators;
+pub use cross::CrossElement;
+pub(crate) use cross::cross_values;
 mod ops;
 mod pool;
 mod slices;
