@@ -28,6 +28,13 @@ pub struct Dual<T> {
     pub dual: T,
 }
 
+impl<T: super::Conj<Output = T>> super::Conj for Dual<T> {
+    type Output = Self;
+    fn conj(&self) -> Self {
+        Self::new(self.real.conj(), self.dual.conj())
+    }
+}
+
 impl<T> Dual<T> {
     /// Construct `real + dual·ε`.
     pub fn new(real: T, dual: T) -> Self {

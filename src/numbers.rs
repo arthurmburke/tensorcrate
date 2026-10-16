@@ -9,6 +9,7 @@
 
 mod complex;
 mod dual;
+mod field;
 mod primitive;
 
 use std::fmt::{self, Display};
@@ -17,6 +18,7 @@ use num_traits::{Float, Num};
 
 pub use complex::Complex;
 pub use dual::Dual;
+pub use field::Field;
 pub use half::{bf16, f16};
 
 /// What a numeric element must provide: the primitive integers and floats,

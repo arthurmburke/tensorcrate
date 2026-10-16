@@ -153,6 +153,14 @@ mod tests {
     }
 
     #[test]
+    fn hermitian_operations_validate_shapes_and_preserve_types() {
+        assert!(expansion_error(quote! { dotc([1, 2], [1]) }).contains("`dotc` expects vectors"));
+        assert!(expansion_error(quote! { adjoint([1, 2]) }).contains("`adjoint` expects a matrix"));
+        assert!(expansion(quote! { let z = [1 + 2i, 3]; dotc(z, z) }).contains("Dotc :: dotc"));
+        assert!(expansion(quote! { adjoint([[1 + 2i, 3]]) }).contains("Adjoint :: adjoint"));
+    }
+
+    #[test]
     fn static_kernels_are_optimized() {
         // `exp(x)` is written twice and computed once.
         let shared = expansion(quote! { backend = Metal; let x = [1, 2]; exp(x) * 2 + exp(x) / 3 });

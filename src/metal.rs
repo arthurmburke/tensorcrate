@@ -35,6 +35,7 @@ mod codegen;
 mod device;
 mod encode;
 mod fused;
+mod operators;
 mod ops;
 mod pool;
 mod slices;
@@ -54,6 +55,8 @@ pub use codegen::set_fused_codegen;
 pub use device::set_tensorops;
 pub use device::{MatmulPrecision, matmul_precision, set_matmul_precision};
 pub(crate) use fused::{FusedPlace, fused_elementwise, fused_rows, fused_sum, matmul_epilogue};
+pub use operators::OperatorElement;
+pub(crate) use operators::{operator_adjoint, operator_dotc};
 pub use slices::{broadcast_f32, elementwise_f32, fft_f32_interleaved, ifft_f32_interleaved};
 pub use sync::synchronize;
 

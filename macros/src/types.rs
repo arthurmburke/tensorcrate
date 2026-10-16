@@ -454,13 +454,13 @@ fn call(builtin: Builtin, args: &[Expr<Ty>], span: Span) -> syn::Result<Ty> {
             }
             Ok(a.unify(b))
         }
-        Builtin::Dot => {
+        Builtin::Dot | Builtin::Dotc => {
             let (a, b) = (args[0].ty, args[1].ty);
             match (a.shape, b.shape) {
                 (Shape::Vector(n), Shape::Vector(m)) if n == m => Ok(a.unify(b).element()),
-                _ => Err(error(
-                    "`dot` expects vectors of the same length".to_string(),
-                )),
+                _ => Err(error(format!(
+                    "`{name}` expects vectors of the same length"
+                ))),
             }
         }
         Builtin::MatMul => matmul(args[0].ty, args[1].ty).ok_or_else(|| {
@@ -477,11 +477,11 @@ fn call(builtin: Builtin, args: &[Expr<Ty>], span: Span) -> syn::Result<Ty> {
                 _ => Err(error(format!("`{name}` expects a square matrix"))),
             }
         }
-        Builtin::Transpose => {
+        Builtin::Transpose | Builtin::Adjoint => {
             let a = args[0].ty;
             match a.shape {
                 Shape::Matrix(r, c) => Ok(a.with_shape(Shape::Matrix(c, r))),
-                _ => Err(error("`transpose` expects a matrix".to_string())),
+                _ => Err(error(format!("`{name}` expects a matrix"))),
             }
         }
         // `conj` is only meaningful on complex numbers.

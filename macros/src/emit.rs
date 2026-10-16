@@ -407,6 +407,14 @@ fn call(
             let (a, b) = (tensor_arg(0)?, tensor_arg(1)?);
             Ok(quote!((#a).dot(&(#b))))
         }
+        Builtin::Dotc => {
+            let (a, b) = (tensor_arg(0)?, tensor_arg(1)?);
+            Ok(quote!(::tensorcrate::tensors::Dotc::dotc(&(#a), &(#b))))
+        }
+        Builtin::Adjoint => {
+            let a = tensor_arg(0)?;
+            Ok(quote!(::tensorcrate::tensors::Adjoint::adjoint(&(#a))))
+        }
         Builtin::MatMul => {
             let (a, b) = (tensor_arg(0)?, tensor_arg(1)?);
             Ok(match (args[0].ty.shape, args[1].ty.shape) {

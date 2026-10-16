@@ -42,6 +42,7 @@ pub(super) struct Gpu {
     pub(super) strided_copy: [Pipeline; 5],
     pub(super) fft_bit_reverse: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub(super) fft_stage: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub(super) operators: [Pipeline; 2],
     pub(super) pool: RefCell<Pool>,
     /// Command buffers committed but not yet known to have finished, oldest
     /// first, each with its sequence number — see [`commit`](super::sync::commit).
@@ -454,6 +455,10 @@ pub(super) fn build_gpu() -> Option<Gpu> {
         ],
         fft_bit_reverse: pipeline("fft_bit_reverse")?,
         fft_stage: pipeline("fft_stage")?,
+        operators: [
+            pipeline("linear_operator_f32")?,
+            pipeline("linear_operator_c32")?,
+        ],
         pool: RefCell::new(Pool::default()),
         pending: RefCell::new(VecDeque::new()),
         committed: Cell::new(0),

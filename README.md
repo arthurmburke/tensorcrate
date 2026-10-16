@@ -111,6 +111,68 @@ where
 
 Borrow operands when you want to keep using them: `&a + &b` leaves both tensors intact.
 
+## Sparse and block operators
+
+`CooBuilder<T>` assembles local contributions into `CsrMatrix<T, B>`. CSR
+validates sorted unique column indices and permits explicit zero values so its
+pattern can be reused. Its indices are 32-bit. A transposed index view stores
+positions, not duplicate values, for linear-time adjoint products.
+
+`LinearOperator<T, B>` applies a map or its adjoint to existing vectors.
+`apply_add(alpha, x, beta, y)` fuses the product and accumulation. A zero beta
+overwrites the output without reading it. Implementations include dense
+`Matrix`, CSR, `DiagonalOperator`, `ElementOperator`, and `BlockOperator`.
+Blocks may be rectangular or nested; omitted blocks are zero.
+
+```rust
+use tensorcrate::tensors::{BlockOperator, CooBuilder, LinearOperator, Matrix, Vector};
+use tensorcrate::solvers::{gmres, GmresOptions, StopReason};
+
+let mut assembly = CooBuilder::new(2, 2);
+assembly.add_local(&[0, 1], &[0, 1], &[4.0f64, -1.0, -1.0, 4.0]);
+let mut a = BlockOperator::new(&[2, 1], &[2, 1])?;
+a.set_block(0, 0, assembly.finish())?;
+a.set_block(0, 1, Matrix::from_rows([[1.0], [1.0]]))?;
+a.set_block(1, 0, Matrix::from_rows([[1.0, 1.0]]))?;
+a.set_block(1, 1, Matrix::from_rows([[3.0]]))?;
+let b = Vector::new([1.0, 2.0, 3.0]);
+let mut x = Vector::zeros(3);
+let report = gmres(&a, &b, &mut x, GmresOptions::default())?;
+assert_eq!(report.reason, StopReason::Converged);
+# Ok::<(), tensorcrate::errors::Error>(())
+```
+
+GMRES uses right preconditioning, two passes of modified Gram-Schmidt, complex
+unitary rotations, and true residual checks before reporting convergence.
+`gmres_preconditioned` accepts Host `Jacobi`, `Ilu0`, or custom preconditioners.
+ILU(0) preserves the CSR pattern and rejects zero pivots; it does not pivot.
+`gmres_preconditioned_operator` accepts an inverse operator, including a block
+preconditioner. `Jacobi::operator::<B>()` produces a diagonal inverse map.
+
+Host operators support `f32`, `f64`, `Complex<f32>`, and `Complex<f64>`.
+Metal operators and GMRES support `f32` and `Complex<f32>`. Upload matrices
+and vectors with `to_backend::<Metal>()`; all full-sized Krylov vectors stay
+resident. Reductions synchronize small partial results for CPU scalar work.
+Mixing Host and Metal blocks in one operator requires an explicit custom
+transfer adapter and is not automatic. Complex support here covers operator
+products, adjoints, vector updates, and inner products, not every tensor kernel.
+
+`ElementOperator` stores local dense matrices and global DOF maps. It groups
+overlapping contributions by output DOF, avoiding scatter races and atomics.
+The caller supplies oriented local matrices; mesh geometry, basis functions,
+quadrature, materials, and boundary conditions belong to the FEM layer.
+
+`Dotc` computes the conjugate inner product in one pass, while `dot` retains
+its bilinear meaning. `Adjoint` conjugates and transposes matrices or the last
+two tensor axes. `math!` supports `dotc(a, b)` and `adjoint(a)` for vectors
+and matrices respectively. Complex and dual products follow the existing
+fusion limits: these operations are contraction boundaries, not elementwise
+program instructions.
+
+Run `cargo run --release --example fem_operators` for a complex block solve
+on Host and Metal, or `cargo bench --bench nn_ops -- fem` for the operator
+benchmarks. See [performance notes](docs/fem-performance.md).
+
 ## N-dimensional tensors
 
 `Tensor<T, B>` holds up to six axes (`MAX_RANK`) over the same flat row-major storage as a

@@ -97,10 +97,13 @@ pub mod tape;
 
 mod algebra;
 mod chain;
+mod csr;
 mod fft;
+mod hermitian;
 mod host_inplace;
 pub(crate) mod layout;
 mod matrix;
+pub mod operator;
 mod ops;
 mod order;
 mod reduction;
@@ -131,16 +134,21 @@ pub use backend::{Backend, Host};
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub use backend::{Metal, MetalStorage};
 pub use chain::{chained_matmul, chained_matmul_cost};
+pub use csr::{CooBuilder, CsrMatrix};
 pub use dual::{
     DualMatrix, DualVector, gradient, gradient_wrt_matrix, jacobian, jacobian_wrt_matrix,
     matrix_gradient,
 };
+pub use hermitian::{Adjoint, Dotc};
 pub use kernels::{
     Analytic, Axis, BinaryOp, Compare, Family, Kernels, Ordered, Reduce, SortOrder, Statistic,
     Transposed,
 };
 pub use layout::{AxisIndex, MAX_RANK};
 pub use matrix::Matrix;
+pub use operator::{
+    BlockOperator, DiagonalOperator, ElementOperator, LinearOperator, OperatorBackend,
+};
 pub use reduction::Axes;
 pub use sparse::SparseMatrix;
 pub use tape::{MatrixVar, ScalarVar, Tape, TensorVar, Var, VectorVar};

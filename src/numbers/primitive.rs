@@ -6,6 +6,16 @@ use super::{
     Sinh, Sqrt, Tan, Tanh, bf16, f16,
 };
 
+macro_rules! real_conjugate {
+    ($($t:ty),* $(,)?) => {$(
+        impl super::Conj for $t {
+            type Output = Self;
+            fn conj(&self) -> Self { *self }
+        }
+    )*};
+}
+real_conjugate!(i8, u8, i16, u16, i32, u32, i64, u64, f32, f64, f16, bf16);
+
 macro_rules! int_coefficient {
     ($($t:ty),+ $(,)?) => {$(
         impl Coefficient for $t {

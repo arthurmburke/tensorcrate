@@ -1510,8 +1510,142 @@ fn main() {
     simd(&mut bench);
     dispatch(&mut bench);
     training(&mut bench);
+    fem_operators(&mut bench);
 
     if bench.cases == 0 {
         println!("\nno case matches {:?}", bench.cfg.filters);
+    }
+}
+
+/// Sparse assembly, local dense elements, complex reductions and Krylov solves.
+fn fem_operators(bench: &mut Bench) {
+    use tensorcrate::numbers::{Complex, Conj};
+    use tensorcrate::solvers::{GmresOptions, Ilu0, StopReason, gmres_preconditioned};
+    use tensorcrate::tensors::{BlockOperator, CooBuilder, Dotc, ElementOperator, LinearOperator};
+
+    for n in bench.cfg.pick(&[256, 4096, 65536]) {
+        let Some(mut case) = bench.case(
+            "fem",
+            &format!("assembled vs elements, n={n}"),
+            Work::Elements(n),
+        ) else {
+            continue;
+        };
+        let mut builder = CooBuilder::new(n, n);
+        let mut dofs = Vec::new();
+        let mut local = Vec::new();
+        for i in 0..n - 1 {
+            builder.add_local(&[i, i + 1], &[i, i + 1], &[2.0f32, -1.0, -1.0, 2.0]);
+            dofs.extend([i as u32, i as u32 + 1]);
+            local.extend([2.0f32, -1.0, -1.0, 2.0]);
+        }
+        let csr = builder.finish();
+        let coo = csr.to_coo();
+        let element = ElementOperator::new(n, 2, dofs, local).unwrap();
+        let x = Vector::new(values(n, 4));
+        let expected = coo.matvec(x.as_slice());
+        let mut y = Vector::zeros(n);
+        csr.apply(&x, &mut y);
+        assert_close("CSR vs COO", y.as_slice(), &expected, 1e-5);
+        element.apply(&x, &mut y);
+        assert_close("element vs COO", y.as_slice(), &expected, 1e-5);
+        case.row("COO (allocating)", Drain::None, || {
+            coo.matvec(black_box(x.as_slice()))
+        });
+        case.row("CSR (reused output)", Drain::None, || {
+            csr.apply(black_box(&x), &mut y);
+            black_box(&mut y);
+        });
+        case.row("elements (reused output)", Drain::None, || {
+            element.apply(black_box(&x), &mut y);
+            black_box(&mut y);
+        });
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            let gpu = csr.to_backend::<Metal>();
+            let elements = element.to_backend::<Metal>();
+            let x = x.to_backend::<Metal>();
+            let mut y = y.to_backend::<Metal>();
+            gpu.apply(&x, &mut y);
+            assert_close("GPU CSR", y.as_slice(), &expected, 1e-5);
+            elements.apply(&x, &mut y);
+            assert_close("GPU elements", y.as_slice(), &expected, 1e-5);
+            case.row("Metal CSR (pipelined)", Drain::PerBatch, || {
+                gpu.apply(&x, &mut y)
+            });
+            case.row("Metal elements (pipelined)", Drain::PerBatch, || {
+                elements.apply(&x, &mut y)
+            });
+        }
+    }
+    if let Some(mut case) = bench.case(
+        "fem",
+        "mixed CSR and dense blocks, n=1024",
+        Work::Elements(1024),
+    ) {
+        use tensorcrate::tensors::CsrMatrix;
+        let mut a = BlockOperator::new(&[16, 1008], &[16, 1008]).unwrap();
+        a.set_block(0, 0, Matrix::<f32>::identity(16)).unwrap();
+        a.set_block(
+            1,
+            1,
+            CsrMatrix::from_triplets(1008, 1008, (0..1008).map(|i| (i, i, 2.0f32))),
+        )
+        .unwrap();
+        let x = Vector::filled(1024, 1.0);
+        let mut y = Vector::zeros(1024);
+        a.apply(&x, &mut y);
+        assert_eq!(&y.as_slice()[..16], &[1.0; 16]);
+        assert!(y.as_slice()[16..].iter().all(|&v| v == 2.0));
+        case.row("host mixed blocks", Drain::None, || {
+            a.apply(&x, &mut y);
+            black_box(&mut y);
+        });
+    }
+    if let Some(mut case) = bench.case("fem", "complex dotc, n=65536", Work::Elements(65536)) {
+        let x = Vector::new(
+            (0..65536)
+                .map(|i| Complex::new((i % 13) as f32, (i % 7) as f32))
+                .collect::<Vec<_>>(),
+        );
+        let expected = x.conj().dot(&x);
+        assert_eq!(x.dotc(&x), expected);
+        case.row("conjugate then dot", Drain::None, || x.conj().dot(&x));
+        case.row("fused dotc", Drain::None, || x.dotc(&x));
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        {
+            let gpu = x.to_backend::<Metal>();
+            let actual = gpu.dotc(&gpu);
+            assert!((actual.real - expected.real).abs() <= 1e-4 * expected.real);
+            case.row("Metal dotc (scalar readback)", Drain::PerCall, || {
+                gpu.dotc(&gpu)
+            });
+        }
+    }
+    if let Some(mut case) = bench.case("fem", "GMRES + ILU(0), n=128", Work::Steps) {
+        let a = tensorcrate::tensors::CsrMatrix::from_triplets(
+            128,
+            128,
+            (0..128).flat_map(|i| {
+                let mut entries = vec![(i, i, 4.0f64)];
+                if i > 0 {
+                    entries.push((i, i - 1, -1.0));
+                }
+                if i < 127 {
+                    entries.push((i, i + 1, -1.0));
+                }
+                entries
+            }),
+        );
+        let preconditioner = Ilu0::new(&a).unwrap();
+        let b = Vector::filled(128, 1.0);
+        case.row("host solve (setup excluded)", Drain::None, || {
+            let mut x = Vector::zeros(128);
+            let report =
+                gmres_preconditioned(&a, &b, &mut x, &preconditioner, GmresOptions::default())
+                    .unwrap();
+            assert_eq!(report.reason, StopReason::Converged);
+            black_box(x)
+        });
     }
 }

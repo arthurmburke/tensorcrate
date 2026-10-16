@@ -446,7 +446,8 @@ fn elementwise_functions_apply_to_bound_tensors_and_complex_elements() {
     assert!(close(scaled.data()[2], 2.0_f64.exp()));
 
     // Complex elements follow the complex definition: exp(iπ) = −1.
-    let rotated: Vector<Complex<f64>> = math! { exp([1i, 1i] * 3.141592653589793) };
+    let pi = std::f64::consts::PI;
+    let rotated: Vector<Complex<f64>> = math! { exp([1i, 1i] * pi) };
     assert!(close(rotated.data()[0].real, -1.0));
     assert!(close(rotated.data()[0].im, 0.0));
 
