@@ -75,7 +75,7 @@ impl<T: Copy + Neg<Output = T>> Conj for Complex<T> {
     type Output = Self;
 
     /// The complex conjugate `a − b·i`.
-    fn conj(&self) -> Self {
+    fn conj(self) -> Self {
         Complex::new(self.real, -self.im)
     }
 }

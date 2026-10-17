@@ -10,7 +10,7 @@ macro_rules! real_conjugate {
     ($($t:ty),* $(,)?) => {$(
         impl super::Conj for $t {
             type Output = Self;
-            fn conj(&self) -> Self { *self }
+            fn conj(self) -> Self { self }
         }
     )*};
 }

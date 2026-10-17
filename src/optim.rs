@@ -56,7 +56,7 @@ use crate::tensors::fused::{
     self, Algebra, Builder, CostModel, Decl, Element, Fusable, FusableMut, FusableOf, Instr,
     Output, Program,
 };
-use crate::tensors::tape::Adjoint;
+use crate::tensors::tape::TapeValue;
 use crate::tensors::{
     Analytic, BinaryOp, Host, Kernels, Matrix, ScalarVar, Tape, Tensor, Var, Vector,
 };
@@ -133,7 +133,7 @@ pub trait Parameter: Sized + 'static {
     /// gradient.
     fn record<'t>(&self, tape: &'t Tape<Self::Backend>) -> Var<'t, Self, Self::Backend>
     where
-        Self: Adjoint<Self::Backend>;
+        Self: TapeValue<Self::Backend>;
 
     /// Run a fused elementwise [`Program`] over this parameter's shape, as
     /// [`Program::run`](crate::tensors::fused::Program::run) would: `inputs`
@@ -1237,7 +1237,7 @@ pub fn minimize<P, R>(
     objective: impl for<'t> Fn(&Var<'t, P, P::Backend>, usize) -> ScalarVar<'t, P::Backend, P::Elem>,
 ) -> P::Elem
 where
-    P: Parameter + Adjoint<P::Backend>,
+    P: Parameter + TapeValue<P::Backend>,
     R: Rule<P>,
 {
     let mut last = <P::Elem as Float>::nan();

@@ -226,19 +226,19 @@ impl<T: Field, B: OperatorBackend<T>> LinearOperator<T, B> for CsrMatrix<T, B> {
     }
 }
 
-impl<T: Field, B: OperatorBackend<T>> MatVec<Vector<T, B>> for CsrMatrix<T, B> {
+impl<'b, T: Field, B: OperatorBackend<T>> MatVec<&'b Vector<T, B>> for &CsrMatrix<T, B> {
     type Output = Vector<T, B>;
-    fn matvec(&self, x: &Vector<T, B>) -> Self::Output {
+    fn matvec(self, x: &'b Vector<T, B>) -> Self::Output {
         let mut y = Vector::filled(self.rows, T::zero());
         self.apply(x, &mut y);
         y
     }
 }
 
-impl<T: Coefficient> Transpose for CsrMatrix<T> {
-    type Output = Self;
-    fn transpose(&self) -> Self {
-        self.transpose()
+impl<T: Coefficient> Transpose for &CsrMatrix<T> {
+    type Output = CsrMatrix<T>;
+    fn transpose(self) -> CsrMatrix<T> {
+        CsrMatrix::transpose(self)
     }
 }
 

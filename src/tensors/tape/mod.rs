@@ -41,7 +41,7 @@
 //! start as `None` rather than zeros, which keeps untouched nodes from
 //! allocating (and, on `Metal`, from dispatching) — and is why the zero an
 //! adjoint falls back to is built *from* a recorded value, by
-//! [`Adjoint::zeros_like`], instead of from a type.
+//! [`TapeValue::zeros_like`], instead of from a type.
 //!
 //! Every rule is expressed with the [`Kernels`] trait, so reverse mode runs on
 //! either backend and a `Metal` graph stays resident from the forward pass right
@@ -172,7 +172,7 @@ mod tensor;
 /// The methods are what adjoint bookkeeping needs — a zero to start from, a copy,
 /// and a sum — expressed without a `Clone` bound, which on a generic backend
 /// would infect every signature that touches a node.
-pub trait Adjoint<B: Backend>: Sized + 'static {
+pub trait TapeValue<B: Backend>: Sized + 'static {
     /// The additive identity of *this value's* shape.
     ///
     /// A zero adjoint has to match the value it belongs to, and the shape is a
@@ -187,7 +187,7 @@ pub trait Adjoint<B: Backend>: Sized + 'static {
     fn add(&self, other: &Self) -> Self;
 }
 
-impl<T: Real, B: Kernels<T>> Adjoint<B> for T {
+impl<T: Real, B: Kernels<T>> TapeValue<B> for T {
     fn zeros_like(&self) -> Self {
         T::zero()
     }
@@ -201,7 +201,7 @@ impl<T: Real, B: Kernels<T>> Adjoint<B> for T {
     }
 }
 
-impl<T: Real, B: Kernels<T>> Adjoint<B> for Vector<T, B> {
+impl<T: Real, B: Kernels<T>> TapeValue<B> for Vector<T, B> {
     fn zeros_like(&self) -> Self {
         Vector::filled(self.len(), T::zero())
     }
@@ -215,7 +215,7 @@ impl<T: Real, B: Kernels<T>> Adjoint<B> for Vector<T, B> {
     }
 }
 
-impl<T: Real, B: Kernels<T>> Adjoint<B> for Matrix<T, B> {
+impl<T: Real, B: Kernels<T>> TapeValue<B> for Matrix<T, B> {
     fn zeros_like(&self) -> Self {
         let (rows, cols) = self.shape();
         Matrix::filled(rows, cols, T::zero())
@@ -230,7 +230,7 @@ impl<T: Real, B: Kernels<T>> Adjoint<B> for Matrix<T, B> {
     }
 }
 
-impl<T: Real, B: Kernels<T>> Adjoint<B> for Tensor<T, B> {
+impl<T: Real, B: Kernels<T>> TapeValue<B> for Tensor<T, B> {
     fn zeros_like(&self) -> Self {
         Tensor::filled(self.shape(), T::zero())
     }
@@ -308,7 +308,7 @@ struct Node<T, B: Backend> {
     marker: PhantomData<B>,
 }
 
-impl<T: Adjoint<B>, B: Backend> Node<T, B> {
+impl<T: TapeValue<B>, B: Backend> Node<T, B> {
     fn value(&self) -> &T {
         self.value.get()
     }
@@ -331,7 +331,7 @@ impl<T: Adjoint<B>, B: Backend> Node<T, B> {
     }
 }
 
-impl<T: Adjoint<B>, B: Backend> Backprop for Node<T, B> {
+impl<T: TapeValue<B>, B: Backend> Backprop for Node<T, B> {
     fn propagate(&self) {
         // A node with no adjoint contributed nothing, and a leaf has no rule.
         let adjoint = self.adjoint.borrow();
@@ -420,11 +420,11 @@ impl<B: Backend> Tape<B> {
         }
     }
 
-    fn push<T: Adjoint<B>>(&self, value: T, rule: Option<Rule<T>>) -> Var<'_, T, B> {
+    fn push<T: TapeValue<B>>(&self, value: T, rule: Option<Rule<T>>) -> Var<'_, T, B> {
         self.push_lazy(Lazy::ready(value), rule)
     }
 
-    fn push_lazy<T: Adjoint<B>>(&self, value: Lazy<T>, rule: Option<Rule<T>>) -> Var<'_, T, B> {
+    fn push_lazy<T: TapeValue<B>>(&self, value: Lazy<T>, rule: Option<Rule<T>>) -> Var<'_, T, B> {
         let mut nodes = self.nodes.borrow_mut();
         let node = Rc::new(Node {
             index: nodes.len(),
@@ -467,7 +467,7 @@ pub type MatrixVar<'t, B = Host, T = f32> = Var<'t, Matrix<T, B>, B>;
 /// [`Var`]'s tensor methods and in the [module documentation](self#tensors).
 pub type TensorVar<'t, B = Host, T = f32> = Var<'t, Tensor<T, B>, B>;
 
-impl<'t, T: Adjoint<B>, B: Backend> Var<'t, T, B> {
+impl<'t, T: TapeValue<B>, B: Backend> Var<'t, T, B> {
     /// The value computed in the forward pass.
     pub fn value(&self) -> &T {
         self.node.value()
@@ -528,12 +528,12 @@ impl<'t, T: Adjoint<B>, B: Backend> Var<'t, T, B> {
     }
 
     /// Record a node whose rule pushes into this graph.
-    fn record<U: Adjoint<B>>(&self, value: U, rule: impl Fn(&U) + 'static) -> Var<'t, U, B> {
+    fn record<U: TapeValue<B>>(&self, value: U, rule: impl Fn(&U) + 'static) -> Var<'t, U, B> {
         self.tape.push(value, Some(Box::new(rule)))
     }
 
     /// [`record`](Self::record) a value that may not be computed yet.
-    fn record_lazy<U: Adjoint<B>>(
+    fn record_lazy<U: TapeValue<B>>(
         &self,
         value: Lazy<U>,
         rule: impl Fn(&U) + 'static,

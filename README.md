@@ -94,16 +94,18 @@ explicit:
 - `vector.outer(&vector)` on differentiable variables
 
 The named products also have operation traits: `MatMul`, `MatVec`, `VecMat`,
-`Dot`, and `Transpose`. Their associated output types preserve the concrete
-representation, so one generic function can accept a dense value, a
-forward-mode dual value, or a reverse-mode tape variable:
+`Dot`, `Transpose`, `Dotc` and `Adjoint`. `tensorcrate::prelude::*` imports
+them all. Like `std::ops`, they take `self` by value and tensors implement them
+for references, so `a.matmul(&b)` leaves `a` usable. Their associated output
+types preserve the concrete representation, so one generic function can accept
+a dense value, a forward-mode dual value, or a reverse-mode tape variable:
 
 ```rust
-use tensorcrate::tensors::{MatMul, Transpose};
+use tensorcrate::prelude::*;
 
-fn gram<M>(matrix: &M) -> M::Output
+fn gram<M>(matrix: &M) -> M
 where
-    M: MatMul + Transpose<Output = M>,
+    for<'a> &'a M: MatMul<&'a M, Output = M> + Transpose<Output = M>,
 {
     matrix.transpose().matmul(matrix)
 }

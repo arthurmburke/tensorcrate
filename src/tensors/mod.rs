@@ -88,6 +88,7 @@
 //! assert_eq!(shifted.argmax(-1, true).shape(), [3, 1]);
 //! ```
 
+pub mod algebra;
 pub mod analytic;
 pub mod backend;
 pub mod dual;
@@ -95,7 +96,6 @@ pub mod fused;
 pub mod kernels;
 pub mod tape;
 
-mod algebra;
 mod chain;
 mod csr;
 mod fft;
@@ -126,7 +126,10 @@ pub(crate) mod simd_dispatch;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 mod metal_backend;
 
-pub use algebra::{Dot, MatMul, MatVec, Transpose, VecMat};
+pub use algebra::{
+    Adjoint, Clamp, Comparison, Determinant, Dot, Dotc, Inverse, MatMul, MatMulAdd, MatVec,
+    MatVecAdd, MinMax, PrefixSum, Reduction, Scale, Sort, Transpose, VecMat,
+};
 pub use analytic::Transcendental;
 #[cfg(all(feature = "metal", target_os = "macos"))]
 pub(crate) use backend::require_metal;
@@ -139,7 +142,6 @@ pub use dual::{
     DualMatrix, DualVector, gradient, gradient_wrt_matrix, jacobian, jacobian_wrt_matrix,
     matrix_gradient,
 };
-pub use hermitian::{Adjoint, Dotc};
 pub use kernels::{
     Analytic, Axis, BinaryOp, Compare, Family, Kernels, Ordered, Reduce, SortOrder, Statistic,
     Transposed,

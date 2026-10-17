@@ -8,7 +8,7 @@
 
 use std::ops::{Add, Div, Mul, RangeBounds, Sub};
 
-use super::{Adjoint, Lazy, MatrixVar, Node, ScalarVar, TensorVar, VectorVar, sum_of};
+use super::{Lazy, MatrixVar, Node, ScalarVar, TapeValue, TensorVar, VectorVar, sum_of};
 use crate::numbers::Real;
 use crate::statistics::Correction;
 use crate::tensors::layout::{AxisIndex, bounds, resolve_axis};
