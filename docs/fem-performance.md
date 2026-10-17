@@ -124,3 +124,10 @@ and [Piola mappings](https://defelement.org/finite-elements.html).
 Validation passed: workspace tests with Metal, scalar-only tests, SIMD tests,
 format checks, all-target/all-feature Clippy, and the release benchmark smoke
 run. Clippy still reports pre-existing warnings outside these changes.
+
+Integration with main's algebraic-trait refactor passed the same validation
+and the full benchmark suite. GMRES measured 11.97 ms for the Metal reference
+and 2.77 ms for batched CGS2. Stack cross products, reused LU solves, and
+cached integration measured 1.0 ns, 2.7 ns, and 3.8 ns respectively. Triangular
+Metal solves measured 259 µs for the serial chain and 20.6 µs for the wider
+case. These preserve the performance tradeoffs above.
