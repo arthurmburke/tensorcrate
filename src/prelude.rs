@@ -21,7 +21,7 @@ pub use crate::numbers::{
     Tanh,
 };
 pub use crate::tensors::algebra::{
-    Adjoint, Clamp, Comparison, Determinant, Dot, Dotc, Inverse, MatMul, MatMulAdd, MatVec,
+    Adjoint, Clamp, Comparison, Cross, Determinant, Dot, Dotc, Inverse, MatMul, MatMulAdd, MatVec,
     MatVecAdd, MinMax, PrefixSum, Reduction, Scale, Sort, Transpose, VecMat,
 };
 pub use crate::tensors::{Ordered, Transcendental};

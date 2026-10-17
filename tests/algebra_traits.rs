@@ -51,6 +51,56 @@ where
 }
 
 #[test]
+fn geometry_uses_the_shared_algebraic_entry_points() {
+    use tensorcrate::geometry::{Mat2, Vec2, Vec3};
+
+    fn cross<'a, V>(a: &'a V, b: &'a V) -> <&'a V as Cross<&'a V>>::Output
+    where
+        &'a V: Cross<&'a V>,
+    {
+        a.cross(b)
+    }
+
+    let a = Vec3::new([1.0, 0.0, 0.0]);
+    let b = Vec3::new([0.0, 1.0, 0.0]);
+    assert_eq!(cross(&a, &b), Vec3::new([0.0, 0.0, 1.0]));
+    assert_eq!(
+        cross(&Vector::new(a.0), &Vector::new(b.0)).as_slice(),
+        [0.0, 0.0, 1.0]
+    );
+    let rows = Matrix::from_rows([a.0, b.0]);
+    let rhs = Matrix::from_rows([b.0, a.0]);
+    assert_eq!(
+        cross(&rows, &rhs).as_slice(),
+        [0.0, 0.0, 1.0, 0.0, 0.0, -1.0]
+    );
+    let tensor = Tensor::from_vec(&[1, 2, 3], rows.as_slice().to_vec());
+    let rhs = Tensor::from_vec(&[1, 2, 3], rhs.as_slice().to_vec());
+    assert_eq!(
+        cross(&tensor, &rhs).as_slice(),
+        [0.0, 0.0, 1.0, 0.0, 0.0, -1.0]
+    );
+    assert_eq!(dot(&a, &b), 0.0);
+    assert_eq!(Dotc::dotc(&a, &a), 1.0);
+
+    let matrix = Mat2::new([[2.0, 1.0], [0.0, 4.0]]);
+    let vector = Vec2::new([3.0, 2.0]);
+    assert_eq!(matvec(&matrix, &vector), Vec2::new([8.0, 8.0]));
+    assert_eq!(
+        multiply(&matrix, &matrix),
+        Mat2::new([[4.0, 6.0], [0.0, 16.0]])
+    );
+    assert_eq!(transpose(&matrix), Mat2::new([[2.0, 0.0], [1.0, 4.0]]));
+    assert_eq!(Adjoint::adjoint(&matrix), transpose(&matrix));
+    assert_eq!(Determinant::determinant(&matrix), 8.0);
+    assert_eq!(
+        multiply(&matrix, &Inverse::inverse(&matrix).unwrap()),
+        Mat2::identity()
+    );
+    assert_eq!(matrix.0, [[2.0, 1.0], [0.0, 4.0]]);
+}
+
+#[test]
 fn dense_values_implement_linear_algebra_traits() {
     let a = Matrix::from_rows([[1, 2], [3, 4]]);
     let b = Matrix::from_rows([[5, 6], [7, 8]]);

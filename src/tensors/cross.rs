@@ -1,5 +1,5 @@
-use super::{Host, Matrix, Tensor, Vector};
-use crate::{geometry::Cross, numbers::Coefficient};
+use super::{Cross, Host, Matrix, Tensor, Vector};
+use crate::numbers::Coefficient;
 
 fn cross<T: Coefficient>(a: &[T], b: &[T]) -> Vec<T> {
     a.chunks_exact(3)
@@ -13,24 +13,24 @@ fn cross<T: Coefficient>(a: &[T], b: &[T]) -> Vec<T> {
         })
         .collect()
 }
-impl<T: Coefficient> Cross for Vector<T, Host> {
-    type Output = Self;
-    fn cross(&self, rhs: &Self) -> Self {
+impl<'b, T: Coefficient> Cross<&'b Vector<T, Host>> for &Vector<T, Host> {
+    type Output = Vector<T, Host>;
+    fn cross(self, rhs: &'b Vector<T, Host>) -> Self::Output {
         assert_eq!((self.len(), rhs.len()), (3, 3), "cross requires 3-vectors");
         Vector::new(cross(self.as_slice(), rhs.as_slice()))
     }
 }
-impl<T: Coefficient> Cross for Matrix<T, Host> {
-    type Output = Self;
-    fn cross(&self, rhs: &Self) -> Self {
+impl<'b, T: Coefficient> Cross<&'b Matrix<T, Host>> for &Matrix<T, Host> {
+    type Output = Matrix<T, Host>;
+    fn cross(self, rhs: &'b Matrix<T, Host>) -> Self::Output {
         assert_eq!(self.shape(), rhs.shape(), "cross shape mismatch");
         assert_eq!(self.cols(), 3, "cross requires a last axis of three");
         Matrix::from_flat(self.rows(), 3, cross(self.as_slice(), rhs.as_slice()))
     }
 }
-impl<T: Coefficient> Cross for Tensor<T, Host> {
-    type Output = Self;
-    fn cross(&self, rhs: &Self) -> Self {
+impl<'b, T: Coefficient> Cross<&'b Tensor<T, Host>> for &Tensor<T, Host> {
+    type Output = Tensor<T, Host>;
+    fn cross(self, rhs: &'b Tensor<T, Host>) -> Self::Output {
         assert_eq!(self.shape(), rhs.shape(), "cross shape mismatch");
         assert_eq!(
             self.shape().last(),
@@ -47,24 +47,24 @@ mod metal {
         metal::{CrossElement, cross_values},
         tensors::Metal,
     };
-    impl<T: CrossElement> Cross for Vector<T, Metal> {
-        type Output = Self;
-        fn cross(&self, rhs: &Self) -> Self {
+    impl<'b, T: CrossElement> Cross<&'b Vector<T, Metal>> for &Vector<T, Metal> {
+        type Output = Vector<T, Metal>;
+        fn cross(self, rhs: &'b Vector<T, Metal>) -> Self::Output {
             assert_eq!((self.len(), rhs.len()), (3, 3), "cross requires 3-vectors");
             Vector::from_storage(3, cross_values(self.storage(), rhs.storage()))
         }
     }
-    impl<T: CrossElement> Cross for Matrix<T, Metal> {
-        type Output = Self;
-        fn cross(&self, rhs: &Self) -> Self {
+    impl<'b, T: CrossElement> Cross<&'b Matrix<T, Metal>> for &Matrix<T, Metal> {
+        type Output = Matrix<T, Metal>;
+        fn cross(self, rhs: &'b Matrix<T, Metal>) -> Self::Output {
             assert_eq!(self.shape(), rhs.shape(), "cross shape mismatch");
             assert_eq!(self.cols(), 3, "cross requires a last axis of three");
             Matrix::from_storage(self.rows(), 3, cross_values(self.storage(), rhs.storage()))
         }
     }
-    impl<T: CrossElement> Cross for Tensor<T, Metal> {
-        type Output = Self;
-        fn cross(&self, rhs: &Self) -> Self {
+    impl<'b, T: CrossElement> Cross<&'b Tensor<T, Metal>> for &Tensor<T, Metal> {
+        type Output = Tensor<T, Metal>;
+        fn cross(self, rhs: &'b Tensor<T, Metal>) -> Self::Output {
             assert_eq!(self.shape(), rhs.shape(), "cross shape mismatch");
             assert_eq!(
                 self.shape().last(),

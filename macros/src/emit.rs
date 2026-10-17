@@ -413,7 +413,7 @@ fn call(
         }
         Builtin::Cross => {
             let (a, b) = (tensor_arg(0)?, tensor_arg(1)?);
-            Ok(quote!(::tensorcrate::geometry::Cross::cross(&(#a), &(#b))))
+            Ok(quote!(::tensorcrate::tensors::Cross::cross(&(#a), &(#b))))
         }
         Builtin::Adjoint => {
             let a = tensor_arg(0)?;

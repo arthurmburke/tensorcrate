@@ -99,7 +99,6 @@ pub mod tape;
 mod chain;
 mod cross;
 mod csr;
-pub use crate::geometry::Cross;
 mod fft;
 mod hermitian;
 mod host_inplace;
@@ -130,7 +129,7 @@ pub(crate) mod simd_dispatch;
 mod metal_backend;
 
 pub use algebra::{
-    Adjoint, Clamp, Comparison, Determinant, Dot, Dotc, Inverse, MatMul, MatMulAdd, MatVec,
+    Adjoint, Clamp, Comparison, Cross, Determinant, Dot, Dotc, Inverse, MatMul, MatMulAdd, MatVec,
     MatVecAdd, MinMax, PrefixSum, Reduction, Scale, Sort, Transpose, VecMat,
 };
 pub use analytic::Transcendental;

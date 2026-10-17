@@ -189,8 +189,10 @@ benchmarks. See [performance notes](docs/fem-performance.md).
 `geometry::{Vec2, Vec3, Mat2, Mat3}` are aliases for stack-allocated
 `SmallVector<T, N>` and `SmallMatrix<T, R, C>` values. The default type is
 `f64`. Their algebra supports real, complex and dual coefficients where
-appropriate. `SmallLu` provides reusable scaled-partial-pivoting factors for
-real floating-point matrices. Its relative pivot tolerance rejects singular
+appropriate. They implement the shared algebraic traits for references;
+`prelude::*` also brings `Cross` into scope. `SmallLu` provides reusable
+scaled-partial-pivoting factors for real floating-point matrices. Its relative
+pivot tolerance rejects singular
 or numerically singular inputs; it never silently perturbs a pivot.
 
 ```rust

@@ -93,6 +93,17 @@ pub trait Dot<Rhs = Self> {
     fn dot(self, rhs: Rhs) -> Self::Output;
 }
 
+/// The right-handed three-dimensional cross product.
+///
+/// Tensor implementations apply it along the last axis. Both shapes must
+/// match and that axis must have extent three. Products do not broadcast.
+pub trait Cross<Rhs = Self> {
+    type Output;
+
+    /// Compute the cross product, panicking on incompatible tensor shapes.
+    fn cross(self, rhs: Rhs) -> Self::Output;
+}
+
 /// Transposition of a matrix-like value.
 ///
 /// A [`Tensor`](crate::tensors::Tensor) exchanges its last two axes, as

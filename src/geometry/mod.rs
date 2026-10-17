@@ -15,9 +15,4 @@ pub type Mat3<T = f64> = SmallMatrix<T, 3, 3>;
 pub type AffineTriangle<T = f64> = AffineSimplex<T, 2>;
 pub type AffineTetrahedron<T = f64> = AffineSimplex<T, 3>;
 
-/// The right-handed three-dimensional cross product. Tensor implementations
-/// apply it to each vector on the last axis, whose extent must be three.
-pub trait Cross<Rhs: ?Sized = Self> {
-    type Output;
-    fn cross(&self, rhs: &Rhs) -> Self::Output;
-}
+pub use crate::tensors::algebra::Cross;

@@ -2,7 +2,7 @@ use super::Cross;
 use crate::{
     errors::Error,
     numbers::{Coefficient, Conj, Real},
-    tensors::{Adjoint, Dot, Dotc, MatMul, MatVec, Transpose},
+    tensors::{Adjoint, Determinant, Dot, Dotc, Inverse, MatMul, MatVec, Transpose},
 };
 use std::ops::{Add, Div, Index, IndexMut, Mul, Neg, Sub};
 
@@ -130,25 +130,27 @@ impl<T: Coefficient + Neg<Output = T>, const N: usize> Neg for SmallVector<T, N>
         self.map(|v| -v)
     }
 }
-impl<T: Coefficient, const N: usize> Dot for SmallVector<T, N> {
+impl<'b, T: Coefficient, const N: usize> Dot<&'b SmallVector<T, N>> for &SmallVector<T, N> {
     type Output = T;
-    fn dot(&self, rhs: &Self) -> T {
-        self.dot(rhs)
+    fn dot(self, rhs: &'b SmallVector<T, N>) -> T {
+        SmallVector::dot(self, rhs)
     }
 }
-impl<T: Coefficient + Conj<Output = T>, const N: usize> Dotc for SmallVector<T, N> {
+impl<'b, T: Coefficient + Conj<Output = T>, const N: usize> Dotc<&'b SmallVector<T, N>>
+    for &SmallVector<T, N>
+{
     type Output = T;
-    fn dotc(&self, rhs: &Self) -> T {
+    fn dotc(self, rhs: &'b SmallVector<T, N>) -> T {
         self.0
             .iter()
             .zip(&rhs.0)
             .fold(T::zero(), |s, (a, b)| s + a.conj() * *b)
     }
 }
-impl<T: Coefficient> Cross for SmallVector<T, 3> {
-    type Output = Self;
-    fn cross(&self, rhs: &Self) -> Self {
-        self.cross(rhs)
+impl<'b, T: Coefficient> Cross<&'b SmallVector<T, 3>> for &SmallVector<T, 3> {
+    type Output = SmallVector<T, 3>;
+    fn cross(self, rhs: &'b SmallVector<T, 3>) -> Self::Output {
+        SmallVector::cross(self, rhs)
     }
 }
 
@@ -224,36 +226,55 @@ impl<T: Coefficient> SmallMatrix<T, 3, 3> {
             + self[(0, 2)] * (self[(1, 0)] * self[(2, 1)] - self[(1, 1)] * self[(2, 0)])
     }
 }
-impl<T: Coefficient, const R: usize, const C: usize> Transpose for SmallMatrix<T, R, C> {
+impl<T: Coefficient, const R: usize, const C: usize> Transpose for &SmallMatrix<T, R, C> {
     type Output = SmallMatrix<T, C, R>;
-    fn transpose(&self) -> Self::Output {
-        self.transpose()
+    fn transpose(self) -> Self::Output {
+        SmallMatrix::transpose(self)
     }
 }
-impl<T: Coefficient, const R: usize, const C: usize, const K: usize> MatMul<SmallMatrix<T, C, K>>
-    for SmallMatrix<T, R, C>
+impl<'b, T: Coefficient, const R: usize, const C: usize, const K: usize>
+    MatMul<&'b SmallMatrix<T, C, K>> for &SmallMatrix<T, R, C>
 {
     type Output = SmallMatrix<T, R, K>;
-    fn matmul(&self, rhs: &SmallMatrix<T, C, K>) -> Self::Output {
-        self.matmul(rhs)
+    fn matmul(self, rhs: &'b SmallMatrix<T, C, K>) -> Self::Output {
+        SmallMatrix::matmul(self, rhs)
     }
 }
-impl<T: Coefficient, const R: usize, const C: usize> MatVec<SmallVector<T, C>>
-    for SmallMatrix<T, R, C>
+impl<'b, T: Coefficient, const R: usize, const C: usize> MatVec<&'b SmallVector<T, C>>
+    for &SmallMatrix<T, R, C>
 {
     type Output = SmallVector<T, R>;
-    fn matvec(&self, rhs: &SmallVector<T, C>) -> Self::Output {
-        self.matvec(rhs)
+    fn matvec(self, rhs: &'b SmallVector<T, C>) -> Self::Output {
+        SmallMatrix::matvec(self, rhs)
     }
 }
 impl<T: Coefficient + Conj<Output = T>, const R: usize, const C: usize> Adjoint
-    for SmallMatrix<T, R, C>
+    for &SmallMatrix<T, R, C>
 {
     type Output = SmallMatrix<T, C, R>;
-    fn adjoint(&self) -> Self::Output {
+    fn adjoint(self) -> Self::Output {
         SmallMatrix(std::array::from_fn(|i| {
             std::array::from_fn(|j| self[(j, i)].conj())
         }))
+    }
+}
+
+impl<T: Coefficient> Determinant for &SmallMatrix<T, 2, 2> {
+    type Output = T;
+    fn determinant(self) -> T {
+        SmallMatrix::<T, 2, 2>::determinant(self)
+    }
+}
+impl<T: Coefficient> Determinant for &SmallMatrix<T, 3, 3> {
+    type Output = T;
+    fn determinant(self) -> T {
+        SmallMatrix::<T, 3, 3>::determinant(self)
+    }
+}
+impl<T: Real, const N: usize> Inverse for &SmallMatrix<T, N, N> {
+    type Output = Result<SmallMatrix<T, N, N>, Error>;
+    fn inverse(self) -> Self::Output {
+        SmallMatrix::inverse(self)
     }
 }
 

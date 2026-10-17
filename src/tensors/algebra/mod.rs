@@ -59,6 +59,6 @@ pub mod reduce;
 pub use conjugate::{Adjoint, Dotc};
 pub use elementwise::{Clamp, Comparison, MinMax, Scale};
 pub use linear::{
-    Determinant, Dot, Inverse, MatMul, MatMulAdd, MatVec, MatVecAdd, Transpose, VecMat,
+    Cross, Determinant, Dot, Inverse, MatMul, MatMulAdd, MatVec, MatVecAdd, Transpose, VecMat,
 };
 pub use reduce::{PrefixSum, Reduction, Sort};
