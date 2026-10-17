@@ -207,8 +207,11 @@ pub trait Recip {
 }
 
 /// A numeric type usable for taking a conjugate.
+///
+/// Copy scalars implement it by value and tensors by reference, as with the
+/// [algebraic traits](crate::tensors::algebra).
 pub trait Conj {
     type Output;
 
-    fn conj(&self) -> Self::Output;
+    fn conj(self) -> Self::Output;
 }

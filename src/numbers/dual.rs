@@ -30,7 +30,7 @@ pub struct Dual<T> {
 
 impl<T: super::Conj<Output = T>> super::Conj for Dual<T> {
     type Output = Self;
-    fn conj(&self) -> Self {
+    fn conj(self) -> Self {
         Self::new(self.real.conj(), self.dual.conj())
     }
 }

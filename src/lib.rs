@@ -43,6 +43,7 @@ pub mod metal;
 pub mod numbers;
 pub mod optim;
 mod parallel;
+pub mod prelude;
 #[doc(hidden)]
 pub use parallel::set_host_threads;
 pub mod persist;
