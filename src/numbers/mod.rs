@@ -2,14 +2,15 @@
 //!
 //! Everything here is a concrete Rust type — there is no runtime type tag. The
 //! [`Coefficient`] trait is what a numeric element must satisfy, and it is
-//! implemented for the primitive integers and floats, for [`Complex`], and for
-//! [`Dual`]. That closure is deliberate: it lets the extensions nest, so
+//! implemented for the primitive integers and floats, for [`Complex`], for
+//! [`Dual`], and for the decimal [`FixedPoint`]. That closure is deliberate: it lets the extensions nest, so
 //! `Dual<Complex<f64>>` (a dual number with complex coefficients) and
 //! `Matrix<Dual<f64>>` both work.
 
 mod complex;
 mod dual;
 mod field;
+mod fixed;
 mod primitive;
 
 use std::fmt::{self, Display};
@@ -19,10 +20,11 @@ use num_traits::{Float, Num};
 pub use complex::Complex;
 pub use dual::Dual;
 pub use field::Field;
+pub use fixed::{FixedPoint, ParseFixedPointError, Rounding};
 pub use half::{bf16, f16};
 
 /// What a numeric element must provide: the primitive integers and floats,
-/// [`Complex`], and [`Dual`] all implement it.
+/// [`Complex`], [`Dual`] and [`FixedPoint`] all implement it.
 ///
 /// Because `Complex` and `Dual` are themselves coefficients, the extensions
 /// nest — `Dual<Complex<f64>>` and `Vector<Dual<f64>>` are ordinary types.

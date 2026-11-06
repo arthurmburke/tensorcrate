@@ -12,6 +12,8 @@ tensorcrate-fusion = { path = "fusion" }
 half = { version = "2.7", features = ["num-traits"] }
 num-traits = "0.2"
 typenum = "1.20"
+# Optional (de)serialization of FixedPoint, as exact decimal strings.
+serde = { version = "1", optional = true }
 
 [features]
 default = ["metal", "simd"]
@@ -19,6 +21,8 @@ default = ["metal", "simd"]
 metal = ["dep:dispatch2", "dep:objc2", "dep:objc2-metal", "dep:objc2-foundation"]
 # NEON on aarch64; runtime-selected AVX2/FMA or SSE2 on x86_64.
 simd = []
+# Serialize/Deserialize for FixedPoint.
+serde = ["dep:serde"]
 # Per-thread counts of kernels launched, bytes moved and allocations made, for
 # measuring fusion. Off by default: without it the recording calls compile away.
 counters = []

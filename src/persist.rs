@@ -70,7 +70,8 @@
 //! ```
 //!
 //! Element tags are a recursive prefix code — `Complex<Dual<f64>>` is
-//! `[0x20, 0x21, 0x11]` — so nesting needs no cases of its own. Tags `0x80`
+//! `[0x20, 0x21, 0x11]` — so nesting needs no cases of its own. A
+//! `FixedPoint<N>` is `[0x30, N]`: its precision is part of its type. Tags `0x80`
 //! through `0xFF` are reserved for out-of-crate implementations of [`Storable`].
 
 use std::fs::File;
@@ -78,7 +79,7 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 use crate::errors::Error;
-use crate::numbers::{Coefficient, Complex, Dual, bf16, f16};
+use crate::numbers::{Coefficient, Complex, Dual, FixedPoint, bf16, f16};
 use crate::tensors::{Host, MAX_RANK, Matrix, Tensor, Vector};
 
 const MAGIC: [u8; 4] = *b"TCR1";
@@ -89,6 +90,7 @@ const KIND_TENSOR: u8 = 2;
 
 const TAG_COMPLEX: u8 = 0x20;
 const TAG_DUAL: u8 = 0x21;
+const TAG_FIXED_POINT: u8 = 0x30;
 
 /// An element type that can be written to and read back from a byte stream.
 ///
@@ -174,6 +176,23 @@ impl<T: Storable> Storable for Dual<T> {
     }
 }
 
+/// A value is its raw `i64` count of `10⁻ᴺ`; the tag carries `N`, so a file of
+/// `FixedPoint<2>` cents does not load as `FixedPoint<6>`.
+impl<const N: usize> Storable for FixedPoint<N> {
+    fn write_tag(tag: &mut Vec<u8>) {
+        tag.push(TAG_FIXED_POINT);
+        tag.push(N as u8);
+    }
+
+    fn write_value<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        self.raw().write_value(writer)
+    }
+
+    fn read_value<Rd: Read>(reader: &mut Rd) -> io::Result<Self> {
+        i64::read_value(reader).map(FixedPoint::from_raw)
+    }
+}
+
 /// The tag for `T`, as bytes.
 fn tag_of<T: Storable>() -> Vec<u8> {
     let mut tag = Vec::new();
@@ -207,6 +226,11 @@ fn describe(tag: &[u8]) -> String {
             0x13 => "bf16".to_string(),
             TAG_COMPLEX => format!("Complex<{}>", walk(tag, at)),
             TAG_DUAL => format!("Dual<{}>", walk(tag, at)),
+            TAG_FIXED_POINT => {
+                let precision = tag.get(*at).map_or("?".to_string(), u8::to_string);
+                *at += 1;
+                format!("FixedPoint<{precision}>")
+            }
             other => format!("<unknown tag 0x{other:02x}>"),
         }
     }
