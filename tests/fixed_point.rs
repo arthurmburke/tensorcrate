@@ -1,7 +1,7 @@
 //! `FixedPoint` through the generic tensor algebra: vectors, matrices, small matrices and
 //! persistence, all exact where a float would not be.
 
-use tensorcrate::geometry::{DenseMatrix, SmallVector};
+use tensorcrate::geometry::{DenseMatrix, DenseVector};
 use tensorcrate::numbers::{FixedPoint, Rounding};
 use tensorcrate::prelude::*;
 use tensorcrate::tensors::{Matrix, Vector};
@@ -39,7 +39,7 @@ fn matrices_multiply_and_invert() {
 #[test]
 fn small_matrices_work_on_decimals() {
     let a: DenseMatrix<Micros, 2, 2> = [[m("1.5"), m("0")], [m("0"), m("2")]].into();
-    let x: SmallVector<Micros, 2> = [m("0.1"), m("0.2")].into();
+    let x: DenseVector<Micros, 2> = [m("0.1"), m("0.2")].into();
     let y = a.matvec(&x);
     assert_eq!((y[0], y[1]), (m("0.15"), m("0.4")));
     assert_eq!(a.determinant(), m("3"));

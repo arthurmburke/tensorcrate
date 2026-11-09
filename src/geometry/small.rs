@@ -8,36 +8,36 @@ use std::ops::{Add, Div, Index, IndexMut, Mul, Neg, Sub};
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SmallVector<T, const N: usize>(pub [T; N]);
+pub struct DenseVector<T, const N: usize>(pub [T; N]);
 
-impl<T, const N: usize> SmallVector<T, N> {
+impl<T, const N: usize> DenseVector<T, N> {
     pub const fn new(values: [T; N]) -> Self {
         Self(values)
     }
     pub fn as_array(&self) -> &[T; N] {
         &self.0
     }
-    pub fn map<U>(self, f: impl FnMut(T) -> U) -> SmallVector<U, N> {
-        SmallVector(self.0.map(f))
+    pub fn map<U>(self, f: impl FnMut(T) -> U) -> DenseVector<U, N> {
+        DenseVector(self.0.map(f))
     }
 }
-impl<T, const N: usize> From<[T; N]> for SmallVector<T, N> {
+impl<T, const N: usize> From<[T; N]> for DenseVector<T, N> {
     fn from(values: [T; N]) -> Self {
         Self(values)
     }
 }
-impl<T, const N: usize> Index<usize> for SmallVector<T, N> {
+impl<T, const N: usize> Index<usize> for DenseVector<T, N> {
     type Output = T;
     fn index(&self, i: usize) -> &T {
         &self.0[i]
     }
 }
-impl<T, const N: usize> IndexMut<usize> for SmallVector<T, N> {
+impl<T, const N: usize> IndexMut<usize> for DenseVector<T, N> {
     fn index_mut(&mut self, i: usize) -> &mut T {
         &mut self.0[i]
     }
 }
-impl<T: Coefficient, const N: usize> SmallVector<T, N> {
+impl<T: Coefficient, const N: usize> DenseVector<T, N> {
     pub fn zeros() -> Self {
         Self([T::zero(); N])
     }
@@ -48,7 +48,7 @@ impl<T: Coefficient, const N: usize> SmallVector<T, N> {
             .fold(T::zero(), |s, (&a, &b)| s + a * b)
     }
 }
-impl<T: Coefficient> SmallVector<T, 3> {
+impl<T: Coefficient> DenseVector<T, 3> {
     pub fn cross(&self, rhs: &Self) -> Self {
         Self([
             self[1] * rhs[2] - self[2] * rhs[1],
@@ -57,7 +57,7 @@ impl<T: Coefficient> SmallVector<T, 3> {
         ])
     }
 }
-impl<T: Real, const N: usize> SmallVector<T, N> {
+impl<T: Real, const N: usize> DenseVector<T, N> {
     /// Euclidean norm with scaling to avoid intermediate squared overflow.
     pub fn norm(&self) -> T {
         if self.0.iter().any(|v| v.is_nan()) {
@@ -88,69 +88,69 @@ impl<T: Real, const N: usize> SmallVector<T, N> {
         Ok(scaled / scaled.norm())
     }
 }
-impl<T: Coefficient, const N: usize> Add for SmallVector<T, N> {
+impl<T: Coefficient, const N: usize> Add for DenseVector<T, N> {
     type Output = Self;
     fn add(self, rhs: Self) -> Self {
         Self(std::array::from_fn(|i| self[i] + rhs[i]))
     }
 }
-impl<T: Coefficient, const N: usize> Sub for SmallVector<T, N> {
+impl<T: Coefficient, const N: usize> Sub for DenseVector<T, N> {
     type Output = Self;
     fn sub(self, rhs: Self) -> Self {
         Self(std::array::from_fn(|i| self[i] - rhs[i]))
     }
 }
-impl<T: Coefficient, const N: usize> Add<&SmallVector<T, N>> for &SmallVector<T, N> {
-    type Output = SmallVector<T, N>;
-    fn add(self, rhs: &SmallVector<T, N>) -> Self::Output {
+impl<T: Coefficient, const N: usize> Add<&DenseVector<T, N>> for &DenseVector<T, N> {
+    type Output = DenseVector<T, N>;
+    fn add(self, rhs: &DenseVector<T, N>) -> Self::Output {
         *self + *rhs
     }
 }
-impl<T: Coefficient, const N: usize> Sub<&SmallVector<T, N>> for &SmallVector<T, N> {
-    type Output = SmallVector<T, N>;
-    fn sub(self, rhs: &SmallVector<T, N>) -> Self::Output {
+impl<T: Coefficient, const N: usize> Sub<&DenseVector<T, N>> for &DenseVector<T, N> {
+    type Output = DenseVector<T, N>;
+    fn sub(self, rhs: &DenseVector<T, N>) -> Self::Output {
         *self - *rhs
     }
 }
-impl<T: Coefficient, const N: usize> Mul<T> for SmallVector<T, N> {
+impl<T: Coefficient, const N: usize> Mul<T> for DenseVector<T, N> {
     type Output = Self;
     fn mul(self, rhs: T) -> Self {
         self.map(|v| v * rhs)
     }
 }
-impl<T: Coefficient, const N: usize> Div<T> for SmallVector<T, N> {
+impl<T: Coefficient, const N: usize> Div<T> for DenseVector<T, N> {
     type Output = Self;
     fn div(self, rhs: T) -> Self {
         self.map(|v| v / rhs)
     }
 }
-impl<T: Coefficient + Neg<Output = T>, const N: usize> Neg for SmallVector<T, N> {
+impl<T: Coefficient + Neg<Output = T>, const N: usize> Neg for DenseVector<T, N> {
     type Output = Self;
     fn neg(self) -> Self {
         self.map(|v| -v)
     }
 }
-impl<'b, T: Coefficient, const N: usize> Dot<&'b SmallVector<T, N>> for &SmallVector<T, N> {
+impl<'b, T: Coefficient, const N: usize> Dot<&'b DenseVector<T, N>> for &DenseVector<T, N> {
     type Output = T;
-    fn dot(self, rhs: &'b SmallVector<T, N>) -> T {
-        SmallVector::dot(self, rhs)
+    fn dot(self, rhs: &'b DenseVector<T, N>) -> T {
+        DenseVector::dot(self, rhs)
     }
 }
-impl<'b, T: Coefficient + Conj<Output = T>, const N: usize> Dotc<&'b SmallVector<T, N>>
-    for &SmallVector<T, N>
+impl<'b, T: Coefficient + Conj<Output = T>, const N: usize> Dotc<&'b DenseVector<T, N>>
+    for &DenseVector<T, N>
 {
     type Output = T;
-    fn dotc(self, rhs: &'b SmallVector<T, N>) -> T {
+    fn dotc(self, rhs: &'b DenseVector<T, N>) -> T {
         self.0
             .iter()
             .zip(&rhs.0)
             .fold(T::zero(), |s, (a, b)| s + a.conj() * *b)
     }
 }
-impl<'b, T: Coefficient> Cross<&'b SmallVector<T, 3>> for &SmallVector<T, 3> {
-    type Output = SmallVector<T, 3>;
-    fn cross(self, rhs: &'b SmallVector<T, 3>) -> Self::Output {
-        SmallVector::cross(self, rhs)
+impl<'b, T: Coefficient> Cross<&'b DenseVector<T, 3>> for &DenseVector<T, 3> {
+    type Output = DenseVector<T, 3>;
+    fn cross(self, rhs: &'b DenseVector<T, 3>) -> Self::Output {
+        DenseVector::cross(self, rhs)
     }
 }
 
@@ -186,7 +186,7 @@ impl<T: Coefficient, const R: usize, const C: usize> DenseMatrix<T, R, C> {
     pub fn zeros() -> Self {
         Self([[T::zero(); C]; R])
     }
-    pub fn from_columns(columns: [SmallVector<T, R>; C]) -> Self {
+    pub fn from_columns(columns: [DenseVector<T, R>; C]) -> Self {
         Self(std::array::from_fn(|i| {
             std::array::from_fn(|j| columns[j][i])
         }))
@@ -196,8 +196,8 @@ impl<T: Coefficient, const R: usize, const C: usize> DenseMatrix<T, R, C> {
             std::array::from_fn(|j| self[(j, i)])
         }))
     }
-    pub fn matvec(&self, x: &SmallVector<T, C>) -> SmallVector<T, R> {
-        SmallVector(std::array::from_fn(|i| {
+    pub fn matvec(&self, x: &DenseVector<T, C>) -> DenseVector<T, R> {
+        DenseVector(std::array::from_fn(|i| {
             (0..C).fold(T::zero(), |s, j| s + self[(i, j)] * x[j])
         }))
     }
@@ -240,11 +240,11 @@ impl<'b, T: Coefficient, const R: usize, const C: usize, const K: usize>
         DenseMatrix::matmul(self, rhs)
     }
 }
-impl<'b, T: Coefficient, const R: usize, const C: usize> MatVec<&'b SmallVector<T, C>>
+impl<'b, T: Coefficient, const R: usize, const C: usize> MatVec<&'b DenseVector<T, C>>
     for &DenseMatrix<T, R, C>
 {
-    type Output = SmallVector<T, R>;
-    fn matvec(self, rhs: &'b SmallVector<T, C>) -> Self::Output {
+    type Output = DenseVector<T, R>;
+    fn matvec(self, rhs: &'b DenseVector<T, C>) -> Self::Output {
         DenseMatrix::matvec(self, rhs)
     }
 }
@@ -290,7 +290,7 @@ impl<T: Real, const N: usize> DenseMatrix<T, N, N> {
     pub fn lu(&self) -> Result<SmallLu<T, N>, Error> {
         SmallLu::factor(*self, T::epsilon() * T::from_f64(N.max(1) as f64))
     }
-    pub fn solve(&self, rhs: &SmallVector<T, N>) -> Result<SmallVector<T, N>, Error> {
+    pub fn solve(&self, rhs: &DenseVector<T, N>) -> Result<DenseVector<T, N>, Error> {
         self.lu()?.solve(rhs)
     }
     pub fn inverse(&self) -> Result<Self, Error> {
@@ -350,11 +350,11 @@ impl<T: Real, const N: usize> SmallLu<T, N> {
             odd,
         })
     }
-    pub fn solve(&self, rhs: &SmallVector<T, N>) -> Result<SmallVector<T, N>, Error> {
+    pub fn solve(&self, rhs: &DenseVector<T, N>) -> Result<DenseVector<T, N>, Error> {
         if rhs.0.iter().any(|v| !v.is_finite()) {
             return Err(Error::InvalidArgument("nonfinite right hand side".into()));
         }
-        let mut x = SmallVector(std::array::from_fn(|i| rhs[self.permutation[i]]));
+        let mut x = DenseVector(std::array::from_fn(|i| rhs[self.permutation[i]]));
         for i in 0..N {
             for j in 0..i {
                 x[i] = x[i] - self.lu[(i, j)] * x[j];
@@ -374,7 +374,7 @@ impl<T: Real, const N: usize> SmallLu<T, N> {
     pub fn inverse(&self) -> Result<DenseMatrix<T, N, N>, Error> {
         let mut inverse = DenseMatrix::zeros();
         for j in 0..N {
-            let mut e = SmallVector::zeros();
+            let mut e = DenseVector::zeros();
             e[j] = T::one();
             let column = self.solve(&e)?;
             for i in 0..N {

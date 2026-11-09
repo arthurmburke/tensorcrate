@@ -1,17 +1,17 @@
-use super::{AffineSimplex, SmallVector};
+use super::{AffineSimplex, DenseVector};
 use crate::{errors::Error, numbers::Real};
 
 /// Reference-cell quadrature. Weights include reference measure: one for the
 /// unit interval, one half for the triangle, and one sixth for the tetrahedron.
 #[derive(Clone, Debug)]
 pub struct QuadratureRule<T, const D: usize> {
-    points: Vec<SmallVector<T, D>>,
+    points: Vec<DenseVector<T, D>>,
     weights: Vec<T>,
     degree: usize,
 }
 
 impl<T: Real, const D: usize> QuadratureRule<T, D> {
-    pub fn points(&self) -> &[SmallVector<T, D>] {
+    pub fn points(&self) -> &[DenseVector<T, D>] {
         &self.points
     }
     pub fn weights(&self) -> &[T] {
@@ -20,7 +20,7 @@ impl<T: Real, const D: usize> QuadratureRule<T, D> {
     pub fn degree(&self) -> usize {
         self.degree
     }
-    pub fn integrate<V>(&self, f: impl Fn(SmallVector<T, D>) -> V) -> V
+    pub fn integrate<V>(&self, f: impl Fn(DenseVector<T, D>) -> V) -> V
     where
         V: num_traits::Zero + std::ops::Add<Output = V> + std::ops::Mul<T, Output = V>,
     {
@@ -32,7 +32,7 @@ impl<T: Real, const D: usize> QuadratureRule<T, D> {
     pub fn integrate_mapped<V>(
         &self,
         map: &AffineSimplex<T, D>,
-        f: impl Fn(SmallVector<T, D>) -> V,
+        f: impl Fn(DenseVector<T, D>) -> V,
     ) -> V
     where
         V: num_traits::Zero + std::ops::Add<Output = V> + std::ops::Mul<T, Output = V>,
@@ -88,7 +88,7 @@ impl<T: Real> QuadratureRule<T, 1> {
         Ok(Self {
             points: rule
                 .iter()
-                .map(|&(x, _)| SmallVector([T::from_f64(x)]))
+                .map(|&(x, _)| DenseVector([T::from_f64(x)]))
                 .collect(),
             weights: rule.iter().map(|&(_, w)| T::from_f64(w)).collect(),
             degree: 2 * order - 1,
@@ -128,7 +128,7 @@ impl<T: Real> QuadratureRule<T, 2> {
         Ok(Self {
             points: points
                 .into_iter()
-                .map(|p| SmallVector(p.map(T::from_f64)))
+                .map(|p| DenseVector(p.map(T::from_f64)))
                 .collect(),
             weights: weights.into_iter().map(T::from_f64).collect(),
             degree: degree.max(1),
@@ -170,7 +170,7 @@ impl<T: Real> QuadratureRule<T, 3> {
         Ok(Self {
             points: points
                 .into_iter()
-                .map(|p| SmallVector(p.map(T::from_f64)))
+                .map(|p| DenseVector(p.map(T::from_f64)))
                 .collect(),
             weights: weights.into_iter().map(T::from_f64).collect(),
             degree: degree.max(1),

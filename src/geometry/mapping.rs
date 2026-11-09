@@ -1,4 +1,4 @@
-use super::{QuadratureRule, DenseMatrix, SmallVector};
+use super::{QuadratureRule, DenseMatrix, DenseVector};
 use crate::{errors::Error, numbers::Real};
 
 /// A constant nonsingular Jacobian. Differential mappings preserve its signed
@@ -37,28 +37,28 @@ impl<T: Real, const N: usize> Jacobian<T, N> {
     pub fn measure_scale(&self) -> T {
         self.determinant.abs()
     }
-    pub fn map_vector(&self, v: &SmallVector<T, N>) -> SmallVector<T, N> {
+    pub fn map_vector(&self, v: &DenseVector<T, N>) -> DenseVector<T, N> {
         self.matrix.matvec(v)
     }
-    pub fn map_gradient(&self, v: &SmallVector<T, N>) -> SmallVector<T, N> {
+    pub fn map_gradient(&self, v: &DenseVector<T, N>) -> DenseVector<T, N> {
         self.inverse.transpose().matvec(v)
     }
     /// Covariant Piola map for H(curl) vector fields.
-    pub fn covariant_piola(&self, v: &SmallVector<T, N>) -> SmallVector<T, N> {
+    pub fn covariant_piola(&self, v: &DenseVector<T, N>) -> DenseVector<T, N> {
         self.map_gradient(v)
     }
     /// Contravariant Piola map for H(div) vector fields.
-    pub fn contravariant_piola(&self, v: &SmallVector<T, N>) -> SmallVector<T, N> {
+    pub fn contravariant_piola(&self, v: &DenseVector<T, N>) -> DenseVector<T, N> {
         self.map_vector(v) / self.determinant
     }
     /// Oriented cofactor map of an area normal.
-    pub fn map_area_normal(&self, v: &SmallVector<T, N>) -> SmallVector<T, N> {
+    pub fn map_area_normal(&self, v: &DenseVector<T, N>) -> DenseVector<T, N> {
         self.map_gradient(v) * self.determinant
     }
 }
 impl<T: Real> Jacobian<T, 3> {
     /// Curl of the covariantly mapped field on an affine cell.
-    pub fn map_curl(&self, curl: &SmallVector<T, 3>) -> SmallVector<T, 3> {
+    pub fn map_curl(&self, curl: &DenseVector<T, 3>) -> DenseVector<T, 3> {
         self.map_vector(curl) / self.determinant
     }
 }
@@ -67,13 +67,13 @@ impl<T: Real> Jacobian<T, 3> {
 /// most one). Negative cell orientations are supported explicitly.
 #[derive(Clone, Copy, Debug)]
 pub struct AffineSimplex<T, const N: usize> {
-    origin: SmallVector<T, N>,
+    origin: DenseVector<T, N>,
     jacobian: Jacobian<T, N>,
 }
 impl<T: Real, const N: usize> AffineSimplex<T, N> {
     pub fn new(
-        origin: SmallVector<T, N>,
-        endpoints: [SmallVector<T, N>; N],
+        origin: DenseVector<T, N>,
+        endpoints: [DenseVector<T, N>; N],
     ) -> Result<Self, Error> {
         if origin.0.iter().any(|v| !v.is_finite()) {
             return Err(Error::InvalidArgument("nonfinite simplex origin".into()));
@@ -84,10 +84,10 @@ impl<T: Real, const N: usize> AffineSimplex<T, N> {
     pub fn jacobian(&self) -> &Jacobian<T, N> {
         &self.jacobian
     }
-    pub fn map_point(&self, reference: SmallVector<T, N>) -> SmallVector<T, N> {
+    pub fn map_point(&self, reference: DenseVector<T, N>) -> DenseVector<T, N> {
         self.origin + self.jacobian.map_vector(&reference)
     }
-    pub fn reference_point(&self, physical: SmallVector<T, N>) -> SmallVector<T, N> {
+    pub fn reference_point(&self, physical: DenseVector<T, N>) -> DenseVector<T, N> {
         self.jacobian.inverse.matvec(&(physical - self.origin))
     }
     pub fn measure(&self) -> T {
@@ -95,19 +95,19 @@ impl<T: Real, const N: usize> AffineSimplex<T, N> {
     }
 }
 impl<T: Real> AffineSimplex<T, 2> {
-    pub fn from_vertices(v: [SmallVector<T, 2>; 3]) -> Result<Self, Error> {
+    pub fn from_vertices(v: [DenseVector<T, 2>; 3]) -> Result<Self, Error> {
         Self::new(v[0], [v[1], v[2]])
     }
-    pub fn barycentric(&self, physical: SmallVector<T, 2>) -> [T; 3] {
+    pub fn barycentric(&self, physical: DenseVector<T, 2>) -> [T; 3] {
         let r = self.reference_point(physical);
         [T::one() - r[0] - r[1], r[0], r[1]]
     }
 }
 impl<T: Real> AffineSimplex<T, 3> {
-    pub fn from_vertices(v: [SmallVector<T, 3>; 4]) -> Result<Self, Error> {
+    pub fn from_vertices(v: [DenseVector<T, 3>; 4]) -> Result<Self, Error> {
         Self::new(v[0], [v[1], v[2], v[3]])
     }
-    pub fn barycentric(&self, physical: SmallVector<T, 3>) -> [T; 4] {
+    pub fn barycentric(&self, physical: DenseVector<T, 3>) -> [T; 4] {
         let r = self.reference_point(physical);
         [T::one() - r[0] - r[1] - r[2], r[0], r[1], r[2]]
     }
@@ -116,13 +116,13 @@ impl<T: Real> AffineSimplex<T, 3> {
 /// A planar triangle embedded in 3D, for boundary-face integration.
 #[derive(Clone, Copy, Debug)]
 pub struct Triangle3<T> {
-    origin: SmallVector<T, 3>,
-    edges: [SmallVector<T, 3>; 2],
-    normal: SmallVector<T, 3>,
+    origin: DenseVector<T, 3>,
+    edges: [DenseVector<T, 3>; 2],
+    normal: DenseVector<T, 3>,
     scale: T,
 }
 impl<T: Real> Triangle3<T> {
-    pub fn new(v: [SmallVector<T, 3>; 3]) -> Result<Self, Error> {
+    pub fn new(v: [DenseVector<T, 3>; 3]) -> Result<Self, Error> {
         if v.iter().flat_map(|v| v.0).any(|x| !x.is_finite()) {
             return Err(Error::InvalidArgument("nonfinite triangle vertex".into()));
         }
@@ -142,16 +142,16 @@ impl<T: Real> Triangle3<T> {
             scale,
         })
     }
-    pub fn normal(&self) -> SmallVector<T, 3> {
+    pub fn normal(&self) -> DenseVector<T, 3> {
         self.normal
     }
     pub fn area(&self) -> T {
         self.scale / T::from_f64(2.0)
     }
-    pub fn map_point(&self, r: SmallVector<T, 2>) -> SmallVector<T, 3> {
+    pub fn map_point(&self, r: DenseVector<T, 2>) -> DenseVector<T, 3> {
         self.origin + self.edges[0] * r[0] + self.edges[1] * r[1]
     }
-    pub fn integrate<V>(&self, rule: &QuadratureRule<T, 2>, f: impl Fn(SmallVector<T, 3>) -> V) -> V
+    pub fn integrate<V>(&self, rule: &QuadratureRule<T, 2>, f: impl Fn(DenseVector<T, 3>) -> V) -> V
     where
         V: num_traits::Zero + std::ops::Add<Output = V> + std::ops::Mul<T, Output = V>,
     {
