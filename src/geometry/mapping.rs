@@ -1,17 +1,17 @@
-use super::{QuadratureRule, SmallMatrix, SmallVector};
+use super::{QuadratureRule, DenseMatrix, SmallVector};
 use crate::{errors::Error, numbers::Real};
 
 /// A constant nonsingular Jacobian. Differential mappings preserve its signed
 /// determinant; integration uses the absolute determinant.
 #[derive(Clone, Copy, Debug)]
 pub struct Jacobian<T, const N: usize> {
-    matrix: SmallMatrix<T, N, N>,
-    inverse: SmallMatrix<T, N, N>,
+    matrix: DenseMatrix<T, N, N>,
+    inverse: DenseMatrix<T, N, N>,
     determinant: T,
 }
 
 impl<T: Real, const N: usize> Jacobian<T, N> {
-    pub fn new(matrix: SmallMatrix<T, N, N>) -> Result<Self, Error> {
+    pub fn new(matrix: DenseMatrix<T, N, N>) -> Result<Self, Error> {
         let lu = matrix.lu()?;
         let determinant = lu.determinant();
         if determinant.is_zero() || !determinant.is_finite() {
@@ -25,10 +25,10 @@ impl<T: Real, const N: usize> Jacobian<T, N> {
             determinant,
         })
     }
-    pub fn matrix(&self) -> &SmallMatrix<T, N, N> {
+    pub fn matrix(&self) -> &DenseMatrix<T, N, N> {
         &self.matrix
     }
-    pub fn inverse(&self) -> &SmallMatrix<T, N, N> {
+    pub fn inverse(&self) -> &DenseMatrix<T, N, N> {
         &self.inverse
     }
     pub fn determinant(&self) -> T {
@@ -78,7 +78,7 @@ impl<T: Real, const N: usize> AffineSimplex<T, N> {
         if origin.0.iter().any(|v| !v.is_finite()) {
             return Err(Error::InvalidArgument("nonfinite simplex origin".into()));
         }
-        let jacobian = Jacobian::new(SmallMatrix::from_columns(endpoints.map(|v| v - origin)))?;
+        let jacobian = Jacobian::new(DenseMatrix::from_columns(endpoints.map(|v| v - origin)))?;
         Ok(Self { origin, jacobian })
     }
     pub fn jacobian(&self) -> &Jacobian<T, N> {

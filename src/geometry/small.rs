@@ -156,9 +156,9 @@ impl<'b, T: Coefficient> Cross<&'b SmallVector<T, 3>> for &SmallVector<T, 3> {
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SmallMatrix<T, const R: usize, const C: usize>(pub [[T; C]; R]);
+pub struct DenseMatrix<T, const R: usize, const C: usize>(pub [[T; C]; R]);
 
-impl<T, const R: usize, const C: usize> SmallMatrix<T, R, C> {
+impl<T, const R: usize, const C: usize> DenseMatrix<T, R, C> {
     pub const fn new(rows: [[T; C]; R]) -> Self {
         Self(rows)
     }
@@ -166,23 +166,23 @@ impl<T, const R: usize, const C: usize> SmallMatrix<T, R, C> {
         &self.0
     }
 }
-impl<T, const R: usize, const C: usize> From<[[T; C]; R]> for SmallMatrix<T, R, C> {
+impl<T, const R: usize, const C: usize> From<[[T; C]; R]> for DenseMatrix<T, R, C> {
     fn from(rows: [[T; C]; R]) -> Self {
         Self(rows)
     }
 }
-impl<T, const R: usize, const C: usize> Index<(usize, usize)> for SmallMatrix<T, R, C> {
+impl<T, const R: usize, const C: usize> Index<(usize, usize)> for DenseMatrix<T, R, C> {
     type Output = T;
     fn index(&self, (i, j): (usize, usize)) -> &T {
         &self.0[i][j]
     }
 }
-impl<T, const R: usize, const C: usize> IndexMut<(usize, usize)> for SmallMatrix<T, R, C> {
+impl<T, const R: usize, const C: usize> IndexMut<(usize, usize)> for DenseMatrix<T, R, C> {
     fn index_mut(&mut self, (i, j): (usize, usize)) -> &mut T {
         &mut self.0[i][j]
     }
 }
-impl<T: Coefficient, const R: usize, const C: usize> SmallMatrix<T, R, C> {
+impl<T: Coefficient, const R: usize, const C: usize> DenseMatrix<T, R, C> {
     pub fn zeros() -> Self {
         Self([[T::zero(); C]; R])
     }
@@ -191,8 +191,8 @@ impl<T: Coefficient, const R: usize, const C: usize> SmallMatrix<T, R, C> {
             std::array::from_fn(|j| columns[j][i])
         }))
     }
-    pub fn transpose(&self) -> SmallMatrix<T, C, R> {
-        SmallMatrix(std::array::from_fn(|i| {
+    pub fn transpose(&self) -> DenseMatrix<T, C, R> {
+        DenseMatrix(std::array::from_fn(|i| {
             std::array::from_fn(|j| self[(j, i)])
         }))
     }
@@ -201,92 +201,92 @@ impl<T: Coefficient, const R: usize, const C: usize> SmallMatrix<T, R, C> {
             (0..C).fold(T::zero(), |s, j| s + self[(i, j)] * x[j])
         }))
     }
-    pub fn matmul<const K: usize>(&self, rhs: &SmallMatrix<T, C, K>) -> SmallMatrix<T, R, K> {
-        SmallMatrix(std::array::from_fn(|i| {
+    pub fn matmul<const K: usize>(&self, rhs: &DenseMatrix<T, C, K>) -> DenseMatrix<T, R, K> {
+        DenseMatrix(std::array::from_fn(|i| {
             std::array::from_fn(|j| (0..C).fold(T::zero(), |s, k| s + self[(i, k)] * rhs[(k, j)]))
         }))
     }
 }
-impl<T: Coefficient, const N: usize> SmallMatrix<T, N, N> {
+impl<T: Coefficient, const N: usize> DenseMatrix<T, N, N> {
     pub fn identity() -> Self {
         Self(std::array::from_fn(|i| {
             std::array::from_fn(|j| if i == j { T::one() } else { T::zero() })
         }))
     }
 }
-impl<T: Coefficient> SmallMatrix<T, 2, 2> {
+impl<T: Coefficient> DenseMatrix<T, 2, 2> {
     pub fn determinant(&self) -> T {
         self[(0, 0)] * self[(1, 1)] - self[(0, 1)] * self[(1, 0)]
     }
 }
-impl<T: Coefficient> SmallMatrix<T, 3, 3> {
+impl<T: Coefficient> DenseMatrix<T, 3, 3> {
     pub fn determinant(&self) -> T {
         self[(0, 0)] * (self[(1, 1)] * self[(2, 2)] - self[(1, 2)] * self[(2, 1)])
             - self[(0, 1)] * (self[(1, 0)] * self[(2, 2)] - self[(1, 2)] * self[(2, 0)])
             + self[(0, 2)] * (self[(1, 0)] * self[(2, 1)] - self[(1, 1)] * self[(2, 0)])
     }
 }
-impl<T: Coefficient, const R: usize, const C: usize> Transpose for &SmallMatrix<T, R, C> {
-    type Output = SmallMatrix<T, C, R>;
+impl<T: Coefficient, const R: usize, const C: usize> Transpose for &DenseMatrix<T, R, C> {
+    type Output = DenseMatrix<T, C, R>;
     fn transpose(self) -> Self::Output {
-        SmallMatrix::transpose(self)
+        DenseMatrix::transpose(self)
     }
 }
 impl<'b, T: Coefficient, const R: usize, const C: usize, const K: usize>
-    MatMul<&'b SmallMatrix<T, C, K>> for &SmallMatrix<T, R, C>
+    MatMul<&'b DenseMatrix<T, C, K>> for &DenseMatrix<T, R, C>
 {
-    type Output = SmallMatrix<T, R, K>;
-    fn matmul(self, rhs: &'b SmallMatrix<T, C, K>) -> Self::Output {
-        SmallMatrix::matmul(self, rhs)
+    type Output = DenseMatrix<T, R, K>;
+    fn matmul(self, rhs: &'b DenseMatrix<T, C, K>) -> Self::Output {
+        DenseMatrix::matmul(self, rhs)
     }
 }
 impl<'b, T: Coefficient, const R: usize, const C: usize> MatVec<&'b SmallVector<T, C>>
-    for &SmallMatrix<T, R, C>
+    for &DenseMatrix<T, R, C>
 {
     type Output = SmallVector<T, R>;
     fn matvec(self, rhs: &'b SmallVector<T, C>) -> Self::Output {
-        SmallMatrix::matvec(self, rhs)
+        DenseMatrix::matvec(self, rhs)
     }
 }
 impl<T: Coefficient + Conj<Output = T>, const R: usize, const C: usize> Adjoint
-    for &SmallMatrix<T, R, C>
+    for &DenseMatrix<T, R, C>
 {
-    type Output = SmallMatrix<T, C, R>;
+    type Output = DenseMatrix<T, C, R>;
     fn adjoint(self) -> Self::Output {
-        SmallMatrix(std::array::from_fn(|i| {
+        DenseMatrix(std::array::from_fn(|i| {
             std::array::from_fn(|j| self[(j, i)].conj())
         }))
     }
 }
 
-impl<T: Coefficient> Determinant for &SmallMatrix<T, 2, 2> {
+impl<T: Coefficient> Determinant for &DenseMatrix<T, 2, 2> {
     type Output = T;
     fn determinant(self) -> T {
-        SmallMatrix::<T, 2, 2>::determinant(self)
+        DenseMatrix::<T, 2, 2>::determinant(self)
     }
 }
-impl<T: Coefficient> Determinant for &SmallMatrix<T, 3, 3> {
+impl<T: Coefficient> Determinant for &DenseMatrix<T, 3, 3> {
     type Output = T;
     fn determinant(self) -> T {
-        SmallMatrix::<T, 3, 3>::determinant(self)
+        DenseMatrix::<T, 3, 3>::determinant(self)
     }
 }
-impl<T: Real, const N: usize> Inverse for &SmallMatrix<T, N, N> {
-    type Output = Result<SmallMatrix<T, N, N>, Error>;
+impl<T: Real, const N: usize> Inverse for &DenseMatrix<T, N, N> {
+    type Output = Result<DenseMatrix<T, N, N>, Error>;
     fn inverse(self) -> Self::Output {
-        SmallMatrix::inverse(self)
+        DenseMatrix::inverse(self)
     }
 }
 
 /// Reusable scaled-partial-pivoting LU with relative pivot rejection.
 #[derive(Clone, Copy, Debug)]
 pub struct SmallLu<T, const N: usize> {
-    lu: SmallMatrix<T, N, N>,
+    lu: DenseMatrix<T, N, N>,
     permutation: [usize; N],
     odd: bool,
 }
 
-impl<T: Real, const N: usize> SmallMatrix<T, N, N> {
+impl<T: Real, const N: usize> DenseMatrix<T, N, N> {
     pub fn lu(&self) -> Result<SmallLu<T, N>, Error> {
         SmallLu::factor(*self, T::epsilon() * T::from_f64(N.max(1) as f64))
     }
@@ -298,7 +298,7 @@ impl<T: Real, const N: usize> SmallMatrix<T, N, N> {
     }
 }
 impl<T: Real, const N: usize> SmallLu<T, N> {
-    pub fn factor(mut lu: SmallMatrix<T, N, N>, relative_tolerance: T) -> Result<Self, Error> {
+    pub fn factor(mut lu: DenseMatrix<T, N, N>, relative_tolerance: T) -> Result<Self, Error> {
         if !relative_tolerance.is_finite()
             || relative_tolerance < T::zero()
             || lu.0.iter().flatten().any(|v| !v.is_finite())
@@ -371,8 +371,8 @@ impl<T: Real, const N: usize> SmallLu<T, N> {
         }
         Ok(x)
     }
-    pub fn inverse(&self) -> Result<SmallMatrix<T, N, N>, Error> {
-        let mut inverse = SmallMatrix::zeros();
+    pub fn inverse(&self) -> Result<DenseMatrix<T, N, N>, Error> {
+        let mut inverse = DenseMatrix::zeros();
         for j in 0..N {
             let mut e = SmallVector::zeros();
             e[j] = T::one();

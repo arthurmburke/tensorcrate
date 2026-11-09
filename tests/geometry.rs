@@ -53,7 +53,7 @@ fn small_products_and_complex_adjoints_match_dynamic_algebra() {
     );
     close(a.determinant(), 31.0);
     type C = Complex<f64>;
-    let a = SmallMatrix::new([[C::new(1.0, 2.0), C::new(3.0, -4.0)]]);
+    let a = DenseMatrix::new([[C::new(1.0, 2.0), C::new(3.0, -4.0)]]);
     assert_eq!(a.adjoint().0, [[C::new(1.0, -2.0)], [C::new(3.0, 4.0)]]);
     let v = Vec2::new([C::new(1.0, 2.0), C::new(3.0, -4.0)]);
     assert_eq!(v.dotc(&v), C::new(30.0, 0.0));
